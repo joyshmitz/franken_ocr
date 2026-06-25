@@ -20,9 +20,14 @@
 | `ddb4e9e5c97c4e560cf133e2bb2adeb1b1609a467c3f504b7495b66852cb32ef` | `README.md` | 8721 | runtime pin, inference example, modes |
 | `d985048c6d69429d685fdbe7557340aa0897c0fd8dc038299b148b9c75dc3383` | `LICENSE` | 1061 | MIT, Copyright (c) 2026 Baidu |
 
-**Not yet hashed (fetched on demand by the beads that need them):** `tokenizer.json`
-(9.98 MB, needed by OQ-16 tokenizer conformance) and `model-00001-of-000001.safetensors`
-(6.67 GB bf16 weights, needed for parity fixtures — out-of-band via `scripts/fetch_model.sh`).
+**Large source (hashed, fetched on demand by `scripts/fetch_sources.sh`):**
+
+| SHA-256 | File | Bytes | Role |
+|---------|------|-------|------|
+| `a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4` | `tokenizer.json` | 9979544 | byte-level **BPE** (base vocab 128000 + 830 added tokens), merges, pre-tokenizer `Sequence` (OQ-16) |
+
+**Not yet hashed:** `model-00001-of-000001.safetensors` (6.67 GB bf16 weights, needed
+for parity fixtures — out-of-band via `scripts/fetch_model.sh`; hash recorded when fetched).
 
 ## Verify
 
