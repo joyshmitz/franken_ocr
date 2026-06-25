@@ -4,7 +4,7 @@
 //! [`perf_harness`](support/perf_harness.rs) infra: it MEASURES franken_ocr's
 //! own forward path, and — when a baseline (ONNX/`ort` or a CPU torch reference)
 //! and the 6.67 GB weights are present — compares the two under the §9.3 fairness
-//! controls, tagging each stage's honest `focr/reference` ratio. It is
+//! controls, tagging each stage's honest `reference/focr` ratio. It is
 //! auto-discovered by cargo on the nightly toolchain via the `#![feature(test)]`
 //! plus `extern crate test;` plus `#[bench]` mechanism (no `[[bench]]` manifest
 //! entry, no criterion — adding either would edit `Cargo.toml`, which this
@@ -455,7 +455,7 @@ fn run_gauntlet(budget: BenchBudget) -> Vec<BenchRecord> {
     // Each stage logs EXACTLY what it would measure and why it skipped, so a
     // no-weights/no-baseline run is informative, not silent. With both present,
     // the runner would shell out to $FOCR_REFERENCE_CMD per stage under thread
-    // parity and record the honest focr/reference ratio (NOT a self-relative
+    // parity and record the honest reference/focr ratio (NOT a self-relative
     // number). The honest target per stage (doctrine #4 / METHODOLOGY §5.1):
     //   * preprocess      : parity-or-better (cheap; not gating)
     //   * vision_encode   : parity-or-slower in f32 v1 ACCEPTABLE, recorded honestly

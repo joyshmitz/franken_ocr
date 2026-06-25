@@ -173,7 +173,8 @@ row** (`perf_harness::Fairness`):
 - **Best-of-N with warmup discard.** `SampleStats::from_durations` discards the
   warmup samples and reports p50/p90/**min** (the best-of-N) plus `cv_pct`.
 
-The honest `focr/reference` ratio is computed per stage and tagged
+The honest `reference/focr` ratio is computed per stage (`>1.0` means `focr`
+is faster) and tagged
 `focr_faster` / `ok` / `warn` / `slower` (`BenchRecord::ratio_tag`) — never a
 self-relative number.
 

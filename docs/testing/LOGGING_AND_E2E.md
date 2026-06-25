@@ -467,7 +467,8 @@ page index stalled.
    discard**, and **`cv_pct`** (a coefficient of variation >5% is noise and the
    row is ineligible). The `gauntlet` bench shells out to the **Phase −1 proven
    CPU reference** via `FOCR_REFERENCE_CMD` / `FOCR_REFERENCE_PYTHON` (plan §9.3)
-   and reports the **honest focr/reference ratio**, not a self-relative number.
+   and reports the **honest reference/focr ratio** (`>1.0` means `focr` is
+   faster), not a self-relative number.
 5. **Profile.** Benches build with the `[profile.release-perf]` profile
    (`debug=line-tables-only`, `lto=thin`, `codegen-units=1`) so timings reflect a
    profiling-grade build, not the dev profile.

@@ -52,7 +52,7 @@ use std::time::Duration;
 // Fairness controls (plan §9.3 — ALL mandatory for a meaningful ratio).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The numeric precision a row was measured at. A raw `focr/reference` ratio is
+/// The numeric precision a row was measured at. A raw `reference/focr` ratio is
 /// meaningless without this — `focr-int8` vs `torch-bf16` is a different claim
 /// than `focr-int8` vs `torch-int8` (plan §9.3, METHODOLOGY §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +307,7 @@ pub struct BenchRecord {
     /// The fairness controls under which this row was measured.
     pub fairness: Fairness,
     /// Head-to-head: the reference baseline's p50 seconds, when a baseline ran.
-    /// `None` ⇒ self-relative microbench (no `focr/reference` ratio claimed).
+    /// `None` ⇒ self-relative microbench (no `reference/focr` ratio claimed).
     pub reference_p50_s: Option<f64>,
     /// Precision tag the *reference* ran at (e.g. `"bf16"`); pairs with `ratio`.
     pub reference_precision: Option<String>,
@@ -316,11 +316,11 @@ pub struct BenchRecord {
 }
 
 impl BenchRecord {
-    /// The honest `focr/reference` ratio for this stage, or `None` when no
-    /// baseline ran. `< 1.0` ⇒ focr is faster; `> 1.0` ⇒ slower (plan §9.3).
+    /// The honest `reference/focr` ratio for this stage, or `None` when no
+    /// baseline ran. `> 1.0` ⇒ focr is faster; `< 1.0` ⇒ slower (PERF_LEDGER).
     #[must_use]
     pub fn ratio(&self) -> Option<f64> {
-        self.reference_p50_s.map(|r| self.stats.p50_s / r)
+        self.reference_p50_s.map(|r| r / self.stats.p50_s)
     }
 
     /// Tag the ratio OK / warn / slower / "focr faster" (plan §9.3 row tags).
@@ -328,11 +328,11 @@ impl BenchRecord {
     #[must_use]
     pub fn ratio_tag(&self) -> Option<&'static str> {
         self.ratio().map(|r| {
-            if r < 0.97 {
+            if r > 1.03 {
                 "focr_faster"
-            } else if r <= 1.05 {
+            } else if r >= 0.95 {
                 "ok"
-            } else if r <= 1.25 {
+            } else if r >= 0.80 {
                 "warn"
             } else {
                 "slower"
@@ -1516,10 +1516,14 @@ mod tests {
             r.reference_p50_s = Some(refr);
             r
         };
-        assert_eq!(mk(0.8, 1.0).ratio_tag(), Some("focr_faster")); // 0.8
-        assert_eq!(mk(1.0, 1.0).ratio_tag(), Some("ok")); // 1.0
-        assert_eq!(mk(1.2, 1.0).ratio_tag(), Some("warn")); // 1.2
-        assert_eq!(mk(1.5, 1.0).ratio_tag(), Some("slower")); // 1.5
+        assert_eq!(mk(0.8, 1.0).ratio(), Some(1.25));
+        assert_eq!(mk(0.8, 1.0).ratio_tag(), Some("focr_faster"));
+        assert_eq!(mk(1.0, 1.0).ratio(), Some(1.0));
+        assert_eq!(mk(1.0, 1.0).ratio_tag(), Some("ok"));
+        assert_eq!(mk(1.2, 1.0).ratio(), Some(1.0 / 1.2));
+        assert_eq!(mk(1.2, 1.0).ratio_tag(), Some("warn"));
+        assert_eq!(mk(1.5, 1.0).ratio(), Some(1.0 / 1.5));
+        assert_eq!(mk(1.5, 1.0).ratio_tag(), Some("slower"));
         assert_eq!(rec("x", "decode", 1.0, 1.0, None, 1.0).ratio_tag(), None);
     }
 }
