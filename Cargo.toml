@@ -58,6 +58,9 @@ image = "0.25"
 [features]
 mimalloc = []
 
+[dev-dependencies]
+sha2 = "0.10"
+
 # The `>=0.3.5,<0.4` asupersync the engine needs is not yet on crates.io (the
 # index tops out at 0.3.4); it lives as the local sibling crate `/dp/asupersync`
 # (version 0.3.5). Patch crates-io to that path so the whole dependency graph —

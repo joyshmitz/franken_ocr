@@ -45,6 +45,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 0. Provenance constants (line-backed to the pinned oracle — see
@@ -469,6 +470,9 @@ pub struct ActivationEntry {
     pub dtype: String,
     /// SHA-256 of the array bytes (for provenance cross-check).
     pub sha256: Option<String>,
+    /// SHA-256 of the exact `.npy` file bytes. This is what [`FixtureLoader`] can
+    /// verify before parsing the array.
+    pub file_sha256: Option<String>,
 }
 
 /// Loads + reports presence of the oracle fixtures under [`fixtures_root`].
@@ -573,6 +577,10 @@ impl FixtureLoader {
                     .get("sha256")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let file_sha256 = entry
+                    .get("file_sha256")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 activations.insert(
                     stage.clone(),
                     ActivationEntry {
@@ -580,6 +588,7 @@ impl FixtureLoader {
                         shape,
                         dtype,
                         sha256,
+                        file_sha256,
                     },
                 );
             }
@@ -608,25 +617,49 @@ impl FixtureLoader {
         if torch != PIN_TORCH {
             return Err(format!("pinned_torch {torch:?} != {PIN_TORCH:?}"));
         }
+        let transformers = p
+            .get("pinned_transformers")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if transformers != PIN_TRANSFORMERS {
+            return Err(format!(
+                "pinned_transformers {transformers:?} != {PIN_TRANSFORMERS:?}"
+            ));
+        }
         Ok(())
     }
 
     /// Load one activation `.npy` for a doc+stage into a [`NormalizedValue`].
     /// The oracle writes C-order little-endian `<f4` arrays (`np.save(..,
     /// astype(np.float32))`), so [`read_npy_f32`] handles exactly that subset.
-    pub fn load_activation(&self, doc: &str, stage: &str) -> Result<NormalizedValue, String> {
-        let path = self
-            .root
-            .join("activations")
-            .join(doc)
-            .join(format!("{stage}.npy"));
+    pub fn load_activation(
+        &self,
+        doc: &str,
+        stage: &str,
+        entry: &ActivationEntry,
+    ) -> Result<NormalizedValue, String> {
+        let path = self.activation_path(doc, stage, entry)?;
         let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let (shape, data) =
-            read_npy_f32(&bytes).map_err(|e| format!("parse npy {}: {e}", path.display()))?;
-        Ok(NormalizedValue::from_f32(
-            TensorSpec::new(shape, DType::F32),
-            data,
-        ))
+        activation_from_manifest_bytes(stage, entry, &path, &bytes)
+    }
+
+    fn activation_path(
+        &self,
+        doc: &str,
+        stage: &str,
+        entry: &ActivationEntry,
+    ) -> Result<PathBuf, String> {
+        if entry.file.is_empty() {
+            return Err(format!("activation {stage} manifest missing `file`"));
+        }
+        let rel = Path::new(&entry.file);
+        if rel.is_absolute() || rel.components().count() != 1 {
+            return Err(format!(
+                "activation {stage} file must be a plain filename, got {:?}",
+                entry.file
+            ));
+        }
+        Ok(self.root.join("activations").join(doc).join(rel))
     }
 }
 
@@ -634,6 +667,43 @@ impl Default for FixtureLoader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn activation_from_manifest_bytes(
+    stage: &str,
+    entry: &ActivationEntry,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<NormalizedValue, String> {
+    let actual_file_sha = sha256_hex(bytes);
+    let expected_file_sha = required_hex64(entry.file_sha256.as_deref(), "file_sha256")?;
+    if actual_file_sha != expected_file_sha {
+        return Err(format!(
+            "activation {stage} file_sha256 mismatch for {}: got {actual_file_sha}, expected {expected_file_sha}",
+            path.display()
+        ));
+    }
+    let (shape, data) =
+        read_npy_f32(bytes).map_err(|e| format!("parse npy {}: {e}", path.display()))?;
+    if shape != entry.shape {
+        return Err(format!(
+            "activation {stage} shape mismatch for {}: file {:?}, manifest {:?}",
+            path.display(),
+            shape,
+            entry.shape
+        ));
+    }
+    if !matches!(entry.dtype.as_str(), "float32" | "f32") {
+        return Err(format!(
+            "activation {stage} dtype mismatch for {}: manifest {:?}, expected float32/f32",
+            path.display(),
+            entry.dtype
+        ));
+    }
+    Ok(NormalizedValue::from_f32(
+        TensorSpec::new(shape, DType::F32),
+        data,
+    ))
 }
 
 /// Minimal `.npy` v1/v2 reader for the exact subset `gen_reference_fixtures.py`
@@ -715,6 +785,26 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>, String> {
         dims.push(n);
     }
     Ok(dims)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn required_hex64(value: Option<&str>, field: &str) -> Result<String, String> {
+    let value = value.ok_or_else(|| format!("activation manifest missing `{field}`"))?;
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "activation manifest `{field}` must be 64 hex chars, got {value:?}"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1291,13 +1381,9 @@ mod tests {
         assert_eq!(floor.l3_logit_tolerance(), 0.0);
     }
 
-    #[test]
-    fn read_npy_roundtrip_synthetic_v1() {
-        // Hand-build a minimal v1.0 .npy: magic, header, C-order f32 payload.
-        let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }";
-        // Pad header so total (10 + header) is a multiple of 64, terminated by \n.
-        let mut hdr = header.to_string();
+    fn synthetic_npy_v1(data: &[f32], shape: &str) -> Vec<u8> {
+        let header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+        let mut hdr = header;
         let base = 10 + hdr.len() + 1; // +1 for trailing \n
         let pad = (64 - base % 64) % 64;
         hdr.push_str(&" ".repeat(pad));
@@ -1308,9 +1394,17 @@ mod tests {
         bytes.push(0); // minor
         bytes.extend_from_slice(&(hdr.len() as u16).to_le_bytes());
         bytes.extend_from_slice(hdr.as_bytes());
-        for &x in &data {
+        for &x in data {
             bytes.extend_from_slice(&x.to_le_bytes());
         }
+        bytes
+    }
+
+    #[test]
+    fn read_npy_roundtrip_synthetic_v1() {
+        // Hand-build a minimal v1.0 .npy: magic, header, C-order f32 payload.
+        let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bytes = synthetic_npy_v1(&data, "(2, 3)");
         let (shape, parsed) = read_npy_f32(&bytes).expect("parse synthetic npy");
         assert_eq!(shape, vec![2, 3]);
         assert_eq!(parsed, data.to_vec());
@@ -1329,14 +1423,24 @@ mod tests {
             "decoded_text_sha256": "deadbeef",
             "activations": {
                 "sam_output": { "file": "sam_output.npy", "shape": [1, 256, 1280],
-                                "dtype": "float32", "sha256": "aa" }
+                                "dtype": "float32", "sha256": "aa",
+                                "file_sha256": "bb".repeat(32) }
             },
-            "provenance": { "hf_commit": HF_COMMIT, "pinned_torch": PIN_TORCH }
+            "provenance": {
+                "hf_commit": HF_COMMIT,
+                "pinned_torch": PIN_TORCH,
+                "pinned_transformers": PIN_TRANSFORMERS
+            }
         });
         let g = FixtureLoader::golden_from_value(raw).expect("parse golden");
         assert_eq!(g.doc, "doc01.png");
         assert_eq!(g.decoded_text.as_deref(), Some("# Title\nbody"));
         assert_eq!(g.activations["sam_output"].shape, vec![1, 256, 1280]);
+        let expected_file_sha = "bb".repeat(32);
+        assert_eq!(
+            g.activations["sam_output"].file_sha256.as_deref(),
+            Some(expected_file_sha.as_str())
+        );
         assert!(
             FixtureLoader::check_provenance(&g).is_ok(),
             "pinned provenance resolves"
@@ -1346,13 +1450,112 @@ mod tests {
     #[test]
     fn check_provenance_rejects_wrong_commit() {
         let raw = json!({
-            "doc": "x", "provenance": { "hf_commit": "wrong", "pinned_torch": PIN_TORCH }
+            "doc": "x",
+            "provenance": {
+                "hf_commit": "wrong",
+                "pinned_torch": PIN_TORCH,
+                "pinned_transformers": PIN_TRANSFORMERS
+            }
         });
         let g = FixtureLoader::golden_from_value(raw).unwrap();
         assert!(
             FixtureLoader::check_provenance(&g)
                 .unwrap_err()
                 .contains("hf_commit")
+        );
+    }
+
+    #[test]
+    fn check_provenance_rejects_missing_transformers_pin() {
+        let raw = json!({
+            "doc": "x",
+            "provenance": { "hf_commit": HF_COMMIT, "pinned_torch": PIN_TORCH }
+        });
+        let g = FixtureLoader::golden_from_value(raw).unwrap();
+        assert!(
+            FixtureLoader::check_provenance(&g)
+                .unwrap_err()
+                .contains("pinned_transformers")
+        );
+    }
+
+    #[test]
+    fn activation_manifest_bytes_verify_file_sha_shape_and_dtype() {
+        let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bytes = synthetic_npy_v1(&data, "(2, 3)");
+        let entry = ActivationEntry {
+            file: "sam_output.npy".into(),
+            shape: vec![2, 3],
+            dtype: "float32".into(),
+            sha256: Some("aa".repeat(32)),
+            file_sha256: Some(sha256_hex(&bytes)),
+        };
+
+        let parsed = activation_from_manifest_bytes(
+            "sam_output",
+            &entry,
+            Path::new("sam_output.npy"),
+            &bytes,
+        )
+        .expect("valid manifest and file bytes");
+        assert_eq!(parsed.spec, TensorSpec::new([2, 3], DType::F32));
+        assert_eq!(parsed.data, data.to_vec());
+
+        let mut bad_sha = entry.clone();
+        bad_sha.file_sha256 = Some("00".repeat(32));
+        assert!(
+            activation_from_manifest_bytes(
+                "sam_output",
+                &bad_sha,
+                Path::new("sam_output.npy"),
+                &bytes
+            )
+            .unwrap_err()
+            .contains("file_sha256")
+        );
+
+        let mut bad_shape = entry.clone();
+        bad_shape.shape = vec![3, 2];
+        assert!(
+            activation_from_manifest_bytes(
+                "sam_output",
+                &bad_shape,
+                Path::new("sam_output.npy"),
+                &bytes
+            )
+            .unwrap_err()
+            .contains("shape mismatch")
+        );
+
+        let mut bad_dtype = entry;
+        bad_dtype.dtype = "float16".into();
+        assert!(
+            activation_from_manifest_bytes(
+                "sam_output",
+                &bad_dtype,
+                Path::new("sam_output.npy"),
+                &bytes
+            )
+            .unwrap_err()
+            .contains("dtype mismatch")
+        );
+    }
+
+    #[test]
+    fn activation_manifest_rejects_path_traversal() {
+        let loader = FixtureLoader::at("/tmp/franken_ocr_fixture_test");
+        let entry = ActivationEntry {
+            file: "../sam_output.npy".into(),
+            shape: vec![1],
+            dtype: "float32".into(),
+            sha256: None,
+            file_sha256: Some("00".repeat(32)),
+        };
+        assert!(
+            loader
+                .activation_path("doc01", "sam_output", &entry)
+                .unwrap_err()
+                .contains("plain filename")
         );
     }
 

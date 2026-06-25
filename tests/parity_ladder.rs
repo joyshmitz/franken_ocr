@@ -187,7 +187,7 @@ fn l1_per_op_cosine() {
         }
         let doc_stem = golden.doc_stem_or(&stem);
         for (stage, entry) in &golden.activations {
-            match loader.load_activation(&doc_stem, stage) {
+            match loader.load_activation(&doc_stem, stage, entry) {
                 Ok(oracle) => {
                     // Subject-side seam capture pending; demonstrate the comparator
                     // on the real loaded oracle tensor (self-compare ⇒ cosine 1.0)
@@ -270,8 +270,8 @@ fn l2_per_layer_cosine_and_ledger() {
             continue;
         };
         let doc_stem = golden.doc_stem_or(&stem);
-        for stage in golden.activations.keys() {
-            if let Ok(oracle) = loader.load_activation(&doc_stem, stage) {
+        for (stage, entry) in &golden.activations {
+            if let Ok(oracle) = loader.load_activation(&doc_stem, stage, entry) {
                 let c = cosine(&oracle.data, &oracle.data);
                 let mad = max_abs_diff(&oracle.data, &oracle.data);
                 log.parity(
@@ -363,18 +363,27 @@ fn l3_logits_measured_budget_and_argmax() {
             continue;
         };
         let doc_stem = golden.doc_stem_or(&stem);
-        if let Ok(logits) = loader.load_activation(&doc_stem, "lm_head_logits") {
-            let report = ulp_compare(&logits.data, &logits.data, OpFamily::MatmulF32);
-            log.parity(
-                "L3",
-                "max_abs_diff",
-                report.max_abs_diff,
-                derived_tol,
-                "lm_head_logits",
-                "",
-                json!({"budget_source": "oracle_floor §2", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                false,
-            );
+        match golden.activations.get("lm_head_logits") {
+            Some(entry) => {
+                if let Ok(logits) = loader.load_activation(&doc_stem, "lm_head_logits", entry) {
+                    let report = ulp_compare(&logits.data, &logits.data, OpFamily::MatmulF32);
+                    log.parity(
+                        "L3",
+                        "max_abs_diff",
+                        report.max_abs_diff,
+                        derived_tol,
+                        "lm_head_logits",
+                        entry.sha256.as_deref().unwrap_or(""),
+                        json!({"budget_source": "oracle_floor §2", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
+                        false,
+                    );
+                }
+            }
+            None => log.error(
+                "ActivationManifest",
+                1,
+                &format!("{stem}: missing lm_head_logits activation manifest entry"),
+            ),
         }
     }
     // No subject (engine) prefill logits to compare yet — the loop ran the
