@@ -59,6 +59,31 @@ def is_empty_cell(value: str) -> bool:
     return value.strip() in {"", "_—_", "_-_", "_no measurements yet_"}
 
 
+def kill_switch_env_vars(text: str) -> list[str]:
+    return sorted(set(re.findall(r"\bFOCR_[A-Z0-9_]+\b", text)))
+
+
+def undefined_kill_switches(kill_line: str, src_text: str) -> list[str]:
+    return [var for var in kill_switch_env_vars(kill_line) if var not in src_text]
+
+
+def self_test_kill_switch_validation(failures: list[str]) -> None:
+    kill_line = "- Fallback / kill-switch state: FOCR_LEDGER_ONLY=1 restores reference behavior"
+
+    missing = undefined_kill_switches(kill_line, "")
+    missing_ok = missing == ["FOCR_LEDGER_ONLY"]
+    emit("ledger-self-test-kill-switch-missing", missing_ok, undefined=missing)
+    if not missing_ok:
+        failures.append("self-test: ledger-only FOCR_* var must be reported undefined")
+
+    source_text = 'pub const LEDGER_TEST_ENV: &str = "FOCR_LEDGER_ONLY";'
+    defined = undefined_kill_switches(kill_line, source_text)
+    defined_ok = defined == []
+    emit("ledger-self-test-kill-switch-defined", defined_ok, undefined=defined)
+    if not defined_ok:
+        failures.append("self-test: source-defined FOCR_* var must be accepted")
+
+
 def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
     required_columns = [
         "date",
@@ -230,8 +255,9 @@ def check_discrepancies(path: Path, text: str, failures: list[str]) -> None:
             (line for line in section.splitlines() if line.startswith("- Fallback / kill-switch state:")),
             "",
         )
-        for var in sorted(set(re.findall(r"\bFOCR_[A-Z0-9_]+\b", kill_line))):
-            defined = var in src_text or var in unfenced
+        undefined = set(undefined_kill_switches(kill_line, src_text))
+        for var in kill_switch_env_vars(kill_line):
+            defined = var not in undefined
             emit("disc-kill-switch-defined", defined, entry=title, env=var)
             if not defined:
                 failures.append(f"{path}: {title} references undefined kill switch {var}")
@@ -255,6 +281,8 @@ def main() -> int:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         return 1
+
+    self_test_kill_switch_validation(failures)
 
     negative = files["negative"].read_text(encoding="utf-8")
     perf = files["perf"].read_text(encoding="utf-8")
