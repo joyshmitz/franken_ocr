@@ -87,18 +87,62 @@ pub enum ArmTier {
     None,
 }
 
-/// Detect the best available ARM int8 tier on this CPU.
+/// Detect the int8 tier this CPU should dispatch to (cached after first call).
 ///
 /// On non-AArch64 builds this is always [`ArmTier::None`].
+///
+/// **Apple Silicon prefers SDOT over SMMLA.** Every macOS/aarch64 host (M-series)
+/// issues `SMMLA`/i8mm at *half* the rate of `SDOT`, so SMMLA's 2× MACs per
+/// instruction exactly cancel — measured on an Apple M4, SMMLA delivers 0.994× of
+/// SDOT's int8 MACs/second (`vmmlaq_s32` 5.31 Ginstr/s vs `vdotq_s32`
+/// 10.69 Ginstr/s) — and SMMLA *additionally* needs a 2×2 operand repack the dot
+/// path skips, so SDOT is the strictly faster kernel here. On other aarch64 cores
+/// (e.g. Neoverse) i8mm can be full-rate, so there SMMLA leads.
+///
+/// `FOCR_FORCE_ARCH=smmla|sdot|scalar` overrides the choice (benchmark/debug only;
+/// a tier whose feature is absent is ignored). Read once and cached.
 #[must_use]
 pub fn detect_tier() -> ArmTier {
+    use std::sync::OnceLock;
+    static TIER: OnceLock<ArmTier> = OnceLock::new();
+    *TIER.get_or_init(detect_tier_uncached)
+}
+
+fn detect_tier_uncached() -> ArmTier {
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("i8mm") {
-            return ArmTier::Smmla;
+        let has_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+        let has_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+
+        // Optional override (benchmark/debug). Only honor a present feature.
+        if let Ok(force) = std::env::var("FOCR_FORCE_ARCH") {
+            match force.trim().to_ascii_lowercase().as_str() {
+                "smmla" if has_i8mm => return ArmTier::Smmla,
+                "sdot" if has_dotprod => return ArmTier::Sdot,
+                "scalar" => return ArmTier::None,
+                _ => {}
+            }
         }
-        if std::arch::is_aarch64_feature_detected!("dotprod") {
-            return ArmTier::Sdot;
+
+        // Apple Silicon: SDOT > SMMLA (i8mm is half-rate; see fn docs).
+        #[cfg(target_os = "macos")]
+        {
+            if has_dotprod {
+                return ArmTier::Sdot;
+            }
+            if has_i8mm {
+                return ArmTier::Smmla;
+            }
+        }
+        // Other aarch64: SMMLA > SDOT (i8mm may be full-rate).
+        #[cfg(not(target_os = "macos"))]
+        {
+            if has_i8mm {
+                return ArmTier::Smmla;
+            }
+            if has_dotprod {
+                return ArmTier::Sdot;
+            }
         }
         ArmTier::None
     }
@@ -112,8 +156,9 @@ pub fn detect_tier() -> ArmTier {
 /// accumulating in i32 and adding into the caller-provided `out` buffer,
 /// matching the scalar oracle's contract.
 ///
-/// Picks the best available ARM tier (SMMLA > SDOT > scalar) and produces output
-/// bit-identical to [`scalar::igemm_s8s8`].
+/// Picks the best available ARM tier via [`detect_tier`] (SDOT > SMMLA > scalar
+/// on Apple Silicon, SMMLA > SDOT > scalar elsewhere) and produces output
+/// bit-identical to [`scalar::igemm_s8s8`] on every tier.
 ///
 /// # Panics
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n` (a

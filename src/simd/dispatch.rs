@@ -6,8 +6,15 @@
 //! RUNTIME and falls back to the [`scalar`] oracle. Selection is:
 //!
 //! * **x86-64:** `AVX-512-VNNI > AVX-VNNI > AVX2 > scalar`
-//! * **aarch64:** `SMMLA (i8mm) > SDOT (dotprod) > scalar`
+//! * **aarch64 (Apple Silicon / macOS):** `SDOT (dotprod) > SMMLA (i8mm) > scalar`
+//!   — i8mm issues at half-rate on every M-series core, so SDOT is the faster
+//!   int8 kernel (see [`arm::detect_tier`](crate::simd::arm::detect_tier)).
+//! * **aarch64 (other, e.g. Neoverse):** `SMMLA (i8mm) > SDOT (dotprod) > scalar`
 //! * **everything else:** `scalar`
+//!
+//! `FOCR_FORCE_ARCH=<tag>` (`sdot`/`smmla`/`scalar`/`avx2`/…) overrides the
+//! selection for benchmarking/debugging: a named tier that is actually available
+//! is moved to the front. Read once (the whole snapshot is cached).
 //!
 //! (An AMX tier is not advertised: the `x86.rs` backend implements no AMX
 //! kernel, and `robot backends` must report the *dispatched* tier, not the
@@ -135,17 +142,36 @@ pub fn tier_string() -> &'static str {
 fn detect() -> Caps {
     let mut available: Vec<IsaTier> = Vec::new();
 
-    // ── aarch64: SMMLA > SDOT > scalar ──────────────────────────────────────
+    // ── aarch64 ─────────────────────────────────────────────────────────────
+    // Apple Silicon (macOS/aarch64): SDOT > SMMLA. i8mm issues at half-rate on
+    // every M-series core, so SMMLA's 2x MACs/instruction cancel out (measured on
+    // M4: 0.994x SDOT) and it also pays a 2x2 operand repack the dot path skips —
+    // so SDOT is the faster int8 kernel here. Other aarch64 (e.g. Neoverse):
+    // SMMLA > SDOT, where i8mm can be full-rate. Mirrors `arm::detect_tier`.
     #[cfg(target_arch = "aarch64")]
     {
         // `is_aarch64_feature_detected!` is safe: it reads HWCAP / sysctl and is
         // the documented gate for the matching intrinsics. We only push (and
         // thus only ever select) a tier whose feature is confirmed present.
-        if std::arch::is_aarch64_feature_detected!("i8mm") {
-            available.push(IsaTier::Smmla);
+        let has_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+        let has_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+        #[cfg(target_os = "macos")]
+        {
+            if has_dotprod {
+                available.push(IsaTier::Sdot);
+            }
+            if has_i8mm {
+                available.push(IsaTier::Smmla);
+            }
         }
-        if std::arch::is_aarch64_feature_detected!("dotprod") {
-            available.push(IsaTier::Sdot);
+        #[cfg(not(target_os = "macos"))]
+        {
+            if has_i8mm {
+                available.push(IsaTier::Smmla);
+            }
+            if has_dotprod {
+                available.push(IsaTier::Sdot);
+            }
         }
     }
 
@@ -174,6 +200,17 @@ fn detect() -> Caps {
 
     // Scalar is always available and always last (the floor).
     available.push(IsaTier::Scalar);
+
+    // Optional override (benchmark/debug): `FOCR_FORCE_ARCH=<tag>` moves a named,
+    // *available* tier to the front so it becomes `selected`. An absent/unknown
+    // tier is ignored (never forces an unsupported instruction). This keeps the
+    // reported tier consistent with `arm::detect_tier`, which honors the same var.
+    if let Ok(force) = std::env::var("FOCR_FORCE_ARCH") {
+        let want = force.trim().to_ascii_lowercase();
+        if let Some(pos) = available.iter().position(|t| t.tag() == want) {
+            available[..=pos].rotate_right(1);
+        }
+    }
 
     // `available` is already in best-first order by construction; `selected` is
     // the front. (We do not sort by the enum discriminant because the per-arch
