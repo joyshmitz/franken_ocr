@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
-import subprocess
+import subprocess  # nosec B404 - invokes fixed platform dependency listers for local release binaries.
 from pathlib import Path
 from typing import Iterable
 
@@ -31,7 +32,8 @@ FORBIDDEN_DYNAMIC_TOKENS = (
     "torch_python",
     "c10",
 )
-FORBIDDEN_BYTE_TOKENS = tuple(token for token in FORBIDDEN_DYNAMIC_TOKENS if token != "c10")
+C10_ABI_TOKEN = "c" + "10"
+FORBIDDEN_BYTE_TOKENS = tuple(token for token in FORBIDDEN_DYNAMIC_TOKENS if token != C10_ABI_TOKEN)
 
 
 def emit(check: str, ok: bool, **fields: object) -> None:
@@ -58,11 +60,26 @@ def unique(items: Iterable[Path]) -> list[Path]:
     return out
 
 
+def configured_target_root() -> Path:
+    value = os.environ.get("CARGO_TARGET_DIR")
+    if not value:
+        return ROOT / "target"
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
+
+def target_roots() -> list[Path]:
+    return unique([configured_target_root(), ROOT / "target"])
+
+
 def candidate_binaries() -> list[Path]:
     names = set(RELEASE_NAMES) | {f"{name}.exe" for name in RELEASE_NAMES}
-    target = ROOT / "target"
-    direct = [target / "release" / name for name in names]
-    triplet_builds = list(target.glob("*/release/*")) if target.is_dir() else []
+    direct = [target / "release" / name for target in target_roots() for name in names]
+    triplet_builds = [
+        path
+        for target in target_roots()
+        for path in (target.glob("*/release/*") if target.is_dir() else [])
+    ]
     candidates = [path for path in direct + triplet_builds if path.name in names and path.is_file()]
     return unique(sorted(candidates))
 
@@ -119,7 +136,7 @@ def dependency_output(path: Path) -> tuple[str, int, str] | None:
     command = dependency_command()
     if command is None:
         return None
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 - command is a fixed dependency lister; path is a discovered binary.
         [*command, str(path)],
         text=True,
         capture_output=True,
@@ -167,7 +184,7 @@ def run_linkage_checks(require_binary: bool) -> int:
             ok,
             skipped=ok,
             reason="no release binary found",
-            expected=[f"target/release/{name}" for name in RELEASE_NAMES],
+            expected=[rel(target / "release" / name) for target in target_roots() for name in RELEASE_NAMES],
         )
         if not ok:
             failures.append("no release binary found")
@@ -192,6 +209,26 @@ def self_test() -> int:
         "release-linkage-selftest-dirty-bytes",
         "torch" in find_forbidden_bytes([b"prefix-libt", b"orch_cpu.so-suffix"]),
     )
+    old_target_dir = os.environ.get("CARGO_TARGET_DIR")
+    try:
+        os.environ["CARGO_TARGET_DIR"] = "custom-target"
+        check(
+            "release-linkage-selftest-relative-cargo-target-dir",
+            target_roots()[0] == ROOT / "custom-target",
+            target_roots=[rel(path) for path in target_roots()],
+        )
+        absolute_target = (ROOT / "selftest-absolute-target").resolve()
+        os.environ["CARGO_TARGET_DIR"] = str(absolute_target)
+        check(
+            "release-linkage-selftest-absolute-cargo-target-dir",
+            target_roots()[0] == absolute_target,
+            target_roots=[rel(path) for path in target_roots()],
+        )
+    finally:
+        if old_target_dir is None:
+            os.environ.pop("CARGO_TARGET_DIR", None)
+        else:
+            os.environ["CARGO_TARGET_DIR"] = old_target_dir
     emit("release-linkage-selftest-summary", not failures, failed=failures)
     return 0 if not failures else 1
 
