@@ -35,6 +35,14 @@ use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
 
+fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
 /// Decoder hyperparameters (compile-time shapes — plan §1.1 P2). Mirrors the
 /// pinned `config.json` so the forward never reads runtime params.
 pub mod config {
@@ -81,15 +89,17 @@ pub mod config {
 /// [`FocrError::Other`] if `table.len() != vocab * hidden`, or any id is
 /// `>= vocab`.
 pub fn embed_tokens(table: &[f32], vocab: usize, hidden: usize, ids: &[u32]) -> FocrResult<Mat> {
-    if table.len() != vocab * hidden {
+    let expected_table_len = checked_shape_mul("embed_tokens", vocab, hidden, "vocab*hidden")?;
+    if table.len() != expected_table_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "embed_tokens: table len {} != vocab*hidden {}",
             table.len(),
-            vocab * hidden
+            expected_table_len
         )));
     }
     let seq = ids.len();
-    let mut out = vec![0.0f32; seq * hidden];
+    let out_len = checked_shape_mul("embed_tokens", seq, hidden, "seq*hidden")?;
+    let mut out = vec![0.0f32; out_len];
     for (t, &id) in ids.iter().enumerate() {
         let row = id as usize;
         if row >= vocab {
@@ -273,15 +283,16 @@ fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat>
             x.cols
         )));
     }
-    if w.len() != out * in_ {
+    let expected_weight_len = checked_shape_mul("linear_no_bias", out, in_, "out*in")?;
+    if w.len() != expected_weight_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "linear_no_bias: w len {} != out*in {}",
             w.len(),
-            out * in_
+            expected_weight_len
         )));
     }
     // Transpose [out, in] -> [in, out] so matmul does [seq,in] x [in,out].
-    let mut wt = vec![0.0f32; in_ * out];
+    let mut wt = vec![0.0f32; expected_weight_len];
     for o in 0..out {
         for i in 0..in_ {
             wt[i * out + o] = w[o * in_ + i];
@@ -504,6 +515,17 @@ pub fn forward(_weights: &Weights, _inputs_embeds: &Mat) -> FocrResult<Mat> {
 mod tests {
     use super::*;
 
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
+
     // ── Token embedding ([SPEC-070]) ────────────────────────────────────────
 
     #[test]
@@ -528,6 +550,16 @@ mod tests {
     fn embed_tokens_rejects_bad_table_len() {
         let table = vec![0.0, 1.0, 2.0];
         assert!(embed_tokens(&table, 2, 2, &[0]).is_err());
+    }
+
+    #[test]
+    fn embed_tokens_rejects_table_shape_product_overflow_without_panic() {
+        assert_err_contains(embed_tokens(&[], usize::MAX, 2, &[]), "vocab*hidden");
+    }
+
+    #[test]
+    fn embed_tokens_rejects_output_shape_product_overflow_without_panic() {
+        assert_err_contains(embed_tokens(&[], 0, usize::MAX, &[0, 1]), "seq*hidden");
     }
 
     // ── RoPE ([SPEC-078]) ───────────────────────────────────────────────────
@@ -648,6 +680,12 @@ mod tests {
         let y = linear_no_bias(&x, &w, 2, 3).unwrap();
         assert_eq!(y.shape(), (1, 3));
         assert_eq!(y.data, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn linear_no_bias_rejects_weight_shape_product_overflow_without_panic() {
+        let x = Mat::zeros(1, 2);
+        assert_err_contains(linear_no_bias(&x, &[], 2, usize::MAX), "out*in");
     }
 
     // ── Residual add ([SPEC-072]) ───────────────────────────────────────────
