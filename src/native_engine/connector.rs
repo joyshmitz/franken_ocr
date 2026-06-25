@@ -267,8 +267,8 @@ pub fn masked_scatter(
     let mut feat = 0usize;
     for (row, &masked) in images_seq_mask.iter().enumerate() {
         if masked {
-            let src = vision_features.row(feat).to_vec();
-            inputs_embeds.row_mut(row).copy_from_slice(&src);
+            let src = vision_features.row(feat);
+            inputs_embeds.row_mut(row).copy_from_slice(src);
             feat += 1;
         }
     }
