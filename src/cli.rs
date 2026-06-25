@@ -23,12 +23,10 @@ use std::process::ExitCode;
 /// exit codes documented in [`crate::error`].
 pub fn cli_main() -> ExitCode {
     let cli = Cli::parse();
+    let error_mode = ErrorMode::from_cli(&cli);
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("focr: {err}");
-            ExitCode::from(err.exit_code() as u8)
-        }
+        Err(err) => exit_code_from_error(&err, error_mode),
     }
 }
 
@@ -142,4 +140,75 @@ fn emit(value: &serde_json::Value) {
         "{}",
         serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ErrorMode {
+    Human,
+    Robot,
+}
+
+impl ErrorMode {
+    fn from_cli(cli: &Cli) -> Self {
+        match &cli.command {
+            Command::Ocr { robot: true, .. } => Self::Robot,
+            _ => Self::Human,
+        }
+    }
+}
+
+fn exit_code_from_error(err: &FocrError, mode: ErrorMode) -> ExitCode {
+    match mode {
+        ErrorMode::Human => eprintln!("focr: {err}"),
+        ErrorMode::Robot => emit(&robot::run_error_event(err)),
+    }
+    ExitCode::from(exit_code_byte(err))
+}
+
+fn exit_code_byte(err: &FocrError) -> u8 {
+    u8::try_from(err.exit_code()).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_error_variant_maps_to_process_exit_byte_from_error_contract() {
+        let cases = [
+            (FocrError::Usage("bad flag".into()), 2),
+            (FocrError::ModelNotFound("missing".into()), 3),
+            (FocrError::InputDecode("bad image".into()), 4),
+            (FocrError::Timeout("stage".into()), 5),
+            (FocrError::Cancelled, 6),
+            (FocrError::FormatMismatch("bad header".into()), 7),
+            (FocrError::NotImplemented("phase gap".into()), 1),
+            (FocrError::Other(anyhow::anyhow!("misc")), 1),
+        ];
+        for (err, code) in cases {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "suite": "cli",
+                    "test": "every_error_variant_maps_to_process_exit_byte_from_error_contract",
+                    "variant": err.kind(),
+                    "exit_code": code,
+                    "process_exit_byte": exit_code_byte(&err),
+                })
+            );
+            assert_eq!(exit_code_byte(&err), code);
+        }
+    }
+
+    #[test]
+    fn ocr_robot_flag_selects_robot_error_mode() {
+        let cli = Cli {
+            command: Command::Ocr {
+                image: std::path::PathBuf::from("scan.png"),
+                json: false,
+                robot: true,
+            },
+        };
+        assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
+    }
 }

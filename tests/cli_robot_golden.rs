@@ -25,6 +25,7 @@
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
 //!   [R6] `robot backends` is a single JSON line; host `logical_cpus` scrubbed. -> robot_backends_golden
 //!   [R7] robot mode is data-only on stdout (no human decoration mixed in).    -> robot_*_stdout_is_pure_json
+//!   [R8] `ocr --robot` errors emit `run_error.code` from FocrError::exit_code. -> ocr_robot_error_event_matches_exit_code
 //! CLI surface (`src/cli.rs`):
 //!   [C1] `--help` (root) renders the frozen help golden.                       -> cli_root_help_golden
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
@@ -653,6 +654,54 @@ fn robot_stdout_is_pure_json() {
         );
         assert_eq!(code, Some(0), "robot {sub} must exit 0; stdout:\n{stdout}");
     }
+}
+
+/// [R8] `ocr --robot` must report command errors as robot NDJSON, with
+/// `run_error.code` coming from the same stable error contract that drives the
+/// process exit code.
+#[test]
+fn ocr_robot_error_event_matches_exit_code() {
+    let test = "ocr_robot_error_event_matches_exit_code";
+    let out = run_focr(&["ocr", "/some/document.png", "--robot"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "ocr --robot error must emit exactly one NDJSON line; stdout:\n{stdout}"
+    );
+    let event = parse_json_line(lines[0], "ocr --robot run_error");
+    let code = out.status.code();
+    let pass = code == event["code"].as_i64().map(|n| n as i32);
+    tlog!(test,
+        "case": "ocr_not_implemented_robot_error",
+        "event": "assert",
+        "assertion": "run_error.code equals process exit code and stderr stays human-decoration-free",
+        "inputs": {"argv": ["ocr", "/some/document.png", "--robot"]},
+        "exit_code": code,
+        "robot_code": event["code"],
+        "stderr": stderr.trim(),
+        "pass": pass && stderr.trim().is_empty(),
+        "result": if pass && stderr.trim().is_empty() { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        event["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION)
+    );
+    assert_eq!(event["event"].as_str(), Some("run_error"));
+    assert_eq!(event["error_kind"].as_str(), Some("not_implemented"));
+    assert!(
+        event["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not yet implemented")
+    );
+    assert_eq!(event["code"].as_i64(), code.map(i64::from));
+    assert!(
+        stderr.trim().is_empty(),
+        "robot-mode command errors must not write human decoration to stderr: {stderr:?}"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════

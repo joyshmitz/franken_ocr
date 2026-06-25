@@ -5,6 +5,7 @@
 //! can validate against a stable contract. This is the Phase-0 seed; event
 //! payloads are finalized + contract-tested in Phase 5.
 
+use crate::error::{EXIT_CODE_TABLE, FocrError};
 use serde_json::{Value, json};
 
 /// The robot event-stream schema version. Bumped on any breaking contract change.
@@ -18,7 +19,23 @@ pub fn robot_schema() -> Value {
     json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
         "events": EVENT_KINDS,
-        "status": "skeleton — event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+        "exit_codes": EXIT_CODE_TABLE,
+        "status": "skeleton — run_error is wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+    })
+}
+
+/// Build the robot-mode `run_error` event from the canonical [`FocrError`].
+///
+/// This is the only place that shapes a `run_error` payload. The numeric `code`
+/// is read directly from [`FocrError::exit_code`] so robot consumers and process
+/// supervisors observe the same stable contract.
+pub fn run_error_event(err: &FocrError) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "run_error",
+        "error_kind": err.kind(),
+        "code": err.exit_code(),
+        "message": err.to_string(),
     })
 }
 
@@ -30,6 +47,46 @@ mod tests {
     fn schema_advertises_all_events() {
         let s = robot_schema();
         assert_eq!(s["schema_version"], ROBOT_SCHEMA_VERSION);
-        assert_eq!(s["events"].as_array().unwrap().len(), EVENT_KINDS.len());
+        assert_eq!(
+            s["events"].as_array().map(Vec::len),
+            Some(EVENT_KINDS.len())
+        );
+        assert_eq!(
+            s["exit_codes"].as_array().map(Vec::len),
+            Some(EXIT_CODE_TABLE.len())
+        );
+    }
+
+    #[test]
+    fn run_error_event_uses_error_exit_code_for_every_variant() {
+        let cases = [
+            FocrError::Usage("bad flag".into()),
+            FocrError::ModelNotFound("missing".into()),
+            FocrError::InputDecode("bad image".into()),
+            FocrError::Timeout("stage".into()),
+            FocrError::Cancelled,
+            FocrError::FormatMismatch("bad header".into()),
+            FocrError::NotImplemented("phase gap".into()),
+            FocrError::Other(anyhow::anyhow!("misc")),
+        ];
+
+        for err in &cases {
+            let event = run_error_event(err);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "suite": "robot",
+                    "test": "run_error_event_uses_error_exit_code_for_every_variant",
+                    "variant": err.kind(),
+                    "exit_code": err.exit_code(),
+                    "robot_code": event["code"],
+                })
+            );
+            assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
+            assert_eq!(event["event"], "run_error");
+            assert_eq!(event["error_kind"], err.kind());
+            assert_eq!(event["code"], err.exit_code());
+            assert_eq!(event["message"], err.to_string());
+        }
     }
 }

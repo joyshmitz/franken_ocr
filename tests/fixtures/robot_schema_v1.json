@@ -6,6 +6,48 @@
     "run_complete",
     "run_error"
   ],
+  "exit_codes": [
+    {
+      "code": 0,
+      "meaning": "successful completion",
+      "name": "success"
+    },
+    {
+      "code": 1,
+      "meaning": "generic error or not-yet-implemented surface",
+      "name": "generic"
+    },
+    {
+      "code": 2,
+      "meaning": "usage or CLI argument error",
+      "name": "usage"
+    },
+    {
+      "code": 3,
+      "meaning": "model artifact was not found or could not be resolved",
+      "name": "model_not_found"
+    },
+    {
+      "code": 4,
+      "meaning": "input image or page could not be decoded",
+      "name": "input_decode"
+    },
+    {
+      "code": 5,
+      "meaning": "budget or timeout was exceeded",
+      "name": "timeout"
+    },
+    {
+      "code": 6,
+      "meaning": "operation was cancelled cooperatively",
+      "name": "cancelled"
+    },
+    {
+      "code": 7,
+      "meaning": "format or version mismatch",
+      "name": "format_mismatch"
+    }
+  ],
   "schema_version": 1,
-  "status": "skeleton — event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+  "status": "skeleton — run_error is wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
 }
