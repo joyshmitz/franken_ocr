@@ -199,9 +199,10 @@ them.
 ## franken_ocr measurements
 
 No `PERF_LEDGER.md` head-to-head row exists yet: there is still no certified
-Phase -1 CPU-reference ratio for this path. The entry below is a local,
-synthetic before/after microbench that retires one bad loop order and preserves
-the raw artifact bundle for gauntlet follow-up; it is not a G2 claim.
+Phase -1 CPU-reference ratio for this path. The entries below are local,
+synthetic before/after microbenches that retire or keep one narrow loop lever
+and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
+claims.
 
 2026-06-25 | NEGATIVE(reverted) | strided-destination projector transpose in `src/native_engine/vision_bridge.rs::transpose`
   claim_id: CLAIM-bd-1gv.10.1-projector-transpose-store-order   evidence_id: artifacts/perf/bd-1gv.10.1/
@@ -223,6 +224,26 @@ the raw artifact bundle for gauntlet follow-up; it is not a G2 claim.
   per-lever tally: W 0 / L 1 / N 0
   agent: WhiteCave
   evidence dir: artifacts/perf/bd-1gv.10.1/
+
+2026-06-25 | WIN | per-query decomposed rel-pos bias precompute in `src/native_engine/vision_sam.rs::attention`
+  claim_id: CLAIM-bd-3n16-sam-relpos-bias-precompute   evidence_id: artifacts/perf/bd-3n16/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    synthetic SAM attention fixture: ignored unit probe `sam_attention_relpos_bias_local_probe`; evidence README sha256 0da258756f8be90e27c6064187cce2022158039db2cbb7e15e4f5f213424ac94 (SHA256SUMS)
+  CPU feature string: arm64 Apple M4, dotprod=1, i8mm=1; SAM attention probe is f32 through the current frankentorch facade, no SIMD tier override
+  exact command + env:
+    FOCR_SAM_ATTN_PROBE_RUNS=5 CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
+  fallback / kill-switch state: no FOCR_* performance kill-switches set; allocator=system; harness calls the real `vision_sam::attention`
+  measured before -> after vs reference:
+    local focr-only synthetic SAM attention probe (no reference ratio): 26.8490916 ms -> 17.787375 ms average for 5 calls, local speedup 1.509x and 33.75% less wall time; PERF_LEDGER ineligible until the gauntlet has a pinned CPU reference row
+  bit-exact correctness proof:
+    output checksum unchanged (`-0.009587256237864494` before and after); `decomposed_rel_pos_bias_matches_direct_inner_loop_formula` proves the precomputed H/W bias tables match the old direct inner-loop formula exactly; `CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test vision_sam::tests --lib -- --nocapture` -> 17 passed, 0 failed, 1 ignored
+  disposition: KEEP
+  do-not-retry: "do not recompute decomposed rel-pos dot products inside the SAM key loop unless a future batched-QK/probs@V rewrite proves a faster and parity-preserving full attention path on the pinned fixture"
+  per-lever tally: W 1 / L 0 / N 0
+  agent: WhiteCave
+  evidence dir: artifacts/perf/bd-3n16/
 
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`

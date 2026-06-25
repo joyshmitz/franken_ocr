@@ -424,12 +424,11 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
         let qh = &q[head * n * hd..(head + 1) * n * hd];
         let kh = &k[head * n * hd..(head + 1) * n * hd];
         let vh = &v[head * n * hd..(head + 1) * n * hd];
+        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
 
         // logits[i,j] = scale * dot(q_i, k_j) + bias
         let mut logits = vec![0.0f32; n * n];
         for i in 0..n {
-            let qy = i / gw;
-            let qx = i % gw;
             let qi = &qh[i * hd..(i + 1) * hd];
             for j in 0..n {
                 let ky = j / gw;
@@ -439,18 +438,8 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
                 for c in 0..hd {
                     dot += qi[c] * kj[c];
                 }
-                // rel_h bias: dot(q_i, Rh[qy, ky])
-                let mut bh = 0.0f32;
-                let rh_base = (qy * gh + ky) * hd;
-                for c in 0..hd {
-                    bh += qi[c] * rh[rh_base + c];
-                }
-                // rel_w bias: dot(q_i, Rw[qx, kx])
-                let mut bw = 0.0f32;
-                let rw_base = (qx * gw + kx) * hd;
-                for c in 0..hd {
-                    bw += qi[c] * rw[rw_base + c];
-                }
+                let bh = rel_h_bias[i * gh + ky];
+                let bw = rel_w_bias[i * gw + kx];
                 logits[i * n + j] = scale * dot + bh + bw;
             }
         }
@@ -480,6 +469,45 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     }
     let ctx_mat = Mat::from_vec(n, dim, ctx);
     p.proj.apply(&ctx_mat)
+}
+
+fn decomposed_rel_pos_bias(
+    qh: &[f32],
+    rh: &[f32],
+    rw: &[f32],
+    gh: usize,
+    gw: usize,
+    hd: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = gh * gw;
+    debug_assert_eq!(qh.len(), n * hd);
+    debug_assert_eq!(rh.len(), gh * gh * hd);
+    debug_assert_eq!(rw.len(), gw * gw * hd);
+
+    let mut rel_h_bias = vec![0.0f32; n * gh];
+    let mut rel_w_bias = vec![0.0f32; n * gw];
+    for i in 0..n {
+        let qy = i / gw;
+        let qx = i % gw;
+        let qi = &qh[i * hd..(i + 1) * hd];
+        for ky in 0..gh {
+            let rh_base = (qy * gh + ky) * hd;
+            let mut bh = 0.0f32;
+            for c in 0..hd {
+                bh += qi[c] * rh[rh_base + c];
+            }
+            rel_h_bias[i * gh + ky] = bh;
+        }
+        for kx in 0..gw {
+            let rw_base = (qx * gw + kx) * hd;
+            let mut bw = 0.0f32;
+            for c in 0..hd {
+                bw += qi[c] * rw[rw_base + c];
+            }
+            rel_w_bias[i * gw + kx] = bw;
+        }
+    }
+    (rel_h_bias, rel_w_bias)
 }
 
 /// `get_rel_pos(q_size, k_size, rel_pos)` -> `[q_size, k_size, head_dim]`.
@@ -788,6 +816,8 @@ fn clamp_idx(i: isize, n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::time::Instant;
 
     /// Identity 1x1 conv (out_ch==in_ch, k=1) with an identity-ish weight is a
     /// channel mixing; here we use a diagonal weight so output == input.
@@ -933,6 +963,42 @@ mod tests {
         assert_eq!(r[3], 20.0); // q1,k1
     }
 
+    #[test]
+    fn decomposed_rel_pos_bias_matches_direct_inner_loop_formula() {
+        let (gh, gw, hd) = (3, 2, 5);
+        let n = gh * gw;
+        let qh: Vec<f32> = (0..n * hd)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.013)
+            .collect();
+        let rh: Vec<f32> = (0..gh * gh * hd)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.017)
+            .collect();
+        let rw: Vec<f32> = (0..gw * gw * hd)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.019)
+            .collect();
+
+        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(&qh, &rh, &rw, gh, gw, hd);
+        for i in 0..n {
+            let qy = i / gw;
+            let qx = i % gw;
+            let qi = &qh[i * hd..(i + 1) * hd];
+            for j in 0..n {
+                let ky = j / gw;
+                let kx = j % gw;
+                let rh_base = (qy * gh + ky) * hd;
+                let rw_base = (qx * gw + kx) * hd;
+                let mut expected_h = 0.0f32;
+                let mut expected_w = 0.0f32;
+                for c in 0..hd {
+                    expected_h += qi[c] * rh[rh_base + c];
+                    expected_w += qi[c] * rw[rw_base + c];
+                }
+                assert_eq!(rel_h_bias[i * gh + ky], expected_h);
+                assert_eq!(rel_w_bias[i * gw + kx], expected_w);
+            }
+        }
+    }
+
     /// Build a tiny single-block SAM with `dim=NUM_HEADS*hd`. Here we use the
     /// real `EMBED_DIM`/`NUM_HEADS` but a tiny 2x2 grid (no window padding since
     /// global block) to exercise attention + rel-pos + residual + MLP shapes.
@@ -1072,6 +1138,79 @@ mod tests {
         for &v in &out.data {
             assert!((v - 1.0).abs() < 1e-4, "got {v}");
         }
+    }
+
+    #[test]
+    #[ignore = "local perf probe; run explicitly with --ignored --nocapture"]
+    fn sam_attention_relpos_bias_local_probe() {
+        let dim = EMBED_DIM;
+        let hd = HEAD_DIM;
+        let grid = 14usize;
+        let n = grid * grid;
+        let rel_rows = 2 * grid - 1;
+        let attn = AttnP {
+            qkv: Linear {
+                w: identity_block_3(dim),
+                b: vec![0.0; 3 * dim],
+                out: 3 * dim,
+                in_: dim,
+            },
+            proj: Linear {
+                w: identity_mat(dim),
+                b: vec![0.0; dim],
+                out: dim,
+                in_: dim,
+            },
+            rel_pos_h: (0..rel_rows * hd)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.0007)
+                .collect(),
+            rel_pos_w: (0..rel_rows * hd)
+                .map(|i| ((i % 19) as f32 - 9.0) * 0.0005)
+                .collect(),
+            size_h: grid,
+            size_w: grid,
+        };
+        let x = Mat::from_vec(
+            n,
+            dim,
+            (0..n * dim)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.002)
+                .collect(),
+        );
+
+        let runs = std::env::var("FOCR_SAM_ATTN_PROBE_RUNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3)
+            .max(1);
+        let warm = attention(&attn, &x, grid, grid).unwrap();
+        let warm_checksum: f32 = warm.data.iter().step_by(97).copied().sum();
+        let start = Instant::now();
+        let mut checksum = 0.0f32;
+        for _ in 0..runs {
+            let out = attention(&attn, &x, grid, grid).unwrap();
+            checksum += out.data.iter().step_by(97).copied().sum::<f32>();
+        }
+        let elapsed = start.elapsed();
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let avg_ms = total_ms / runs as f64;
+        assert!(checksum.is_finite());
+        println!(
+            "{}",
+            json!({
+                "probe": "sam_attention_relpos_bias_local_probe",
+                "grid": grid,
+                "tokens": n,
+                "dim": dim,
+                "heads": NUM_HEADS,
+                "head_dim": hd,
+                "runs": runs,
+                "total_ms": total_ms,
+                "avg_ms": avg_ms,
+                "warm_checksum": warm_checksum,
+                "checksum": checksum
+            })
+        );
     }
 
     #[test]
