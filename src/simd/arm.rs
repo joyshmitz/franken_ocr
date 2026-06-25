@@ -479,29 +479,28 @@ mod aarch64_impl {
 
     // ── tiny lane-extraction helpers (register-only) ────────────────────────
 
+    // These lane reads are register-only and side-effect-free. Inside a
+    // `#[target_feature]` fn (edition 2024) the intrinsic call needs no inner
+    // `unsafe` block — the function's target-feature contract is what gates it.
     #[inline]
     #[target_feature(enable = "neon")]
     fn vgetq_lane0(v: int32x4_t) -> i32 {
-        // SAFETY: vgetq_lane_s32 with a const-0 index is a register read.
-        unsafe { core::arch::aarch64::vgetq_lane_s32::<0>(v) }
+        core::arch::aarch64::vgetq_lane_s32::<0>(v)
     }
     #[inline]
     #[target_feature(enable = "neon")]
     fn vgetq_lane1(v: int32x4_t) -> i32 {
-        // SAFETY: const-1 lane read.
-        unsafe { core::arch::aarch64::vgetq_lane_s32::<1>(v) }
+        core::arch::aarch64::vgetq_lane_s32::<1>(v)
     }
     #[inline]
     #[target_feature(enable = "neon")]
     fn vgetq_lane2(v: int32x4_t) -> i32 {
-        // SAFETY: const-2 lane read.
-        unsafe { core::arch::aarch64::vgetq_lane_s32::<2>(v) }
+        core::arch::aarch64::vgetq_lane_s32::<2>(v)
     }
     #[inline]
     #[target_feature(enable = "neon")]
     fn vgetq_lane3(v: int32x4_t) -> i32 {
-        // SAFETY: const-3 lane read.
-        unsafe { core::arch::aarch64::vgetq_lane_s32::<3>(v) }
+        core::arch::aarch64::vgetq_lane_s32::<3>(v)
     }
 
     // A tiny extension so we can write `vdupq_n_s32(0).into_i8()` for a zero
