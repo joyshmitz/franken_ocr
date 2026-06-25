@@ -21,6 +21,12 @@
 #     • avx512-vnni — AVX-512-VNNI (512-bit VPDPBUSD, server Ice Lake+/Zen4+).
 #                     Highest-throughput int8 accumulation tier.
 #
+#   Phase-0 CI also tracks linux arm64, darwin x86-64, and windows-msvc x86-64 as
+#   advisory targets. This release workflow builds the Unix/macOS targets whose
+#   sibling path dependencies can be provisioned in Actions today; the Windows
+#   release artifact remains blocked until the `/dp/asupersync` patch path becomes
+#   portable or the dependency is vendored for Windows.
+#
 # Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
 # referenced. Tag pushes (v*) cut a versioned set of artifacts.
 #
@@ -57,11 +63,23 @@ jobs:
         include:
           # ── Apple Silicon / ARM64 ──────────────────────────────────────────
           # NEON+SDOT+SMMLA via target-cpu=apple-m1 (dotprod + i8mm). Built on a
-          # native arm64 macOS runner (macos-14), so no cross-linking needed.
+          # native arm64 macOS runner (macos-15), so no cross-linking needed.
           - name: aarch64-apple-darwin (neon+sdot+i8mm)
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             rustflags: "-C target-cpu=apple-m1"
+
+          # ── Intel macOS / x86-64 portability build ─────────────────────────
+          - name: x86_64-apple-darwin (baseline)
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            rustflags: ""
+
+          # ── Linux ARM64 / baseline AArch64 build ───────────────────────────
+          - name: aarch64-linux (baseline)
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rustflags: ""
 
           # ── x86-64 / AVX2 baseline ─────────────────────────────────────────
           # Portability floor: AVX2 + FMA, no VNNI. Runs on the broadest set of
@@ -90,6 +108,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Provision sibling path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
+          sudo mkdir -p /dp
+          sudo chown "$(id -un)" /dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
 
       # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
       # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.

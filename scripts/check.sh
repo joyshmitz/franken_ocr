@@ -14,6 +14,10 @@
 # is handed off or a bead is closed. `cargo check --all-targets` must also be free
 # of the "src/main.rs present in multiple build targets" warning — both binaries
 # (`focr`, `franken_ocr`) build from their own thin shims over `cli_main()`.
+#
+# UBS is part of the required local gate when the `ubs` binary is installed. In
+# CI the tool may be unavailable; in that case the script reports the missing
+# scanner explicitly instead of pretending it ran.
 set -eu
 
 FAST=0
@@ -27,6 +31,23 @@ done
 run() {
   echo "==> $*"
   "$@"
+}
+
+run_ubs() {
+  if ! command -v ubs >/dev/null 2>&1; then
+    echo "==> ubs (skipped: command not found; install UBS to enable this gate)"
+    return 0
+  fi
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+    ! git diff --quiet --diff-filter=ACMRTUXB --; then
+    echo "==> ubs --diff"
+    ubs --diff
+    return 0
+  fi
+
+  echo "==> ubs ."
+  ubs .
 }
 
 run python3 scripts/check_ledgers.py
@@ -43,5 +64,6 @@ if [ "$FAST" -eq 0 ]; then
   run cargo clippy --all-targets -- -D warnings
 fi
 run cargo test
+run_ubs
 
 echo "OK: all gates passed."

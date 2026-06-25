@@ -7,10 +7,16 @@
 # the gate sequence ever changes, it changes in ONE place — the script — and CI
 # follows automatically.
 #
-# Toolchain: the pinned nightly is declared in `rust-toolchain.toml` (nightly is
+# Toolchain: `rust-toolchain.toml` selects the nightly channel (nightly is
 # REQUIRED for stdarch i8mm/dotprod intrinsics + portable_simd — Toolchain note).
-# We do NOT pass an explicit toolchain to `dtolnay/rust-toolchain`; we let the
-# repo's `rust-toolchain.toml` select it so CI and local builds are bit-identical.
+# The `dtolnay/rust-toolchain@nightly` action installs that same channel plus the
+# needed components/targets, so CI and local builds stay aligned.
+#
+# Path dependencies: franken_ocr currently consumes sibling checkouts at
+# `../frankentorch`, `../frankensqlite`, and `/dp/asupersync`. Fresh GitHub
+# runners do not have those paths, so every Unix Cargo job provisions them before
+# installing/building Rust. Windows remains advisory-only until the absolute
+# `/dp/asupersync` patch is made portable.
 #
 # Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
 # tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
@@ -49,14 +55,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS-14 is Apple Silicon (aarch64) — exercises the NEON/SDOT/SMMLA
+        # macOS-15 is Apple Silicon (aarch64) — exercises the NEON/SDOT/SMMLA
         # scalar-fallback compile path; ubuntu-latest is x86_64 (AVX2/VNNI).
         # Both must stay green: the kernels carry per-arch scalar fallbacks.
-        os: [macos-14, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Provision sibling path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
+          sudo mkdir -p /dp
+          sudo chown "$(id -un)" /dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
@@ -65,9 +82,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Honor `rust-toolchain.toml` — DO NOT pin a channel here. clippy + rustfmt
-      # components are declared in the toolchain file; install them too.
-      - name: Install pinned nightly toolchain
+      # Install the repo's nightly channel plus the components declared for the
+      # local gate.
+      - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
@@ -84,3 +101,91 @@ jobs:
       # duplicate its commands here — the script is the single source of truth.
       - name: Run the gate (scripts/check.sh)
         run: ./scripts/check.sh
+
+  advisory-targets:
+    name: advisory target (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            runnable: true
+            skip: false
+            skip_reason: ""
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            runnable: true
+            skip: false
+            skip_reason: ""
+          - name: darwin-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            runnable: true
+            skip: false
+            skip_reason: ""
+          - name: darwin-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            runnable: true
+            skip: false
+            skip_reason: ""
+          - name: windows-msvc-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            runnable: false
+            skip: true
+            skip_reason: "Cargo.toml currently patches asupersync to Unix absolute path /dp/asupersync"
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Explain advisory skip
+        if: ${{ matrix.skip }}
+        shell: bash
+        run: |
+          echo "Advisory target '${{ matrix.name }}' is not built in Phase 0:"
+          echo "${{ matrix.skip_reason }}"
+
+      - name: Provision sibling path dependencies
+        if: ${{ !matrix.skip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
+          sudo mkdir -p /dp
+          sudo chown "$(id -un)" /dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
+
+      - name: Install nightly toolchain
+        if: ${{ !matrix.skip }}
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        if: ${{ !matrix.skip }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: advisory-${{ matrix.name }}-${{ matrix.target }}
+          cache-all-crates: true
+
+      - name: Cargo check target
+        if: ${{ !matrix.skip }}
+        run: cargo check --target ${{ matrix.target }} --all-targets
+
+      - name: Build focr target
+        if: ${{ !matrix.skip }}
+        run: cargo build --target ${{ matrix.target }} --bin focr
+
+      - name: Run target lib tests where executable
+        if: ${{ !matrix.skip && matrix.runnable }}
+        run: cargo test --target ${{ matrix.target }} --lib
