@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_SCHEMA_VERSION = 1
 PINNED_TORCH = "2.10.0"
 PINNED_TRANSFORMERS = "4.57.1"
@@ -55,6 +54,8 @@ def assert_distinct_identities() -> bool:
 
 
 def reference_env(seed: int = DEFAULT_SEED, threads: int = DEFAULT_THREADS) -> dict[str, str]:
+    if threads < 1:
+        raise ValueError("threads must be >= 1")
     env = os.environ.copy()
     env.update(
         {
@@ -68,9 +69,24 @@ def reference_env(seed: int = DEFAULT_SEED, threads: int = DEFAULT_THREADS) -> d
     return env
 
 
+def parse_seed_threads(payload: dict[str, Any]) -> tuple[int, int]:
+    try:
+        seed = int(payload.get("seed", DEFAULT_SEED))
+        threads = int(payload.get("threads", DEFAULT_THREADS))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid seed/threads: {exc}") from exc
+    if threads < 1:
+        raise ValueError("threads must be >= 1")
+    return seed, threads
+
+
 def f32_ordered_bits(value: float) -> int:
     bits = struct.unpack(">i", struct.pack(">f", float(value)))[0]
     return bits if bits >= 0 else 0x80000000 - bits
+
+
+def round_f32(value: float) -> float:
+    return struct.unpack(">f", struct.pack(">f", float(value)))[0]
 
 
 def ulp_distance_f32(lhs: float, rhs: float) -> int:
@@ -92,12 +108,44 @@ def compare_vectors(lhs: list[float], rhs: list[float], max_ulp: int) -> dict[st
 def subject_rmsnorm(values: list[float], weight: list[float], eps: float) -> list[float]:
     if len(values) != len(weight):
         raise ValueError("rmsnorm values and weight lengths differ")
-    mean_square = sum(v * v for v in values) / len(values)
-    inv_rms = 1.0 / math.sqrt(mean_square + eps)
-    return [float(v * inv_rms * w) for v, w in zip(values, weight, strict=True)]
+    if not values:
+        raise ValueError("rmsnorm input must be non-empty")
+    square_sum = round_f32(0.0)
+    for value in values:
+        value_f32 = round_f32(value)
+        square_sum = round_f32(square_sum + round_f32(value_f32 * value_f32))
+    mean_square = round_f32(square_sum / round_f32(float(len(values))))
+    inv_rms = round_f32(1.0 / math.sqrt(round_f32(mean_square + round_f32(eps))))
+    return [
+        round_f32(round_f32(round_f32(value) * inv_rms) * round_f32(scale))
+        for value, scale in zip(values, weight, strict=True)
+    ]
+
+
+def parse_rmsnorm_payload(payload: dict[str, Any]) -> tuple[list[float], list[float], float, int, int]:
+    seed, threads = parse_seed_threads(payload)
+    values_raw = payload["values"]
+    weight_raw = payload["weight"]
+    if not isinstance(values_raw, list) or not isinstance(weight_raw, list):
+        raise ValueError("values and weight must be JSON arrays")
+    values = [float(value) for value in values_raw]
+    weight = [float(value) for value in weight_raw]
+    if len(values) != len(weight):
+        raise ValueError("rmsnorm values and weight lengths differ")
+    if not values:
+        raise ValueError("rmsnorm input must be non-empty")
+    return values, weight, float(payload["eps"]), seed, threads
 
 
 def run_worker(payload: dict[str, Any]) -> dict[str, object]:
+    op = payload.get("op")
+    if op != "rmsnorm_f32":
+        return json_response("fail", error=f"unsupported oracle op {op!r}")
+    try:
+        values_list, weight_list, eps, seed, threads = parse_rmsnorm_payload(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        return json_response("fail", error=f"invalid rmsnorm_f32 request: {exc}")
+
     try:
         import torch  # type: ignore[import-not-found]
         import transformers  # type: ignore[import-not-found]
@@ -109,25 +157,19 @@ def run_worker(payload: dict[str, Any]) -> dict[str, object]:
     if torch_version != PINNED_TORCH or transformers_version != PINNED_TRANSFORMERS:
         return json_response(
             "skip_unpinned_oracle",
+            reason="oracle dependency versions are not pinned",
             torch_version=torch.__version__,
             transformers_version=transformers_version,
             required_torch=PINNED_TORCH,
             required_transformers=PINNED_TRANSFORMERS,
         )
 
-    seed = int(payload.get("seed", DEFAULT_SEED))
-    threads = int(payload.get("threads", DEFAULT_THREADS))
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
     torch.set_num_threads(threads)
 
-    op = payload.get("op")
-    if op != "rmsnorm_f32":
-        return json_response("fail", error=f"unsupported oracle op {op!r}")
-
-    values = torch.tensor(payload["values"], dtype=torch.float32)
-    weight = torch.tensor(payload["weight"], dtype=torch.float32)
-    eps = float(payload["eps"])
+    values = torch.tensor(values_list, dtype=torch.float32)
+    weight = torch.tensor(weight_list, dtype=torch.float32)
     out = values * torch.rsqrt(torch.mean(values * values) + eps) * weight
     return json_response(
         "pass",
@@ -142,12 +184,16 @@ def run_worker(payload: dict[str, Any]) -> dict[str, object]:
 
 def call_oracle(payload: dict[str, Any], python: str = sys.executable, timeout_s: float = 10.0) -> dict[str, object]:
     try:
+        seed, threads = parse_seed_threads(payload)
+    except ValueError as exc:
+        return json_response("fail", error=str(exc))
+    try:
         proc = subprocess.run(
             [python, str(Path(__file__).resolve()), "--worker"],
             input=json.dumps(payload, sort_keys=True),
             text=True,
             capture_output=True,
-            env=reference_env(int(payload.get("seed", DEFAULT_SEED)), int(payload.get("threads", DEFAULT_THREADS))),
+            env=reference_env(seed, threads),
             timeout=timeout_s,
             check=False,
         )
@@ -179,7 +225,11 @@ def self_test() -> int:
     env = reference_env(seed=7, threads=2)
     check(
         "deterministic-reference-env",
-        env["PYTHONHASHSEED"] == "7" and env["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8" and env["OMP_NUM_THREADS"] == "2",
+        env["PYTHONHASHSEED"] == "7"
+        and env["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+        and env["OMP_NUM_THREADS"] == "2"
+        and env["TORCH_NUM_THREADS"] == "2"
+        and env["FOCR_ORACLE_SEED"] == "7",
     )
 
     request = {
@@ -202,13 +252,21 @@ def self_test() -> int:
     else:
         check("oracle-subprocess-result", oracle.get("result") == "pass", detail=oracle)
         if oracle.get("result") == "pass":
-            cmp = compare_vectors(subject, list(oracle["output"]), ULP_TOLERANCE_BY_OP["rmsnorm_f32"])
-            check(
-                "oracle-rmsnorm-within-ulp",
-                bool(cmp["within_tolerance"]),
-                max_ulp=cmp["max_ulp"],
-                tolerance=ULP_TOLERANCE_BY_OP["rmsnorm_f32"],
-            )
+            output = oracle.get("output")
+            check("oracle-output-vector", isinstance(output, list), detail=oracle)
+            if isinstance(output, list):
+                try:
+                    output_values = [float(value) for value in output]
+                except (TypeError, ValueError) as exc:
+                    check("oracle-output-values-numeric", False, error=str(exc), detail=oracle)
+                else:
+                    cmp = compare_vectors(subject, output_values, ULP_TOLERANCE_BY_OP["rmsnorm_f32"])
+                    check(
+                        "oracle-rmsnorm-within-ulp",
+                        bool(cmp["within_tolerance"]),
+                        max_ulp=cmp["max_ulp"],
+                        tolerance=ULP_TOLERANCE_BY_OP["rmsnorm_f32"],
+                    )
             check("oracle-identity", oracle.get("identity") == EngineIdentity.ORACLE.value)
             check("oracle-deterministic-flag", oracle.get("deterministic_algorithms") is True)
 
