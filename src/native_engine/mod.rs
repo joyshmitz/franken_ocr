@@ -34,7 +34,7 @@ pub mod vision_sam;
 pub mod weights;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::error::{FocrError, FocrResult};
 use crate::preprocess::{self, Preprocessed};
@@ -79,11 +79,18 @@ pub struct OcrModel {
 /// [`Arc<OcrModel>`] handle is dropped, the weight blob is freed; a subsequent
 /// [`OcrModel::load`] of the same path re-reads it. While at least one handle is
 /// live, repeat loads of the same path hand back a cheap `Arc::clone`.
-type ModelCache = Mutex<Option<(PathBuf, Weak<OcrModel>)>>;
+type ModelCacheEntry = Option<(PathBuf, Weak<OcrModel>)>;
+type ModelCache = Mutex<ModelCacheEntry>;
 
 fn model_cache() -> &'static ModelCache {
     static CACHE: OnceLock<ModelCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn model_cache_guard() -> FocrResult<MutexGuard<'static, ModelCacheEntry>> {
+    model_cache()
+        .lock()
+        .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))
 }
 
 fn looks_like_safetensors_container(bytes: &[u8]) -> bool {
@@ -93,7 +100,9 @@ fn looks_like_safetensors_container(bytes: &[u8]) -> bool {
     let Ok(header_len_bytes) = bytes[..8].try_into() else {
         return false;
     };
-    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+    let Ok(header_len) = usize::try_from(u64::from_le_bytes(header_len_bytes)) else {
+        return false;
+    };
     let Some(header_end) = 8usize.checked_add(header_len) else {
         return false;
     };
@@ -164,15 +173,14 @@ impl OcrModel {
     pub fn load(path: &Path) -> FocrResult<Arc<Self>> {
         let resolved = Self::resolve_model(path)?;
 
-        let cache = model_cache();
-        let mut guard = cache
-            .lock()
-            .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))?;
-        if let Some((cached_path, weak)) = guard.as_ref()
-            && *cached_path == resolved
-            && let Some(strong) = weak.upgrade()
         {
-            return Ok(strong);
+            let guard = model_cache_guard()?;
+            if let Some((cached_path, weak)) = guard.as_ref()
+                && *cached_path == resolved
+                && let Some(strong) = weak.upgrade()
+            {
+                return Ok(strong);
+            }
         }
 
         // `resolve_model` is still a skeleton that accepts ANY existing path. A
@@ -192,6 +200,14 @@ impl OcrModel {
             weights,
             decode_params: DecodeParams::single_image(),
         });
+
+        let mut guard = model_cache_guard()?;
+        if let Some((cached_path, weak)) = guard.as_ref()
+            && *cached_path == resolved
+            && let Some(strong) = weak.upgrade()
+        {
+            return Ok(strong);
+        }
         *guard = Some((resolved, Arc::downgrade(&model)));
         Ok(model)
     }

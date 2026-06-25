@@ -30,7 +30,7 @@ pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use native_engine::OcrModel;
@@ -114,15 +114,32 @@ impl OcrEngine {
     /// whatever [`OcrModel::load`] returns (currently [`FocrError::NotImplemented`]
     /// once a path *does* resolve — the `.focrq` reader is Phase 2).
     fn model_at(&self, path: &Path) -> FocrResult<Arc<OcrModel>> {
-        let mut guard = self.model.lock().expect("OcrEngine model mutex poisoned");
+        {
+            let guard = self.model_guard()?;
+            if let Some(m) = guard.as_ref()
+                && m.path() == path
+            {
+                return Ok(Arc::clone(m));
+            }
+        }
+
+        let loaded = OcrModel::load(path)?;
+        let loaded_path = loaded.path().to_path_buf();
+
+        let mut guard = self.model_guard()?;
         if let Some(m) = guard.as_ref()
-            && m.path() == path
+            && m.path() == loaded_path
         {
             return Ok(Arc::clone(m));
         }
-        let m = OcrModel::load(path)?;
-        *guard = Some(Arc::clone(&m));
-        Ok(m)
+        *guard = Some(Arc::clone(&loaded));
+        Ok(loaded)
+    }
+
+    fn model_guard(&self) -> FocrResult<MutexGuard<'_, Option<Arc<OcrModel>>>> {
+        self.model
+            .lock()
+            .map_err(|_| FocrError::Other(anyhow::anyhow!("OcrEngine model mutex poisoned")))
     }
 
     /// Recognize a single document image, returning structured markdown.
@@ -176,7 +193,7 @@ mod tests {
         let engine = OcrEngine::new().expect("runtime builds");
         // Constructing alone must not have loaded a model.
         assert!(
-            engine.model.lock().expect("mutex").is_none(),
+            engine.model_guard().expect("mutex").is_none(),
             "model must be loaded lazily, not at construction"
         );
     }

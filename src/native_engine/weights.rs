@@ -134,10 +134,26 @@ pub struct TensorRecord {
 }
 
 impl TensorRecord {
-    /// Total element count (`shape.iter().product()`).
+    /// Total element count, saturating at [`usize::MAX`] instead of panicking on
+    /// a malformed in-memory shape. Loader validation uses [`Self::checked_numel`]
+    /// so corrupt on-disk directories still fail loudly.
     #[must_use]
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.shape
+            .iter()
+            .copied()
+            .fold(1usize, usize::saturating_mul)
+    }
+
+    fn checked_numel(&self, name: &str) -> FocrResult<usize> {
+        self.shape.iter().copied().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(dim).ok_or_else(|| {
+                FocrError::FormatMismatch(format!(
+                    "tensor {name:?}: shape {:?} element count overflows usize",
+                    self.shape
+                ))
+            })
+        })
     }
 
     /// Bytes-per-element for the **payload** of this dtype (scales are separate).
@@ -154,11 +170,24 @@ impl TensorRecord {
 
     /// Expected payload byte length implied by `shape` + `dtype`, used by the
     /// census to catch a directory that disagrees with its own shapes.
-    #[must_use]
-    fn expected_byte_len(&self) -> usize {
+    fn expected_byte_len(&self, name: &str) -> FocrResult<usize> {
+        let numel = self.checked_numel(name)?;
         match self.dtype {
-            DType::QInt4PerGroup => self.numel() / 2,
-            _ => self.numel() * self.elem_bytes(),
+            DType::QInt4PerGroup => {
+                if !numel.is_multiple_of(2) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 shape {:?} has odd element count {numel}",
+                        self.shape
+                    )));
+                }
+                Ok(numel / 2)
+            }
+            _ => numel.checked_mul(self.elem_bytes()).ok_or_else(|| {
+                FocrError::FormatMismatch(format!(
+                    "tensor {name:?}: byte length for {:?}, shape {:?} overflows usize",
+                    self.dtype, self.shape
+                ))
+            }),
         }
     }
 }
@@ -202,10 +231,14 @@ pub struct TensorView<'a> {
 }
 
 impl TensorView<'_> {
-    /// Total element count of the tensor.
+    /// Total element count of the tensor, saturating at [`usize::MAX`] rather
+    /// than panicking if a caller constructs a malformed view.
     #[must_use]
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.shape
+            .iter()
+            .copied()
+            .fold(1usize, usize::saturating_mul)
     }
 
     /// Widen the whole tensor to an owned f32 `Vec` (any of F32/F16/BF16).
@@ -339,7 +372,7 @@ impl Weights {
         }
         let mut cur = FOCRQ_MAGIC.len();
 
-        let version = u32::from_le_bytes(bytes[cur..cur + 4].try_into().expect("4 bytes"));
+        let version = read_u32_le(&bytes[cur..cur + 4], ".focrq format_version")?;
         cur += 4;
         if version > FOCRQ_FORMAT_VERSION {
             return Err(FocrError::FormatMismatch(format!(
@@ -354,8 +387,7 @@ impl Weights {
         let preamble_sha = hex_encode(&bytes[cur..cur + 32]);
         cur += 32;
 
-        let header_len =
-            u64::from_le_bytes(bytes[cur..cur + 8].try_into().expect("8 bytes")) as usize;
+        let header_len = read_u64_len_le(&bytes[cur..cur + 8], ".focrq header_len")?;
         cur += 8;
 
         let header_end = cur
@@ -410,7 +442,7 @@ impl Weights {
                 bytes.len()
             )));
         }
-        let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")) as usize;
+        let header_len = read_u64_len_le(&bytes[..8], "safetensors header_len")?;
         let header_end = 8usize
             .checked_add(header_len)
             .ok_or_else(|| FocrError::FormatMismatch("safetensors header_len overflows".into()))?;
@@ -794,7 +826,7 @@ fn validate_directory(
                 "tensor {name:?} ends at {end} but payload is {payload_len} bytes"
             )));
         }
-        let expected = rec.expected_byte_len();
+        let expected = rec.expected_byte_len(name)?;
         if rec.byte_len != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: byte_len {} != shape×dtype {} ({:?}, shape {:?})",
@@ -868,6 +900,25 @@ fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+fn read_u32_le(bytes: &[u8], field: &str) -> FocrResult<u32> {
+    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+        FocrError::FormatMismatch(format!("{field} truncated: {} bytes < 4", bytes.len()))
+    })?;
+    Ok(u32::from_le_bytes(arr))
+}
+
+fn read_u64_len_le(bytes: &[u8], field: &str) -> FocrResult<usize> {
+    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+        FocrError::FormatMismatch(format!("{field} truncated: {} bytes < 8", bytes.len()))
+    })?;
+    let raw = u64::from_le_bytes(arr);
+    usize::try_from(raw).map_err(|_| {
+        FocrError::FormatMismatch(format!(
+            "{field} {raw} exceeds this platform's addressable size"
+        ))
+    })
 }
 
 /// Lowercase-hex-encode a byte slice (for the source-sha256 provenance field).
@@ -1300,6 +1351,29 @@ mod tests {
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let err = Weights::from_bytes(blob).unwrap_err();
         assert!(format!("{err}").contains("shape×dtype") || format!("{err}").contains("overruns"));
+    }
+
+    #[test]
+    fn rejects_shape_numel_overflow_without_panicking() {
+        let dir = format!(
+            "{{\"x\":{{\"dtype\":\"BF16\",\"shape\":[{},2],\"byte_offset\":0,\"byte_len\":0}}}}",
+            usize::MAX
+        );
+        let blob = build_focrq(1, 0, [0u8; 32], &dir, &[]);
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("element count overflows"));
+    }
+
+    #[test]
+    fn rejects_qint4_odd_numel_at_load_time() {
+        let dir = "{\"odd\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[1,3],\
+             \"byte_offset\":0,\"byte_len\":1,\"scales_offset\":1,\"scales_len\":0,\
+             \"group_size\":1}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &[0u8]);
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("odd element count"));
     }
 
     #[test]
