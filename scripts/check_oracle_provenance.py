@@ -25,6 +25,8 @@ HF_COMMIT = "3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5"
 GITHUB_COMMIT = "7e98affeacba24e95562fbaa234ddb89b856874a"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+REPLAY_SCHEMA_VERSION = 1
+DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
 
 def emit(check: str, ok: bool, **fields: object) -> None:
@@ -124,6 +126,116 @@ def validate_provenance(path: Path, value: dict[str, Any], failures: list[str]) 
     if not ok_bytes:
         failures.append(f"{path}: model_weights_bytes must be a positive integer")
 
+    determinism = provenance.get("determinism")
+    if not isinstance(determinism, dict):
+        fail(failures, f"{path}: missing determinism object", "oracle-determinism-object", file=str(path.relative_to(ROOT)))
+    else:
+        seed = determinism.get("seed")
+        ok_seed = isinstance(seed, int) and seed >= 0
+        emit("oracle-determinism-seed", ok_seed, file=str(path.relative_to(ROOT)), seed=seed)
+        if not ok_seed:
+            failures.append(f"{path}: determinism.seed must be a non-negative integer")
+        for field in ("torch_manual_seed", "torch_deterministic_algorithms"):
+            ok_flag = determinism.get(field) is True
+            emit("oracle-determinism-flag", ok_flag, file=str(path.relative_to(ROOT)), field=field, actual=determinism.get(field))
+            if not ok_flag:
+                failures.append(f"{path}: determinism.{field} must be true")
+        cublas_ok = determinism.get("cublas_workspace_config") == DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG
+        emit(
+            "oracle-determinism-cublas-workspace",
+            cublas_ok,
+            file=str(path.relative_to(ROOT)),
+            expected=DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG,
+            actual=determinism.get("cublas_workspace_config"),
+        )
+        if not cublas_ok:
+            failures.append(f"{path}: determinism.cublas_workspace_config must be {DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG}")
+
+    generation = provenance.get("generation_config")
+    if not isinstance(generation, dict):
+        fail(failures, f"{path}: missing generation_config object", "oracle-generation-config", file=str(path.relative_to(ROOT)))
+    else:
+        deterministic_generation = generation.get("temperature") == 0.0 and generation.get("do_sample") is False
+        emit(
+            "oracle-generation-deterministic",
+            deterministic_generation,
+            file=str(path.relative_to(ROOT)),
+            temperature=generation.get("temperature"),
+            do_sample=generation.get("do_sample"),
+        )
+        if not deterministic_generation:
+            failures.append(f"{path}: generation_config must be greedy deterministic")
+
+
+def validate_deterministic_replay(
+    path: Path,
+    value: dict[str, Any],
+    decoded: object,
+    expected_decoded_sha: object,
+    failures: list[str],
+) -> None:
+    replay = value.get("deterministic_replay")
+    if not isinstance(replay, dict):
+        fail(failures, f"{path}: missing deterministic_replay object", "oracle-replay-object", file=str(path.relative_to(ROOT)))
+        return
+    emit("oracle-replay-object", True, file=str(path.relative_to(ROOT)))
+
+    schema_ok = replay.get("schema_version") == REPLAY_SCHEMA_VERSION
+    emit("oracle-replay-schema", schema_ok, file=str(path.relative_to(ROOT)), schema_version=replay.get("schema_version"))
+    if not schema_ok:
+        failures.append(f"{path}: deterministic_replay.schema_version must be {REPLAY_SCHEMA_VERSION}")
+
+    seed = replay.get("rng_seed")
+    seed_ok = isinstance(seed, int) and seed >= 0
+    emit("oracle-replay-seed", seed_ok, file=str(path.relative_to(ROOT)), seed=seed)
+    if not seed_ok:
+        failures.append(f"{path}: deterministic_replay.rng_seed must be a non-negative integer")
+
+    requires_cuda_ok = replay.get("requires_cuda") is True
+    emit("oracle-replay-requires-cuda", requires_cuda_ok, file=str(path.relative_to(ROOT)), requires_cuda=replay.get("requires_cuda"))
+    if not requires_cuda_ok:
+        failures.append(f"{path}: correctness-golden replay must require CUDA")
+
+    kind_ok = replay.get("expected_prefix_kind") == "full_decoded_text"
+    emit("oracle-replay-prefix-kind", kind_ok, file=str(path.relative_to(ROOT)), kind=replay.get("expected_prefix_kind"))
+    if not kind_ok:
+        failures.append(f"{path}: deterministic_replay.expected_prefix_kind must be full_decoded_text")
+
+    prefix_chars = replay.get("expected_prefix_chars")
+    expected_chars = len(decoded) if isinstance(decoded, str) else None
+    chars_ok = isinstance(prefix_chars, int) and prefix_chars == expected_chars
+    emit("oracle-replay-prefix-chars", chars_ok, file=str(path.relative_to(ROOT)), expected=expected_chars, actual=prefix_chars)
+    if not chars_ok:
+        failures.append(f"{path}: deterministic_replay.expected_prefix_chars mismatch")
+
+    for field in ("expected_prefix_sha256", "expected_decoded_text_sha256"):
+        actual = replay.get(field)
+        ok = isinstance(actual, str) and actual == expected_decoded_sha
+        emit("oracle-replay-sha", ok, file=str(path.relative_to(ROOT)), field=field, expected=expected_decoded_sha, actual=actual)
+        if not ok:
+            failures.append(f"{path}: deterministic_replay.{field} mismatch")
+
+    replay_argv = replay.get("replay_command_argv")
+    argv_ok = isinstance(replay_argv, list) and any("gen_reference_fixtures.py" in str(arg) for arg in replay_argv)
+    emit("oracle-replay-command", argv_ok, file=str(path.relative_to(ROOT)), argc=len(replay_argv) if isinstance(replay_argv, list) else None)
+    if not argv_ok:
+        failures.append(f"{path}: deterministic_replay.replay_command_argv must name gen_reference_fixtures.py")
+
+    provenance = value.get("provenance")
+    if isinstance(provenance, dict):
+        determinism = provenance.get("determinism")
+        if isinstance(determinism, dict):
+            seed_match = determinism.get("seed") == seed
+            emit(
+                "oracle-replay-seed-matches-provenance",
+                seed_match,
+                file=str(path.relative_to(ROOT)),
+                replay_seed=seed,
+                provenance_seed=determinism.get("seed"),
+            )
+            if not seed_match:
+                failures.append(f"{path}: replay seed does not match provenance determinism seed")
+
 
 def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
     covered_npys: set[Path] = set()
@@ -147,6 +259,8 @@ def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
             failures.append(f"{path}: decoded_text_sha256 mismatch")
     else:
         fail(failures, f"{path}: decoded_text/decoded_text_sha256 have invalid types", "oracle-decoded-text-sha", file=str(path.relative_to(ROOT)))
+
+    validate_deterministic_replay(path, value, decoded, expected, failures)
 
     activations = value.get("activations", {})
     if not isinstance(activations, dict):

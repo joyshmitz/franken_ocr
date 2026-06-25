@@ -123,6 +123,8 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 # Stop string appended by the tokenizer at the end of the decoded output.
 EOS_STOP_STRING = "<｜end▁of▁sentence｜>"
+DEFAULT_RNG_SEED = 0
+DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +189,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Process at most N corpus documents (0 = no limit). Useful to "
         "establish the nondeterminism floor cheaply.",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_RNG_SEED,
+        help="RNG seed captured into every fixture replay contract.",
     )
     p.add_argument(
         "--run-tag",
@@ -588,6 +596,22 @@ def _run_one(
         act_dir = out_dir / "activations" / stem
         activations_manifest = capture.dump(act_dir)
 
+    decoded_text_sha256 = (
+        hashlib.sha256(decoded_text.encode("utf-8")).hexdigest()
+        if decoded_text is not None
+        else None
+    )
+    replay_contract = {
+        "schema_version": 1,
+        "rng_seed": provenance["determinism"]["seed"],
+        "requires_cuda": provenance["device"] == "cuda",
+        "expected_prefix_kind": "full_decoded_text",
+        "expected_prefix_chars": len(decoded_text or ""),
+        "expected_prefix_sha256": decoded_text_sha256,
+        "expected_decoded_text_sha256": decoded_text_sha256,
+        "replay_command_argv": provenance["command_argv"],
+    }
+
     golden = {
         "schema_version": 1,
         "doc": doc.name,
@@ -606,11 +630,8 @@ def _run_one(
         # canonicalization (strip timing; sort bboxes). Timing is intentionally
         # NOT part of the comparison surface.
         "decoded_text": decoded_text,
-        "decoded_text_sha256": (
-            hashlib.sha256(decoded_text.encode("utf-8")).hexdigest()
-            if decoded_text is not None
-            else None
-        ),
+        "decoded_text_sha256": decoded_text_sha256,
+        "deterministic_replay": replay_contract,
         "result_md_present": md_text is not None,
         "activations": activations_manifest,
         "non_comparable": {
@@ -653,6 +674,7 @@ def _build_provenance(
     mode: str,
     device: str,
     max_length: int,
+    determinism: dict[str, Any],
     command_argv: list[str],
 ) -> dict[str, Any]:
     """Audit record written into every fixture. The expensive bit (the model
@@ -708,6 +730,7 @@ def _build_provenance(
         "pinned_transformers": PIN_TRANSFORMERS,
         "python": platform.python_version(),
         "platform": platform.platform(),
+        "determinism": determinism,
         "generation_config": {
             "mode": mode,
             "prompt": prompt,
@@ -736,6 +759,7 @@ def _provenance_markdown(manifest: dict[str, Any]) -> str:
         f"- Hugging Face commit: `{provenance['hf_commit']}`",
         f"- GitHub commit: `{provenance['github_commit']}`",
         f"- Exact command: `{provenance['exact_command']}`",
+        f"- RNG seed: `{provenance['determinism']['seed']}`",
         f"- Model weights SHA-256: `{provenance['model_weights_sha256']}`",
         f"- Correctness golden: `{provenance['oracle_is_correctness_golden']}`",
         "",
@@ -756,11 +780,58 @@ def _provenance_markdown(manifest: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _apply_determinism(torch: Any, transformers: Any, seed: int) -> dict[str, Any]:
+    """Best-effort deterministic setup captured into fixture provenance.
+
+    The oracle still needs a separate nondeterminism-floor run; this only makes a
+    replay attempt carry the same explicit seed and deterministic-algorithm knobs.
+    """
+    if seed < 0:
+        raise SystemExit("gen_reference_fixtures: --seed must be non-negative")
+
+    record: dict[str, Any] = {
+        "seed": seed,
+        "transformers_set_seed": False,
+        "torch_manual_seed": False,
+        "torch_cuda_manual_seed_all": False,
+        "torch_deterministic_algorithms": False,
+        "torch_deterministic_warn_only": True,
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+
+    try:
+        transformers.set_seed(seed)
+        record["transformers_set_seed"] = True
+    except Exception as exc:  # noqa: BLE001 - older/newer API shape
+        record["transformers_set_seed_error"] = str(exc)
+
+    torch.manual_seed(seed)
+    record["torch_manual_seed"] = True
+
+    if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        record["torch_cuda_manual_seed_all"] = True
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        record["torch_deterministic_algorithms"] = True
+    except TypeError:
+        torch.use_deterministic_algorithms(True)
+        record["torch_deterministic_algorithms"] = True
+        record["torch_deterministic_warn_only"] = False
+    except Exception as exc:  # noqa: BLE001 - environment/backend dependent
+        record["torch_deterministic_algorithms_error"] = str(exc)
+
+    return record
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG
 
     # 1. Assert the pinned oracle stack BEFORE touching anything expensive.
     torch, transformers = _assert_pinned_stack()
@@ -781,7 +852,16 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
-    # 3. Provenance (hashes the weights once, shared by every fixture this run).
+    # 3. Load the model + tokenizer (bf16, eval, device). This may allocate and
+    # consume RNG internally, so the replay seed is applied immediately after it.
+    model, tokenizer = _load_model_and_tokenizer(torch, model_dir, args.device)
+
+    # 4. Make generation as deterministic as the runtime allows (the oracle's own
+    # nondeterminism floor is established by running this script twice — plan §8.1
+    # — NOT by pretending bf16 CUDA matmul is bitwise reproducible).
+    determinism = _apply_determinism(torch, transformers, args.seed)
+
+    # 5. Provenance (hashes the weights once, shared by every fixture this run).
     provenance = _build_provenance(
         torch=torch,
         transformers=transformers,
@@ -791,21 +871,11 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
         device=args.device,
         max_length=args.max_length,
+        determinism=determinism,
         command_argv=[sys.executable, *sys.argv],
     )
 
-    # 4. Load the model + tokenizer (bf16, eval, device).
-    model, tokenizer = _load_model_and_tokenizer(torch, model_dir, args.device)
-
-    # Make generation as deterministic as the runtime allows (the oracle's own
-    # nondeterminism floor is established by running this script twice — plan §8.1
-    # — NOT by pretending bf16 CUDA matmul is bitwise reproducible).
-    try:
-        transformers.set_seed(0)
-    except Exception:  # noqa: BLE001 - older/newer API shape
-        torch.manual_seed(0)
-
-    # 5. Per-document oracle runs.
+    # 6. Per-document oracle runs.
     records: list[dict[str, Any]] = []
     for doc in docs:
         with torch.no_grad():
@@ -823,7 +893,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         records.append(rec)
 
-    # 6. Run-level provenance manifest (one per run; --run-tag keeps two side by
+    # 7. Run-level provenance manifest (one per run; --run-tag keeps two side by
     # side for the nondeterminism floor).
     tag = f"_{args.run_tag}" if args.run_tag else ""
     run_manifest = {
