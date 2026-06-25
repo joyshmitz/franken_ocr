@@ -1,0 +1,7 @@
+
+running 1 test
+{"probe":"sam_attention_relpos_bias_local_probe","grid":14,"tokens":196,"dim":768,"heads":12,"head_dim":64,"runs":7,"total_ms":126.52608300000001,"avg_ms":18.075154714285716,"warm_checksum":-0.0019174511544406414,"checksum":-0.013422159478068352}
+test native_engine::vision_sam::tests::sam_attention_relpos_bias_local_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 437 filtered out; finished in 0.15s
+

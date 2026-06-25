@@ -71,6 +71,27 @@ Retry condition: only revisit this layout lever as part of a larger batched
 QK^T/probs@V rewrite where profiling shows the QKV split or coordinate math has
 become a measurable hotspot.
 
+## Kept Follow-Up: Per-Head GEMM QK^T + Probs@V
+
+The larger structural rewrite requested by `bd-3n16` was then tested:
+
+- replace the per-query scalar QK dot loop with `nn::matmul(Q, K^T)` per head;
+- transpose each head's K with contiguous stores before the GEMM;
+- replace the scalar `probs @ V` weighted-sum loop with a second `nn::matmul`.
+
+It kept the focused SAM test suite green and improved the 7-run local probe:
+
+- fresh baseline: `18.075154714285716 ms`
+- attempted/kept: `12.591648857142857 ms`
+- delta: `1.435488x` speedup, `30.3373%` less wall time
+
+Correctness note: the GEMM path is not bit-exact with the scalar loop because the
+kernel changes f32 accumulation order. The probe checksum drift was tiny
+(`-0.013422159478068352` -> `-0.013422181829810143` over 7 runs), and the
+committed focused test `attention_gemm_matches_scalar_reference_with_relpos`
+compares GEMM attention against the old scalar loop with non-zero decomposed
+rel-pos tables and requires `max_abs <= 2e-6`.
+
 ## Files
 
 - `baseline_sam_attention_probe.txt`: old nested rel-pos loop.
@@ -78,4 +99,6 @@ become a measurable hotspot.
 - `qkv_grid_hoist_baseline_7run.txt`: baseline for the rejected layout-only
   follow-up.
 - `qkv_grid_hoist_attempt_7run.txt`: attempted layout-only follow-up result.
+- `gemm_baseline_7run.txt`: fresh baseline before the kept per-head GEMM rewrite.
+- `gemm_attempt_7run.txt`: kept per-head GEMM QK^T/probs@V rewrite result.
 - `SHA256SUMS`: hash manifest for this evidence bundle.

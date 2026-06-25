@@ -265,6 +265,26 @@ claims.
   agent: WhiteCave
   evidence dir: artifacts/perf/bd-3n16/
 
+2026-06-25 | WIN | per-head GEMM QK^T + probs@V in `src/native_engine/vision_sam.rs::attention`
+  claim_id: CLAIM-bd-3n16-sam-gemm-attention   evidence_id: artifacts/perf/bd-3n16/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    synthetic SAM attention fixture: ignored unit probe `sam_attention_relpos_bias_local_probe`; baseline artifact `gemm_baseline_7run.txt`, attempt artifact `gemm_attempt_7run.txt`, and README hashes recorded in SHA256SUMS
+  CPU feature string: arm64 Apple M4, dotprod=1, i8mm=1; SAM attention probe is f32 through the current frankentorch facade, no SIMD tier override
+  exact command + env:
+    FOCR_SAM_ATTN_PROBE_RUNS=7 CARGO_TARGET_DIR=target-codex-verify timeout 240s cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
+  fallback / kill-switch state: no FOCR_* performance kill-switches set; allocator=system; harness calls the real `vision_sam::attention`
+  measured before -> after vs reference:
+    local focr-only synthetic SAM attention probe (no reference ratio): 18.075154714285716 ms -> 12.591648857142857 ms average for 7 calls, local speedup 1.435488x and 30.3373% less wall time; PERF_LEDGER ineligible until the gauntlet has a pinned CPU reference row
+  bit-exact correctness proof:
+    not bit-exact because the frankentorch GEMM changes f32 accumulation order; checksum drift stayed tiny over 7 calls (`-0.013422159478068352` -> `-0.013422181829810143`), and `attention_gemm_matches_scalar_reference_with_relpos` compares the GEMM path against the old scalar loop with non-zero rel-pos tables at `max_abs <= 2e-6`; `CARGO_TARGET_DIR=target-codex-verify timeout 240s cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test vision_sam::tests --lib -- --nocapture` -> 18 passed, 0 failed, 1 ignored
+  disposition: KEEP
+  do-not-retry: "do not return this SAM attention stage to scalar per-query QK/probs@V loops unless a full L1/L2 parity gate or pinned gauntlet row proves the GEMM accumulation drift is unacceptable"
+  per-lever tally: W 2 / L 1 / N 0
+  agent: WhiteCave
+  evidence dir: artifacts/perf/bd-3n16/
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a

@@ -426,36 +426,24 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
         let vh = &v[head * n * hd..(head + 1) * n * hd];
         let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
 
-        // logits[i,j] = scale * dot(q_i, k_j) + bias
-        let mut logits = vec![0.0f32; n * n];
+        // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
+        let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
+        let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
+        let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
         for i in 0..n {
-            let qi = &qh[i * hd..(i + 1) * hd];
             for j in 0..n {
                 let ky = j / gw;
                 let kx = j % gw;
-                let kj = &kh[j * hd..(j + 1) * hd];
-                let mut dot = 0.0f32;
-                for c in 0..hd {
-                    dot += qi[c] * kj[c];
-                }
                 let bh = rel_h_bias[i * gh + ky];
                 let bw = rel_w_bias[i * gw + kx];
-                logits[i * n + j] = scale * dot + bh + bw;
+                lm.data[i * n + j] = scale * lm.data[i * n + j] + bh + bw;
             }
         }
         // softmax rows then weighted sum of v.
-        let mut lm = Mat::from_vec(n, n, logits);
         nn::softmax_rows(&mut lm)?;
-        for i in 0..n {
-            let probs = lm.row(i);
-            let o = &mut out[(head * n + i) * hd..(head * n + i + 1) * hd];
-            for (j, &pj) in probs.iter().enumerate() {
-                let vj = &vh[j * hd..(j + 1) * hd];
-                for c in 0..hd {
-                    o[c] += pj * vj[c];
-                }
-            }
-        }
+        let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
+        let head_out = nn::matmul(&lm, &vh_mat)?;
+        out[head * n * hd..(head + 1) * n * hd].copy_from_slice(&head_out.data);
     }
 
     // Reassemble [n, dim] from [nh][n, hd] (head-major -> token rows).
@@ -705,6 +693,17 @@ fn transpose(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     for r in 0..rows {
         for c in 0..cols {
             out[c * rows + r] = m[r * cols + c];
+        }
+    }
+    out
+}
+
+fn transpose_contiguous_stores(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for c in 0..cols {
+        let dst = &mut out[c * rows..(c + 1) * rows];
+        for r in 0..rows {
+            dst[r] = m[r * cols + c];
         }
     }
     out
@@ -1072,6 +1071,122 @@ mod tests {
             }
         }
         w
+    }
+
+    fn attention_scalar_reference(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
+        let n = gh * gw;
+        let dim = x.cols;
+        let nh = NUM_HEADS;
+        let hd = dim / nh;
+        let scale = (hd as f32).powf(-0.5);
+        let qkv = p.qkv.apply(x)?;
+        let mut q = vec![0.0f32; nh * n * hd];
+        let mut k = vec![0.0f32; nh * n * hd];
+        let mut v = vec![0.0f32; nh * n * hd];
+        for r in 0..n {
+            let row = qkv.row(r);
+            for head in 0..nh {
+                for d in 0..hd {
+                    q[(head * n + r) * hd + d] = row[head * hd + d];
+                    k[(head * n + r) * hd + d] = row[(nh + head) * hd + d];
+                    v[(head * n + r) * hd + d] = row[(2 * nh + head) * hd + d];
+                }
+            }
+        }
+
+        let rh = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
+        let rw = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+        let mut out = vec![0.0f32; nh * n * hd];
+        for head in 0..nh {
+            let qh = &q[head * n * hd..(head + 1) * n * hd];
+            let kh = &k[head * n * hd..(head + 1) * n * hd];
+            let vh = &v[head * n * hd..(head + 1) * n * hd];
+            let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
+            let mut logits = vec![0.0f32; n * n];
+            for i in 0..n {
+                let qi = &qh[i * hd..(i + 1) * hd];
+                for j in 0..n {
+                    let ky = j / gw;
+                    let kx = j % gw;
+                    let kj = &kh[j * hd..(j + 1) * hd];
+                    let mut dot = 0.0f32;
+                    for c in 0..hd {
+                        dot += qi[c] * kj[c];
+                    }
+                    logits[i * n + j] =
+                        scale * dot + rel_h_bias[i * gh + ky] + rel_w_bias[i * gw + kx];
+                }
+            }
+            let mut lm = Mat::from_vec(n, n, logits);
+            nn::softmax_rows(&mut lm)?;
+            for i in 0..n {
+                let probs = lm.row(i);
+                let o = &mut out[(head * n + i) * hd..(head * n + i + 1) * hd];
+                for (j, &pj) in probs.iter().enumerate() {
+                    let vj = &vh[j * hd..(j + 1) * hd];
+                    for c in 0..hd {
+                        o[c] += pj * vj[c];
+                    }
+                }
+            }
+        }
+
+        let mut ctx = vec![0.0f32; n * dim];
+        for head in 0..nh {
+            for r in 0..n {
+                let src = (head * n + r) * hd;
+                let dst = r * dim + head * hd;
+                ctx[dst..dst + hd].copy_from_slice(&out[src..src + hd]);
+            }
+        }
+        p.proj.apply(&Mat::from_vec(n, dim, ctx))
+    }
+
+    #[test]
+    fn attention_gemm_matches_scalar_reference_with_relpos() {
+        let dim = EMBED_DIM;
+        let hd = HEAD_DIM;
+        let grid = 3usize;
+        let n = grid * grid;
+        let rel_rows = 2 * grid - 1;
+        let attn = AttnP {
+            qkv: Linear {
+                w: identity_block_3(dim),
+                b: vec![0.0; 3 * dim],
+                out: 3 * dim,
+                in_: dim,
+            },
+            proj: Linear {
+                w: identity_mat(dim),
+                b: vec![0.0; dim],
+                out: dim,
+                in_: dim,
+            },
+            rel_pos_h: (0..rel_rows * hd)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.0011)
+                .collect(),
+            rel_pos_w: (0..rel_rows * hd)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.0009)
+                .collect(),
+            size_h: grid,
+            size_w: grid,
+        };
+        let x = Mat::from_vec(
+            n,
+            dim,
+            (0..n * dim)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
+                .collect(),
+        );
+        let got = attention(&attn, &x, grid, grid).unwrap();
+        let expected = attention_scalar_reference(&attn, &x, grid, grid).unwrap();
+        let max_abs = got
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 2.0e-6, "max_abs={max_abs}");
     }
 
     #[test]
