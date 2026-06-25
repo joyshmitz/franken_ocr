@@ -1,0 +1,12 @@
+bd-3n16 SAM attention negative lever baseline
+
+Repository commit: afcd9b7
+Candidate state: existing rel-pos-bias-precompute implementation from 5736f46.
+Command:
+FOCR_SAM_ATTN_PROBE_RUNS=7 CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
+
+Result row:
+{"probe":"sam_attention_relpos_bias_local_probe","grid":14,"tokens":196,"dim":768,"heads":12,"head_dim":64,"runs":7,"total_ms":122.74312499999999,"avg_ms":17.53473214285714,"warm_checksum":-0.0019174511544406414,"checksum":-0.013422159478068352}
+
+Disposition:
+Baseline for the rejected layout-only attempt recorded in qkv_grid_hoist_attempt_7run.txt.

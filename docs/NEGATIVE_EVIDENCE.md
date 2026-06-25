@@ -230,7 +230,7 @@ claims.
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
     config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
-    synthetic SAM attention fixture: ignored unit probe `sam_attention_relpos_bias_local_probe`; evidence README sha256 0da258756f8be90e27c6064187cce2022158039db2cbb7e15e4f5f213424ac94 (SHA256SUMS)
+    synthetic SAM attention fixture: ignored unit probe `sam_attention_relpos_bias_local_probe`; evidence README sha256 6a0f8c7bc22b5ad5012ed546ab1443a4897ea43e5be31b6314d42d25f3ae721c (SHA256SUMS)
   CPU feature string: arm64 Apple M4, dotprod=1, i8mm=1; SAM attention probe is f32 through the current frankentorch facade, no SIMD tier override
   exact command + env:
     FOCR_SAM_ATTN_PROBE_RUNS=5 CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
@@ -242,6 +242,26 @@ claims.
   disposition: KEEP
   do-not-retry: "do not recompute decomposed rel-pos dot products inside the SAM key loop unless a future batched-QK/probs@V rewrite proves a faster and parity-preserving full attention path on the pinned fixture"
   per-lever tally: W 1 / L 0 / N 0
+  agent: WhiteCave
+  evidence dir: artifacts/perf/bd-3n16/
+
+2026-06-25 | NEGATIVE(reverted) | QKV split slice-copy + key-grid coordinate hoist in `src/native_engine/vision_sam.rs::attention`
+  claim_id: CLAIM-bd-3n16-sam-qkv-grid-hoist   evidence_id: artifacts/perf/bd-3n16/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    synthetic SAM attention fixture: ignored unit probe `sam_attention_relpos_bias_local_probe`; baseline artifact sha256 ec449a86484cf0d8b709b8a71a011ff379a7a3efe6751c2568e911f2a72dc9b7 and attempt artifact sha256 950af2eb4723834c9fdb777848b1b3a0777054bcab3d7dbdd52fac4bfa064b5e (SHA256SUMS)
+  CPU feature string: arm64 Apple M4, dotprod=1, i8mm=1; SAM attention probe is f32 through the current frankentorch facade, no SIMD tier override
+  exact command + env:
+    FOCR_SAM_ATTN_PROBE_RUNS=7 CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
+  fallback / kill-switch state: no FOCR_* performance kill-switches set; allocator=system; harness calls the real `vision_sam::attention`
+  measured before -> after vs reference:
+    local focr-only synthetic SAM attention probe (no reference ratio): 17.53473214285714 ms -> 18.066375 ms average for 7 calls, a 3.03% slowdown; PERF_LEDGER ineligible until the gauntlet has a pinned CPU reference row
+  bit-exact correctness proof:
+    output checksum unchanged (`-0.013422159478068352` before and after); the local experiment added helper tests proving the slice-copy QKV split and precomputed grid coordinates matched the old indexing formulas, but the code was reverted before commit because the timing regressed
+  disposition: REVERT
+  do-not-retry: "do not retry QKV slice-copy splitting or key-coordinate hoisting as standalone SAM attention levers; revisit only inside a larger batched-QK/probs@V rewrite if profiling shows QKV split or coordinate math is a named hotspot"
+  per-lever tally: W 0 / L 1 / N 0
   agent: WhiteCave
   evidence dir: artifacts/perf/bd-3n16/
 

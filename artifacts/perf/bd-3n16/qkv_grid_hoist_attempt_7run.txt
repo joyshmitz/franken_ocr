@@ -1,0 +1,16 @@
+bd-3n16 SAM attention rejected lever attempt
+
+Repository commit: uncommitted local experiment after afcd9b7.
+Candidate state:
+- Replaced the nested scalar Q/K/V copy loop with per-head contiguous slice copies through a private split_qkv_head_major helper.
+- Precomputed key grid coordinates with a private grid_coords helper and loaded ky/kx from vectors inside the logits loop.
+- Added focused unit tests proving both helpers matched the old indexing formulas.
+
+Command:
+FOCR_SAM_ATTN_PROBE_RUNS=7 CARGO_TARGET_DIR=target-codex-verify cargo +nightly --config patch.crates-io.asupersync.path='"/dp/asupersync"' test --profile release-perf sam_attention_relpos_bias_local_probe --lib -- --ignored --nocapture
+
+Result row:
+{"probe":"sam_attention_relpos_bias_local_probe","grid":14,"tokens":196,"dim":768,"heads":12,"head_dim":64,"runs":7,"total_ms":126.464625,"avg_ms":18.066375,"warm_checksum":-0.0019174511544406414,"checksum":-0.013422159478068352}
+
+Disposition:
+REVERTED / not committed. The checksum matched, but the local synthetic probe slowed from 17.53473214285714 ms to 18.066375 ms (+3.03% wall time), so the lever does not meet the keep bar.

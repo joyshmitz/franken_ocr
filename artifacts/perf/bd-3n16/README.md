@@ -52,8 +52,30 @@ After, per-query decomposed rel-pos bias precompute:
 Local speedup for this probe: `26.8490916 / 17.787375 = 1.509x`
 (`33.75%` less wall time for the same 5 attention calls).
 
+## Rejected Follow-Up: QKV Copy + Grid-Coord Hoist
+
+A narrower layout-only follow-up was tested after `afcd9b7`:
+
+- replace the nested scalar Q/K/V split loop with per-head contiguous slice
+  copies;
+- precompute key `ky/kx` grid coordinates instead of computing `j / gw` and
+  `j % gw` inside the logits loop.
+
+It preserved the checksum but regressed the 7-run local probe:
+
+- baseline: `17.53473214285714 ms`
+- attempted: `18.066375 ms`
+- delta: `+3.03%` wall time, so the code was reverted and not committed.
+
+Retry condition: only revisit this layout lever as part of a larger batched
+QK^T/probs@V rewrite where profiling shows the QKV split or coordinate math has
+become a measurable hotspot.
+
 ## Files
 
 - `baseline_sam_attention_probe.txt`: old nested rel-pos loop.
 - `after_sam_attention_probe.txt`: rel-pos bias precompute.
+- `qkv_grid_hoist_baseline_7run.txt`: baseline for the rejected layout-only
+  follow-up.
+- `qkv_grid_hoist_attempt_7run.txt`: attempted layout-only follow-up result.
 - `SHA256SUMS`: hash manifest for this evidence bundle.
