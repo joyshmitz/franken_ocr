@@ -64,7 +64,7 @@
 //!
 //! ```text
 //! D_t = 1{draft_t ≠ full_t} ∈ {0,1}      (disagreement indicator)
-//! e_t = 1 + λ·(D_t − q0) ,   q0 = 1 − p0 ,   λ ∈ [0, 1/(1 − q0))
+//! e_t = 1 + λ·(D_t − q0) ,   q0 = 1 − p0 ,   λ ∈ [0, 1/q0)
 //! ```
 //!
 //! Under `H0` (`E[D_t] ≤ q0`): `E_{H0}[e_t|F_{t-1}] = 1 + λ(E[D_t] − q0) ≤ 1`.
@@ -260,7 +260,7 @@ impl fmt::Display for CalibrationError {
             }
             CalibrationError::P0OutOfRange => f.write_str("p0 out of (0,1)"),
             CalibrationError::LambdaOutOfRange => {
-                f.write_str("lambda out of [0, 1/(1-q0)) (would break e_t >= 0)")
+                f.write_str("lambda out of [0, 1/q0) (would break e_t >= 0)")
             }
             CalibrationError::AuditCadenceZero => f.write_str("audit_cadence must be >= 1"),
         }
@@ -290,8 +290,11 @@ impl Calibration {
             return Err(CalibrationError::P0OutOfRange);
         }
         let q0 = 1.0 - p0;
-        // λ ∈ [0, 1/(1 − q0)) ⇒ keeps e_t = 1 + λ(D_t − q0) ≥ 0 even at D_t = 1.
-        let lambda_cap = 1.0 / (1.0 - q0);
+        // The betting update e_t = 1 + λ(D_t − q0) is most negative at the
+        // AGREEMENT step D_t = 0: e_t = 1 − λ·q0. (The D_t = 1 step gives
+        // 1 + λ·p0 ≥ 1, never binding.) Keeping e_t ≥ 0 there ⇒ λ < 1/q0.
+        // (NOT 1/p0 = 1/(1−q0); that looser bound admits e_t < 0 when p0 < 0.5.)
+        let lambda_cap = 1.0 / q0;
         if !(lambda.is_finite() && lambda >= 0.0 && lambda < lambda_cap) {
             return Err(CalibrationError::LambdaOutOfRange);
         }
@@ -395,7 +398,8 @@ impl EProcess {
         self.obs_count += 1;
         let d_t = if disagree { 1.0 } else { 0.0 };
         let e_t = 1.0 + self.lambda * (d_t - self.q0);
-        // e_t ≥ 0 is guaranteed by the λ-cap validated in Calibration::new.
+        // e_t > 0 is guaranteed by the λ < 1/q0 cap validated in Calibration::new
+        // (worst case D_t = 0 gives e_t = 1 − λ·q0 > 0).
         self.e_value *= e_t;
         // Saturate (never reset): clamp to (E_FLOOR, f64::MAX/2] — Ville's bound
         // is about the unclamped trajectory; this only tames f64 noise.
@@ -908,10 +912,23 @@ mod tests {
             Calibration::new(0.01, 1.0, 0.5, 8, 4.0),
             Err(CalibrationError::P0OutOfRange)
         );
-        // lambda must keep e_t >= 0: cap is 1/(1-q0) = 1/p0.
-        let cap = 1.0 / 0.97; // q0 = 0.03 => cap ≈ 1.0309
-        assert!(Calibration::new(0.01, 0.97, cap, 8, 4.0).is_err());
-        assert!(Calibration::new(0.01, 0.97, cap - 1e-6, 8, 4.0).is_ok());
+        // lambda must keep e_t >= 0. The binding step is AGREEMENT (D_t=0):
+        // e_t = 1 - lambda*q0 >= 0  <=>  lambda < 1/q0  (NOT 1/p0 = 1/(1-q0)).
+        // p0=0.97 => q0=0.03 => cap = 1/q0 ≈ 33.33.
+        let q0_hi = 1.0 - 0.97_f64;
+        let cap_hi = 1.0 / q0_hi;
+        assert!(Calibration::new(0.01, 0.97, cap_hi, 8, 4.0).is_err());
+        assert!(Calibration::new(0.01, 0.97, cap_hi - 1e-6, 8, 4.0).is_ok());
+        // Regression (audit rank 2): for p0 < 0.5 the WRONG 1/p0 cap is too loose
+        // and admits lambda that makes the agreement step e_t = 1 - lambda*q0 < 0,
+        // destroying the supermartingale. p0=0.4 => q0=0.6 => correct cap ≈ 1.667;
+        // lambda=2.0 (which the buggy 1/p0=2.5 cap accepted) MUST be rejected.
+        assert_eq!(
+            Calibration::new(0.01, 0.4, 2.0, 8, 4.0),
+            Err(CalibrationError::LambdaOutOfRange)
+        );
+        let q0_lo = 1.0 - 0.4_f64;
+        assert!(Calibration::new(0.01, 0.4, 1.0 / q0_lo - 1e-6, 8, 4.0).is_ok());
         // audit cadence must be >= 1.
         assert_eq!(
             Calibration::new(0.01, 0.97, 0.5, 0, 4.0),

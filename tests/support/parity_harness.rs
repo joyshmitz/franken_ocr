@@ -228,7 +228,13 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
-        .fold(0.0, f64::max)
+        // Propagate NaN: `f64::max` returns the non-NaN arg, so a plain
+        // `fold(0.0, f64::max)` SWALLOWS a NaN difference and reports finite drift
+        // for a kernel that emitted NaN where the oracle is finite (audit rank 7).
+        .fold(
+            0.0f64,
+            |m, d| if d.is_nan() { f64::INFINITY } else { m.max(d) },
+        )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

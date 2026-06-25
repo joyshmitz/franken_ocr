@@ -107,11 +107,15 @@ fn quantize_row(row: &[f32]) -> (Vec<i8>, f32) {
         return (vec![0i8; row.len()], 1.0);
     }
     let scale = max_abs / Q_MAX as f32;
-    let inv = 1.0 / scale;
     let q: Vec<i8> = row
         .iter()
         .map(|&w| {
-            let r = round_ties_even_f32(w * inv);
+            // True division — the documented contract is q = round(w / scale),
+            // matching the PyTorch reference. Reciprocal-multiply (w * 1/scale)
+            // diverges by a ULP on non-power-of-two scales, flipping the
+            // round-ties boundary for occasional codes. Quant is offline, so the
+            // divide costs nothing on the hot path. (audit rank 3)
+            let r = round_ties_even_f32(w / scale);
             // clamp into [-127, 127] then narrow; the clamp guarantees the cast
             // never wraps.
             r.clamp(-(Q_MAX as f32), Q_MAX as f32) as i32 as i8
@@ -234,14 +238,16 @@ pub fn quantize_activation_u8(x: &[f32]) -> QuantizedU8Activation {
     }
     let range = max - min;
     let scale = if range > 0.0 { range / 255.0 } else { 1.0 };
-    let inv = 1.0 / scale;
+    // True division — the documented contract; reciprocal-multiply (v * 1/scale)
+    // diverges by a ULP on non-power-of-two scales (audit rank 3). Offline quant,
+    // so the divide is free.
     // zero_point quantizes the real value 0.0: zp = round(0 - min/scale) = round(-min/scale).
-    let zp_f = round_ties_even_f32(-min * inv);
+    let zp_f = round_ties_even_f32(-min / scale);
     let zero_point = zp_f.clamp(0.0, 255.0) as i32;
     let q: Vec<u8> = x
         .iter()
         .map(|&v| {
-            let r = round_ties_even_f32(v * inv) as i32 + zero_point;
+            let r = round_ties_even_f32(v / scale) as i32 + zero_point;
             r.clamp(0, 255) as u8
         })
         .collect();

@@ -509,7 +509,10 @@ fn get_rel_pos(q_size: usize, k_size: usize, rel_pos: &[f32], size: usize, hd: u
         for ki in 0..k_size {
             let qc = qi as f32 * ratio_qk;
             let kc = ki as f32 * ratio_kq;
-            let rc = (qc - kc) + (k_size as f32 - 1.0) * ratio_qk;
+            // PyTorch SAM uses max(q_size/k_size, 1.0) = ratio_kq for this offset
+            // term (audit rank 8). Identical to ratio_qk only when q_size == k_size
+            // (every current call site), so this hardens the helper for q != k.
+            let rc = (qc - kc) + (k_size as f32 - 1.0) * ratio_kq;
             let idx = rc as usize; // .long() truncation
             let src = idx * hd;
             let dst = (qi * k_size + ki) * hd;

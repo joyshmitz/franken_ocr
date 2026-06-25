@@ -168,9 +168,10 @@ pub fn pack_int4_f32(weights: &[f32], n: usize, k: usize, group_size: usize) -> 
                 max_abs / Q4_MAX as f32
             };
             scales.push(scale);
-            let inv = 1.0 / scale;
             for (i, &w) in grp.iter().enumerate() {
-                let r = round_ties_even_f32(w * inv);
+                // True division — documented contract; reciprocal-multiply diverges
+                // by a ULP on non-power-of-two scales (audit rank 3).
+                let r = round_ties_even_f32(w / scale);
                 let qv = r.clamp(Q4_MIN as f32, Q4_MAX as f32) as i32 as i8;
                 row_q[g * group_size + i] = qv;
             }

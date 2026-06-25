@@ -200,15 +200,25 @@ fn l1_per_op_cosine() {
                         COSINE_F32_THRESHOLD,
                         stage,
                         entry.sha256.as_deref().unwrap_or(""),
-                        json!({"note": "subject seam capture pending (engine mid-flux)"}),
-                        c >= COSINE_F32_THRESHOLD,
+                        json!({"note": "DIAGNOSTIC self-compare (oracle vs oracle): proves the read+comparator path runs on real fixtures; subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
+                        false,
                     );
                 }
                 Err(e) => log.error("ActivationLoad", 1, &format!("{stage}: {e}")),
             }
         }
     }
-    log.result("pass", t0.elapsed().as_micros());
+    // No subject (engine) tensor exists to compare yet — the loop above ran the
+    // read+comparator path on the ORACLE only. Mirror L0: XFAIL, never a fabricated
+    // pass (audit rank 1; previously logged "pass" after an oracle-vs-oracle compare).
+    log.assertion("L1 subject (engine) per-op seam capture wired", false);
+    log.error(
+        "NotImplemented",
+        1,
+        "L1 live cosine compare needs engine per-op seam capture; oracle fixtures \
+         were present but the subject side is a stub.",
+    );
+    log.result("xfail", t0.elapsed().as_micros());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,13 +281,23 @@ fn l2_per_layer_cosine_and_ledger() {
                     0.0,
                     stage,
                     "",
-                    json!({"cosine": c, "ledger": "per-layer max-abs (cross-layer drift)"}),
-                    c >= COSINE_F32_THRESHOLD,
+                    json!({"cosine": c, "ledger": "per-layer max-abs (cross-layer drift)", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
+                    false,
                 );
             }
         }
     }
-    log.result("pass", t0.elapsed().as_micros());
+    // No subject (engine) hidden states to compare yet — the loop ran the per-layer
+    // read+ledger path on the ORACLE only. Mirror L0: XFAIL, never a fabricated pass
+    // (audit rank 1).
+    log.assertion("L2 subject (engine) per-layer seam capture wired", false);
+    log.error(
+        "NotImplemented",
+        1,
+        "L2 per-layer cosine + max-abs ledger needs engine hidden-state capture; \
+         oracle fixtures were present but the subject side is a stub.",
+    );
+    log.result("xfail", t0.elapsed().as_micros());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -306,8 +326,13 @@ fn l3_logits_measured_budget_and_argmax() {
     let floor = establish_floor(&run_a, &run_b, &tokens_a, &tokens_b);
     let derived_tol = floor.l3_logit_tolerance();
     log.assertion(
-        "L3 tolerance DERIVED from oracle floor (not the imported 0.055)",
-        (derived_tol - 0.05).abs() > 1e-9 || derived_tol < 0.055, // never silently 0.055
+        "L3 tolerance DERIVED from oracle floor (== measured spread, not imported 0.055)",
+        // Binds the derived tolerance to the INDEPENDENTLY measured floor spread and
+        // excludes the imported constant. The old `(tol-0.05).abs()>1e-9 || tol<0.055`
+        // was a tautology — true for EVERY value including the forbidden 0.055 — so it
+        // could never catch a regression that hard-codes 0.055 (audit rank 4).
+        (derived_tol - floor.per_logit_max_abs_spread).abs() < 1e-12
+            && (derived_tol - 0.055).abs() > 1e-9,
     );
     log.assertion(
         "argmax stable across the two oracle runs (deterministic positions exist)",
@@ -347,12 +372,25 @@ fn l3_logits_measured_budget_and_argmax() {
                 derived_tol,
                 "lm_head_logits",
                 "",
-                json!({"argmax_match": true, "budget_source": "oracle_floor §2"}),
-                report.max_abs_diff <= derived_tol,
+                json!({"budget_source": "oracle_floor §2", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
+                false,
             );
         }
     }
-    log.result("pass", t0.elapsed().as_micros());
+    // No subject (engine) prefill logits to compare yet — the loop ran the
+    // argmax+budget comparator on the ORACLE only. Mirror L0: XFAIL, never a
+    // fabricated pass (audit rank 1).
+    log.assertion(
+        "L3 subject (engine) prefill-logits seam capture wired",
+        false,
+    );
+    log.error(
+        "NotImplemented",
+        1,
+        "L3 logit compare needs engine prefill-logit capture; the oracle lm_head \
+         logits were present but the subject side is a stub.",
+    );
+    log.result("xfail", t0.elapsed().as_micros());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,19 +428,18 @@ fn l4_token_exact_prefix() {
         return;
     }
 
-    // FIXTURE+MODEL PRESENT: decode greedily, compare token ids EXACT over the
-    // reproducible prefix. Engine decode is mid-flux ⇒ unreachable on a dev box.
-    log.parity(
-        "L4",
-        "token_exact",
-        1.0,
-        1.0,
-        "golden tokens",
-        "",
-        json!({"prefix_len": prefix}),
-        true,
+    // FIXTURE+MODEL PRESENT, but there is no subject (engine) decode yet, so there is
+    // nothing to compare against the golden token stream. Mirror L0: XFAIL, never a
+    // hard-coded pass. (Previously this logged token_exact passed=true UNCONDITIONALLY
+    // — a fabricated green that would certify an arbitrarily-wrong engine; audit rank 1.)
+    log.assertion("L4 subject (engine) greedy decode wired", false);
+    log.error(
+        "NotImplemented",
+        1,
+        "L4 token-exact compare needs the engine greedy decode; the golden token \
+         stream was present but the subject side is a stub.",
     );
-    log.result("pass", t0.elapsed().as_micros());
+    log.result("xfail", t0.elapsed().as_micros());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -463,11 +500,20 @@ fn l5_end_to_end_cer_budget() {
             0.0, // int8-within-noise budget is derived per-corpus when the engine lands
             &golden.doc,
             golden.decoded_text_sha256.as_deref().unwrap_or(""),
-            json!({"note": "subject forward pending; bar+provenance read proven"}),
-            cer <= 0.0,
+            json!({"note": "DIAGNOSTIC self-compare (bar vs bar); subject forward pending ⇒ NOT a parity pass (audit rank 1)"}),
+            false,
         );
     }
-    log.result("pass", t0.elapsed().as_micros());
+    // No subject (engine) decode exists yet — the loop ran the read+CER path on the
+    // golden bar only. Mirror L0: XFAIL, never a fabricated pass (audit rank 1).
+    log.assertion("L5 subject (engine) end-to-end forward wired", false);
+    log.error(
+        "NotImplemented",
+        1,
+        "L5 end-to-end CER compare needs the engine forward (6.67 GB weights); the \
+         golden text + provenance were read but the subject side is a stub.",
+    );
+    log.result("xfail", t0.elapsed().as_micros());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
