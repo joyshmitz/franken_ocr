@@ -23,9 +23,9 @@
 #
 #   Phase-0 CI also tracks linux arm64, darwin x86-64, and windows-msvc x86-64 as
 #   advisory targets. This release workflow builds the Unix/macOS targets whose
-#   sibling path dependencies can be provisioned in Actions today; the Windows
-#   release artifact remains blocked until the `/dp/asupersync` patch path becomes
-#   portable or the dependency is vendored for Windows.
+#   sibling path dependencies can be provisioned in Actions today. Because hosted
+#   macOS has a read-only root filesystem, the workflow rewrites only the runner
+#   checkout's asupersync patch path from `/dp/asupersync` to `../asupersync`.
 #
 # Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
 # referenced. Tag pushes (v*) cut a versioned set of artifacts.
@@ -110,15 +110,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Provision sibling path dependencies
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          parent="$(dirname "$GITHUB_WORKSPACE")"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+
+          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
+          $text = Get-Content -Raw -Path $cargoToml
+          $needle = 'path = "/dp/asupersync"'
+          if (-not $text.Contains($needle)) {
+            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          }
+          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
 
       # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
       # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.

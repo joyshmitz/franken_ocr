@@ -13,10 +13,10 @@
 # needed components/targets, so CI and local builds stay aligned.
 #
 # Path dependencies: franken_ocr currently consumes sibling checkouts at
-# `../frankentorch`, `../frankensqlite`, and `/dp/asupersync`. Fresh GitHub
-# runners do not have those paths, so every Unix Cargo job provisions them before
-# installing/building Rust. Windows remains advisory-only until the absolute
-# `/dp/asupersync` patch is made portable.
+# `../frankentorch`, `../frankensqlite`, and a host-local `/dp/asupersync`.
+# Fresh GitHub runners do not have those paths, and hosted macOS has a read-only
+# root filesystem, so each Cargo job clones the siblings and rewrites only the CI
+# checkout's `Cargo.toml` patch path to `../asupersync`.
 #
 # Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
 # tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
@@ -65,15 +65,21 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Provision sibling path dependencies
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          parent="$(dirname "$GITHUB_WORKSPACE")"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+
+          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
+          $text = Get-Content -Raw -Path $cargoToml
+          $needle = 'path = "/dp/asupersync"'
+          if (-not $text.Contains($needle)) {
+            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          }
+          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
@@ -137,9 +143,9 @@ jobs:
           - name: windows-msvc-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            runnable: false
-            skip: true
-            skip_reason: "Cargo.toml currently patches asupersync to Unix absolute path /dp/asupersync"
+            runnable: true
+            skip: false
+            skip_reason: ""
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -154,15 +160,21 @@ jobs:
 
       - name: Provision sibling path dependencies
         if: ${{ !matrix.skip }}
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          parent="$(dirname "$GITHUB_WORKSPACE")"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git "${parent}/frankentorch"
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git "${parent}/frankensqlite"
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git /dp/asupersync
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+
+          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
+          $text = Get-Content -Raw -Path $cargoToml
+          $needle = 'path = "/dp/asupersync"'
+          if (-not $text.Contains($needle)) {
+            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          }
+          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
 
       - name: Install nightly toolchain
         if: ${{ !matrix.skip }}
