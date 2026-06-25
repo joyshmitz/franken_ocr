@@ -59,6 +59,12 @@ storage.sqlite3-wal.corrupt-*
 # Cargo lock is committed (binary crate)
 # Cargo.lock
 
+# Golden-artifact test sidecars (written next to a golden on mismatch / pending bless;
+# never committed — review the diff and re-bless via UPDATE_GOLDENS=1 instead). See
+# docs/conformance/GOLDEN.md §5 and tests/cli_robot_golden.rs's gitignore-discipline guard.
+*.actual
+*.snap.new
+
 # Temporary files
 *.tmp
 *.bak
