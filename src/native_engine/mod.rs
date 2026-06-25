@@ -452,8 +452,7 @@ impl OcrModel {
             // prefill cost (the "compute only the rows you read" structural win,
             // proved bit-identical by decoder::lm_head_last_row_is_full_last_row).
             // Decode steps after the first already carry one hidden row → no-op slice.
-            debug_assert!(hidden.rows >= 1, "decoder forward must yield >= 1 row");
-            let last_hidden = Mat::from_vec(1, hidden.cols, hidden.row(hidden.rows - 1).to_vec());
+            let last_hidden = Self::last_hidden_row(&hidden)?;
             let logits = decoder::lm_head(&self.weights, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token);
@@ -469,6 +468,19 @@ impl OcrModel {
             hidden = decoder::forward(&self.weights, &step_embed)?;
         }
         Ok(emitted)
+    }
+
+    fn last_hidden_row(hidden: &Mat) -> FocrResult<Mat> {
+        if hidden.rows == 0 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate: decoder forward returned zero hidden rows"
+            )));
+        }
+        Ok(Mat::from_vec(
+            1,
+            hidden.cols,
+            hidden.row(hidden.rows - 1).to_vec(),
+        ))
     }
 
     // ── preprocess/weights field accessors (loader-handoff shims) ──────────────
@@ -661,5 +673,21 @@ mod tests {
     fn image_dims_placeholder_is_zero_until_preprocess_lands() {
         let pre = Preprocessed::default();
         assert_eq!(OcrModel::image_dims(&pre), (0, 0));
+    }
+
+    #[test]
+    fn last_hidden_row_rejects_empty_decoder_output_without_panic() {
+        let hidden = Mat::zeros(0, 4);
+        let err = OcrModel::last_hidden_row(&hidden).expect_err("expected empty hidden error");
+        assert!(matches!(err, FocrError::Other(_)));
+        assert!(err.to_string().contains("zero hidden rows"));
+    }
+
+    #[test]
+    fn last_hidden_row_extracts_final_row() {
+        let hidden = Mat::from_vec(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let last = OcrModel::last_hidden_row(&hidden).expect("last row");
+        assert_eq!(last.shape(), (1, 2));
+        assert_eq!(last.row(0), &[5.0, 6.0]);
     }
 }
