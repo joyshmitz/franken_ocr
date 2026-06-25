@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use image::{DynamicImage, GenericImageView, ImageReader, imageops::FilterType};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageReader, imageops::FilterType};
 
 use crate::error::{FocrError, FocrResult};
 
@@ -89,6 +89,14 @@ pub enum PreprocessMode {
     },
 }
 
+impl Default for PreprocessMode {
+    /// The pinned README "base" config: a single 1024-pixel global view
+    /// ([SPEC-029]); the 273-slot census is defined at this base size.
+    fn default() -> Self {
+        Self::Base { base_size: 1024 }
+    }
+}
+
 impl PreprocessMode {
     /// The pinned base mode: a single 1024 global view ([SPEC-029], OQ-18).
     #[must_use]
@@ -135,7 +143,7 @@ pub fn num_queries(size: usize) -> usize {
 /// row-major `[3, H, W]` matrix — `pixels.rows == 3` (RGB channels), `pixels.cols
 /// == H*W`, element `(c, y*W + x)` is channel `c` of pixel `(x, y)`. Values are
 /// normalized to `[-1, 1]` ([SPEC-021]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewTensor {
     /// `[3, H*W]` normalized RGB pixels (channel-major, the SAM patch-embed
     /// NCHW layout for `batch=1`).
@@ -158,7 +166,7 @@ impl ViewTensor {
 /// (width_crop_num, height_crop_num)`).
 ///
 /// For base mode (and the Gundam no-crop short-circuit) this is `(1, 1)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CropGrid {
     /// Number of tiles across (columns) — `width_crop_num`.
     pub width_crop_num: usize,
@@ -199,7 +207,7 @@ impl CropGrid {
 /// `global.pixels` and every `tiles[i].pixels`; the connector then uses
 /// `crop_grid` + [`Self::placeholder_token_count`] to assemble
 /// `image_newline`/`view_seperator` and the `images_seq_mask`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Preprocessed {
     /// The mode this bundle was produced under.
     pub mode: PreprocessMode,

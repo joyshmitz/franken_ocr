@@ -561,23 +561,19 @@ mod tests {
         // A rotation preserves the L2 norm of each head block.
         let rope = RopeTable::build(&[7, 13], 4, 10000.0);
         let mut x = Mat::from_vec(2, 8, (0..16).map(|i| (i as f32) * 0.25 - 2.0).collect());
-        let before: Vec<f32> = (0..2)
-            .flat_map(|t| {
-                (0..2).map(move |h| {
-                    let r = &x.data[t * 8 + h * 4..t * 8 + h * 4 + 4];
-                    r.iter().map(|v| v * v).sum::<f32>()
-                })
-            })
-            .collect();
+        let head_norms = |data: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(4);
+            for t in 0..2 {
+                for h in 0..2 {
+                    let r = &data[t * 8 + h * 4..t * 8 + h * 4 + 4];
+                    out.push(r.iter().map(|v| v * v).sum::<f32>());
+                }
+            }
+            out
+        };
+        let before = head_norms(&x.data);
         apply_rope(&mut x, &rope).unwrap();
-        let after: Vec<f32> = (0..2)
-            .flat_map(|t| {
-                (0..2).map(move |h| {
-                    let r = &x.data[t * 8 + h * 4..t * 8 + h * 4 + 4];
-                    r.iter().map(|v| v * v).sum::<f32>()
-                })
-            })
-            .collect();
+        let after = head_norms(&x.data);
         for (b, a) in before.iter().zip(after.iter()) {
             assert!((b - a).abs() < 1e-4, "norm changed: {b} -> {a}");
         }

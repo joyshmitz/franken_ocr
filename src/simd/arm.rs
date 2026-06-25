@@ -64,6 +64,8 @@
 //! and the public entrypoints delegate to the scalar reference, so the file
 //! compiles and is correct everywhere.
 
+#![allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+
 use super::scalar;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,7 +690,7 @@ mod tests {
         ];
         let au = a
             .iter()
-            .map(|&x| x.wrapping_add(128) as u8)
+            .map(|&x| (x as i16 + 128) as u8)
             .collect::<Vec<_>>();
         let b = vec![
             2i8, 1, -1, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, -2, 3, -4, 5, -6, 7, -8,

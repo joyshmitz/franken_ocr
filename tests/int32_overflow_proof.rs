@@ -372,7 +372,6 @@ fn stress_k_at_the_i32_boundary() {
          headroom={}); K+1={} overflows (acc={one_past} > {})",
         I32_MAX_I64 - at_boundary,
         max_safe_k_u8s8 + 1,
-        one_past,
         i32::MAX
     );
 

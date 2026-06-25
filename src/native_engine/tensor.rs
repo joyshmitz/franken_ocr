@@ -17,7 +17,7 @@
 /// `data.len() == rows * cols`; element `(r, c)` lives at `data[r * cols + c]`.
 /// This is the contiguous layout every `ft-kernel-cpu` f32 entrypoint expects
 /// (it matches a `TensorMeta::from_shape(vec![rows, cols], F32, Cpu)` exactly).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Mat {
     /// Number of rows.
     pub rows: usize,

@@ -183,7 +183,8 @@ impl OcrModel {
     /// image front end is bd-1gv.2/3), surfaced through the typed pipeline.
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
         // ── 1. preprocess ────────────────────────────────────────────────────
-        let pre = preprocess::preprocess_image(image_path)?;
+        let pre =
+            preprocess::preprocess_image(image_path, preprocess::PreprocessMode::Base { base_size: 1024 })?;
         let (image_w, image_h) = Self::image_dims(&pre);
 
         // ── 2. vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ─────────

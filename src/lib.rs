@@ -12,6 +12,7 @@
 //! output (doctrine #1).
 //!
 //! [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`]: ../COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md
+#![feature(stdarch_neon_dotprod, stdarch_neon_i8mm)]
 #![deny(unsafe_code)]
 
 pub mod adaptive;

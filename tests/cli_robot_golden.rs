@@ -64,12 +64,14 @@ use std::process::{Command, Output};
 /// values are anything `serde_json::json!` accepts. `suite`/`test` are stamped
 /// automatically so a CI log grep can pivot on `"suite":"golden"`.
 macro_rules! tlog {
-    ($test:expr, $($k:literal : $v:expr),+ $(,)?) => {{
+    ($test:expr, $($rest:tt)*) => {{
+        // Pass the trailing tokens straight to `json!` so nested JSON objects
+        // (`"diag": { ... }`) parse natively rather than as Rust `$v:expr`.
         let line = ::serde_json::json!({
             "suite": "golden",
             "schema_version": 1u32,
             "test": $test,
-            $($k : $v),+
+            $($rest)*
         });
         eprintln!("{}", ::serde_json::to_string(&line).expect("log line serializes"));
     }};
