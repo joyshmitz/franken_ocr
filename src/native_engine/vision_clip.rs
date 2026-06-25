@@ -252,12 +252,31 @@ fn transformer_block(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrRes
 fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult<Mat> {
     let dim = cfg.hidden_size;
     let heads = cfg.num_heads;
-    let hd = cfg.head_dim();
     let seq = x.rows;
+    if heads == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention: num_heads must be non-zero"
+        )));
+    }
+    if dim == 0 || !dim.is_multiple_of(heads) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention: hidden_size {} must be non-zero and divisible by heads {}",
+            dim,
+            heads
+        )));
+    }
+    if x.cols != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention: x.cols {} != hidden_size {}",
+            x.cols,
+            dim
+        )));
+    }
+    let hd = dim / heads;
 
     // Fused qkv projection -> [seq, 3*dim].
     let qkv = linear(&w.qkv_proj, x)?;
-    debug_assert_eq!(qkv.cols, 3 * dim);
+    ensure_mat_shape(&qkv, seq, 3 * dim, "vision_clip self_attention qkv output")?;
 
     // Repack into head-major flat buffers [heads, seq, hd] for q, k, v.
     // PyTorch view: xqkv.view(bsz, seq, 3, heads, hd) — so within a row the
@@ -284,7 +303,14 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
     // Full (non-causal) SDPA. num_bh = batch(1) * heads.
     let scale = 1.0f32 / (hd as f32).sqrt();
     let ctx = nn::sdpa(&q, &k, &v, heads, seq, seq, hd, hd, scale, false);
-    debug_assert_eq!(ctx.len(), heads * seq * hd);
+    let expected_ctx_len = heads * seq * hd;
+    if ctx.len() != expected_ctx_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention: sdpa context len {} != expected {}",
+            ctx.len(),
+            expected_ctx_len
+        )));
+    }
 
     // Repack [heads, seq, hd] -> [seq, dim] (permute(0,2,1,3).reshape).
     let mut merged = Mat::zeros(seq, dim);
@@ -299,7 +325,24 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
     }
 
     // out_proj.
-    linear(&w.out_proj, &merged)
+    let out = linear(&w.out_proj, &merged)?;
+    ensure_mat_shape(
+        &out,
+        seq,
+        dim,
+        "vision_clip self_attention projection output",
+    )?;
+    Ok(out)
+}
+
+fn ensure_mat_shape(mat: &Mat, rows: usize, cols: usize, context: &str) -> FocrResult<()> {
+    if mat.rows == rows && mat.cols == cols {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: shape {:?} != expected ({rows}, {cols})",
+        mat.shape()
+    )))
 }
 
 /// `NoTPFeedForward`: `fc2(quick_gelu(fc1(x)))` ([SPEC-049],
@@ -652,6 +695,15 @@ mod tests {
         }
     }
 
+    fn assert_err_contains<T: std::fmt::Debug>(res: FocrResult<T>, needle: &str) {
+        let err = res.expect_err("expected vision_clip shape error");
+        let message = err.to_string();
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
+
     // ── transpose / linear ─────────────────────────────────────────────────
 
     #[test]
@@ -776,6 +828,46 @@ mod tests {
         );
         let out = self_attention(&cfg, &block, &x).unwrap();
         assert_eq!(out.shape(), (3, 4));
+    }
+
+    #[test]
+    fn self_attention_rejects_bad_head_config_without_panic() {
+        let mut cfg = tiny_cfg();
+        let block = block_identity(cfg.hidden_size, cfg.ffn_hidden_size);
+        let x = Mat::zeros(2, cfg.hidden_size);
+
+        cfg.num_heads = 0;
+        assert_err_contains(self_attention(&cfg, &block, &x), "num_heads");
+
+        cfg.num_heads = 3;
+        assert_err_contains(self_attention(&cfg, &block, &x), "divisible");
+    }
+
+    #[test]
+    fn self_attention_rejects_malformed_qkv_and_projection_shapes() {
+        let cfg = tiny_cfg();
+        let dim = cfg.hidden_size;
+        let x = Mat::zeros(3, dim);
+
+        let mut bad_qkv = block_identity(dim, cfg.ffn_hidden_size);
+        bad_qkv.qkv_proj.out_features = 3 * dim - 1;
+        bad_qkv.qkv_proj.weight =
+            vec![0.0; bad_qkv.qkv_proj.out_features * bad_qkv.qkv_proj.in_features];
+        bad_qkv.qkv_proj.bias = Some(vec![0.0; bad_qkv.qkv_proj.out_features]);
+        assert_err_contains(
+            self_attention(&cfg, &bad_qkv, &x),
+            "self_attention qkv output",
+        );
+
+        let mut bad_proj = block_identity(dim, cfg.ffn_hidden_size);
+        bad_proj.out_proj.out_features = dim - 1;
+        bad_proj.out_proj.weight =
+            vec![0.0; bad_proj.out_proj.out_features * bad_proj.out_proj.in_features];
+        bad_proj.out_proj.bias = Some(vec![0.0; bad_proj.out_proj.out_features]);
+        assert_err_contains(
+            self_attention(&cfg, &bad_proj, &x),
+            "self_attention projection output",
+        );
     }
 
     /// With q=k=v=x and identity out_proj, attention is a softmax-weighted
