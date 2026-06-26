@@ -187,7 +187,9 @@ impl CropGrid {
     /// Total local tile count `width_crop_num * height_crop_num`.
     #[must_use]
     pub fn blocks(self) -> usize {
-        self.width_crop_num.saturating_mul(self.height_crop_num)
+        self.width_crop_num
+            .checked_mul(self.height_crop_num)
+            .expect("CropGrid::blocks: width_crop_num*height_crop_num overflow")
     }
 
     /// Whether local tiles are emitted (grid larger than 1×1, [SPEC-026]).
@@ -242,9 +244,10 @@ impl Preprocessed {
         let q_base = num_queries(self.mode.base_size());
         // Global: 16 rows of (16 patches + 1 newline) + 1 view separator.
         let mut total = q_base
-            .saturating_add(1)
-            .saturating_mul(q_base)
-            .saturating_add(1);
+            .checked_add(1)
+            .and_then(|cols| cols.checked_mul(q_base))
+            .and_then(|tokens| tokens.checked_add(1))
+            .expect("Preprocessed::placeholder_token_count: global placeholder count overflow");
         if let PreprocessMode::Gundam { tile_size, .. } = self.mode
             && self.crop_grid.is_tiled()
         {
@@ -252,9 +255,19 @@ impl Preprocessed {
             let w = self.crop_grid.width_crop_num;
             let h = self.crop_grid.height_crop_num;
             // Local: (q_local*W patches + 1 newline) per (q_local*H) rows.
-            let local_cols = q_local.saturating_mul(w).saturating_add(1);
-            let local_rows = q_local.saturating_mul(h);
-            total = total.saturating_add(local_cols.saturating_mul(local_rows));
+            let local_cols = q_local
+                .checked_mul(w)
+                .and_then(|cols| cols.checked_add(1))
+                .expect("Preprocessed::placeholder_token_count: local column count overflow");
+            let local_rows = q_local
+                .checked_mul(h)
+                .expect("Preprocessed::placeholder_token_count: local row count overflow");
+            let local = local_cols
+                .checked_mul(local_rows)
+                .expect("Preprocessed::placeholder_token_count: local placeholder count overflow");
+            total = total
+                .checked_add(local)
+                .expect("Preprocessed::placeholder_token_count: total placeholder count overflow");
         }
         total
     }
@@ -401,18 +414,18 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
     let (rw, rh) = if w == 0 || h == 0 {
         (size, size)
     } else if w >= h {
-        let rh = ((u64::from(h) * u64::from(size)) / u64::from(w)).max(1) as u32;
+        let rh = pillow_fit_edge(h, w, size);
         (size, rh)
     } else {
-        let rw = ((u64::from(w) * u64::from(size)) / u64::from(h)).max(1) as u32;
+        let rw = pillow_fit_edge(w, h, size);
         (rw, size)
     };
     let resized = img.resize_exact(rw, rh, FilterType::CatmullRom).to_rgb8();
 
     // Center on a gray canvas.
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([PAD_FILL; 3]));
-    let ox = (size - rw) / 2;
-    let oy = (size - rh) / 2;
+    let ox = pillow_center_offset(size, rw);
+    let oy = pillow_center_offset(size, rh);
     for y in 0..rh {
         for x in 0..rw {
             let p = *resized.get_pixel(x, y);
@@ -420,6 +433,35 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
         }
     }
     DynamicImage::ImageRgb8(canvas)
+}
+
+fn pillow_fit_edge(short: u32, long: u32, size: u32) -> u32 {
+    let scaled = f64::from(short) / f64::from(long) * f64::from(size);
+    round_ties_even_positive(scaled).max(1)
+}
+
+fn pillow_center_offset(size: u32, resized: u32) -> u32 {
+    round_ties_even_positive(f64::from(size - resized) * 0.5)
+}
+
+fn round_ties_even_positive(value: f64) -> u32 {
+    debug_assert!(value.is_finite());
+    debug_assert!(value >= 0.0);
+    let floor = value.floor();
+    let frac = value - floor;
+    let rounded = if frac < 0.5 {
+        floor
+    } else if frac > 0.5 {
+        floor + 1.0
+    } else {
+        let floor_u = floor as u64;
+        if floor_u.is_multiple_of(2) {
+            floor
+        } else {
+            floor + 1.0
+        }
+    };
+    rounded as u32
 }
 
 // ── Gundam tiling ([SPEC-024], OQ-7) ─────────────────────────────────────────
@@ -756,11 +798,37 @@ mod tests {
         assert_eq!(p.original_size, (100, 40));
 
         // The pad rows (top/bottom gray bands) must be the normalized gray value
-        // (127/255 -> 2*(127/255)-1). 100x40 -> fit width 64 => rh = 40*64/100 =
-        // 25, centered with oy = (64-25)/2 = 19, so row 0 is pad.
+        // (127/255 -> 2*(127/255)-1). 100x40 -> fit width 64 =>
+        // rh=round(40/100*64)=26, centered with oy=round((64-26)*0.5)=19, so
+        // row 0 is pad.
         let gray = 2.0 * (f32::from(PAD_FILL) / 255.0) - 1.0;
         // s for (x=0, y=0) is 0; channel 0.
         assert!((p.global.pixels.get(0, 0) - gray).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pad_to_square_matches_pillow_rounding_geometry() {
+        // Pillow ImageOps.contain rounds the fitted short edge, and ImageOps.pad
+        // rounds the centered paste offset. Integer floor division shifts the
+        // content/pad boundary by one pixel for both of these ordinary cases.
+        let color = [200, 0, 0];
+        let pad = [PAD_FILL; 3];
+
+        // 100x40 -> 64x26, y offset 19. The old floor-based path made this
+        // 64x25 and left row 44 as padding.
+        let rounded_size = pad_to_square(&solid(100, 40, color), 64).to_rgb8();
+        assert_eq!(rounded_size.get_pixel(0, 18).0, pad);
+        assert_eq!(rounded_size.get_pixel(0, 19).0, color);
+        assert_eq!(rounded_size.get_pixel(0, 44).0, color);
+        assert_eq!(rounded_size.get_pixel(0, 45).0, pad);
+
+        // 101x40 -> 64x25, y offset round(39*0.5)=20. The old floor-based
+        // centering started content at row 19.
+        let rounded_offset = pad_to_square(&solid(101, 40, color), 64).to_rgb8();
+        assert_eq!(rounded_offset.get_pixel(0, 19).0, pad);
+        assert_eq!(rounded_offset.get_pixel(0, 20).0, color);
+        assert_eq!(rounded_offset.get_pixel(0, 44).0, color);
+        assert_eq!(rounded_offset.get_pixel(0, 45).0, pad);
     }
 
     // ── Gundam tiling geometry ([SPEC-023/024]) ─────────────────────────────
@@ -866,13 +934,22 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_count_saturates_for_malformed_grid() {
+    fn malformed_crop_grid_blocks_rejects_overflow() {
         let grid = CropGrid {
             width_crop_num: usize::MAX,
             height_crop_num: usize::MAX,
         };
-        assert_eq!(grid.blocks(), usize::MAX);
+        let panic = std::panic::catch_unwind(|| grid.blocks()).expect_err("overflow must panic");
+        let message = panic_message(panic);
+        assert!(message.contains("CropGrid::blocks"));
+    }
 
+    #[test]
+    fn placeholder_count_rejects_malformed_grid_overflow() {
+        let grid = CropGrid {
+            width_crop_num: usize::MAX,
+            height_crop_num: usize::MAX,
+        };
         let p = Preprocessed {
             mode: PreprocessMode::gundam(),
             global: view_tensor(&solid(4, 4, [0, 0, 0])),
@@ -880,7 +957,20 @@ mod tests {
             crop_grid: grid,
             original_size: (4, 4),
         };
-        assert_eq!(p.placeholder_token_count(), usize::MAX);
+        let panic = std::panic::catch_unwind(|| p.placeholder_token_count())
+            .expect_err("overflow must panic");
+        let message = panic_message(panic);
+        assert!(message.contains("Preprocessed::placeholder_token_count"));
+    }
+
+    fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = panic.downcast_ref::<&str>() {
+            (*s).to_owned()
+        } else if let Some(s) = panic.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic>".to_owned()
+        }
     }
 
     // ── decode error path ───────────────────────────────────────────────────
