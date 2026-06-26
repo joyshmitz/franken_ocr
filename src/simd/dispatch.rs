@@ -65,8 +65,9 @@ pub enum IsaTier {
 impl IsaTier {
     /// A stable, lowercase feature string for the dispatched tier — the value
     /// `focr robot backends`, `PERF_LEDGER.md`, and `DISCREPANCIES.md` record
-    /// (e.g. `aarch64+neon+dotprod+i8mm`, `x86_64+avx512vnni`, `scalar`). This
-    /// is the **dispatched** tier, not the host's maximum capability.
+    /// (e.g. `aarch64+neon+dotprod`, `aarch64+neon+i8mm`,
+    /// `x86_64+avx512vnni`, `scalar`). This is the **dispatched** tier, not the
+    /// host's maximum capability.
     #[must_use]
     pub fn feature_string(self) -> &'static str {
         match self {
@@ -75,7 +76,7 @@ impl IsaTier {
             IsaTier::AvxVnni => "x86_64+avx2+avxvnni",
             IsaTier::Avx512Vnni => "x86_64+avx512vnni",
             IsaTier::Sdot => "aarch64+neon+dotprod",
-            IsaTier::Smmla => "aarch64+neon+dotprod+i8mm",
+            IsaTier::Smmla => "aarch64+neon+i8mm",
         }
     }
 
@@ -245,7 +246,8 @@ fn detect() -> Caps {
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
     #[cfg(target_arch = "aarch64")]
     {
-        // ARM backend: picks SMMLA > SDOT > scalar internally.
+        // ARM backend mirrors `arm::detect_tier`: SDOT > SMMLA > scalar on
+        // Apple Silicon, SMMLA > SDOT > scalar on other aarch64.
         super::arm::igemm_s8s8(a, b, m, k, n, out);
     }
     #[cfg(target_arch = "x86_64")]
@@ -336,6 +338,8 @@ mod tests {
             assert!(!t.tag().is_empty());
         }
         assert_eq!(IsaTier::Scalar.feature_string(), "scalar");
+        assert_eq!(IsaTier::Sdot.feature_string(), "aarch64+neon+dotprod");
+        assert_eq!(IsaTier::Smmla.feature_string(), "aarch64+neon+i8mm");
         // The currently-dispatched tier_string() round-trips through caps().
         assert_eq!(tier_string(), detected_tier().feature_string());
     }
