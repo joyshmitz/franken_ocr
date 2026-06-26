@@ -420,9 +420,10 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
 /// Transpose a row-major `[rows, cols]` flat matrix into `[cols, rows]`.
 fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = src[r * cols + c];
+    for c in 0..cols {
+        let dst = &mut out[c * rows..(c + 1) * rows];
+        for (r, slot) in dst.iter_mut().enumerate() {
+            *slot = src[r * cols + c];
         }
     }
     out
@@ -734,9 +735,11 @@ mod tests {
         }
     }
 
-    fn assert_err_contains<T: std::fmt::Debug>(res: FocrResult<T>, needle: &str) {
-        let err = res.expect_err("expected vision_clip shape error");
-        let message = err.to_string();
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             message.contains(needle),
             "error {message:?} did not contain {needle:?}"
@@ -748,12 +751,14 @@ mod tests {
     #[test]
     fn transpose_roundtrips() {
         // [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
-        let t = transpose(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let src = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let t = transpose(&src, 2, 3);
         assert_eq!(t, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(transpose(&t, 3, 2), src);
     }
 
     #[test]
-    fn linear_applies_weight_and_bias() {
+    fn linear_applies_weight_and_bias() -> FocrResult<()> {
         // W = [[1,0,0],[0,1,0]] (out=2,in=3), b=[10,20]; x=[1,2,3] -> [11,22].
         let w = LinearParams {
             weight: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
@@ -762,10 +767,11 @@ mod tests {
             in_features: 3,
         };
         let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
-        let y = linear(&w, &x).unwrap();
+        let y = linear(&w, &x)?;
         assert_eq!(y.shape(), (1, 2));
         assert!((y.data[0] - 11.0).abs() < 1e-6);
         assert!((y.data[1] - 22.0).abs() < 1e-6);
+        Ok(())
     }
 
     #[test]
@@ -800,16 +806,17 @@ mod tests {
     }
 
     #[test]
-    fn abs_pos_passthrough_when_lengths_match() {
+    fn abs_pos_passthrough_when_lengths_match() -> FocrResult<()> {
         // num_positions = 5 (1 CLS + 2x2 grid), dim 2, seq 5 -> identity.
         let table: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let pos = abs_pos_for_len(&table, 5, 2, 5).unwrap();
+        let pos = abs_pos_for_len(&table, 5, 2, 5)?;
         assert_eq!(pos.shape(), (5, 2));
         assert_eq!(pos.data, table);
+        Ok(())
     }
 
     #[test]
-    fn abs_pos_same_grid_size_is_identity_even_via_resize_branch() {
+    fn abs_pos_same_grid_size_is_identity_even_via_resize_branch() -> FocrResult<()> {
         // Force src==tgt path with seq != num_positions impossible; instead test
         // that a genuine 2x2->2x2 (num_pos 5, seq 5) is exact above; here check
         // the CLS row is always preserved on the interpolation branch (3x3->2x2).
@@ -821,7 +828,7 @@ mod tests {
             *slot = i as f32;
         }
         // seq = 1 + 2*2 = 5
-        let pos = abs_pos_for_len(&table, np, dim, 5).unwrap();
+        let pos = abs_pos_for_len(&table, np, dim, 5)?;
         assert_eq!(pos.shape(), (5, 1));
         // CLS row preserved exactly.
         assert!((pos.data[0] - 99.0).abs() < 1e-6);
@@ -832,6 +839,7 @@ mod tests {
                 "interp out of expected range: {v}"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -878,7 +886,7 @@ mod tests {
     // ── attention shape & residual structure ───────────────────────────────
 
     #[test]
-    fn self_attention_preserves_shape() {
+    fn self_attention_preserves_shape() -> FocrResult<()> {
         let cfg = tiny_cfg();
         let block = block_identity(cfg.hidden_size, cfg.ffn_hidden_size);
         let x = Mat::from_vec(
@@ -890,8 +898,9 @@ mod tests {
                 0.9, 1.0, 1.1, 1.2,
             ],
         );
-        let out = self_attention(&cfg, &block, &x).unwrap();
+        let out = self_attention(&cfg, &block, &x)?;
         assert_eq!(out.shape(), (3, 4));
+        Ok(())
     }
 
     #[test]
@@ -938,7 +947,7 @@ mod tests {
     /// average of the value rows — every output row stays inside the convex hull
     /// of the inputs (each column bounded by per-column min/max).
     #[test]
-    fn self_attention_is_convex_average_of_values() {
+    fn self_attention_is_convex_average_of_values() -> FocrResult<()> {
         let cfg = tiny_cfg();
         let block = block_identity(cfg.hidden_size, cfg.ffn_hidden_size);
         let x = Mat::from_vec(
@@ -950,7 +959,7 @@ mod tests {
                 8.0, 9.0, 10.0, 11.0,
             ],
         );
-        let out = self_attention(&cfg, &block, &x).unwrap();
+        let out = self_attention(&cfg, &block, &x)?;
         for c in 0..4 {
             let col_min = (0..3).map(|r| x.get(r, c)).fold(f32::INFINITY, f32::min);
             let col_max = (0..3)
@@ -964,17 +973,18 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     // ── feed-forward = quick_gelu sandwiched in identities ─────────────────
 
     #[test]
-    fn feed_forward_applies_quick_gelu() {
+    fn feed_forward_applies_quick_gelu() -> FocrResult<()> {
         let cfg = tiny_cfg();
         let block = block_identity(cfg.hidden_size, cfg.ffn_hidden_size);
         // fc1=I (padded), fc2=I (padded) => ff(x) == quick_gelu(x) elementwise.
         let x = Mat::from_vec(1, 4, vec![-1.0, 0.0, 1.0, 2.0]);
-        let out = feed_forward(&block, &x).unwrap();
+        let out = feed_forward(&block, &x)?;
         for (i, &xi) in x.data.iter().enumerate() {
             let want = nn::quick_gelu_scalar(xi);
             assert!(
@@ -983,6 +993,7 @@ mod tests {
                 out.data[i]
             );
         }
+        Ok(())
     }
 
     // ── full tower forward_with ─────────────────────────────────────────────
@@ -1002,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_with_produces_class_plus_patches_rows() {
+    fn forward_with_produces_class_plus_patches_rows() -> FocrResult<()> {
         let cfg = tiny_cfg();
         let num_patches = 4; // 2x2 grid -> square, no interpolation needed
         let w = tiny_weights(&cfg, num_patches);
@@ -1013,10 +1024,11 @@ mod tests {
                 .map(|i| (i as f32) * 0.01)
                 .collect(),
         );
-        let out = forward_with(&cfg, &w, &sam).unwrap();
+        let out = forward_with(&cfg, &w, &sam)?;
         // class token row + num_patches rows.
         assert_eq!(out.shape(), (num_patches + 1, cfg.hidden_size));
         assert!(out.data.iter().all(|v| v.is_finite()));
+        Ok(())
     }
 
     #[test]
@@ -1041,7 +1053,7 @@ mod tests {
     /// attention and mlp both produce ~0 (zero out_proj / zero fc2) so the block
     /// is the identity map x -> x.
     #[test]
-    fn zeroed_sublayers_make_block_identity() {
+    fn zeroed_sublayers_make_block_identity() -> FocrResult<()> {
         let cfg = tiny_cfg();
         let dim = cfg.hidden_size;
         let mut block = block_identity(dim, cfg.ffn_hidden_size);
@@ -1052,10 +1064,11 @@ mod tests {
         block.fc2.weight.iter_mut().for_each(|v| *v = 0.0);
         block.fc2.bias = Some(vec![0.0; dim]);
         let x = Mat::from_vec(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let out = transformer_block(&cfg, &block, &x).unwrap();
+        let out = transformer_block(&cfg, &block, &x)?;
         for (o, i) in out.data.iter().zip(&x.data) {
             assert!((o - i).abs() < 1e-5, "block not identity: {o} vs {i}");
         }
+        Ok(())
     }
 
     #[test]
