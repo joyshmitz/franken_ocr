@@ -778,9 +778,10 @@ fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> Vec<f
 fn nchw_to_nhwc_rows(nchw: &[f32], ch: usize, gh: usize, gw: usize) -> Mat {
     let n = gh * gw;
     let mut data = vec![0.0f32; n * ch];
-    for c in 0..ch {
-        for s in 0..n {
-            data[s * ch + c] = nchw[c * n + s];
+    for s in 0..n {
+        let dst = &mut data[s * ch..(s + 1) * ch];
+        for c in 0..ch {
+            dst[c] = nchw[c * n + s];
         }
     }
     Mat::from_vec(n, ch, data)
@@ -793,10 +794,10 @@ fn nhwc_rows_to_nchw(x: &Mat, ch: usize, gh: usize, gw: usize) -> Vec<f32> {
     debug_assert_eq!(x.rows, n);
     debug_assert_eq!(x.cols, ch);
     let mut out = vec![0.0f32; ch * n];
-    for s in 0..n {
-        let row = x.row(s);
-        for c in 0..ch {
-            out[c * n + s] = row[c];
+    for c in 0..ch {
+        let dst = &mut out[c * n..(c + 1) * n];
+        for (s, slot) in dst.iter_mut().enumerate() {
+            *slot = x.data[s * ch + c];
         }
     }
     out
@@ -1049,6 +1050,23 @@ mod tests {
         assert_eq!(rows.row(0), &[1.0, 5.0]);
         assert_eq!(rows.row(3), &[4.0, 8.0]);
         let back = nhwc_rows_to_nchw(&rows, 2, 2, 2);
+        assert_eq!(back, nchw);
+    }
+
+    #[test]
+    fn nchw_nhwc_roundtrip_nonsquare_grid() {
+        // ch=3, grid 2x3 (n=6). Each output row gathers the same spatial
+        // position from all channel planes.
+        let nchw = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, // c0
+            10.0, 11.0, 12.0, 13.0, 14.0, 15.0, // c1
+            20.0, 21.0, 22.0, 23.0, 24.0, 25.0, // c2
+        ];
+        let rows = nchw_to_nhwc_rows(&nchw, 3, 2, 3);
+        assert_eq!(rows.row(0), &[1.0, 10.0, 20.0]);
+        assert_eq!(rows.row(5), &[6.0, 15.0, 25.0]);
+
+        let back = nhwc_rows_to_nchw(&rows, 3, 2, 3);
         assert_eq!(back, nchw);
     }
 
