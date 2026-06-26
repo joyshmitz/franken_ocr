@@ -170,12 +170,13 @@ disagreement probability is at most `q0`," i.e. `H0: E[D_t | F_{t-1}] ≤ q0` (w
 single-step **e-value that grows when disagreements pile up** is the betting wealth update
 
 ```
-e_t = 1 + λ · ( D_t − q0 ) ,        λ ∈ [0, 1/(1 − q0)) ,        E_t = Π_{audited s ≤ t} e_s
+e_t = 1 + λ · ( D_t − q0 ) ,        λ ∈ [0, 1/q0) ,        E_t = Π_{audited s ≤ t} e_s
 ```
 
 Under `H0` (`E[D_t] ≤ q0`) we have `E_{H0}[e_t | F_{t-1}] = 1 + λ·(E[D_t] − q0) ≤ 1` — the
 **e-value property** (§2.1) holds, so `E_t` is a non-negative supermartingale and Ville (★)
-applies. The bound on `λ` keeps `e_t ≥ 0` even when `D_t = 1` (`e_t = 1 + λ·(1 − q0) ≥ 0`).
+applies. The binding non-negativity case is an agreement (`D_t = 0`), where
+`e_t = 1 − λ·q0`; the strict cap `λ < 1/q0` keeps the e-value positive.
 **Direction:** an *agreement* (`D_t = 0`) shrinks wealth (`e_t = 1 − λ·q0 < 1`); a
 *disagreement* (`D_t = 1`) grows it (`e_t = 1 + λ·(1 − q0) > 1`). So accumulating
 disagreements drive `E_t` toward the `1/α` alarm and trip the guard — exactly the alarm
@@ -200,7 +201,7 @@ the bounded-horizon analog the bead notes (bd-1xfa.3 step 3); the **e-value/e-pr
 ### 2.3 Substituted values (worked sketch)
 Take α = 0.01 ⇒ guard boundary `1/α = 100`. Suppose calibration sets the tolerated
 disagreement rate `q0 = 0.03` (so the break-even agreement rate `p0 = 0.97`) and betting
-fraction `λ = 0.5` (well inside the cap `1/(1 − q0) ≈ 1.031`). Then per audited step:
+fraction `λ = 0.5` (well inside the cap `1/q0 ≈ 33.33`). Then per audited step:
 
 - **Agreement** (`D_t = 0`): `e_t = 1 + 0.5·(0 − 0.03) = 0.985` — wealth shrinks ×0.985
   (evidence *for* the null; safe to keep accepting).
