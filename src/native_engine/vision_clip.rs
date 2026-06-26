@@ -163,12 +163,59 @@ pub struct ClipWeights {
 /// # Errors
 /// [`FocrError::NotImplemented`] until the weight loader lands; thereafter
 /// whatever [`forward_with`] returns.
-pub fn forward(_weights: &Weights, _image: &Mat, _sam_features: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::vision_clip::forward — awaiting .focrq weight accessors (bd-1es.3); \
-         the tower math is in vision_clip::forward_with"
-            .into(),
-    ))
+pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResult<Mat> {
+    let cfg = ClipConfig::default();
+    // SAM `x3` is [OUT_CH, num_patches] channel-major; CLIP consumes
+    // [num_patches, hidden] (flatten(2).transpose(1,2)), so transpose it.
+    let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols);
+    let sam_mat = Mat::from_vec(sam_features.cols, sam_features.rows, sam_t);
+    let cw = clip_weights_from(weights)?;
+    forward_with(&cfg, &cw, &sam_mat)
+}
+
+/// Build a [`ClipWeights`] from the `model.vision_model.*` tensors (note the
+/// preserved upstream `pre_layrnorm` typo). Dims read from each tensor shape.
+fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
+    let p = "model.vision_model";
+    let ln = |n: &str| -> FocrResult<LayerNormParams> {
+        Ok(LayerNormParams {
+            weight: weights.vec(&format!("{n}.weight"))?,
+            bias: weights.vec(&format!("{n}.bias"))?,
+        })
+    };
+    let lin = |n: &str| -> FocrResult<LinearParams> {
+        let d = weights.tensor(&format!("{n}.weight"))?.shape.to_vec();
+        Ok(LinearParams {
+            weight: weights.vec(&format!("{n}.weight"))?,
+            bias: Some(weights.vec(&format!("{n}.bias"))?),
+            out_features: d[0],
+            in_features: d[1],
+        })
+    };
+    let cfg = ClipConfig::default();
+    let mut blocks = Vec::with_capacity(cfg.num_layers);
+    for l in 0..cfg.num_layers {
+        let b = format!("{p}.transformer.layers.{l}");
+        blocks.push(ClipBlockWeights {
+            layer_norm1: ln(&format!("{b}.layer_norm1"))?,
+            qkv_proj: lin(&format!("{b}.self_attn.qkv_proj"))?,
+            out_proj: lin(&format!("{b}.self_attn.out_proj"))?,
+            layer_norm2: ln(&format!("{b}.layer_norm2"))?,
+            fc1: lin(&format!("{b}.mlp.fc1"))?,
+            fc2: lin(&format!("{b}.mlp.fc2"))?,
+        });
+    }
+    let pos_dims = weights
+        .tensor(&format!("{p}.embeddings.position_embedding.weight"))?
+        .shape
+        .to_vec();
+    Ok(ClipWeights {
+        class_embedding: weights.vec(&format!("{p}.embeddings.class_embedding"))?,
+        position_embedding: weights.vec(&format!("{p}.embeddings.position_embedding.weight"))?,
+        num_positions: pos_dims[0],
+        pre_layernorm: ln(&format!("{p}.pre_layrnorm"))?,
+        blocks,
+    })
 }
 
 /// Run the CLIP tower with explicit weights ([SPEC-048..050]).

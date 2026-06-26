@@ -60,7 +60,10 @@ pub const TOKENS_PER_VIEW: usize = 256;
 /// * [`FocrError::Other`] on a shape mismatch (CLIP/SAM rows or channel widths).
 /// * [`FocrError::NotImplemented`] until `Weights` exposes the projector tensors.
 pub fn forward(weights: &Weights, clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
-    let hybrid = concat_hybrid(clip, sam)?;
+    // `sam` is the raw vision_sam output [OUT_CH=1024, N=256] (channel-major);
+    // the concat wants the flattened [N, 1024] (flatten(2).permute(0,2,1)).
+    let sam_t = transpose(sam);
+    let hybrid = concat_hybrid(clip, &sam_t)?;
     let (w, b) = projector_params(weights)?;
     project(&hybrid, &w, b.as_deref())
 }
@@ -189,17 +192,15 @@ fn transpose(m: &Mat) -> Mat {
 /// tensor-directory accessors are still being landed by the loader wave; this
 /// returns [`FocrError::NotImplemented`] until they exist. The numeric path
 /// ([`project`]) is fully implemented and tested independently of the loader.
-fn projector_params(_weights: &Weights) -> FocrResult<(Mat, Option<Vec<f32>>)> {
+fn projector_params(weights: &Weights) -> FocrResult<(Mat, Option<Vec<f32>>)> {
     // NOTE(loader-handoff): replace with the real lookups once `Weights` exposes
     // a tensor accessor, e.g.:
     //   let w = weights.mat("model.projector.layers.weight", PROJ_OUT, PROJ_IN)?;
     //   let b = weights.vec("model.projector.layers.bias").ok();
     //   Ok((w, b))
-    Err(FocrError::NotImplemented(
-        "native_engine::vision_bridge::projector_params — awaiting Weights tensor accessor \
-         (model.projector.layers.{weight,bias}); concat_hybrid/project are implemented and tested"
-            .into(),
-    ))
+    let w = weights.mat("model.projector.layers.weight")?;
+    let b = weights.vec("model.projector.layers.bias").ok();
+    Ok((w, b))
 }
 
 #[cfg(test)]

@@ -216,12 +216,109 @@ pub struct SamWeights {
 /// [`FocrError::NotImplemented`] until the `.focrq` reader (Phase 2) exposes
 /// named SAM tensors to build a [`SamWeights`]. The real math lives in
 /// [`forward_with`], which is exercised by the unit tests below.
-pub fn forward(_weights: &Weights, _image: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::vision_sam::forward — SAM weights wiring lands with the .focrq reader \
-         (Phase 2, bd-1es.3); the fp32 forward math is implemented in `forward_with`"
-            .into(),
-    ))
+pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
+    if image.rows != 3 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam::forward: expected 3 input channels, got {}",
+            image.rows
+        )));
+    }
+    // Base-mode vision input is square: image.cols == H*W with H == W.
+    let side = (image.cols as f64).sqrt() as usize;
+    if side * side != image.cols {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam::forward: image.cols {} is not a perfect square",
+            image.cols
+        )));
+    }
+    let w = sam_weights_from(weights)?;
+    forward_with(&w, image, side, side)
+}
+
+/// Build a [`SamWeights`] from the named `model.sam_model.*` tensors in
+/// `weights` (BF16→f32 widened at the accessor). Dims are read from each
+/// tensor's shape; rel-pos table sizes are derived from the stored rows.
+fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
+    let p = "model.sam_model";
+    let flat = |n: &str| weights.vec(n);
+    let dims = |n: &str| -> FocrResult<Vec<usize>> { Ok(weights.tensor(n)?.shape.to_vec()) };
+    let conv = |n: &str, bias: bool| -> FocrResult<Conv> {
+        let d = dims(n)?;
+        Ok(Conv {
+            w: flat(n)?,
+            b: if bias { Some(flat(&n.replace(".weight", ".bias"))?) } else { None },
+            out_ch: d[0],
+            in_ch: d[1],
+            kh: d.get(2).copied().unwrap_or(1),
+            kw: d.get(3).copied().unwrap_or(1),
+        })
+    };
+    let ln = |n: &str| -> FocrResult<LayerNormP> {
+        Ok(LayerNormP {
+            w: flat(&format!("{n}.weight"))?,
+            b: flat(&format!("{n}.bias"))?,
+        })
+    };
+
+    let pe = format!("{p}.patch_embed.proj.weight");
+    let ped = dims(&pe)?;
+    let patch_embed = Conv {
+        w: flat(&pe)?,
+        b: Some(flat(&format!("{p}.patch_embed.proj.bias"))?),
+        out_ch: ped[0],
+        in_ch: ped[1],
+        kh: ped[2],
+        kw: ped[3],
+    };
+
+    let posd = dims(&format!("{p}.pos_embed"))?;
+    let pos_embed = flat(&format!("{p}.pos_embed"))?;
+    let (pgh, pgw) = if posd.len() == 4 {
+        (posd[1], posd[2])
+    } else {
+        (posd[0], posd[1])
+    };
+
+    let mut blocks = Vec::with_capacity(DEPTH);
+    for i in 0..DEPTH {
+        let b = format!("{p}.blocks.{i}");
+        let window = if GLOBAL_BLOCKS.contains(&i) { 0 } else { WINDOW };
+        let qd = dims(&format!("{b}.attn.qkv.weight"))?;
+        let prd = dims(&format!("{b}.attn.proj.weight"))?;
+        let rph_d = dims(&format!("{b}.attn.rel_pos_h"))?;
+        let rpw_d = dims(&format!("{b}.attn.rel_pos_w"))?;
+        let l1 = dims(&format!("{b}.mlp.lin1.weight"))?;
+        let l2 = dims(&format!("{b}.mlp.lin2.weight"))?;
+        blocks.push(BlockP {
+            norm1: ln(&format!("{b}.norm1"))?,
+            attn: AttnP {
+                qkv: Linear { w: flat(&format!("{b}.attn.qkv.weight"))?, b: flat(&format!("{b}.attn.qkv.bias"))?, out: qd[0], in_: qd[1] },
+                proj: Linear { w: flat(&format!("{b}.attn.proj.weight"))?, b: flat(&format!("{b}.attn.proj.bias"))?, out: prd[0], in_: prd[1] },
+                rel_pos_h: flat(&format!("{b}.attn.rel_pos_h"))?,
+                rel_pos_w: flat(&format!("{b}.attn.rel_pos_w"))?,
+                size_h: (rph_d[0] + 1) / 2,
+                size_w: (rpw_d[0] + 1) / 2,
+            },
+            norm2: ln(&format!("{b}.norm2"))?,
+            lin1: Linear { w: flat(&format!("{b}.mlp.lin1.weight"))?, b: flat(&format!("{b}.mlp.lin1.bias"))?, out: l1[0], in_: l1[1] },
+            lin2: Linear { w: flat(&format!("{b}.mlp.lin2.weight"))?, b: flat(&format!("{b}.mlp.lin2.bias"))?, out: l2[0], in_: l2[1] },
+            window,
+        });
+    }
+
+    Ok(SamWeights {
+        patch_embed,
+        pos_embed,
+        pos_grid_h: pgh,
+        pos_grid_w: pgw,
+        blocks,
+        neck_conv1: conv(&format!("{p}.neck.0.weight"), false)?,
+        neck_ln1: ln(&format!("{p}.neck.1"))?,
+        neck_conv2: conv(&format!("{p}.neck.2.weight"), false)?,
+        neck_ln2: ln(&format!("{p}.neck.3"))?,
+        net2: conv(&format!("{p}.net_2.weight"), false)?,
+        net3: conv(&format!("{p}.net_3.weight"), false)?,
+    })
 }
 
 /// Run the SAM tower with an explicit parameter bundle over a `[3, H, W]`
