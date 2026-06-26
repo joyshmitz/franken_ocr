@@ -1,19 +1,32 @@
 //! Dump franken_ocr's Base(1024) preprocessed global-view tensor as raw LE f32
 //! ([3,1024,1024], channel-major) for stage-0 parity vs baidu's image_ori.
-use franken_ocr::preprocess::{preprocess_image, PreprocessMode};
+use anyhow::{Context, Result};
+use franken_ocr::preprocess::{PreprocessMode, preprocess_image};
 use std::io::Write;
 use std::path::Path;
 
-fn main() {
+fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let page = args.next().expect("usage: preprocess_dump <page.png> <out.f32>");
-    let out = args.next().expect("usage: preprocess_dump <page.png> <out.f32>");
-    let pre = preprocess_image(Path::new(&page), PreprocessMode::base()).expect("preprocess failed");
+    let page = args
+        .next()
+        .context("usage: preprocess_dump <page.png> <out.f32>")?;
+    let out = args
+        .next()
+        .context("usage: preprocess_dump <page.png> <out.f32>")?;
+    let pre = preprocess_image(Path::new(&page), PreprocessMode::base())
+        .with_context(|| format!("preprocess {page}"))?;
     let m = &pre.global.pixels;
-    eprintln!("global.pixels rows={} cols={} (expect 3 x 1048576)", m.rows, m.cols);
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&out).expect("create out"));
+    eprintln!(
+        "global.pixels rows={} cols={} (expect 3 x 1048576)",
+        m.rows, m.cols
+    );
+    let mut f = std::io::BufWriter::new(
+        std::fs::File::create(&out).with_context(|| format!("create {out}"))?,
+    );
     for v in &m.data {
-        f.write_all(&v.to_le_bytes()).expect("write");
+        f.write_all(&v.to_le_bytes())
+            .with_context(|| format!("write {out}"))?;
     }
     eprintln!("wrote {} f32 -> {}", m.data.len(), out);
+    Ok(())
 }
