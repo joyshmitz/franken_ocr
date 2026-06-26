@@ -230,9 +230,15 @@ fn build_points(
                     ))
                 })?,
         };
-        if opt.distortion < 0.0 {
+        if !bits.is_finite() || bits <= 0.0 {
             return Err(AllocatorError(format!(
-                "tensor {name:?}: option {:?} has negative distortion {}",
+                "tensor {name:?}: option {:?} bits-per-weight must be finite and positive, got {bits}",
+                opt.option
+            )));
+        }
+        if !opt.distortion.is_finite() || opt.distortion < 0.0 {
+            return Err(AllocatorError(format!(
+                "tensor {name:?}: option {:?} distortion must be finite and non-negative, got {}",
                 opt.option, opt.distortion
             )));
         }
@@ -1718,6 +1724,60 @@ mod tests {
             }],
         }];
         assert!(load_tensors(&doc, &empty_bits()).is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_distortion() {
+        for distortion in [f64::NAN, f64::INFINITY] {
+            let doc = vec![TensorCurve {
+                name: "x".into(),
+                numel: 100,
+                pin: None,
+                tier_floor: None,
+                curve: vec![CurveOption {
+                    option: "int8".into(),
+                    bits: Some(8.0),
+                    distortion,
+                }],
+            }];
+            let err = load_tensors(&doc, &empty_bits()).unwrap_err();
+            assert!(err.0.contains("distortion must be finite"), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_or_non_positive_bits() {
+        for bits in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let doc = vec![TensorCurve {
+                name: "x".into(),
+                numel: 100,
+                pin: None,
+                tier_floor: None,
+                curve: vec![CurveOption {
+                    option: "int8".into(),
+                    bits: Some(bits),
+                    distortion: 0.0001,
+                }],
+            }];
+            let err = load_tensors(&doc, &empty_bits()).unwrap_err();
+            assert!(err.0.contains("bits-per-weight"), "{}", err.0);
+        }
+
+        let doc = vec![TensorCurve {
+            name: "x".into(),
+            numel: 100,
+            pin: None,
+            tier_floor: None,
+            curve: vec![CurveOption {
+                option: "custom".into(),
+                bits: None,
+                distortion: 0.0001,
+            }],
+        }];
+        let mut bits = BTreeMap::new();
+        bits.insert("custom".to_string(), f64::NAN);
+        let err = load_tensors(&doc, &bits).unwrap_err();
+        assert!(err.0.contains("bits-per-weight"), "{}", err.0);
     }
 
     #[test]
