@@ -89,6 +89,33 @@ const SAFETENSORS_SNIFF_MAX_HEADER_BYTES: usize = 8 * 1024 * 1024;
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
 const MODEL_QUANT_ENV: &str = "FOCR_QUANT";
 
+/// The base-mode task prompt. baidu's `infer(..., prompt="<image>document
+/// parsing.")` (modeling_unlimitedocr.py): the literal `<image>` expands to the
+/// per-view image-placeholder block, and this trailing text tokenizes to the
+/// task ids (`document`,`Ġparsing`,`.` = [34030, 76466, 16]). The full base
+/// prompt id-stream is therefore `[BOS] + [IMAGE]×273 + [34030, 76466, 16]`.
+const BASE_PROMPT_TEXT: &str = "document parsing.";
+
+/// Env override for the generated-token cap (`max_length` in [`DecodeParams`]).
+/// Unset ⇒ the reference default ([`sampler::DEFAULT_MAX_LENGTH`]). Setting it
+/// only LOWERS the practical decode cost during bring-up / bounded runs — it
+/// never alters the per-step math, so a capped run's tokens are a true prefix of
+/// the full run's tokens.
+const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
+
+/// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`].
+fn decode_params_from_env() -> DecodeParams {
+    let mut p = DecodeParams::single_image();
+    if let Some(raw) = std::env::var_os(MAX_NEW_TOKENS_ENV)
+        && let Some(s) = raw.to_str()
+        && let Ok(n) = s.trim().parse::<usize>()
+        && n > 0
+    {
+        p.max_length = n;
+    }
+    p
+}
+
 fn model_cache() -> &'static ModelCache {
     static CACHE: OnceLock<ModelCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
@@ -410,7 +437,7 @@ impl OcrModel {
         let model = Arc::new(Self {
             path: resolved.clone(),
             weights,
-            decode_params: DecodeParams::single_image(),
+            decode_params: decode_params_from_env(),
         });
 
         let mut guard = model_cache_guard()?;
@@ -460,15 +487,14 @@ impl OcrModel {
     ///
     /// The numeric kernels of every stage live in their submodules and are
     /// unit-tested there; this method is pure orchestration over the [`Mat`]
-    /// currency. Because [`Weights`] has no tensor accessors yet (the `.focrq`
-    /// reader is Phase 2, bd-1es.3), each `Weights`-backed stage entrypoint
-    /// returns a clean [`FocrError::NotImplemented`] — the pipeline shape is
-    /// fully wired and typed, the first such gap propagates verbatim.
+    /// currency. Each stage reads its weights through the `.focrq`/safetensors
+    /// accessor ([`Weights::mat`]/[`Weights::vec`]), so the full pipeline runs
+    /// end-to-end against a loaded model.
     ///
     /// # Errors
-    /// Whatever the first failing stage returns. Today that is
-    /// [`FocrError::NotImplemented`] from [`preprocess::preprocess_image`] (the
-    /// image front end is bd-1gv.2/3), surfaced through the typed pipeline.
+    /// Whatever the first failing stage returns — e.g. [`FocrError::FormatMismatch`]
+    /// if a required tensor is absent from the loaded weights, or an image-decode
+    /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
         // ── 1. preprocess ────────────────────────────────────────────────────
         let pre = preprocess::preprocess_image(
@@ -481,10 +507,10 @@ impl OcrModel {
         let vision_features = self.vision_tower(&pre)?;
 
         // ── 3. connector: prompt embeds + masked_scatter of the 273-slot block ─
-        let (mut inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
+        let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
 
         // ── 4. decoder prefill + sequential greedy AR decode to EOS ──────────
-        let generated = self.generate(&mut inputs_embeds, &prompt_ids)?;
+        let generated = self.generate(inputs_embeds, &prompt_ids)?;
 
         // Detokenize the generated ids into the raw model text (the postprocess
         // pass strips EOS / parses ref-det / rewrites image spans).
@@ -516,16 +542,16 @@ impl OcrModel {
     ///
     /// The tokenizer is needed for the prompt id-stream (the connector builds
     /// `images_seq_mask` against it) and to detokenize the generated ids. It is
-    /// resolved next to the model file; the loader is bd-1gv.1 and currently
-    /// surfaces [`FocrError::NotImplemented`].
+    /// resolved next to the model file (the `tokenizer.json` ships beside the
+    /// weights).
     ///
     /// # Errors
-    /// [`FocrError::NotImplemented`] until the BPE tokenizer lands (bd-1gv.1).
+    /// [`FocrError::FormatMismatch`] (or an IO error) if `tokenizer.json` is
+    /// missing or malformed beside the model artifact.
     fn tokenizer(&self) -> FocrResult<crate::tokenizer::Tokenizer> {
         // The tokenizer.json ships beside the weights; the resolver hands us the
         // model path, the tokenizer sits in the same directory (or is the same
-        // bundle dir). The real co-location lookup lands with the loader bead;
-        // for the wiring we look next to the resolved model path.
+        // bundle dir). We look next to the resolved model path.
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))
     }
@@ -564,27 +590,25 @@ impl OcrModel {
     /// rows ([SPEC-060..066], [SPEC-070]).
     ///
     /// Returns the `[seq, hidden]` fused embedding plus the prompt id sequence
-    /// (the AR loop seeds its no-repeat-ngram history with it). The connector's
-    /// structural assembly + `masked_scatter` are implemented and tested over
-    /// explicit params; the `Weights`-backed token-embed + `image_newline`/
-    /// `view_seperator` lookups surface [`FocrError::NotImplemented`] until the
-    /// reader lands.
+    /// (the AR loop seeds its no-repeat-ngram history with it). The token-embed
+    /// and `image_newline`/`view_seperator` lookups read through the
+    /// `.focrq`/safetensors accessor; the connector's structural assembly +
+    /// `masked_scatter` are implemented and tested over explicit params.
     ///
     /// # Errors
-    /// The first connector/embed error (today [`FocrError::NotImplemented`]).
+    /// The first connector/embed error — e.g. [`FocrError::FormatMismatch`] if a
+    /// required tensor is absent from the loaded weights.
     fn build_inputs_embeds(
         &self,
         pre: &Preprocessed,
         vision_features: &[Mat],
     ) -> FocrResult<(Mat, Vec<u32>)> {
         // The prompt id-stream (BOS + `<image>` placeholders + the task prompt)
-        // and the row-aligned `images_seq_mask` are produced by preprocess; the
-        // connector scatters `vision_features` into the masked rows.
-        let prompt_ids = Self::prompt_ids(pre);
-        let images_seq_mask = Self::images_seq_mask(pre);
+        // and the row-aligned `images_seq_mask`; the connector scatters
+        // `vision_features` into the masked (image-placeholder) rows.
+        let (prompt_ids, images_seq_mask) = self.build_prompt(pre)?;
 
-        // embed_tokens(prompt_ids) -> [seq, hidden]; needs the embedding table
-        // from Weights (bd-1es.3). decoder::forward is the Weights-backed shim.
+        // embed_tokens(prompt_ids) -> [seq, hidden] against the embedding table.
         let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
 
         let image_newline = Self::image_newline(&self.weights)?;
@@ -622,8 +646,8 @@ impl OcrModel {
                 &global_tail[0],
                 Self::global_grid_h(pre),
                 Self::global_grid_w(pre),
-                image_newline,
-                view_seperator,
+                &image_newline,
+                &view_seperator,
                 &images_seq_mask,
             )?;
         } else {
@@ -635,8 +659,8 @@ impl OcrModel {
                 vision_features,
                 Self::global_grid_h(pre),
                 Self::global_grid_w(pre),
-                image_newline,
-                view_seperator,
+                &image_newline,
+                &view_seperator,
                 &images_seq_mask,
             )?;
         }
@@ -645,24 +669,18 @@ impl OcrModel {
 
     /// Embed the prompt id-stream into the decoder hidden rail ([SPEC-070]).
     ///
-    /// `embed_tokens(prompt_ids)` against `model.embed_tokens.weight`. The
-    /// gather math lives in [`decoder::embed_tokens`]; the `Weights`-backed
-    /// `decoder::forward` shim that would hand it the table is
-    /// [`FocrError::NotImplemented`] until the reader lands, so we route through
-    /// it to keep the dependency explicit.
+    /// `embed_tokens(prompt_ids)` against `model.embed_tokens.weight` (`[vocab,
+    /// hidden]` = `[129280, 1280]`). The gather math lives in
+    /// [`decoder::embed_tokens`] (unit-tested); the table is read through the
+    /// `.focrq`/safetensors accessor [`Weights::mat`].
     ///
     /// # Errors
-    /// [`FocrError::NotImplemented`] until the embedding table is readable.
-    fn embed_prompt(&self, _prompt_ids: &[u32]) -> FocrResult<Mat> {
-        // The embedding table lives in Weights; until the reader exposes it the
-        // decoder's Weights-backed entrypoint reports the gap. We surface that
-        // same error here (a placeholder hidden Mat would be a fabricated value,
-        // which doctrine #1 forbids).
-        Err(FocrError::NotImplemented(
-            "native_engine::OcrModel::embed_prompt — model.embed_tokens.weight needs the .focrq \
-             tensor accessor (bd-1es.3); decoder::embed_tokens math is implemented and tested"
-                .into(),
-        ))
+    /// [`FocrError::FormatMismatch`] if the embedding table is absent/malformed,
+    /// or whatever [`decoder::embed_tokens`] returns on a bad id.
+    fn embed_prompt(&self, prompt_ids: &[u32]) -> FocrResult<Mat> {
+        let table = self.weights.mat("model.embed_tokens.weight")?;
+        let (vocab, hidden) = (table.rows, table.cols);
+        decoder::embed_tokens(&table.data, vocab, hidden, prompt_ids)
     }
 
     /// Prefill the decoder over `inputs_embeds`, then run the **sequential**
@@ -671,21 +689,30 @@ impl OcrModel {
     ///
     /// Doctrine #5: this loop is strictly sequential — one forward at a time, the
     /// per-step R-SWA/MoE math fans out across cores inside the kernels, never a
-    /// nested runtime, never rayon under a lock. The R-SWA ring cache bounds the
-    /// generated-token KV at `W = 128` while retaining the full reference block
-    /// (prefill), so memory does not grow without bound during decode.
+    /// nested runtime, never rayon under a lock. This is the stateless no-cache
+    /// decode: each step re-prefills the full growing sequence (O(n^2)); the
+    /// R-SWA ring cache (bd-1gv.17) replaces it with a bounded O(n) ring update.
     ///
     /// # Errors
-    /// The first decode-stage error (today [`FocrError::NotImplemented`] from the
-    /// `Weights`-backed `decoder::forward`).
-    fn generate(&self, inputs_embeds: &mut Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
+    /// The first decode-stage error — e.g. [`FocrError::FormatMismatch`] if the
+    /// embedding table is absent, or a sampler/lm_head failure.
+    fn generate(&self, mut inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
         let params = &self.decode_params;
+        let hidden_dim = inputs_embeds.cols;
 
-        // Prefill: run all 12 layers over the prompt, capturing each layer's
-        // reference K/V into its R-SWA ring cache and returning the final hidden
-        // state for the first decode step. The Weights-backed driver shim is
-        // NotImplemented until the reader + ring wiring land (bd-1es.3/bd-1gv.17).
-        let mut hidden = decoder::forward(&self.weights, inputs_embeds)?;
+        // The embedding table — one row is appended to `inputs_embeds` per emitted
+        // token so the next forward sees the full growing sequence. This is the
+        // stateless no-cache decode (correct for parity); the R-SWA ring cache
+        // (bd-1gv.17) replaces this O(n^2) re-prefill with an O(n) ring update.
+        let table = self.weights.mat("model.embed_tokens.weight")?;
+        let vocab = table.rows;
+        if table.cols != hidden_dim {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate: embed table hidden {} != inputs_embeds hidden {}",
+                table.cols,
+                hidden_dim
+            )));
+        }
 
         // `generated` seeds the no-repeat-ngram history with the prompt so the
         // sliding-window blocker sees the full context (sampler reads its tail).
@@ -694,16 +721,15 @@ impl OcrModel {
 
         // SEQUENTIAL greedy decode loop (no nested runtime, no rayon-under-lock).
         // Bounded by `max_length` so a non-converging model can never hang.
-        let start = generated.len();
-        while generated.len() - start < params.max_length {
-            // lm_head over ONLY the last hidden row -> [1, vocab] logits. The
-            // next-token logits depend solely on the final position; RMSNorm and the
-            // lm_head linear are per-row independent, so this last-row slice is
-            // bit-identical to projecting ALL rows and discarding the rest — but it
-            // skips the [seq-1, vocab] head GEMM (vocab is huge, 129280), the dominant
-            // prefill cost (the "compute only the rows you read" structural win,
-            // proved bit-identical by decoder::lm_head_last_row_is_full_last_row).
-            // Decode steps after the first already carry one hidden row → no-op slice.
+        while emitted.len() < params.max_length {
+            // Full-sequence forward, then lm_head over ONLY the last hidden row
+            // -> [1, vocab] logits. The next-token logits depend solely on the
+            // final position; RMSNorm and the lm_head linear are per-row
+            // independent, so the last-row slice is bit-identical to projecting
+            // ALL rows and discarding the rest — but it skips the [seq-1, vocab]
+            // head GEMM (vocab is huge, 129280), proved by
+            // decoder::lm_head_last_row_is_full_last_row.
+            let hidden = decoder::forward(&self.weights, &inputs_embeds)?;
             let last_hidden = Self::last_hidden_row(&hidden)?;
             let logits = decoder::lm_head(&self.weights, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
@@ -712,12 +738,18 @@ impl OcrModel {
             if step.is_eos {
                 break;
             }
-            // Next-step hidden: embed the just-emitted token and run one decode
-            // step through the ring-cache'd decoder. The Weights-backed driver is
-            // NotImplemented until the reader lands; the loop body is the wired
-            // shape (one token in -> one hidden row out).
-            let step_embed = self.embed_prompt(&[step.token_id])?;
-            hidden = decoder::forward(&self.weights, &step_embed)?;
+            // Append embed(next_token) as a new trailing row of `inputs_embeds`
+            // so the next forward conditions on the full prefix + this token.
+            let next = step.token_id as usize;
+            if next >= vocab {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::generate: decoded token id {next} outside embed vocab {vocab}"
+                )));
+            }
+            let new_rows = inputs_embeds.rows + 1;
+            let mut data = std::mem::take(&mut inputs_embeds.data);
+            data.extend_from_slice(&table.data[next * hidden_dim..(next + 1) * hidden_dim]);
+            inputs_embeds = Mat::from_vec(new_rows, hidden_dim, data);
         }
         Ok(emitted)
     }
@@ -775,16 +807,34 @@ impl OcrModel {
         views
     }
 
-    /// The prompt token id-stream (BOS + `<image>` placeholders + task prompt),
-    /// [SPEC-019]/[SPEC-035].
-    fn prompt_ids(_pre: &Preprocessed) -> Vec<u32> {
-        Vec::new()
-    }
-
-    /// Row-aligned `images_seq_mask` (one bool per prompt token; `true` at each
-    /// `<image>` placeholder), [SPEC-066].
-    fn images_seq_mask(_pre: &Preprocessed) -> Vec<bool> {
-        Vec::new()
+    /// Build the prompt id-stream + row-aligned `images_seq_mask` for the base /
+    /// no-crop path ([SPEC-019]/[SPEC-035]/[SPEC-066]): a single BOS, then
+    /// `placeholder_token_count()` `<image>` (128815) placeholders, then the
+    /// task-prompt text tokens (`document parsing.` → [34030, 76466, 16]). The
+    /// mask is `true` exactly at the image placeholders so the connector scatters
+    /// the assembled vision block into them. Matches baidu's
+    /// `infer(prompt="<image>document parsing.")` input_ids byte-for-byte.
+    ///
+    /// # Errors
+    /// Propagates [`Self::tokenizer`] (the BPE load) or `encode` failures.
+    fn build_prompt(&self, pre: &Preprocessed) -> FocrResult<(Vec<u32>, Vec<bool>)> {
+        let tok = self.tokenizer()?;
+        let n_image = pre.placeholder_token_count();
+        let text = tok.encode(BASE_PROMPT_TEXT)?;
+        let total = 1 + n_image + text.len();
+        let mut ids = Vec::with_capacity(total);
+        let mut mask = Vec::with_capacity(total);
+        ids.push(tok.bos_id());
+        mask.push(false);
+        for _ in 0..n_image {
+            ids.push(tok.image_id());
+            mask.push(true);
+        }
+        for id in text {
+            ids.push(id);
+            mask.push(false);
+        }
+        Ok((ids, mask))
     }
 
     /// Global feature-grid height (16 at base 1024) ([SPEC-063]).
@@ -798,23 +848,21 @@ impl OcrModel {
     }
 
     /// The learned `model.image_newline` parameter (length `N_EMBED = 1280`),
-    /// [SPEC-060]. Needs the `.focrq` tensor accessor (bd-1es.3).
-    fn image_newline(_weights: &Weights) -> FocrResult<&[f32]> {
-        Err(FocrError::NotImplemented(
-            "native_engine::OcrModel::image_newline — model.image_newline needs the .focrq tensor \
-             accessor (bd-1es.3)"
-                .into(),
-        ))
+    /// [SPEC-060]. Read through the `.focrq`/safetensors accessor.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if the tensor is absent or mis-shaped.
+    fn image_newline(weights: &Weights) -> FocrResult<Vec<f32>> {
+        weights.vec("model.image_newline")
     }
 
     /// The learned `model.view_seperator` parameter (length `N_EMBED = 1280`),
-    /// [SPEC-060]. Needs the `.focrq` tensor accessor (bd-1es.3).
-    fn view_seperator(_weights: &Weights) -> FocrResult<&[f32]> {
-        Err(FocrError::NotImplemented(
-            "native_engine::OcrModel::view_seperator — model.view_seperator needs the .focrq \
-             tensor accessor (bd-1es.3)"
-                .into(),
-        ))
+    /// [SPEC-060]. Read through the `.focrq`/safetensors accessor.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if the tensor is absent or mis-shaped.
+    fn view_seperator(weights: &Weights) -> FocrResult<Vec<f32>> {
+        weights.vec("model.view_seperator")
     }
 }
 
@@ -1076,19 +1124,20 @@ mod tests {
         assert_eq!(OcrModel::global_grid_w(&pre), 16);
     }
 
-    /// The two learned structural params are gated on the (not-yet-built) `.focrq`
-    /// tensor accessor and report a clean NotImplemented, never a panic — the
-    /// connector wiring depends on them.
+    /// The two learned structural params resolve through the `.focrq`/safetensors
+    /// accessor. With an empty weight set they report a clean
+    /// [`FocrError::FormatMismatch`] (tensor not found) — never a panic, and no
+    /// longer the stale `NotImplemented` (the accessor has landed).
     #[test]
-    fn structural_params_pending_weights_accessor() {
+    fn structural_params_read_through_weights_accessor() {
         let w = Weights::default();
         assert!(matches!(
             OcrModel::image_newline(&w),
-            Err(FocrError::NotImplemented(_))
+            Err(FocrError::FormatMismatch(_))
         ));
         assert!(matches!(
             OcrModel::view_seperator(&w),
-            Err(FocrError::NotImplemented(_))
+            Err(FocrError::FormatMismatch(_))
         ));
     }
 
