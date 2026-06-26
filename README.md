@@ -80,7 +80,7 @@ Honest framing against the alternatives. `franken_ocr` is the only one of these 
 
 ## The `focr` CLI
 
-> These commands describe the intended surface. The diagnostic commands work today; `ocr`, `convert`, and `doctor` return a clear "not yet implemented" pointing at the plan phase that lands them.
+> These commands describe the intended surface. The diagnostic commands work today. `ocr` already routes through the native model resolver and reports clean missing-model or format errors before the full forward is complete; `convert` and `doctor` still return a clear "not yet implemented" pointing at the plan phase that lands them.
 
 ```bash
 # Parse a document image into Markdown (human default) or structured JSON
@@ -153,7 +153,7 @@ Being clear about what this is and is not:
 
 ## FAQ
 
-**Is this affiliated with Baidu?** No. It is an independent pure-Rust reimplementation that runs Baidu's openly-licensed (MIT) model weights. The weights and any quantized derivative this project distributes carry Baidu's MIT notice.
+**Is this affiliated with Baidu?** No. It is an independent pure-Rust reimplementation that runs Baidu's openly-licensed (MIT) model weights. The weights and any quantized derivative this project distributes carry the model notice surfaced by the binary and `.focrq` metadata: `Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License`.
 
 **Why not just use llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused experiment: a single fixed model lets the kernels specialize to its exact shapes and skip the generality tax, and the whole thing ships as one Rust binary with no FFI. The community llama.cpp GGUF path for this model also currently depends on an unmerged PR.
 

@@ -117,7 +117,7 @@ Unlimited-OCR is an **end-to-end vision-language model (VLM)**, *not* a detect+r
 | `n_shared_experts` | 2 |
 | `num_experts_per_tok` | 6 (top-6) |
 | `topk_method` | `greedy` |
-| `norm_topk_prob` | true |
+| `norm_topk_prob` | false |
 | `n_group` / `topk_group` | 1 / 1 (no group routing) |
 | `first_k_dense_replace` | 1 → **layer 0 is a DENSE `DeepseekV2MLP`; layers 1–11 are MoE** |
 | `v_head_dim` | 128 (10·128 = 1280, internally consistent) |
@@ -407,10 +407,9 @@ arch_target: enum { Generic, Aarch64Smmla, X86Vnni, X86Amx }   # which pre-packi
 source_sha256: [u8;32]                         # sha256 of the source safetensors (provenance)
 license_notice: utf8                           # "Copyright (c) 2026 Baidu — MIT License ..." (MUST be present)
 model_config: json                             # frozen copy of the relevant config.json fields
-tensor_directory: [
-  { name, dtype: {F32,F16,BF16,QInt8PerChan,QInt4PerGroup}, shape, packing, byte_offset, byte_len,
-    scales_offset, scales_len, group_size?, tier? }
-]
+header_json: { tensors: { name: { dtype, shape, byte_offset, byte_len,
+                                  scales_offset?, scales_len?, group_size?, tier? } },
+               license_notice, model_config?, packing_manifest?, provenance? }
 payload: <raw bytes>
 ```
 
@@ -531,7 +530,7 @@ One `int8_gemm` / `int8_gemv` entrypoint, runtime-dispatched once per process (c
 | **X4** | x86 `avx2` | `_mm256_maddubs_epi16`→`_mm256_madd_epi16` (saturating, see ⚠) | same | u8×s8 | 8×8 |
 | **S** | always (cross-compile floor) | scalar i32 MAC | scalar | row-major | — |
 
-Dispatch order: **X3(AMX) > X1(VNNI-512) > X2(VNNI-256) > X4(AVX2)** on x86; **A1(SMMLA) > A2(SDOT)** on ARM; **S** everywhere as the build-always fallback. ⚠ **AVX2 `vpmaddubsw` saturates at i16** before the i32 widen, so the AVX2 path is *not* automatically bit-identical to the i32-exact paths for adversarial operands — it must carry its own overflow proof (split-accumulate every 2 K-steps, plan §5.4) or be marked a documented `DISCREPANCIES.md` divergence with a measured CER delta. The SMMLA/VNNI/SDOT/scalar paths share one i32 accumulator semantics and ARE bit-identical.
+Dispatch order: **X3(AMX) > X1(VNNI-512) > X2(VNNI-256) > X4(AVX2)** on x86; **A2(SDOT) > A1(SMMLA)** on Apple Silicon/macOS; **A1(SMMLA) > A2(SDOT)** on other aarch64 where i8mm may be full-rate; **S** everywhere as the build-always fallback. ⚠ **AVX2 `vpmaddubsw` saturates at i16** before the i32 widen, so the AVX2 path is *not* automatically bit-identical to the i32-exact paths for adversarial operands — it must carry its own overflow proof (split-accumulate every 2 K-steps, plan §5.4) or be marked a documented `DISCREPANCIES.md` divergence with a measured CER delta. The SMMLA/VNNI/SDOT/scalar paths share one i32 accumulator semantics and ARE bit-identical.
 
 The two prefill matrix engines (SMMLA, AMX) are the *new* code that closes the §3.2 gap to MLAS; the decode GEMV paths reuse frankentorch's existing bit-exact `dot_i8_*`.
 
@@ -721,7 +720,7 @@ For each lever, the 5-pass loop (`.skill-loop-progress.md` shape): **(1)** claim
 
 ### 9.3 Head-to-head gauntlet vs the real reference
 
-`benches/gauntlet` shells out to the **Phase -1 proven CPU reference** (`FOCR_REFERENCE_CMD` / `FOCR_REFERENCE_PYTHON` env) per stage, parses elapsed, reports the **honest focr/reference ratio** (tag each row OK/warn/slower/"focr faster") — not a self-relative number. If CPU-patched HF cannot be proven equivalent to the CUDA oracle, the benchmark target is llama.cpp GGUF / ONNX Runtime / MLAS and is labeled that way. This is how G2 is proved, and it is only meaningful with **apples-to-apples fairness controls, all mandatory**:
+`benches/gauntlet` shells out to the **Phase -1 proven CPU reference** (`FOCR_REFERENCE_CMD` / `FOCR_REFERENCE_BACKEND` env) per stage, parses elapsed, reports the **honest reference/focr ratio** (tag each row OK/warn/slower/"focr faster"; `>1.0` means `focr` is faster) — not a self-relative number. If CPU-patched HF cannot be proven equivalent to the CUDA oracle, the benchmark target is llama.cpp GGUF / ONNX Runtime / MLAS and is labeled that way. This is how G2 is proved, and it is only meaningful with **apples-to-apples fairness controls, all mandatory**:
 - **Thread parity**: pin `OMP_NUM_THREADS` / torch `set_num_threads(N)` **equal to** focr's thread budget; **never benchmark torch at @64** (oversubscription inflates fake "wins" — a hardened frankentorch lesson; measure at @8/@32).
 - **Allocator fairness**: build focr with the same allocator posture used for the claim (mimalloc behind a feature, §9.6), wired into the measured binary, not merely mentioned.
 - **Best-of-N with warmup discard**; report the min and the precision of each side.
