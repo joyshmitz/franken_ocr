@@ -17,6 +17,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "docs" / "focrq-format.md"
+JSON_DECODER = json.JSONDecoder()
 
 REQUIRED_TOKENS = [
     'b"FOCRQ\\0"',
@@ -24,14 +25,12 @@ REQUIRED_TOKENS = [
     "arch_target",
     "source_sha256",
     "header_len",
-    "header_sha256",
-    "payload_len",
     "little-endian",
     "license_notice",
     "Copyright (c) 2026 Baidu",
     "MIT License",
     "model_config",
-    "tensor_directory",
+    "tensors",
     "QInt8PerChan",
     "QInt4PerGroup",
     "scales_offset",
@@ -51,8 +50,6 @@ PREFIX_FIELDS = [
     "arch_target",
     "source_sha256",
     "header_len",
-    "header_sha256",
-    "payload_len",
 ]
 
 ARCH_TARGETS = {
@@ -64,7 +61,11 @@ ARCH_TARGETS = {
 
 DTYPES = {"F32", "F16", "BF16", "QInt8PerChan", "QInt4PerGroup"}
 PACKINGS = {"RowMajor", "Aarch64Smmla2x8", "Aarch64Sdot4x16", "X86VnniU8S8", "X86AmxTile16x16"}
-TIERS = {"BF16", "F32", "Int8", "Int4G16", "Int4G32"}
+TIER_CONTRACT_TOKENS = [
+    "unsigned integer",
+    "`QInt8PerChan` must use `tier = 0`",
+    "`QInt4PerGroup` uses `tier` as opaque converter / allocator provenance",
+]
 
 REQUIRED_MODEL_CONFIG = [
     "model_type",
@@ -106,7 +107,7 @@ def extract_json_blocks(text: str) -> list[dict[str, Any]]:
     for match in re.finditer(r"```json\n(.*?)\n```", text, flags=re.DOTALL):
         raw = match.group(1)
         try:
-            value = json.loads(raw)
+            value = JSON_DECODER.decode(raw)
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
@@ -167,11 +168,11 @@ def main() -> int:
         if not ok:
             failures.append(f"{name} enum missing {sorted(expected - actual)}")
 
-    for tier in sorted(TIERS):
-        ok = f"- `{tier}`" in text
-        emit("focrq-tier-value", ok, tier=tier)
+    for tier_token in TIER_CONTRACT_TOKENS:
+        ok = tier_token in text
+        emit("focrq-tier-contract-token", ok, token=tier_token)
         if not ok:
-            failures.append(f"tier enum missing {tier}")
+            failures.append(f"tier contract missing {tier_token!r}")
 
     for field in REQUIRED_MODEL_CONFIG:
         ok = f"`{field}`" in text
@@ -182,7 +183,7 @@ def main() -> int:
     headers = [
         block
         for block in extract_json_blocks(text)
-        if {"format_version", "arch_target", "license_notice", "model_config", "tensor_directory"}.issubset(block)
+        if {"format_version", "arch_target", "license_notice", "model_config", "tensors"}.issubset(block)
     ]
     ok = bool(headers)
     emit("focrq-header-example-present", ok, count=len(headers))
@@ -192,7 +193,9 @@ def main() -> int:
         header = headers[-1]
         checks = {
             "format_version": header.get("format_version") == 1,
-            "arch_target": header.get("arch_target") in ARCH_TARGETS,
+            "arch_target": header.get("arch_target") in set(ARCH_TARGETS.values()),
+            "source_sha256": isinstance(header.get("source_sha256"), str)
+            and len(header.get("source_sha256", "")) == 64,
             "license_notice": "Copyright (c) 2026 Baidu" in header.get("license_notice", "")
             and "MIT License" in header.get("license_notice", ""),
             "provenance": isinstance(header.get("provenance"), dict)
@@ -201,7 +204,7 @@ def main() -> int:
             and "source_sha256_hex" in header["provenance"],
             "model_config": isinstance(header.get("model_config"), dict),
             "packing_manifest": isinstance(header.get("packing_manifest"), dict),
-            "tensor_directory": isinstance(header.get("tensor_directory"), list),
+            "tensors": isinstance(header.get("tensors"), dict),
         }
         for name, passed in checks.items():
             emit("focrq-header-example-field", passed, field=name)

@@ -54,20 +54,20 @@ file =
 
 ### Fixed Prefix
 
-The fixed prefix is 94 bytes.
+The committed v1 fixed prefix is 51 bytes.
 
 | Byte range | Width | Field | Type | Meaning |
 |------------|------:|-------|------|---------|
 | `0..6` | 6 | `magic` | bytes | Exact bytes `46 4f 43 52 51 00` (`b"FOCRQ\0"`). |
 | `6..10` | 4 | `format_version` | `u32` | Current value `1`. |
-| `10..14` | 4 | `arch_target` | `u32` enum | Offline packing target, see below. |
-| `14..46` | 32 | `source_sha256` | `[u8; 32]` | SHA-256 of source safetensors shard. |
-| `46..54` | 8 | `header_len` | `u64` | Length of `header_json_utf8`. |
-| `54..86` | 32 | `header_sha256` | `[u8; 32]` | SHA-256 of exact header bytes. |
-| `86..94` | 8 | `payload_len` | `u64` | Length of payload blob. |
+| `10..11` | 1 | `arch_target` | `u8` enum | Offline packing target, see below. |
+| `11..43` | 32 | `source_sha256` | `[u8; 32]` | SHA-256 of source safetensors shard. |
+| `43..51` | 8 | `header_len` | `u64` | Length of `header_json_utf8`. |
 
-The header begins at byte 94. The payload begins at `94 + header_len`.
-`94 + header_len + payload_len` must equal the file length.
+The header begins at byte 51. The payload begins at `51 + header_len` and
+continues to end-of-file. v1 has no fixed-prefix `header_sha256` or
+`payload_len`; byte-range validation is performed against the remaining payload
+length.
 
 The fixed prefix is deliberately not padded to a natural alignment. Readers must
 not cast it to a Rust struct; parse each integer from bytes.
@@ -87,30 +87,40 @@ The header object has this top-level shape:
 
 ```json
 {
-  "arch_target": "Aarch64Smmla",
+  "arch_target": 1,
   "format_version": 1,
-  "license_notice": "Copyright (c) 2026 Baidu. MIT License.",
+  "license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "model_config": {},
   "packing_manifest": {},
   "provenance": {},
-  "tensor_directory": []
+  "source_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tensors": {}
 }
 ```
 
-The JSON `format_version`, `arch_target`, and `provenance.source_sha256_hex`
-must duplicate the fixed-prefix values. A mismatch is a format error.
+The fixed prefix is authoritative for `format_version`. The writer also emits a
+forward-compatible JSON `format_version` mirror, but current readers ignore
+unknown header fields. `arch_target` and `source_sha256` are emitted in both
+places; the reader prefers the header value when non-default/non-empty and falls
+back to the prefix value otherwise.
 
 Required top-level fields:
 
 | Field | Type | Required rule |
 |-------|------|---------------|
-| `format_version` | integer | Equal to fixed prefix and supported binary version. |
-| `arch_target` | string enum | Equal to fixed prefix enum. |
-| `provenance` | object | Contains pinned commits and source hashes. |
-| `license_notice` | string | Non-empty and contains `Copyright (c) 2026 Baidu` and `MIT License`. |
-| `model_config` | object | Frozen relevant config fields from truth-pack `config.json`. |
-| `tensor_directory` | array | One entry per tensor payload. |
-| `packing_manifest` | object | Converter/packing metadata and optional bit-allocation table. |
+| `arch_target` | integer | One of the `arch_target` numeric values below. |
+| `source_sha256` | hex string | 64 lowercase hex chars when known; empty means use the prefix bytes. |
+| `license_notice` | string | Non-empty and contains `Copyright (c) 2026 Baidu` and `MIT License`; the project writer fills this from `FOCR_MODEL_LICENSE_NOTICE`. |
+| `tensors` | object | Map from canonical tensor name to one tensor record. |
+
+Forward-compatible optional fields:
+
+| Field | Type | Rule |
+|-------|------|------|
+| `format_version` | integer | Writer emits the prefix version for traceability. |
+| `provenance` | object | Contains pinned commits and source hashes when attached. |
+| `model_config` | object | Frozen relevant config fields from truth-pack `config.json` when attached. |
+| `packing_manifest` | object | Converter/packing metadata and optional bit-allocation table when attached. |
 
 ### Payload
 
@@ -179,65 +189,71 @@ packings produced from the same source tensor.
 
 ### `tier`
 
-`tier` is optional for v1 int8 entries and required for int4 entries.
+In the committed v1 reader/writer, `tier` is an unsigned integer provenance
+field, not a JSON string enum. High-precision tensors omit it and readers default
+an absent value to `0`. Quantized writer records include it:
 
-Allowed values:
+- `QInt8PerChan` must use `tier = 0`.
+- `QInt4PerGroup` uses `tier` as opaque converter / allocator provenance.
+  `group_size`, not `tier`, is the normative runtime contract for 16 vs 32
+  element groups.
 
-- `BF16`
-- `F32`
-- `Int8`
-- `Int4G16`
-- `Int4G32`
-
-The `tier` records the converter's precision policy. It is provenance, not a
-runtime dispatch knob.
+The `tier` value is not a runtime dispatch knob.
 
 ## Tensor Directory
 
-Each tensor entry is a JSON object:
+The current committed v1 header stores tensors as an object keyed by canonical
+tensor name:
 
 ```json
 {
-  "byte_len": 165478400,
-  "byte_offset": 0,
-  "dtype": "BF16",
-  "group_size": null,
-  "name": "decoder.embed",
-  "packing": "RowMajor",
-  "scales_len": 0,
-  "scales_offset": null,
-  "shape": [129280, 1280],
-  "source_name": "model.embed_tokens.weight",
-  "tier": "BF16"
+  "tensors": {
+    "decoder.embed": {
+      "byte_len": 165478400,
+      "byte_offset": 0,
+      "dtype": "BF16",
+      "shape": [129280, 1280]
+    },
+    "decoder.expert.up_proj": {
+      "byte_len": 573440,
+      "byte_offset": 165478400,
+      "dtype": "QInt4PerGroup",
+      "group_size": 16,
+      "scales_len": 8960,
+      "scales_offset": 166051840,
+      "shape": [896, 1280],
+      "tier": 3
+    }
+  }
 }
 ```
 
-Required fields:
+Required tensor-record fields:
 
 | Field | Type | Rule |
 |-------|------|------|
-| `name` | string | Internal canonical tensor path. Unique. |
-| `source_name` | string | HF state_dict tensor path. |
 | `dtype` | enum | One of the dtype strings above. |
 | `shape` | array of integers | Logical dequantized shape. |
-| `packing` | enum | Physical payload layout. |
-| `byte_offset` | integer | Offset into payload. 64-byte aligned for writer output. |
+| `byte_offset` | integer | Offset into payload. 64-byte aligned when writer alignment is enabled. |
 | `byte_len` | integer | Data byte length. Must be non-zero unless the tensor is explicitly empty in config. |
-| `scales_offset` | integer or null | Offset into payload for scale bytes. |
-| `scales_len` | integer | Scale byte length, zero for unquantized tensors. |
-| `group_size` | integer or null | Required for `QInt4PerGroup`, null otherwise. |
-| `tier` | enum or null | Precision policy; required for int4. |
+
+Quantized tensor-record fields:
+
+| Field | Type | Rule |
+|-------|------|------|
+| `scales_offset` | integer | Offset into payload for scale bytes. Required for quantized tensors. |
+| `scales_len` | integer | Scale byte length. Required for quantized tensors. |
+| `group_size` | integer | Required for `QInt4PerGroup`; must be `0` for `QInt8PerChan`. |
+| `tier` | integer | Required in writer output for quantized tensors; see `tier` above. |
 
 Loader validation:
 
-- `name` is unique.
+- Tensor names are unique by construction as object keys.
 - `byte_offset + byte_len <= payload_len`.
-- If `scales_len > 0`, `scales_offset` is non-null and
-  `scales_offset + scales_len <= payload_len`.
+- If `scales_len > 0`, `scales_offset + scales_len <= payload_len`.
 - Data and scale ranges do not overlap.
 - `shape` matches the expected model census for `name`.
 - `dtype` is compatible with `tier`.
-- `packing` is compatible with `arch_target`.
 - Scale count matches `dtype`, shape, and group size.
 
 ## Scale Layout
@@ -263,24 +279,49 @@ Rules:
 - If an all-zero row has `max_abs == 0`, writer stores `scale[row] = 1.0` and all
   `q` values zero. This avoids NaN/Inf while preserving the row exactly.
 
+### Dynamic Activation Quantization
+
+The runtime dynamic activation quantizer uses the same deterministic rounding
+rule as stored weights. For each activation row:
+
+```
+scale_a[row] = max(abs(x[row, :])) / 127
+q[row, k] = round_ties_to_even(clamp(x[row, k] / scale_a[row], -127, 127))
+zero_point = 0
+```
+
+Rules:
+
+- Scalar, row-parallel, and architecture-specific GEMM paths must consume
+  activation bytes produced by this exact rule.
+- `round_ties_to_even` is banker's rounding. Exact ties such as `±0.5`,
+  `±1.5`, and `±2.5` after division round to `0`, `±2`, and `±2` respectively.
+- The contract is true division by `scale_a`, not reciprocal multiply. That
+  avoids one-ULP boundary flips on non-power-of-two scales.
+- Clamp range is `[-127, 127]`; `-128` is outside the symmetric operand domain.
+- An all-zero activation row stores `scale_a[row] = 1.0` and all `q` values zero,
+  avoiding NaN/Inf and making repeated runs byte-identical.
+- U8S8 converter-side activation helpers use the same `round_ties_to_even`
+  convention with clamp range `[0, 255]` and an explicit integer zero point.
+
 ### `QInt4PerGroup`
 
-Int4 is defined now so the v1 reader can reject or inspect it, but int4 writing
-lands later.
+Int4 is defined now so the v1 reader and writer can reject or inspect it. Full
+converter integration lands later.
 
 Rules:
 
 - `group_size` is either 16 or 32.
 - Groups are along the K/input dimension within each output row.
-- `tier` is `Int4G16` or `Int4G32`.
+- `shape[1]` must be an exact multiple of `group_size`; partial final groups
+  are not part of the v1 format.
+- `tier` is numeric converter provenance. `group_size` is the normative group
+  contract.
 - Each logical value is signed two's-complement int4 in `[-8, 7]`.
 - Two int4 values pack into one byte: low nibble first, then high nibble.
-- Scale count is `shape[0] * ceil(shape[1] / group_size)`.
+- Scale count is `shape[0] * (shape[1] / group_size)`.
 - `scales_len == scale_count * 4`.
 - Logical dequantization is `f32(q4) * scale[row, group]`.
-
-Padding inside the final partial group is encoded as zero and ignored by logical
-dequantization.
 
 ## Frozen `model_config`
 
@@ -352,19 +393,19 @@ not baseline assumptions.
 ## Loader Algorithm
 
 1. Read the file into one blob or mmap.
-2. Check length is at least 94 bytes.
+2. Check length is at least 51 bytes.
 3. Check magic equals `b"FOCRQ\0"`.
 4. Parse fixed prefix with little-endian integer reads.
 5. Check `format_version` is supported.
-6. Check `94 + header_len + payload_len == file_len` with checked arithmetic.
-7. Hash header bytes and compare to `header_sha256`.
-8. Parse header JSON.
-9. Check duplicated fixed-prefix fields match header fields.
-10. Check non-empty `license_notice` includes Baidu MIT attribution.
-11. Validate `model_config` against the compiled truth-pack census.
-12. Validate every tensor directory entry and byte range.
-13. Build an immutable map `name -> TensorRange`.
-14. Warn on compatible arch mismatch; error on incompatible packing.
+6. Check `51 + header_len <= file_len` with checked arithmetic.
+7. Parse header JSON.
+8. Resolve `arch_target` and `source_sha256` from the header when present, or
+   from the fixed prefix otherwise.
+9. Check non-empty `license_notice` includes Baidu MIT attribution.
+10. Validate `model_config` against the compiled truth-pack census.
+11. Validate every tensor record and byte range in the `tensors` map.
+12. Build an immutable map `name -> TensorRange`.
+13. Warn on compatible arch mismatch; error on incompatible packing.
 
 No tensor dequantization is required during header sniffing. `native_model_available`
 may stop after step 12.
@@ -408,9 +449,9 @@ file target and selected backend.
 
 ```json
 {
-  "arch_target": "Generic",
+  "arch_target": 0,
   "format_version": 1,
-  "license_notice": "Copyright (c) 2026 Baidu. MIT License.",
+  "license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "model_config": {
     "hidden_size": 1280,
     "max_position_embeddings": 32768,
@@ -440,6 +481,7 @@ file target and selected backend.
     "hf_commit": "3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5",
     "source_sha256_hex": "0000000000000000000000000000000000000000000000000000000000000000"
   },
-  "tensor_directory": []
+  "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "tensors": {}
 }
 ```
