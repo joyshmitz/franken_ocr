@@ -309,6 +309,9 @@ pub struct BenchRecord {
     /// Head-to-head: the reference baseline's p50 seconds, when a baseline ran.
     /// `None` ⇒ self-relative microbench (no `reference/focr` ratio claimed).
     pub reference_p50_s: Option<f64>,
+    /// Which CPU reference backend ran (e.g. `onnx`, `hf`, `gguf`, `mlas`).
+    /// `None` ⇒ self-relative microbench or reference-only probe without a ratio.
+    pub reference_backend: Option<String>,
     /// Precision tag the *reference* ran at (e.g. `"bf16"`); pairs with `ratio`.
     pub reference_precision: Option<String>,
     /// Free-form note (e.g. a skip reason, an isomorphism/golden citation).
@@ -378,6 +381,10 @@ impl BenchRecord {
         match self.reference_p50_s {
             Some(r) => json_kv_num(&mut s, "reference_p50_s", r, false),
             None => json_kv_null(&mut s, "reference_p50_s", false),
+        }
+        match &self.reference_backend {
+            Some(b) => json_kv_str(&mut s, "reference_backend", b, false),
+            None => json_kv_null(&mut s, "reference_backend", false),
         }
         match &self.reference_precision {
             Some(p) => json_kv_str(&mut s, "reference_precision", p, false),
@@ -1017,7 +1024,7 @@ pub mod json {
         }
 
         fn object(&mut self) -> Result<Value, String> {
-            self.expect(b'{')?;
+            self.expect_byte(b'{')?;
             let mut map = BTreeMap::new();
             self.skip_ws();
             if self.b.get(self.i) == Some(&b'}') {
@@ -1028,7 +1035,7 @@ pub mod json {
                 self.skip_ws();
                 let key = self.string()?;
                 self.skip_ws();
-                self.expect(b':')?;
+                self.expect_byte(b':')?;
                 let val = self.value()?;
                 map.insert(key, val);
                 self.skip_ws();
@@ -1047,13 +1054,18 @@ pub mod json {
         }
 
         fn string(&mut self) -> Result<String, String> {
-            self.expect(b'"')?;
+            self.expect_byte(b'"')?;
             let mut out = String::new();
+            let mut raw = Vec::new();
             while let Some(&c) = self.b.get(self.i) {
                 self.i += 1;
                 match c {
-                    b'"' => return Ok(out),
+                    b'"' => {
+                        Self::flush_string_bytes(&mut out, &mut raw, self.i)?;
+                        return Ok(out);
+                    }
                     b'\\' => {
+                        Self::flush_string_bytes(&mut out, &mut raw, self.i)?;
                         let e = *self.b.get(self.i).ok_or("bad escape")?;
                         self.i += 1;
                         match e {
@@ -1076,14 +1088,31 @@ pub mod json {
                             other => return Err(format!("bad escape \\{}", other as char)),
                         }
                     }
-                    _ => {
-                        // Push the raw byte; multi-byte UTF-8 is passed through as
-                        // bytes since the input is valid UTF-8 (we got a &str).
-                        out.push(c as char);
+                    c if c < 0x20 => {
+                        return Err(format!(
+                            "unescaped control byte in string at {}",
+                            self.i - 1
+                        ));
                     }
+                    _ => raw.push(c),
                 }
             }
             Err("unterminated string".into())
+        }
+
+        fn flush_string_bytes(
+            out: &mut String,
+            raw: &mut Vec<u8>,
+            at: usize,
+        ) -> Result<(), String> {
+            if raw.is_empty() {
+                return Ok(());
+            }
+            let text = std::str::from_utf8(raw)
+                .map_err(|_| format!("invalid utf-8 in string ending before byte {at}"))?;
+            out.push_str(text);
+            raw.clear();
+            Ok(())
         }
 
         fn number(&mut self) -> Result<Value, String> {
@@ -1125,7 +1154,7 @@ pub mod json {
             }
         }
 
-        fn expect(&mut self, c: u8) -> Result<(), String> {
+        fn expect_byte(&mut self, c: u8) -> Result<(), String> {
             if self.b.get(self.i) == Some(&c) {
                 self.i += 1;
                 Ok(())
@@ -1173,6 +1202,7 @@ mod tests {
             throughput_unit: throughput.map(|_| "tok/s".into()),
             fairness: Fairness::new(8, Precision::Int8),
             reference_p50_s: None,
+            reference_backend: None,
             reference_precision: None,
             note: None,
         }
@@ -1217,28 +1247,47 @@ mod tests {
     // ── JSON round-trip ─────────────────────────────────────────────────────
 
     #[test]
-    fn history_json_roundtrips() {
+    fn history_json_roundtrips() -> Result<(), String> {
         let records = vec![
             rec("decode_token", "decode", 0.002, 0.0025, Some(500.0), 2.0),
             rec("vision_encode", "vision", 0.05, 0.06, None, 3.0),
         ];
         let h = History::from_records(&records);
         let json = h.to_json();
-        let back = History::from_json(&json).expect("parse");
+        let back = History::from_json(&json)?;
         assert_eq!(h, back);
         assert_eq!(back.rows.len(), 2);
         assert!((back.rows["decode_token"].p50_s - 0.002).abs() < 1e-12);
         assert!((back.rows["decode_token"].throughput - 500.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn history_json_preserves_utf8_names_and_escaped_controls() -> Result<(), String> {
+        let name = "decode_\u{00e9}_\u{6f22}_\u{1f9ea}\nunit\u{001f}";
+        let h = History::from_records(&[rec(name, "decode", 0.002, 0.0025, Some(500.0), 2.0)]);
+        let json = h.to_json();
+        let back = History::from_json(&json)?;
+        assert!(back.rows.contains_key(name));
+        assert!(
+            History::from_json(
+                "{\"rows\":{\"bad\nkey\":{\"p50_s\":1,\"p90_s\":1,\"throughput\":1}}}"
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
     fn bench_record_json_is_data_only_object() {
         let mut r = rec("k", "kernel", 0.001, 0.0012, Some(1234.0), 1.5);
         r.reference_p50_s = Some(0.0011);
+        r.reference_backend = Some("onnx".into());
         r.reference_precision = Some("bf16".into());
         let j = r.to_json();
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(j.contains("\"precision\":\"int8\""));
+        assert!(j.contains("\"reference_backend\":\"onnx\""));
         assert!(j.contains("\"reference_precision\":\"bf16\""));
         assert!(j.contains("\"ratio\":"));
         // parse it back through the embedded parser to prove it is valid JSON.

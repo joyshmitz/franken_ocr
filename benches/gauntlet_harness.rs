@@ -32,9 +32,10 @@
 //!     writes itself (or the committed [`nn`] facade fns) ALWAYS run — they need
 //!     no model and feed the ratchet. These are the rows that gate pass-over-pass.
 //!   * **The head-to-head e2e stages** are **model-gated + baseline-gated**: absent
-//!     the weights or the reference command they **skip-with-SUCCESS**, logging
-//!     exactly what they *would* measure and why the run was skipped. A missing
-//!     6.67 GB file never red-flags CI (LOGGING_AND_E2E §6).
+//!     the weights, reference command, or reference backend label they
+//!     **skip-with-SUCCESS**, logging exactly what they *would* measure and why
+//!     the run was skipped. A missing 6.67 GB file never red-flags CI
+//!     (LOGGING_AND_E2E §6).
 //!   * **Future-kernel slots** (int8/int4/SMMLA GEMM tiers that land in Phase
 //!     2–4) are scaffolded as clearly-logged `would-bench` rows, never silently
 //!     empty — the moment the kernel exists, the slot bears a real measurement.
@@ -51,6 +52,7 @@ extern crate test;
 mod perf_harness;
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use perf_harness::{BenchRecord, Fairness, History, Precision, Ratchet, SampleStats};
@@ -64,7 +66,7 @@ const ENV_MODEL_DIR: &str = "FOCR_MODEL_DIR";
 /// The Phase −1 proven CPU reference command (shelled out per stage; plan §9.3).
 const ENV_REFERENCE_CMD: &str = "FOCR_REFERENCE_CMD";
 /// Which reference backend the command speaks (`onnx` | `hf` | `gguf`).
-const ENV_REFERENCE_PYTHON: &str = "FOCR_REFERENCE_PYTHON";
+const ENV_REFERENCE_BACKEND: &str = "FOCR_REFERENCE_BACKEND";
 /// focr's thread budget for the run; the reference is pinned to the SAME N
 /// (NEVER @64 — plan §9.3 oversubscription trap).
 const ENV_THREADS: &str = "FOCR_THREADS";
@@ -75,6 +77,22 @@ const ENV_THREADS: &str = "FOCR_THREADS";
 /// `reports/bench/latest.json`. CI/perf lanes that intend to update the monotone
 /// ratchet floor set this explicitly, usually to `reports/bench/latest.json`.
 const ENV_BENCH_HISTORY: &str = "FOCR_BENCH_HISTORY";
+/// Per-stage env var passed to `$FOCR_REFERENCE_CMD` when the head-to-head lane runs.
+const ENV_GAUNTLET_STAGE: &str = "FOCR_GAUNTLET_STAGE";
+/// Back-compat / convenience alias for external reference runners.
+const ENV_STAGE_ALIAS: &str = "FOCR_STAGE";
+/// CPU thread-pool knobs pinned for every reference command invocation.
+const REFERENCE_THREAD_ENV_VARS: &[&str] = &[
+    ENV_THREADS,
+    "OMP_NUM_THREADS",
+    "TORCH_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+];
 
 fn history_path() -> Option<PathBuf> {
     history_path_from_env(std::env::var_os(ENV_BENCH_HISTORY))
@@ -82,6 +100,25 @@ fn history_path() -> Option<PathBuf> {
 
 fn history_path_from_env(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.filter(|path| !path.is_empty()).map(PathBuf::from)
+}
+
+fn threads_from_env(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(8)
+}
+
+fn non_empty_trimmed_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 /// The primary bench whose p50 carries the strictest (−3 %) ratchet gate
@@ -94,11 +131,11 @@ const PRIMARY_BENCH: &str = "decode_per_token_ref_gemv";
 
 /// Resolution of the head-to-head preconditions.
 struct GateState {
-    /// `Some(dir)` when `$FOCR_MODEL_DIR` resolves to a dir containing weights.
+    /// `Some(path)` when `$FOCR_MODEL_DIR` resolves to a model artifact or dir.
     model_dir: Option<PathBuf>,
     /// `Some(cmd)` when `$FOCR_REFERENCE_CMD` is set (the baseline to shell out).
     reference_cmd: Option<String>,
-    /// The reference backend tag (`onnx`/`hf`/`gguf`), for the precision column.
+    /// The reference backend tag (`onnx`/`hf`/`gguf`), separate from precision.
     reference_backend: Option<String>,
     /// focr's pinned thread budget.
     threads: usize,
@@ -110,21 +147,13 @@ impl GateState {
         // exists (no 6.67 GB read — LOGGING_AND_E2E §4.1).
         let model_dir = std::env::var(ENV_MODEL_DIR).ok().and_then(|d| {
             let p = PathBuf::from(&d);
-            let has_weights = p.join("model-00001-of-000001.safetensors").exists()
-                || dir_has_extension(&p, "focrq")
-                || dir_has_extension(&p, "safetensors");
+            let has_weights = model_artifact_present(&p);
             if has_weights { Some(p) } else { None }
         });
-        let reference_cmd = std::env::var(ENV_REFERENCE_CMD)
-            .ok()
-            .filter(|s| !s.is_empty());
-        let reference_backend = std::env::var(ENV_REFERENCE_PYTHON)
-            .ok()
-            .filter(|s| !s.is_empty());
-        let threads = std::env::var(ENV_THREADS)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8); // §9.3 default measure point (@8); NEVER 64.
+        let reference_cmd = non_empty_trimmed_env(ENV_REFERENCE_CMD);
+        let reference_backend = non_empty_trimmed_env(ENV_REFERENCE_BACKEND);
+        let thread_value = std::env::var(ENV_THREADS).ok();
+        let threads = threads_from_env(thread_value.as_deref()); // §9.3 default measure point (@8); NEVER 64.
         Self {
             model_dir,
             reference_cmd,
@@ -135,18 +164,43 @@ impl GateState {
 
     /// True when the full head-to-head can run (weights AND a baseline).
     fn head_to_head_ready(&self) -> bool {
-        self.model_dir.is_some() && self.reference_cmd.is_some()
+        self.model_dir.is_some() && self.reference_cmd.is_some() && self.reference_backend.is_some()
     }
 
     /// Why the head-to-head was skipped (logged on a skip-with-SUCCESS).
     fn skip_reason(&self) -> &'static str {
-        match (self.model_dir.is_some(), self.reference_cmd.is_some()) {
-            (false, false) => "skip_no_model_and_no_baseline",
-            (false, true) => "skip_no_model",
-            (true, false) => "skip_no_baseline",
-            (true, true) => "ready",
+        match (
+            self.model_dir.is_some(),
+            self.reference_cmd.is_some(),
+            self.reference_backend.is_some(),
+        ) {
+            (false, false, _) => "skip_no_model_and_no_baseline",
+            (false, true, false) => "skip_no_model_and_no_reference_backend",
+            (false, true, true) => "skip_no_model",
+            (true, false, _) => "skip_no_baseline",
+            (true, true, false) => "skip_no_reference_backend",
+            (true, true, true) => "ready",
         }
     }
+}
+
+fn model_artifact_present(path: &std::path::Path) -> bool {
+    if path.is_file() {
+        return is_model_artifact_path(path);
+    }
+    if !path.is_dir() {
+        return false;
+    }
+    path.join("model-00001-of-000001.safetensors").is_file()
+        || dir_has_extension(path, "focrq")
+        || dir_has_extension(path, "safetensors")
+}
+
+fn is_model_artifact_path(path: &std::path::Path) -> bool {
+    let file_name = path.file_name().and_then(|x| x.to_str());
+    file_name == Some("model-00001-of-000001.safetensors")
+        || path.extension().and_then(|x| x.to_str()) == Some("focrq")
+        || path.extension().and_then(|x| x.to_str()) == Some("safetensors")
 }
 
 fn dir_has_extension(dir: &std::path::Path, ext: &str) -> bool {
@@ -171,7 +225,10 @@ fn log_line(json: &str) {
 
 fn log_skip(bench: &str, reason: &str, would_measure: &str) {
     log_line(&format!(
-        "{{\"event\":\"skip\",\"result\":\"{reason}\",\"bench\":\"{bench}\",\"would_measure\":\"{would_measure}\"}}"
+        "{{\"event\":\"skip\",\"result\":{},\"bench\":{},\"would_measure\":{}}}",
+        json_escape(reason),
+        json_escape(bench),
+        json_escape(would_measure)
     ));
 }
 
@@ -179,9 +236,252 @@ fn log_scaffold(slot: &str, lands_in: &str, would_compare_to: &str) {
     // A future-kernel slot — logged, never silently empty (per the task's
     // "scaffold the slot ... clearly logged" requirement).
     log_line(&format!(
-        "{{\"event\":\"scaffold\",\"result\":\"future_kernel_slot\",\"slot\":\"{slot}\",\
-         \"lands_in\":\"{lands_in}\",\"would_compare_to\":\"{would_compare_to}\"}}"
+        "{{\"event\":\"scaffold\",\"result\":\"future_kernel_slot\",\"slot\":{},\
+         \"lands_in\":{},\"would_compare_to\":{}}}",
+        json_escape(slot),
+        json_escape(lands_in),
+        json_escape(would_compare_to)
     ));
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReferenceTiming {
+    Measured {
+        p50_s: f64,
+        precision: String,
+        threads: usize,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+fn run_reference_command(
+    cmd: &str,
+    stage: &str,
+    threads: usize,
+) -> Result<ReferenceTiming, String> {
+    let expected_threads = threads;
+    let threads = expected_threads.to_string();
+    let mut command = reference_shell_command(cmd);
+    command
+        .env(ENV_GAUNTLET_STAGE, stage)
+        .env(ENV_STAGE_ALIAS, stage);
+    for var in REFERENCE_THREAD_ENV_VARS {
+        command.env(var, &threads);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("running {ENV_REFERENCE_CMD} for stage {stage:?}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "{ENV_REFERENCE_CMD} failed for stage {stage:?} with status {}; stderr={}",
+            output.status,
+            compact_for_log(&stderr)
+        ));
+    }
+    parse_reference_timing_stdout(&stdout, stage, expected_threads).map_err(|e| {
+        format!(
+            "parsing {ENV_REFERENCE_CMD} timing for stage {stage:?}: {e}; stderr={}",
+            compact_for_log(&stderr)
+        )
+    })
+}
+
+#[cfg(windows)]
+fn reference_shell_command(cmd: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg(cmd);
+    command
+}
+
+#[cfg(not(windows))]
+fn reference_shell_command(cmd: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    command
+}
+
+fn parse_reference_timing_stdout(
+    stdout: &str,
+    expected_stage: &str,
+    expected_threads: usize,
+) -> Result<ReferenceTiming, String> {
+    let line = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.starts_with('{'))
+        .ok_or("reference command stdout contained no JSON object line")?;
+    parse_reference_timing_line(line, expected_stage, expected_threads)
+}
+
+fn parse_reference_timing_line(
+    line: &str,
+    expected_stage: &str,
+    expected_threads: usize,
+) -> Result<ReferenceTiming, String> {
+    let value = perf_harness::json::parse(line)?;
+    let obj = value
+        .as_object()
+        .ok_or("reference timing line is not a JSON object")?;
+
+    let stage = obj
+        .get("stage")
+        .and_then(perf_harness::json::Value::as_str)
+        .ok_or("reference timing JSON missing string `stage`")?;
+    if stage != expected_stage {
+        return Err(format!(
+            "reference timing stage mismatch: expected {expected_stage:?}, got {stage:?}"
+        ));
+    }
+
+    let result = obj
+        .get("result")
+        .and_then(perf_harness::json::Value::as_str)
+        .ok_or("reference timing JSON missing string `result`")?;
+    if result.starts_with("skip") {
+        let reason = obj
+            .get("reason")
+            .and_then(perf_harness::json::Value::as_str)
+            .unwrap_or(result)
+            .to_string();
+        return Ok(ReferenceTiming::Skipped { reason });
+    }
+    if matches!(result, "fail" | "error") {
+        let error = obj
+            .get("error")
+            .and_then(perf_harness::json::Value::as_str)
+            .unwrap_or(result);
+        return Err(format!("reference command reported {result}: {error}"));
+    }
+    if !matches!(result, "pass" | "ok" | "measured") {
+        return Err(format!(
+            "reference timing `result` must be pass/ok/measured/skip/fail, got {result:?}"
+        ));
+    }
+
+    let p50_s = reference_p50_seconds(obj)?;
+    let threads = reference_reported_threads(obj, expected_threads)?;
+    let precision = reference_precision(obj)?;
+    Ok(ReferenceTiming::Measured {
+        p50_s,
+        precision,
+        threads,
+    })
+}
+
+fn reference_p50_seconds(
+    obj: &std::collections::BTreeMap<String, perf_harness::json::Value>,
+) -> Result<f64, String> {
+    let seconds = reference_number(
+        obj,
+        &["p50_s", "elapsed_s", "seconds", "ref_s", "reference_s"],
+    )
+    .or_else(|| {
+        reference_number(
+            obj,
+            &[
+                "p50_ms",
+                "elapsed_ms",
+                "milliseconds",
+                "ref_ms",
+                "reference_ms",
+            ],
+        )
+        .map(|ms| ms / 1_000.0)
+    })
+    .ok_or("reference timing JSON missing p50_s/elapsed_s or p50_ms/elapsed_ms")?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!(
+            "reference timing must be a positive finite duration, got {seconds}"
+        ));
+    }
+    Ok(seconds)
+}
+
+fn reference_number(
+    obj: &std::collections::BTreeMap<String, perf_harness::json::Value>,
+    keys: &[&str],
+) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(perf_harness::json::Value::as_f64))
+}
+
+fn reference_reported_threads(
+    obj: &std::collections::BTreeMap<String, perf_harness::json::Value>,
+    expected_threads: usize,
+) -> Result<usize, String> {
+    let value = obj
+        .get("threads")
+        .or_else(|| obj.get("reference_threads"))
+        .or_else(|| obj.get("torch_threads"))
+        .or_else(|| {
+            obj.get("determinism")
+                .and_then(perf_harness::json::Value::as_object)
+                .and_then(|determinism| determinism.get("torch_threads"))
+        })
+        .ok_or(
+            "reference timing JSON missing thread proof \
+             (`threads`, `reference_threads`, `torch_threads`, or \
+             `determinism.torch_threads`)",
+        )?;
+    let reported = value
+        .as_f64()
+        .ok_or("reference timing thread proof must be a JSON number")?;
+    if !reported.is_finite() || reported <= 0.0 || reported.fract() != 0.0 {
+        return Err(format!(
+            "reference timing thread proof must be a positive integer, got {reported}"
+        ));
+    }
+    if reported > usize::MAX as f64 {
+        return Err(format!(
+            "reference timing thread proof {reported} exceeds usize::MAX"
+        ));
+    }
+    let reported = reported as usize;
+    if reported != expected_threads {
+        return Err(format!(
+            "reference timing thread proof mismatch: expected {expected_threads}, got {reported}"
+        ));
+    }
+    Ok(reported)
+}
+
+fn reference_precision(
+    obj: &std::collections::BTreeMap<String, perf_harness::json::Value>,
+) -> Result<String, String> {
+    let precision = obj
+        .get("precision")
+        .or_else(|| obj.get("reference_precision"))
+        .and_then(perf_harness::json::Value::as_str)
+        .ok_or("reference timing JSON missing string `precision`/`reference_precision`")?;
+    let precision = precision.trim();
+    if precision.is_empty() {
+        return Err("reference timing precision annotation must be non-empty".into());
+    }
+    Ok(precision.to_string())
+}
+
+fn compact_for_log(s: &str) -> String {
+    const LIMIT: usize = 512;
+    let trimmed = s.trim();
+    if trimmed.len() <= LIMIT {
+        trimmed.to_string()
+    } else {
+        let mut end = 0;
+        for (idx, ch) in trimmed.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > LIMIT {
+                break;
+            }
+            end = next;
+        }
+        format!("{}...", &trimmed[..end])
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +590,7 @@ fn self_relative_record(
         throughput_unit: throughput.map(|(_, u)| u.to_string()),
         fairness,
         reference_p50_s: None,
+        reference_backend: None,
         reference_precision: None,
         note: Some(note.into()),
     }
@@ -338,6 +639,14 @@ impl BenchBudget {
 /// mark. Returns the records so the `#[bench]` body can keep them alive.
 fn run_gauntlet(budget: BenchBudget) -> Vec<BenchRecord> {
     let gate = GateState::resolve();
+    run_gauntlet_with_config(budget, gate, history_path())
+}
+
+fn run_gauntlet_with_config(
+    budget: BenchBudget,
+    gate: GateState,
+    bench_history_path: Option<PathBuf>,
+) -> Vec<BenchRecord> {
     let fairness = Fairness::new(gate.threads, Precision::Int8);
     let mut records: Vec<BenchRecord> = Vec::new();
 
@@ -480,20 +789,74 @@ fn run_gauntlet(budget: BenchBudget) -> Vec<BenchRecord> {
         ),
     ];
     if gate.head_to_head_ready() {
-        // Both present: a self-hosted model-FULL lane would MEASURE here. We do
-        // not fabricate timings; we log that the measured path is armed. The real
-        // shell-out + parse + ratio lands with the weights-bearing runner; here we
-        // assert the fairness precondition so a mis-pinned reference is caught.
-        let ref_threads = gate.threads; // the runner pins the reference to this N.
-        let parity = fairness.assert_thread_parity(ref_threads);
-        for (stage, what) in stages {
-            log_line(&format!(
-                "{{\"event\":\"head_to_head_armed\",\"stage\":\"{stage}\",\"would_measure\":\"{what}\",\
-                 \"reference_backend\":\"{}\",\"threads\":{},\"thread_parity\":\"{}\"}}",
-                gate.reference_backend.as_deref().unwrap_or("unknown"),
-                gate.threads,
-                if parity.is_ok() { "ok" } else { "VIOLATION" },
-            ));
+        // Both present: execute the configured reference runner once per stage
+        // and parse its measured timing envelope. We still do NOT fabricate a
+        // ratio: the row becomes a full head-to-head BenchRecord only after the
+        // native per-stage timer for the same stage exists.
+        if let (Some(reference_cmd), Some(reference_backend)) = (
+            gate.reference_cmd.as_deref(),
+            gate.reference_backend.as_deref(),
+        ) {
+            for (stage, what) in stages {
+                match run_reference_command(reference_cmd, stage, gate.threads) {
+                    Ok(ReferenceTiming::Measured {
+                        p50_s,
+                        precision,
+                        threads: reference_threads,
+                    }) => {
+                        let parity = fairness.assert_thread_parity(reference_threads);
+                        let thread_parity = if parity.is_ok() { "ok" } else { "VIOLATION" };
+                        log_line(&format!(
+                            "{{\"event\":\"head_to_head_reference\",\"result\":\"reference_measured\",\
+                     \"stage\":{},\"would_measure\":{},\"reference_backend\":{},\
+                     \"reference_p50_s\":{:.9},\"reference_ms\":{:.6},\
+                     \"reference_precision\":{},\"threads\":{},\"reference_threads\":{},\
+                     \"thread_parity\":{},\
+                     \"ratio_ready\":false,\"awaiting\":\"native_stage_timer\"}}",
+                            json_escape(stage),
+                            json_escape(what),
+                            json_escape(reference_backend),
+                            p50_s,
+                            p50_s * 1_000.0,
+                            json_escape(&precision),
+                            gate.threads,
+                            reference_threads,
+                            json_escape(thread_parity),
+                        ));
+                    }
+                    Ok(ReferenceTiming::Skipped { reason }) => log_line(&format!(
+                        "{{\"event\":\"head_to_head_reference_skip\",\"result\":{},\
+                     \"stage\":{},\"would_measure\":{},\"reference_backend\":{},\
+                     \"threads\":{},\"thread_parity\":{}}}",
+                        json_escape(&reason),
+                        json_escape(stage),
+                        json_escape(what),
+                        json_escape(reference_backend),
+                        gate.threads,
+                        json_escape("not_measured"),
+                    )),
+                    Err(error) => log_line(&format!(
+                        "{{\"event\":\"head_to_head_reference_error\",\
+                     \"result\":\"reference_error\",\"stage\":{},\"would_measure\":{},\
+                     \"reference_backend\":{},\"threads\":{},\"thread_parity\":{},\
+                     \"error\":{}}}",
+                        json_escape(stage),
+                        json_escape(what),
+                        json_escape(reference_backend),
+                        gate.threads,
+                        json_escape("not_verified"),
+                        json_escape(&error),
+                    )),
+                }
+            }
+        } else {
+            for (stage, what) in stages {
+                log_skip(
+                    &format!("head_to_head:{stage}"),
+                    "internal_missing_reference_cmd_after_ready",
+                    what,
+                );
+            }
         }
     } else {
         let reason = gate.skip_reason();
@@ -506,15 +869,18 @@ fn run_gauntlet(budget: BenchBudget) -> Vec<BenchRecord> {
     // Only keep-eligible (cv_pct ≤ 5) rows participate. This is the pass-over-pass
     // gate; the honest-bar assertions live here as ratchet checks, NOT numbers.
     let ratchet = Ratchet::new(PRIMARY_BENCH);
-    if let Some(path) = history_path() {
+    if let Some(path) = bench_history_path {
         match History::read_or_empty(&path) {
             Ok(baseline) => {
                 let verdict = ratchet.compare(&records, &baseline);
                 for g in &verdict.gates {
                     log_line(&format!(
-                        "{{\"event\":\"ratchet_gate\",\"gate\":\"{}\",\"observed_regression\":{:.6},\
+                        "{{\"event\":\"ratchet_gate\",\"gate\":{},\"observed_regression\":{:.6},\
                      \"allowed\":{:.6},\"pass\":{}}}",
-                        g.gate, g.observed_regression, g.allowed, g.pass
+                        json_escape(&g.gate),
+                        g.observed_regression,
+                        g.allowed,
+                        g.pass
                     ));
                 }
                 log_line(&format!(
@@ -566,6 +932,12 @@ fn json_escape(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -714,6 +1086,27 @@ mod tests {
         assert!(!g3.head_to_head_ready());
         assert_eq!(g3.skip_reason(), "skip_no_model");
 
+        let g_missing_backend = GateState {
+            model_dir: Some(PathBuf::from("/x")),
+            reference_cmd: Some("python ref.py".into()),
+            reference_backend: None,
+            threads: 8,
+        };
+        assert!(!g_missing_backend.head_to_head_ready());
+        assert_eq!(g_missing_backend.skip_reason(), "skip_no_reference_backend");
+
+        let g_missing_model_and_backend = GateState {
+            model_dir: None,
+            reference_cmd: Some("python ref.py".into()),
+            reference_backend: None,
+            threads: 8,
+        };
+        assert!(!g_missing_model_and_backend.head_to_head_ready());
+        assert_eq!(
+            g_missing_model_and_backend.skip_reason(),
+            "skip_no_model_and_no_reference_backend"
+        );
+
         let g4 = GateState {
             model_dir: Some(PathBuf::from("/x")),
             reference_cmd: Some("python ref.py".into()),
@@ -740,6 +1133,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn threads_from_env_requires_positive_budget() {
+        assert_eq!(threads_from_env(None), 8);
+        assert_eq!(threads_from_env(Some("")), 8);
+        assert_eq!(threads_from_env(Some("not-a-number")), 8);
+        assert_eq!(threads_from_env(Some("0")), 8);
+        assert_eq!(threads_from_env(Some("32")), 32);
+        assert_eq!(threads_from_env(Some(" 32 ")), 32);
+    }
+
+    #[test]
+    fn reference_backend_env_name_is_explicit() {
+        assert_eq!(ENV_REFERENCE_BACKEND, "FOCR_REFERENCE_BACKEND");
+        assert_ne!(ENV_REFERENCE_BACKEND, ENV_REFERENCE_CMD);
+    }
+
+    #[test]
+    fn model_gate_accepts_direct_artifact_or_containing_directory() -> std::io::Result<()> {
+        struct TempTree(PathBuf);
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "focr_gauntlet_model_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let _guard = TempTree(root.clone());
+
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty)?;
+        assert!(!model_artifact_present(&empty));
+
+        let direct_focrq = root.join("unlimited-ocr.focrq");
+        std::fs::write(&direct_focrq, b"not loaded by gate")?;
+        assert!(model_artifact_present(&direct_focrq));
+
+        let containing_dir = root.join("weights");
+        std::fs::create_dir(&containing_dir)?;
+        std::fs::write(
+            containing_dir.join("model-00001-of-000001.safetensors"),
+            b"not loaded by gate",
+        )?;
+        assert!(model_artifact_present(&containing_dir));
+        Ok(())
+    }
+
+    #[test]
+    fn json_escape_keeps_log_fields_valid_and_single_line() {
+        let escaped = json_escape("quote\" slash\\ newline\n carriage\r tab\t unit\u{001f}");
+        assert_eq!(
+            escaped,
+            "\"quote\\\" slash\\\\ newline\\n carriage\\r tab\\t unit\\u001f\""
+        );
+        assert!(!escaped[1..escaped.len() - 1].contains('\n'));
+        assert!(!escaped[1..escaped.len() - 1].contains('\r'));
+    }
+
+    #[test]
+    fn compact_for_log_truncates_on_utf8_boundary() {
+        let input = format!("{}é{}", "a".repeat(511), "tail");
+        let compacted = compact_for_log(&input);
+        assert_eq!(compacted, format!("{}...", "a".repeat(511)));
+    }
+
+    #[test]
+    fn reference_timing_parser_accepts_last_json_line() -> Result<(), String> {
+        let stdout = "diagnostic line\n\
+            {\"stage\":\"decode_per_token\",\"result\":\"pass\",\"p50_ms\":14.5,\
+             \"precision\":\"bf16\",\"threads\":8}\n";
+        let timing = parse_reference_timing_stdout(stdout, "decode_per_token", 8)?;
+        assert_eq!(
+            timing,
+            ReferenceTiming::Measured {
+                p50_s: 0.0145,
+                precision: "bf16".into(),
+                threads: 8,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reference_timing_parser_rejects_stage_mismatch() {
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"prefill\",\"result\":\"pass\",\"p50_s\":0.01,\"threads\":8}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("wrong stage must be rejected");
+        assert!(err.contains("stage mismatch"), "{err}");
+    }
+
+    #[test]
+    fn reference_timing_parser_requires_result_field() {
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"decode_per_token\",\"p50_s\":0.01,\
+             \"threads\":8,\"precision\":\"bf16\"}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("missing result must be rejected");
+        assert!(err.contains("missing string `result`"), "{err}");
+    }
+
+    #[test]
+    fn reference_timing_parser_requires_thread_proof() {
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"decode_per_token\",\"result\":\"pass\",\"p50_s\":0.01}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("missing thread proof must be rejected");
+        assert!(err.contains("missing thread proof"), "{err}");
+    }
+
+    #[test]
+    fn reference_timing_parser_rejects_thread_mismatch() {
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"decode_per_token\",\"result\":\"pass\",\"p50_s\":0.01,\
+             \"torch_threads\":64}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("oversubscribed reference must be rejected");
+        assert!(err.contains("thread proof mismatch"), "{err}");
+    }
+
+    #[test]
+    fn reference_timing_parser_requires_precision_annotation() {
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"decode_per_token\",\"result\":\"pass\",\"p50_s\":0.01,\
+             \"threads\":8}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("missing precision must be rejected");
+        assert!(err.contains("missing string `precision`"), "{err}");
+
+        let err = parse_reference_timing_stdout(
+            "{\"stage\":\"decode_per_token\",\"result\":\"pass\",\"p50_s\":0.01,\
+             \"threads\":8,\"precision\":\"   \"}",
+            "decode_per_token",
+            8,
+        )
+        .expect_err("blank precision must be rejected");
+        assert!(
+            err.contains("precision annotation must be non-empty"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reference_command_receives_stage_and_threads_env() -> Result<(), String> {
+        let cmd = concat!(
+            "[ \"$FOCR_THREADS\" = \"8\" ] && ",
+            "[ \"$OMP_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$TORCH_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$RAYON_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$MKL_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$OPENBLAS_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$VECLIB_MAXIMUM_THREADS\" = \"8\" ] && ",
+            "[ \"$BLIS_NUM_THREADS\" = \"8\" ] && ",
+            "[ \"$NUMEXPR_NUM_THREADS\" = \"8\" ] && ",
+            "printf '{\"stage\":\"%s\",\"result\":\"pass\",\"p50_ms\":7.25,",
+            "\"precision\":\"bf16\",\"threads\":%s}\\n' ",
+            "\"$FOCR_GAUNTLET_STAGE\" \"$FOCR_THREADS\""
+        );
+        let timing = run_reference_command(cmd, "decode_per_token", 8)?;
+        assert_eq!(
+            timing,
+            ReferenceTiming::Measured {
+                p50_s: 0.00725,
+                precision: "bf16".into(),
+                threads: 8,
+            }
+        );
+        Ok(())
+    }
+
     /// The honest-bar gate is encoded as a RATCHET assertion, not a number: a
     /// synthetic round where the decode primary regresses past −3% must Block.
     /// (Proves the harness would refuse a decode-per-token regression — the
@@ -755,6 +1336,7 @@ mod tests {
             throughput_unit: Some("tok/s".into()),
             fairness: Fairness::new(8, Precision::Int8),
             reference_p50_s: None,
+            reference_backend: None,
             reference_precision: None,
             note: None,
         }]);
@@ -769,6 +1351,7 @@ mod tests {
             throughput_unit: Some("tok/s".into()),
             fairness: Fairness::new(8, Precision::Int8),
             reference_p50_s: None,
+            reference_backend: None,
             reference_precision: None,
             note: None,
         }];
@@ -781,17 +1364,17 @@ mod tests {
     /// smoke test that the whole skip-with-SUCCESS + ratchet path is wired.
     #[test]
     fn run_gauntlet_smoke_no_model() {
-        // Run in an isolated cwd so the test never clobbers a real history file.
-        let tmp = std::env::temp_dir().join(format!("focr_gauntlet_smoke_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let prev = std::env::current_dir().ok();
-        std::env::set_current_dir(&tmp).unwrap();
+        let records = run_gauntlet_with_config(
+            BenchBudget::smoke(),
+            GateState {
+                model_dir: None,
+                reference_cmd: None,
+                reference_backend: None,
+                threads: 8,
+            },
+            None,
+        );
 
-        let records = run_gauntlet(BenchBudget::smoke());
-
-        if let Some(p) = prev {
-            let _ = std::env::set_current_dir(p);
-        }
         // The three always-on self-relative rows are present.
         let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&PRIMARY_BENCH));
