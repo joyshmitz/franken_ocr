@@ -9,6 +9,7 @@
 #
 #   scripts/check.sh            # fmt + check + clippy + test (the full gate)
 #   scripts/check.sh --fast     # skip clippy (still runs fmt + check + test)
+#   scripts/check.sh --ubs-only # run only the bounded UBS lane
 #
 # `cargo test` is a HARD gate: a green bar (exit 0) is required before any change
 # is handed off or a bead is closed. `cargo check --all-targets` must also be free
@@ -17,13 +18,16 @@
 #
 # UBS is part of the required local gate when the `ubs` binary is installed. In
 # CI the tool may be unavailable; in that case the script reports the missing
-# scanner explicitly instead of pretending it ran.
+# scanner explicitly instead of pretending it ran. `FOCR_UBS_TIMEOUT_S` bounds
+# the UBS subprocess so a scanner hang fails loudly instead of wedging the gate.
 set -eu
 
 FAST=0
+UBS_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST=1 ;;
+    --ubs-only) UBS_ONLY=1 ;;
     *) echo "check.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -31,6 +35,52 @@ done
 run() {
   echo "==> $*"
   "$@"
+}
+
+run_ubs_bounded() {
+  timeout_s="${FOCR_UBS_TIMEOUT_S:-180}"
+  echo "==> FOCR_UBS_TIMEOUT_S=$timeout_s $*"
+  python3 - "$timeout_s" "$@" <<'PY'
+import subprocess
+import sys
+import os
+import signal
+import time
+
+try:
+    timeout_s = float(sys.argv[1])
+except ValueError:
+    print(f"check.sh: FOCR_UBS_TIMEOUT_S must be numeric, got {sys.argv[1]!r}", file=sys.stderr)
+    sys.exit(2)
+
+cmd = sys.argv[2:]
+if timeout_s <= 0:
+    print(f"check.sh: FOCR_UBS_TIMEOUT_S must be > 0, got {timeout_s:g}", file=sys.stderr)
+    sys.exit(2)
+
+proc = subprocess.Popen(cmd, start_new_session=True)
+try:
+    sys.exit(proc.wait(timeout=timeout_s))
+except subprocess.TimeoutExpired:
+    print(
+        f"check.sh: UBS timed out after {timeout_s:g}s: {' '.join(cmd)}",
+        file=sys.stderr,
+    )
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+    time.sleep(0.05)
+    sys.exit(124)
+PY
 }
 
 run_ubs() {
@@ -41,14 +91,18 @@ run_ubs() {
 
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
     ! git diff --quiet --diff-filter=ACMRTUXB --; then
-    echo "==> ubs --diff"
-    ubs --diff
+    run_ubs_bounded ubs --diff
     return 0
   fi
 
-  echo "==> ubs ."
-  ubs .
+  run_ubs_bounded ubs .
 }
+
+if [ "$UBS_ONLY" -eq 1 ]; then
+  run_ubs
+  echo "OK: UBS gate passed."
+  exit 0
+fi
 
 run python3 scripts/check_ledgers.py
 run python3 scripts/check_test_logs.py --self-test

@@ -162,10 +162,14 @@ def _build_points(name: str, numel: int, curve: dict, option_bits: dict[str, flo
         else:  # bare distortion number, bits from the global table
             bits = float(option_bits.get(option, DEFAULT_OPTION_BITS.get(option, math.nan)))
             distortion = float(entry)
-        if math.isnan(bits):
-            raise AllocatorError(f"tensor {name!r}: option {option!r} has no known bits-per-weight")
-        if distortion < 0.0:
-            raise AllocatorError(f"tensor {name!r}: option {option!r} has negative distortion {distortion}")
+        if not math.isfinite(bits) or bits <= 0.0:
+            raise AllocatorError(
+                f"tensor {name!r}: option {option!r} bits-per-weight must be finite and positive, got {bits}"
+            )
+        if not math.isfinite(distortion) or distortion < 0.0:
+            raise AllocatorError(
+                f"tensor {name!r}: option {option!r} distortion must be finite and non-negative, got {distortion}"
+            )
         raw.append(Point(option, bits, distortion, bytes_for(numel, bits)))
     # Deterministic order: by bytes ascending, then by precision rank, then name.
     raw.sort(key=lambda p: (p.rate_bytes, _option_rank(p.option), p.option))
@@ -719,6 +723,34 @@ def _run_selftest() -> int:
     fb = allocate_uniform(load_tensors(doc), "int4-g32", budget)
     if fb["totals"]["distortion"] + 1e-12 < table["totals"]["distortion"]:
         failures.append("uniform fallback beat the allocator (impossible at equal/looser footprint)")
+
+    # Invariant 8: corrupt calibration curves fail closed before they can poison
+    # byte accounting, hull ordering, or evidence-ledger floats.
+    def expect_invalid(label: str, bad_doc: dict, needle: str) -> None:
+        try:
+            load_tensors(bad_doc)
+        except AllocatorError as exc:
+            if needle not in str(exc):
+                failures.append(f"{label}: wrong error for invalid curve: {exc}")
+        else:
+            failures.append(f"{label}: invalid curve was accepted")
+
+    bad_base = {"tensor": "bad", "numel": 16, "pin": None, "tier_floor": None}
+    expect_invalid(
+        "nan-bits",
+        {"tensors": [{**bad_base, "curve": {"int8": {"bits": math.nan, "distortion": 0.1}}}]},
+        "bits-per-weight",
+    )
+    expect_invalid(
+        "zero-bits",
+        {"tensors": [{**bad_base, "curve": {"int8": {"bits": 0.0, "distortion": 0.1}}}]},
+        "bits-per-weight",
+    )
+    expect_invalid(
+        "infinite-distortion",
+        {"tensors": [{**bad_base, "curve": {"int8": {"bits": 8.0, "distortion": math.inf}}}]},
+        "distortion",
+    )
 
     result = {
         "selftest": "af1_bit_allocator",

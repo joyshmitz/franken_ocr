@@ -109,6 +109,7 @@ schema ``focr robot backends`` reports, bd-2mo.2), e.g.::
 DECISION / FALLBACK (deterministic, AGENTS.md #5)
 -------------------------------------------------
   * ``degenerate``      -> beta <= 0 or fit unusable    -> fallback = physical cores.
+  * ``poor fit``        -> non-finite or low R^2         -> fallback = physical cores.
   * ``noisy``           -> any cv_pct > cv-max          -> peak kept but advisory.
   * ``cap_is_win``      -> predicted speedup(peak) >= speedup(num_cpus)
                            (the AF-5 PROOF OBLIGATION, predicted here, MEASURED
@@ -128,10 +129,12 @@ import json
 import math
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
 DEFAULT_CV_MAX = 5.0
+MIN_R2 = 0.90
 
 
 @dataclass
@@ -393,7 +396,8 @@ def fit_sweep(sweep: Sweep, cv_max: float = DEFAULT_CV_MAX, refine: bool = True)
 
 def decide(sweep: Sweep, fit: UslFit) -> dict:
     """Produce the ``pool_sizing`` row + deterministic fallback decision."""
-    fallback_used = fit.degenerate
+    poor_fit = (not fit.degenerate) and ((not math.isfinite(fit.r2)) or fit.r2 < MIN_R2)
+    fallback_used = fit.degenerate or poor_fit
     if fallback_used:
         chosen = max(1, sweep.physical_cores)
         decision = "fallback-physical-cores"
@@ -501,6 +505,32 @@ def _synthetic_selfcheck() -> int:
     row = decide(sweep, fit)
     print(json.dumps(row, sort_keys=True))
 
+    jagged_sweep = parse_sweep(
+        {
+            "arch": "jagged-selfcheck",
+            "op_class": "decode_gemv",
+            "num_cpus": 32,
+            "physical_cores": 16,
+            "samples": [
+                {"n": 1, "throughput": 1.0},
+                {"n": 2, "throughput": 5.0},
+                {"n": 4, "throughput": 1.2},
+                {"n": 8, "throughput": 6.0},
+                {"n": 16, "throughput": 1.1},
+                {"n": 32, "throughput": 4.0},
+            ],
+        }
+    )
+    jagged_fit = fit_sweep(jagged_sweep)
+    jagged_row = decide(jagged_sweep, jagged_fit)
+    poor_fit_ok = (
+        (not jagged_fit.degenerate)
+        and jagged_fit.r2 < MIN_R2
+        and jagged_row["fallback_used"]
+        and jagged_row["decision"] == "fallback-physical-cores"
+        and jagged_row["chosen_pool_n"] == 16
+    )
+
     # Assertions: the fit must recover the truth and cap below num_cpus.
     expected_peak = usl_peak_real(true_alpha, true_beta)  # ~ sqrt(0.96/0.002) ~ 21.9
     ok = (
@@ -508,14 +538,17 @@ def _synthetic_selfcheck() -> int:
         and abs(fit.beta - true_beta) < 5e-4
         and abs(fit.peak_n_real - expected_peak) < 1.5
         and fit.peak_n < num_cpus
-        and row["cap_is_win"] is True
+        and row["cap_is_win"]
         and fit.r2 > 0.999
+        and poor_fit_ok
     )
     diag = {
         "selfcheck": "af5_usl_fit",
         "recovered_alpha": _round(fit.alpha),
         "recovered_beta": _round(fit.beta, 6),
         "expected_peak_real": _round(expected_peak),
+        "poor_fit_r2": _round(jagged_fit.r2),
+        "poor_fit_fallback_ok": bool(poor_fit_ok),
         "ok": bool(ok),
     }
     print(json.dumps(diag, sort_keys=True), file=sys.stderr)
@@ -554,18 +587,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.selfcheck:
         return _synthetic_selfcheck()
 
-    if args.samples:
-        with open(args.samples, "r", encoding="utf-8") as fh:
-            obj = json.load(fh)
-    elif not sys.stdin.isatty():
-        obj = json.load(sys.stdin)
-    else:
-        # No input at all -> run the self-check so the script is always runnable.
-        return _synthetic_selfcheck()
-
     try:
+        if args.samples:
+            obj = json.JSONDecoder().decode(Path(args.samples).read_text(encoding="utf-8"))
+        elif not sys.stdin.isatty():
+            obj = json.load(sys.stdin)
+        else:
+            # No input at all -> run the self-check so the script is always runnable.
+            return _synthetic_selfcheck()
         sweep = parse_sweep(obj)
-    except (KeyError, ValueError, TypeError) as exc:
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
         print(json.dumps({"error": f"bad input: {exc}"}, sort_keys=True), file=sys.stderr)
         return 2
 
