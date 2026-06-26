@@ -48,6 +48,26 @@ fn scale() -> f32 {
     1.0 / (HEAD_DIM as f32).sqrt()
 }
 
+fn checked_cache_region_elems(rows: usize) -> usize {
+    rows.checked_mul(HEAD_DIM)
+        .expect("rswa: cache rows*HEAD_DIM overflow")
+}
+
+fn checked_head_major_layout(seq: usize, label: &str) -> FocrResult<(usize, usize)> {
+    let stride = seq.checked_mul(HEAD_DIM).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "rswa: {label} seq*HEAD_DIM overflow (seq={seq}, HEAD_DIM={HEAD_DIM})"
+        ))
+    })?;
+    let expect = NUM_HEADS.checked_mul(stride).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "rswa: {label} NUM_HEADS*seq*HEAD_DIM overflow \
+             (NUM_HEADS={NUM_HEADS}, seq={seq}, HEAD_DIM={HEAD_DIM})"
+        ))
+    })?;
+    Ok((stride, expect))
+}
+
 /// Per-layer ring KV cache.
 ///
 /// Two contiguous, head-major regions per K and per V:
@@ -89,8 +109,8 @@ impl RingCache {
     /// Everything is zero-filled up front so the decode loop is allocation-free.
     #[must_use]
     pub fn new(prefill_capacity: usize) -> Self {
-        let ref_elems = prefill_capacity * HEAD_DIM;
-        let ring_elems = RING_WINDOW * HEAD_DIM;
+        let ref_elems = checked_cache_region_elems(prefill_capacity);
+        let ring_elems = checked_cache_region_elems(RING_WINDOW);
         Self {
             ref_capacity: prefill_capacity,
             ref_k: (0..NUM_HEADS).map(|_| vec![0.0f32; ref_elems]).collect(),
@@ -159,7 +179,7 @@ impl RingCache {
                 self.ref_capacity
             )));
         }
-        let expect = NUM_HEADS * seq * HEAD_DIM;
+        let (stride, expect) = checked_head_major_layout(seq, "prefill")?;
         if k.len() != expect || v.len() != expect {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "rswa: prefill k/v len {}/{} != NUM_HEADS*seq*HEAD_DIM {}",
@@ -168,7 +188,6 @@ impl RingCache {
                 expect
             )));
         }
-        let stride = seq * HEAD_DIM;
         for h in 0..NUM_HEADS {
             let src = &k[h * stride..(h + 1) * stride];
             self.ref_k[h][..stride].copy_from_slice(src);
@@ -377,6 +396,24 @@ pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
     Ok(Mat::from_vec(1, NUM_HEADS * HEAD_DIM, out))
 }
 
+fn validate_decode_step_mat(label: &str, mat: &Mat, expect: usize) -> FocrResult<()> {
+    if mat.rows != 1 || mat.cols != expect {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: attention expects {label} [1, {expect}], got [{},{}]",
+            mat.rows,
+            mat.cols
+        )));
+    }
+    if mat.data.len() != expect {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: attention {label} data len {} != NUM_HEADS*HEAD_DIM {}",
+            mat.data.len(),
+            expect
+        )));
+    }
+    Ok(())
+}
+
 /// One step of the streaming (online) softmax recurrence: fold key `(score, v)`
 /// into the running max / denominator / weighted-V accumulators.
 #[inline]
@@ -420,20 +457,9 @@ pub fn attention(
     position_ids: &[usize],
 ) -> FocrResult<Mat> {
     let expect = NUM_HEADS * HEAD_DIM;
-    if q.rows != 1 || q.cols != expect {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "rswa: attention expects q [1, {expect}] (decode q_len=1), got [{},{}]",
-            q.rows,
-            q.cols
-        )));
-    }
-    if k.data.len() != expect || v.data.len() != expect {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "rswa: attention expects k/v [1, {expect}], got k {} v {}",
-            k.data.len(),
-            v.data.len()
-        )));
-    }
+    validate_decode_step_mat("q", q, expect)?;
+    validate_decode_step_mat("k", k, expect)?;
+    validate_decode_step_mat("v", v, expect)?;
     if position_ids.len() != 1 {
         return Err(FocrError::Other(anyhow::anyhow!(
             "rswa: attention expects a single decode position_id, got {}",
@@ -447,6 +473,17 @@ pub fn attention(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
 
     /// A reference V row whose entries are all `val`, for head `h`, row `r`.
     fn fill_head_major(seq: usize, f: impl Fn(usize, usize) -> f32) -> Vec<f32> {
@@ -492,6 +529,27 @@ mod tests {
         // Each head's ring is exactly W * HEAD_DIM.
         assert_eq!(cache.ring_k.len(), NUM_HEADS);
         assert_eq!(cache.ring_k[0].len(), RING_WINDOW * HEAD_DIM);
+    }
+
+    #[test]
+    #[should_panic(expected = "cache rows*HEAD_DIM overflow")]
+    fn new_rejects_ref_capacity_shape_overflow_before_allocating() {
+        let _ = RingCache::new(usize::MAX / HEAD_DIM + 1);
+    }
+
+    #[test]
+    fn head_major_layout_rejects_stride_overflow() {
+        let err = checked_head_major_layout(usize::MAX / HEAD_DIM + 1, "test")
+            .expect_err("seq*HEAD_DIM should overflow");
+        assert!(err.to_string().contains("seq*HEAD_DIM overflow"));
+    }
+
+    #[test]
+    fn head_major_layout_rejects_total_overflow() {
+        let seq = (usize::MAX / HEAD_DIM) / NUM_HEADS + 1;
+        let err = checked_head_major_layout(seq, "test")
+            .expect_err("NUM_HEADS*seq*HEAD_DIM should overflow");
+        assert!(err.to_string().contains("NUM_HEADS*seq*HEAD_DIM overflow"));
     }
 
     #[test]
@@ -728,5 +786,47 @@ mod tests {
         let kt = Mat::zeros(1, NUM_HEADS * HEAD_DIM);
         let vt = Mat::zeros(1, NUM_HEADS * HEAD_DIM);
         assert!(attention(&mut cache, &q, &kt, &vt, &[0]).is_err());
+    }
+
+    #[test]
+    fn attention_rejects_malformed_query_without_mutating_cache() {
+        let mut cache = RingCache::new(4);
+        let k = fill_head_major(1, |_, _| 0.0);
+        cache.record_prefill(&k, &k, 1).unwrap();
+
+        let q = Mat {
+            rows: 1,
+            cols: NUM_HEADS * HEAD_DIM,
+            data: vec![0.0; NUM_HEADS * HEAD_DIM - 1],
+        };
+        let kt = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, _| 1.0));
+        let vt = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, _| 2.0));
+
+        assert_err_contains(
+            attention(&mut cache, &q, &kt, &vt, &[0]),
+            "attention q data len",
+        );
+        assert_eq!(cache.ring_len(), 0, "malformed q must not write K/V");
+    }
+
+    #[test]
+    fn attention_rejects_kv_logical_shape_mismatch_before_mutating_cache() {
+        let mut cache = RingCache::new(4);
+        let prefill = fill_head_major(1, |_, _| 0.0);
+        cache.record_prefill(&prefill, &prefill, 1).unwrap();
+
+        let q = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, _| 1.0));
+        let kt = Mat {
+            rows: 2,
+            cols: (NUM_HEADS * HEAD_DIM) / 2,
+            data: one_token(|_, _| 1.0),
+        };
+        let vt = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, _| 2.0));
+
+        assert_err_contains(
+            attention(&mut cache, &q, &kt, &vt, &[0]),
+            "attention expects k [1",
+        );
+        assert_eq!(cache.ring_len(), 0, "malformed k must not write K/V");
     }
 }

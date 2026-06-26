@@ -47,6 +47,53 @@ fn kernel_err(e: ft_kernel_cpu::KernelError) -> FocrError {
     FocrError::Other(anyhow::anyhow!("ft-kernel-cpu: {e}"))
 }
 
+fn checked_mat_len(context: &str, x: &Mat) -> FocrResult<usize> {
+    let expected = x.rows.checked_mul(x.cols).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: rows*cols overflow ({} * {})",
+            x.rows,
+            x.cols
+        ))
+    })?;
+    if x.data.len() != expected {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: data len {} != rows*cols {} for shape [{}, {}]",
+            x.data.len(),
+            expected,
+            x.rows,
+            x.cols
+        )));
+    }
+    Ok(expected)
+}
+
+fn checked_qint8_len(context: &str, w: &QInt8) -> FocrResult<usize> {
+    let expected = w.n.checked_mul(w.k).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: n*k overflow ({} * {})",
+            w.n,
+            w.k
+        ))
+    })?;
+    if w.w.len() != expected {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: weight len {} != n*k {} for shape [{}, {}]",
+            w.w.len(),
+            expected,
+            w.n,
+            w.k
+        )));
+    }
+    if w.scales.len() != w.n {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: scales len {} != n {}",
+            w.scales.len(),
+            w.n
+        )));
+    }
+    Ok(expected)
+}
+
 // ── §5.1 REUSE ────────────────────────────────────────────────────────────
 
 /// `[m,k] x [k,n] -> [m,n]`, delegating to FrankenTorch's parallel sgemm.
@@ -55,6 +102,8 @@ fn kernel_err(e: ft_kernel_cpu::KernelError) -> FocrError {
 /// Returns [`FocrError::Other`] if the inner dimensions disagree
 /// (`a.cols != b.rows`) or the kernel rejects the shapes.
 pub fn matmul(a: &Mat, b: &Mat) -> FocrResult<Mat> {
+    checked_mat_len("matmul lhs", a)?;
+    checked_mat_len("matmul rhs", b)?;
     if a.cols != b.rows {
         return Err(FocrError::Other(anyhow::anyhow!(
             "matmul inner dim mismatch: [{},{}] x [{},{}]",
@@ -100,6 +149,8 @@ pub fn quantize_int8(w: &[f32], out: usize, in_: usize) -> QInt8 {
 /// Returns [`FocrError::Other`] on a dimension mismatch (`x.cols != w.k`, or a
 /// `bias` whose length isn't `w.n`).
 pub fn linear_int8_dynamic(x: &Mat, w: &QInt8, bias: Option<&[f32]>) -> FocrResult<Mat> {
+    checked_mat_len("linear_int8_dynamic x", x)?;
+    checked_qint8_len("linear_int8_dynamic weight", w)?;
     if x.cols != w.k {
         return Err(FocrError::Other(anyhow::anyhow!(
             "linear_int8_dynamic: x.cols {} != w.k {}",
@@ -187,6 +238,7 @@ pub fn sdpa(
 /// Returns [`FocrError::Other`] if `weight` is present but its length isn't
 /// `x.cols`.
 pub fn rms_norm(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<Mat> {
+    checked_mat_len("rms_norm x", x)?;
     if let Some(w) = weight
         && w.len() != x.cols
     {
@@ -215,6 +267,7 @@ pub fn layer_norm(
     bias: Option<&[f32]>,
     eps: f32,
 ) -> FocrResult<Mat> {
+    checked_mat_len("layer_norm x", x)?;
     if let Some(w) = weight
         && w.len() != x.cols
     {
@@ -247,12 +300,20 @@ pub fn layer_norm(
 /// # Errors
 /// Returns [`FocrError::Other`] if the kernel rejects the shape.
 pub fn softmax_rows(x: &mut Mat) -> FocrResult<()> {
+    checked_mat_len("softmax_rows x", x)?;
     if x.cols == 0 || x.rows == 0 {
         return Ok(());
     }
     let meta = meta_2d(x.rows, x.cols);
     let out =
         ft_kernel_cpu::softmax_dim_tensor_contiguous_f32(&x.data, &meta, 1).map_err(kernel_err)?;
+    if out.len() != x.data.len() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "softmax_rows: kernel output len {} != input len {}",
+            out.len(),
+            x.data.len()
+        )));
+    }
     x.data.copy_from_slice(&out);
     Ok(())
 }
@@ -332,6 +393,17 @@ fn erf_f64(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
+
     /// Hand-computed 2x3 @ 3x2 product:
     ///   A = [[1,2,3],[4,5,6]], B = [[7,8],[9,10],[11,12]]
     ///   AB = [[1*7+2*9+3*11, 1*8+2*10+3*12], [4*7+5*9+6*11, 4*8+5*10+6*12]]
@@ -350,6 +422,17 @@ mod tests {
         let a = Mat::zeros(2, 3);
         let b = Mat::zeros(4, 2); // 3 != 4
         assert!(matmul(&a, &b).is_err());
+    }
+
+    #[test]
+    fn matmul_rejects_malformed_backing_data_without_panicking() {
+        let a = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0],
+        };
+        let b = Mat::zeros(2, 1);
+        assert_err_contains(matmul(&a, &b), "matmul lhs: data len 1 != rows*cols 2");
     }
 
     /// RMSNorm of a single row [3,4] with no weight, eps=0:
@@ -371,6 +454,26 @@ mod tests {
         let rstd = 1.0f32 / 12.5f32.sqrt();
         assert!((y.data[0] - 3.0 * rstd * 2.0).abs() < 1e-6);
         assert!((y.data[1] - 4.0 * rstd * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_norm_rejects_malformed_backing_data_without_panicking() {
+        let x = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert_err_contains(rms_norm(&x, None, 1e-6), "rms_norm x: data len 3");
+    }
+
+    #[test]
+    fn layer_norm_rejects_malformed_backing_data_without_panicking() {
+        let x = Mat {
+            rows: 1,
+            cols: 3,
+            data: vec![1.0, 2.0],
+        };
+        assert_err_contains(layer_norm(&x, None, None, 1e-6), "layer_norm x: data len 2");
     }
 
     /// quick_gelu(0) = 0; quick_gelu(1) = 1/(1+e^-1.702) = 0.845855...;
@@ -429,6 +532,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn softmax_rows_rejects_malformed_backing_data_without_panicking() {
+        let mut x = Mat {
+            rows: 1,
+            cols: 4,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert_err_contains(softmax_rows(&mut x), "softmax_rows x: data len 3");
+    }
+
     /// int8 dynamic linear should approximate the f32 product. With small
     /// integer-valued weights/activations the symmetric quant is near-lossless.
     /// x=[[1,2,3]] (1x3), W=[[1,0,1],[0,1,0]] (n=2,k=3) => y=[1+3, 2]=[4,2].
@@ -440,5 +553,77 @@ mod tests {
         assert_eq!(y.shape(), (1, 2));
         assert!((y.data[0] - 4.0).abs() < 0.1);
         assert!((y.data[1] - 2.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn linear_int8_dynamic_rejects_malformed_backing_data_without_panicking() {
+        let x = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0],
+        };
+        let w = QInt8 {
+            w: vec![1, 2],
+            scales: vec![1.0],
+            n: 1,
+            k: 2,
+        };
+        assert_err_contains(
+            linear_int8_dynamic(&x, &w, None),
+            "linear_int8_dynamic x: data len 1",
+        );
+
+        let x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        let short_weight = QInt8 {
+            w: vec![1],
+            scales: vec![1.0],
+            n: 1,
+            k: 2,
+        };
+        assert_err_contains(
+            linear_int8_dynamic(&x, &short_weight, None),
+            "linear_int8_dynamic weight: weight len 1 != n*k 2",
+        );
+
+        let missing_scale = QInt8 {
+            w: vec![1, 2],
+            scales: vec![],
+            n: 1,
+            k: 2,
+        };
+        assert_err_contains(
+            linear_int8_dynamic(&x, &missing_scale, None),
+            "linear_int8_dynamic weight: scales len 0 != n 1",
+        );
+    }
+
+    #[test]
+    fn linear_int8_dynamic_activation_rounds_ties_to_even() {
+        // The ±127 endpoints force activation scale_a = 1.0. Output 0 reads
+        // x=0.5, which must round to 0; output 1 reads x=2.5, which must round
+        // to 2. A half-away dynamic quantizer would return [1, 3].
+        let x = Mat::from_vec(
+            2,
+            8,
+            vec![
+                -127.0, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        );
+        let w = QInt8::new(
+            vec![
+                0, 0, 0, 0, 1, 0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 1, 0,
+            ],
+            vec![1.0, 1.0],
+            2,
+            8,
+        );
+        let y = linear_int8_dynamic(&x, &w, None).unwrap();
+        assert_eq!(y.shape(), (2, 2));
+        assert_eq!(y.data, vec![0.0, 2.0, 0.0, 0.0]);
+
+        let again = linear_int8_dynamic(&x, &w, None).unwrap();
+        assert_eq!(y, again, "dynamic activation quant must be byte-identical");
     }
 }

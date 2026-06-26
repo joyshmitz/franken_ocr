@@ -41,6 +41,26 @@ pub const PROJ_OUT: usize = 1280;
 /// Vision tokens emitted per 1024-view (16x16 SAM/CLIP grid).
 pub const TOKENS_PER_VIEW: usize = 256;
 
+fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
+fn ensure_mat_data_len(mat: &Mat, context: &str) -> FocrResult<()> {
+    let expected_len = checked_shape_mul(context, mat.rows, mat.cols, "rows*cols")?;
+    if mat.data.len() == expected_len {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: data len {} != rows*cols {}",
+        mat.data.len(),
+        expected_len
+    )))
+}
+
 /// Concatenate CLIP (sans class token) with the flattened SAM feature and apply
 /// the 2048 -> 1280 projector, returning the per-token vision embeddings.
 ///
@@ -51,18 +71,19 @@ pub const TOKENS_PER_VIEW: usize = 256;
 /// on `N` after the CLS drop.
 ///
 /// The projector weight/bias are read from `weights`
-/// (`model.projector.layers.{weight, bias}`, [SPEC-003]). The `Weights` accessor
-/// surface is still being built by the loader wave; until it exposes the
-/// projector tensors this returns [`FocrError::NotImplemented`], but the whole
-/// math path is exercised by [`concat_hybrid`] + [`project`] (and their tests).
+/// (`model.projector.layers.{weight, bias}`, [SPEC-003]). Missing projector
+/// tensors surface through the `Weights` accessor as [`FocrError::FormatMismatch`],
+/// while the math path is exercised by [`concat_hybrid`] + [`project`] (and their
+/// tests).
 ///
 /// # Errors
 /// * [`FocrError::Other`] on a shape mismatch (CLIP/SAM rows or channel widths).
-/// * [`FocrError::NotImplemented`] until `Weights` exposes the projector tensors.
+/// * [`FocrError::FormatMismatch`] when the loaded artifact does not expose the
+///   projector tensors.
 pub fn forward(weights: &Weights, clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
     // `sam` is the raw vision_sam output [OUT_CH=1024, N=256] (channel-major);
     // the concat wants the flattened [N, 1024] (flatten(2).permute(0,2,1)).
-    let sam_t = transpose(sam);
+    let sam_t = transpose(sam)?;
     let hybrid = concat_hybrid(clip, &sam_t)?;
     let (w, b) = projector_params(weights)?;
     project(&hybrid, &w, b.as_deref())
@@ -96,6 +117,8 @@ pub fn concat_hybrid(clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
             sam.cols
         )));
     }
+    ensure_mat_data_len(clip, "vision_bridge concat CLIP")?;
+    ensure_mat_data_len(sam, "vision_bridge concat SAM")?;
     // CLIP after dropping the leading CLS row.
     let n = clip.rows - 1;
     if sam.rows != n {
@@ -105,7 +128,8 @@ pub fn concat_hybrid(clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
         )));
     }
 
-    let mut out = Mat::zeros(n, PROJ_IN);
+    let out_len = checked_shape_mul("vision_bridge concat", n, PROJ_IN, "tokens*PROJ_IN")?;
+    let mut out = Mat::from_vec(n, PROJ_IN, vec![0.0f32; out_len]);
     for r in 0..n {
         // CLIP row r+1 (skip CLS at index 0) -> output cols [0, 1024).
         let clip_src = clip.row(r + 1);
@@ -152,10 +176,12 @@ pub fn project(x: &Mat, w: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
             b.len()
         )));
     }
+    ensure_mat_data_len(x, "vision_bridge::project input")?;
+    ensure_mat_data_len(w, "vision_bridge::project weight")?;
 
     // PyTorch Linear stores weight as [out, in] and computes x @ w^T. The GEMM
     // facade wants [m,k] x [k,n], so transpose w -> [in, out] = [2048, 1280].
-    let wt = transpose(w);
+    let wt = transpose(w)?;
     let mut y = nn::matmul(x, &wt)?;
 
     if let Some(b) = bias {
@@ -173,31 +199,28 @@ pub fn project(x: &Mat, w: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
 ///
 /// Used to turn a PyTorch `[out, in]` Linear weight into the `[in, out]` GEMM
 /// right-hand operand that [`nn::matmul`] expects.
-fn transpose(m: &Mat) -> Mat {
+fn transpose(m: &Mat) -> FocrResult<Mat> {
+    ensure_mat_data_len(m, "vision_bridge transpose input")?;
     let (r, c) = (m.rows, m.cols);
-    let mut out = Mat::zeros(c, r);
+    let out_len = checked_shape_mul("vision_bridge transpose", c, r, "cols*rows")?;
+    let mut out = Mat::from_vec(c, r, vec![0.0f32; out_len]);
     for j in 0..c {
         let dst = &mut out.data[j * r..(j + 1) * r];
         for (i, slot) in dst.iter_mut().enumerate() {
             *slot = m.data[i * c + j];
         }
     }
-    out
+    Ok(out)
 }
 
 /// Fetch the projector weight/bias from the loaded weight set.
 ///
 /// `model.projector.layers.weight` is `[1280, 2048]`;
 /// `model.projector.layers.bias` is `[1280]` ([SPEC-003/016]). The `Weights`
-/// tensor-directory accessors are still being landed by the loader wave; this
-/// returns [`FocrError::NotImplemented`] until they exist. The numeric path
-/// ([`project`]) is fully implemented and tested independently of the loader.
+/// tensor-directory accessors surface a clean [`FocrError::FormatMismatch`] when
+/// the tensors are absent. The numeric path ([`project`]) is fully implemented
+/// and tested independently of the loader.
 fn projector_params(weights: &Weights) -> FocrResult<(Mat, Option<Vec<f32>>)> {
-    // NOTE(loader-handoff): replace with the real lookups once `Weights` exposes
-    // a tensor accessor, e.g.:
-    //   let w = weights.mat("model.projector.layers.weight", PROJ_OUT, PROJ_IN)?;
-    //   let b = weights.vec("model.projector.layers.bias").ok();
-    //   Ok((w, b))
     let w = weights.mat("model.projector.layers.weight")?;
     let b = weights.vec("model.projector.layers.bias").ok();
     Ok((w, b))
@@ -207,11 +230,22 @@ fn projector_params(weights: &Weights) -> FocrResult<(Mat, Option<Vec<f32>>)> {
 mod tests {
     use super::*;
 
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
+
     /// Concat order is CLIP-first / SAM-second, with the CLIP CLS row dropped.
     /// CLIP = [[CLS], [c0..], [c1..]] (3 rows incl. CLS), SAM = [[s0..],[s1..]]
     /// (2 rows). Result rows = 2, cols = 2048; row r = clip[r+1] ++ sam[r].
     #[test]
-    fn concat_drops_cls_and_orders_clip_then_sam() {
+    fn concat_drops_cls_and_orders_clip_then_sam() -> FocrResult<()> {
         // CLIP rows: 1 CLS + 2 real tokens; fill each row with a row-id marker
         // in col 0 and a distinct value in col 1 so we can trace placement.
         let mut clip = Mat::zeros(3, CLIP_WIDTH);
@@ -227,7 +261,7 @@ mod tests {
         sam.set(1, 0, 210.0);
         sam.set(1, 7, 220.0);
 
-        let h = concat_hybrid(&clip, &sam).unwrap();
+        let h = concat_hybrid(&clip, &sam)?;
         assert_eq!(h.shape(), (2, PROJ_IN));
 
         // Row 0 takes CLIP token at index 1 (NOT the CLS) in the first 1024
@@ -244,6 +278,7 @@ mod tests {
         assert_eq!(h.get(1, 5), 22.0);
         assert_eq!(h.get(1, CLIP_WIDTH), 210.0);
         assert_eq!(h.get(1, CLIP_WIDTH + 7), 220.0);
+        Ok(())
     }
 
     #[test]
@@ -271,11 +306,33 @@ mod tests {
         assert!(concat_hybrid(&clip, &sam).is_err());
     }
 
+    #[test]
+    fn concat_rejects_malformed_clip_data_without_panic() {
+        let clip = Mat {
+            rows: 2,
+            cols: CLIP_WIDTH,
+            data: vec![0.0; CLIP_WIDTH],
+        };
+        let sam = Mat::zeros(1, SAM_WIDTH);
+        assert_err_contains(concat_hybrid(&clip, &sam), "concat CLIP");
+    }
+
+    #[test]
+    fn concat_rejects_malformed_sam_data_without_panic() {
+        let clip = Mat::zeros(2, CLIP_WIDTH);
+        let sam = Mat {
+            rows: 1,
+            cols: SAM_WIDTH,
+            data: Vec::new(),
+        };
+        assert_err_contains(concat_hybrid(&clip, &sam), "concat SAM");
+    }
+
     /// Transpose turns `[out, in]` into `[in, out]` with element (i,j)->(j,i).
     #[test]
-    fn transpose_swaps_indices() {
+    fn transpose_swaps_indices() -> FocrResult<()> {
         let m = Mat::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let t = super::transpose(&m);
+        let t = super::transpose(&m)?;
         assert_eq!(t.shape(), (3, 2));
         // original (0,1)=2 -> (1,0); (1,2)=6 -> (2,1)
         assert_eq!(t.get(0, 0), 1.0);
@@ -284,6 +341,27 @@ mod tests {
         assert_eq!(t.get(0, 1), 4.0);
         assert_eq!(t.get(1, 1), 5.0);
         assert_eq!(t.get(2, 1), 6.0);
+        Ok(())
+    }
+
+    #[test]
+    fn transpose_rejects_malformed_data_without_panic() {
+        let m = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![0.0; 5],
+        };
+        assert_err_contains(super::transpose(&m), "data len");
+    }
+
+    #[test]
+    fn transpose_rejects_shape_product_overflow_without_panic() {
+        let m = Mat {
+            rows: usize::MAX,
+            cols: 2,
+            data: Vec::new(),
+        };
+        assert_err_contains(super::transpose(&m), "rows*cols");
     }
 
     /// `project` must reproduce PyTorch `nn.Linear`: y = x @ w^T + b, with w in
@@ -294,7 +372,7 @@ mod tests {
     /// selects the first PROJ_OUT input channels (w[o, o] = 1), so y[:, o] =
     /// x[:, o] for o < PROJ_OUT, plus a per-output bias.
     #[test]
-    fn project_matches_linear_semantics() {
+    fn project_matches_linear_semantics() -> FocrResult<()> {
         let n = 2;
         // x: distinct value per (row, col-of-interest).
         let mut x = Mat::zeros(n, PROJ_IN);
@@ -313,7 +391,7 @@ mod tests {
         let mut bias = vec![0.0f32; PROJ_OUT];
         bias[1] = 0.5;
 
-        let y = project(&x, &w, Some(&bias)).unwrap();
+        let y = project(&x, &w, Some(&bias))?;
         assert_eq!(y.shape(), (n, PROJ_OUT));
 
         // y[r, o] = x[r, o] (+ bias[o]).
@@ -324,18 +402,20 @@ mod tests {
         assert!((y.get(1, 1) - (20.0 + 0.5)).abs() < 1e-5);
         // An unset selected channel stays 0 (+ no bias).
         assert!(y.get(0, 5).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
-    fn project_no_bias_is_pure_gemm() {
+    fn project_no_bias_is_pure_gemm() -> FocrResult<()> {
         let n = 1;
         let mut x = Mat::zeros(n, PROJ_IN);
         x.set(0, 3, 4.0);
         let mut w = Mat::zeros(PROJ_OUT, PROJ_IN);
         // output channel 3 reads input channel 3 with gain 2.
         w.set(3, 3, 2.0);
-        let y = project(&x, &w, None).unwrap();
+        let y = project(&x, &w, None)?;
         assert!((y.get(0, 3) - 8.0).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
@@ -360,28 +440,64 @@ mod tests {
         assert!(project(&x, &w, Some(&bias)).is_err());
     }
 
-    /// End-to-end shape contract for one 1024-view: 256+1 CLIP rows + 256 SAM
-    /// rows -> 256 hybrid rows -> 256 projected tokens at hidden 1280.
     #[test]
-    fn full_bridge_shapes_for_one_view() {
-        let clip = Mat::zeros(TOKENS_PER_VIEW + 1, CLIP_WIDTH); // +1 CLS
-        let sam = Mat::zeros(TOKENS_PER_VIEW, SAM_WIDTH);
-        let hybrid = concat_hybrid(&clip, &sam).unwrap();
-        assert_eq!(hybrid.shape(), (TOKENS_PER_VIEW, PROJ_IN));
-
+    fn project_rejects_malformed_input_data_without_panic() {
+        let x = Mat {
+            rows: 2,
+            cols: PROJ_IN,
+            data: vec![0.0; PROJ_IN],
+        };
         let w = Mat::zeros(PROJ_OUT, PROJ_IN);
-        let y = project(&hybrid, &w, None).unwrap();
-        assert_eq!(y.shape(), (TOKENS_PER_VIEW, PROJ_OUT));
+        assert_err_contains(project(&x, &w, None), "project input");
     }
 
     #[test]
-    fn forward_awaits_weights_accessor() {
-        // The numeric path is done; only the loader handoff is pending.
+    fn project_rejects_malformed_weight_data_without_panic() {
+        let x = Mat::zeros(1, PROJ_IN);
+        let w = Mat {
+            rows: PROJ_OUT,
+            cols: PROJ_IN,
+            data: Vec::new(),
+        };
+        assert_err_contains(project(&x, &w, None), "project weight");
+    }
+
+    #[test]
+    fn forward_rejects_malformed_raw_sam_before_projector_lookup() {
         let w = Weights::default();
         let clip = Mat::zeros(TOKENS_PER_VIEW + 1, CLIP_WIDTH);
+        let sam = Mat {
+            rows: SAM_WIDTH,
+            cols: TOKENS_PER_VIEW,
+            data: Vec::new(),
+        };
+        assert_err_contains(forward(&w, &clip, &sam), "transpose input");
+    }
+
+    /// End-to-end shape contract for one 1024-view: 256+1 CLIP rows + 256 SAM
+    /// rows -> 256 hybrid rows -> 256 projected tokens at hidden 1280.
+    #[test]
+    fn full_bridge_shapes_for_one_view() -> FocrResult<()> {
+        let clip = Mat::zeros(TOKENS_PER_VIEW + 1, CLIP_WIDTH); // +1 CLS
         let sam = Mat::zeros(TOKENS_PER_VIEW, SAM_WIDTH);
+        let hybrid = concat_hybrid(&clip, &sam)?;
+        assert_eq!(hybrid.shape(), (TOKENS_PER_VIEW, PROJ_IN));
+
+        let w = Mat::zeros(PROJ_OUT, PROJ_IN);
+        let y = project(&hybrid, &w, None)?;
+        assert_eq!(y.shape(), (TOKENS_PER_VIEW, PROJ_OUT));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_missing_projector_tensor_errors_cleanly() {
+        // The numeric path is done; an empty default weight set should surface
+        // the missing projector tensor cleanly through the accessor layer.
+        let w = Weights::default();
+        let clip = Mat::zeros(TOKENS_PER_VIEW + 1, CLIP_WIDTH);
+        let sam = Mat::zeros(SAM_WIDTH, TOKENS_PER_VIEW);
         let r = forward(&w, &clip, &sam);
-        assert!(matches!(r, Err(FocrError::NotImplemented(_))));
+        assert!(matches!(r, Err(FocrError::FormatMismatch(_))));
     }
 
     #[test]

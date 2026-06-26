@@ -46,6 +46,20 @@ fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) ->
     })
 }
 
+fn checked_mat_len(context: &str, x: &Mat) -> FocrResult<usize> {
+    let expected = checked_shape_mul(context, x.rows, x.cols, "rows*cols")?;
+    if x.data.len() != expected {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: data len {} != rows*cols {} for shape [{}, {}]",
+            x.data.len(),
+            expected,
+            x.rows,
+            x.cols
+        )));
+    }
+    Ok(expected)
+}
+
 /// Decoder hyperparameters (compile-time shapes — plan §1.1 P2). Mirrors the
 /// pinned `config.json` so the forward never reads runtime params.
 pub mod config {
@@ -205,6 +219,7 @@ impl RopeTable {
 /// [`FocrError::Other`] on a shape mismatch (`x.cols % head_dim != 0`,
 /// `x.rows != positions`, …).
 pub fn apply_rope(x: &mut Mat, rope: &RopeTable) -> FocrResult<()> {
+    checked_mat_len("apply_rope x", x)?;
     let head_dim = rope.head_dim;
     if head_dim == 0 || !x.cols.is_multiple_of(head_dim) {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -293,6 +308,7 @@ pub fn dense_mlp(
 /// # Errors
 /// [`FocrError::Other`] if `x.cols != in_` or `w.len() != out * in_`.
 fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat> {
+    checked_mat_len("linear_no_bias x", x)?;
     if x.cols != in_ {
         return Err(FocrError::Other(anyhow::anyhow!(
             "linear_no_bias: x.cols {} != in {in_}",
@@ -479,6 +495,8 @@ where
 /// # Errors
 /// [`FocrError::Other`] if the shapes differ.
 pub fn add_residual(a: &Mat, b: &Mat) -> FocrResult<Mat> {
+    checked_mat_len("add_residual lhs", a)?;
+    checked_mat_len("add_residual rhs", b)?;
     if a.shape() != b.shape() {
         return Err(FocrError::Other(anyhow::anyhow!(
             "add_residual: shape mismatch {:?} vs {:?}",
@@ -522,6 +540,9 @@ pub fn prefill_attention(
     num_heads: usize,
     head_dim: usize,
 ) -> FocrResult<Mat> {
+    checked_mat_len("prefill_attention q", q)?;
+    checked_mat_len("prefill_attention k", k)?;
+    checked_mat_len("prefill_attention v", v)?;
     let dim = checked_shape_mul(
         "prefill_attention",
         num_heads,
@@ -635,6 +656,7 @@ pub fn lm_head(weights: &Weights, hidden: &Mat) -> FocrResult<Mat> {
 /// [`FocrError::FormatMismatch`] on an absent tensor; [`FocrError::Other`] on a
 /// shape mismatch or kernel error (propagated from the sub-steps).
 pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
+    checked_mat_len("decoder::forward inputs_embeds", inputs_embeds)?;
     let hidden = config::HIDDEN_SIZE;
     let qkv_dim = checked_shape_mul(
         "decoder::forward",
@@ -838,6 +860,17 @@ mod tests {
     }
 
     #[test]
+    fn rope_rejects_malformed_backing_data_without_panic() {
+        let rope = RopeTable::build(&[0], 4, 10000.0);
+        let mut bad = Mat {
+            rows: 1,
+            cols: 4,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert_err_contains(apply_rope(&mut bad, &rope), "apply_rope x: data len 3");
+    }
+
+    #[test]
     #[should_panic(expected = "RopeTable: seq*head_dim overflow")]
     fn rope_table_rejects_shape_product_overflow_before_allocating() {
         let _ = RopeTable::build(&[0, 1], usize::MAX - 1, 10000.0);
@@ -914,6 +947,19 @@ mod tests {
         assert_err_contains(linear_no_bias(&x, &[], 2, usize::MAX), "out*in");
     }
 
+    #[test]
+    fn linear_no_bias_rejects_malformed_input_backing_data_without_panic() {
+        let x = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0],
+        };
+        assert_err_contains(
+            linear_no_bias(&x, &[1.0, 0.0], 2, 1),
+            "linear_no_bias x: data len 1",
+        );
+    }
+
     // ── Residual add ([SPEC-072]) ───────────────────────────────────────────
 
     #[test]
@@ -930,6 +976,17 @@ mod tests {
         let a = Mat::zeros(2, 2);
         let b = Mat::zeros(2, 3);
         assert!(add_residual(&a, &b).is_err());
+    }
+
+    #[test]
+    fn add_residual_rejects_malformed_backing_data_without_panic() {
+        let a = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0],
+        };
+        let b = Mat::zeros(1, 2);
+        assert_err_contains(add_residual(&a, &b), "add_residual lhs: data len 1");
     }
 
     // ── Final norm + lm_head ([SPEC-071]/[SPEC-081]) ────────────────────────
@@ -1149,5 +1206,20 @@ mod tests {
         let k = Mat::zeros(2, 4);
         let v = Mat::zeros(2, 4);
         assert!(prefill_attention(&q, &k, &v, 2, 2).is_err());
+    }
+
+    #[test]
+    fn prefill_attention_rejects_malformed_backing_data_without_panic() {
+        let q = Mat {
+            rows: 2,
+            cols: 4,
+            data: vec![0.0; 7],
+        };
+        let k = Mat::zeros(2, 4);
+        let v = Mat::zeros(2, 4);
+        assert_err_contains(
+            prefill_attention(&q, &k, &v, 2, 2),
+            "prefill_attention q: data len 7",
+        );
     }
 }

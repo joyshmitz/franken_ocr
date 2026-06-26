@@ -57,6 +57,45 @@ fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) ->
     })
 }
 
+fn checked_shape_add(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} + {rhs})"
+        ))
+    })
+}
+
+fn checked_shape_sub(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_sub(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize underflow computing {expression} ({lhs} - {rhs})"
+        ))
+    })
+}
+
+fn checked_nchw_len(
+    context: &str,
+    ch: usize,
+    h: usize,
+    w: usize,
+    expression: &str,
+) -> FocrResult<usize> {
+    let hw = checked_shape_mul(context, h, w, "h*w")?;
+    checked_shape_mul(context, ch, hw, expression)
+}
+
+fn checked_conv_weight_len(
+    context: &str,
+    out_ch: usize,
+    in_ch: usize,
+    kh: usize,
+    kw: usize,
+) -> FocrResult<usize> {
+    let out_in = checked_shape_mul(context, out_ch, in_ch, "out_ch*in_ch")?;
+    let kernel = checked_shape_mul(context, kh, kw, "kh*kw")?;
+    checked_shape_mul(context, out_in, kernel, "out_ch*in_ch*kh*kw")
+}
+
 // ── parameter bundles ──────────────────────────────────────────────────────
 
 /// A `nn.Linear` parameter pair (`[out, in]` row-major weight + length-`out`
@@ -84,12 +123,13 @@ impl Linear {
                 self.in_
             )));
         }
-        if self.w.len() != self.out * self.in_ {
+        let expected_weight_len =
+            checked_shape_mul("vision_sam linear", self.out, self.in_, "out*in")?;
+        if self.w.len() != expected_weight_len {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_sam linear: weight len {} != out*in {}*{}",
+                "vision_sam linear: weight len {} != out*in {}",
                 self.w.len(),
-                self.out,
-                self.in_
+                expected_weight_len
             )));
         }
         if !self.b.is_empty() && self.b.len() != self.out {
@@ -241,12 +281,15 @@ pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
 fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
     let p = "model.sam_model";
     let flat = |n: &str| weights.vec(n);
-    let dims = |n: &str| -> FocrResult<Vec<usize>> { Ok(weights.tensor(n)?.shape.to_vec()) };
     let conv = |n: &str, bias: bool| -> FocrResult<Conv> {
-        let d = dims(n)?;
+        let d = tensor_min_rank_shape(weights, n, 2)?;
         Ok(Conv {
             w: flat(n)?,
-            b: if bias { Some(flat(&n.replace(".weight", ".bias"))?) } else { None },
+            b: if bias {
+                Some(flat(&n.replace(".weight", ".bias"))?)
+            } else {
+                None
+            },
             out_ch: d[0],
             in_ch: d[1],
             kh: d.get(2).copied().unwrap_or(1),
@@ -261,47 +304,73 @@ fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
     };
 
     let pe = format!("{p}.patch_embed.proj.weight");
-    let ped = dims(&pe)?;
+    let (pe_out, pe_in, pe_kh, pe_kw) = tensor_rank4_shape(weights, &pe)?;
     let patch_embed = Conv {
         w: flat(&pe)?,
         b: Some(flat(&format!("{p}.patch_embed.proj.bias"))?),
-        out_ch: ped[0],
-        in_ch: ped[1],
-        kh: ped[2],
-        kw: ped[3],
+        out_ch: pe_out,
+        in_ch: pe_in,
+        kh: pe_kh,
+        kw: pe_kw,
     };
 
-    let posd = dims(&format!("{p}.pos_embed"))?;
+    let pos_name = format!("{p}.pos_embed");
+    let (pgh, pgw) = tensor_pos_grid_shape(weights, &pos_name)?;
     let pos_embed = flat(&format!("{p}.pos_embed"))?;
-    let (pgh, pgw) = if posd.len() == 4 {
-        (posd[1], posd[2])
-    } else {
-        (posd[0], posd[1])
-    };
 
     let mut blocks = Vec::with_capacity(DEPTH);
     for i in 0..DEPTH {
         let b = format!("{p}.blocks.{i}");
-        let window = if GLOBAL_BLOCKS.contains(&i) { 0 } else { WINDOW };
-        let qd = dims(&format!("{b}.attn.qkv.weight"))?;
-        let prd = dims(&format!("{b}.attn.proj.weight"))?;
-        let rph_d = dims(&format!("{b}.attn.rel_pos_h"))?;
-        let rpw_d = dims(&format!("{b}.attn.rel_pos_w"))?;
-        let l1 = dims(&format!("{b}.mlp.lin1.weight"))?;
-        let l2 = dims(&format!("{b}.mlp.lin2.weight"))?;
+        let window = if GLOBAL_BLOCKS.contains(&i) {
+            0
+        } else {
+            WINDOW
+        };
+        let qkv_name = format!("{b}.attn.qkv.weight");
+        let proj_name = format!("{b}.attn.proj.weight");
+        let rph_name = format!("{b}.attn.rel_pos_h");
+        let rpw_name = format!("{b}.attn.rel_pos_w");
+        let lin1_name = format!("{b}.mlp.lin1.weight");
+        let lin2_name = format!("{b}.mlp.lin2.weight");
+        let (q_out, q_in) = tensor_rank2_shape(weights, &qkv_name)?;
+        let (proj_out, proj_in) = tensor_rank2_shape(weights, &proj_name)?;
+        let (rph_rows, _rph_cols) = tensor_rank2_shape(weights, &rph_name)?;
+        let (rpw_rows, _rpw_cols) = tensor_rank2_shape(weights, &rpw_name)?;
+        let (lin1_out, lin1_in) = tensor_rank2_shape(weights, &lin1_name)?;
+        let (lin2_out, lin2_in) = tensor_rank2_shape(weights, &lin2_name)?;
         blocks.push(BlockP {
             norm1: ln(&format!("{b}.norm1"))?,
             attn: AttnP {
-                qkv: Linear { w: flat(&format!("{b}.attn.qkv.weight"))?, b: flat(&format!("{b}.attn.qkv.bias"))?, out: qd[0], in_: qd[1] },
-                proj: Linear { w: flat(&format!("{b}.attn.proj.weight"))?, b: flat(&format!("{b}.attn.proj.bias"))?, out: prd[0], in_: prd[1] },
-                rel_pos_h: flat(&format!("{b}.attn.rel_pos_h"))?,
-                rel_pos_w: flat(&format!("{b}.attn.rel_pos_w"))?,
-                size_h: (rph_d[0] + 1) / 2,
-                size_w: (rpw_d[0] + 1) / 2,
+                qkv: Linear {
+                    w: flat(&qkv_name)?,
+                    b: flat(&format!("{b}.attn.qkv.bias"))?,
+                    out: q_out,
+                    in_: q_in,
+                },
+                proj: Linear {
+                    w: flat(&proj_name)?,
+                    b: flat(&format!("{b}.attn.proj.bias"))?,
+                    out: proj_out,
+                    in_: proj_in,
+                },
+                rel_pos_h: flat(&rph_name)?,
+                rel_pos_w: flat(&rpw_name)?,
+                size_h: rph_rows.div_ceil(2),
+                size_w: rpw_rows.div_ceil(2),
             },
             norm2: ln(&format!("{b}.norm2"))?,
-            lin1: Linear { w: flat(&format!("{b}.mlp.lin1.weight"))?, b: flat(&format!("{b}.mlp.lin1.bias"))?, out: l1[0], in_: l1[1] },
-            lin2: Linear { w: flat(&format!("{b}.mlp.lin2.weight"))?, b: flat(&format!("{b}.mlp.lin2.bias"))?, out: l2[0], in_: l2[1] },
+            lin1: Linear {
+                w: flat(&lin1_name)?,
+                b: flat(&format!("{b}.mlp.lin1.bias"))?,
+                out: lin1_out,
+                in_: lin1_in,
+            },
+            lin2: Linear {
+                w: flat(&lin2_name)?,
+                b: flat(&format!("{b}.mlp.lin2.bias"))?,
+                out: lin2_out,
+                in_: lin2_in,
+            },
             window,
         });
     }
@@ -319,6 +388,51 @@ fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
         net2: conv(&format!("{p}.net_2.weight"), false)?,
         net3: conv(&format!("{p}.net_3.weight"), false)?,
     })
+}
+
+fn tensor_min_rank_shape(weights: &Weights, name: &str, min_rank: usize) -> FocrResult<Vec<usize>> {
+    let view = weights.tensor(name)?;
+    if view.shape.len() < min_rank {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected at least {min_rank}",
+            view.shape.len()
+        )));
+    }
+    Ok(view.shape.to_vec())
+}
+
+fn tensor_rank2_shape(weights: &Weights, name: &str) -> FocrResult<(usize, usize)> {
+    let view = weights.tensor(name)?;
+    let [rows, cols] = view.shape else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 2 ([rows, cols])",
+            view.shape.len()
+        )));
+    };
+    Ok((*rows, *cols))
+}
+
+fn tensor_rank4_shape(weights: &Weights, name: &str) -> FocrResult<(usize, usize, usize, usize)> {
+    let view = weights.tensor(name)?;
+    let [out_ch, in_ch, kh, kw] = view.shape else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 4 ([out_ch, in_ch, kh, kw])",
+            view.shape.len()
+        )));
+    };
+    Ok((*out_ch, *in_ch, *kh, *kw))
+}
+
+fn tensor_pos_grid_shape(weights: &Weights, name: &str) -> FocrResult<(usize, usize)> {
+    let view = weights.tensor(name)?;
+    match view.shape {
+        [_h0, h, w, _c] => Ok((*h, *w)),
+        [h, w, _c] => Ok((*h, *w)),
+        shape => Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 3 ([h, w, c]) or 4 ([1, h, w, c]), got {shape:?}",
+            shape.len()
+        ))),
+    }
 }
 
 /// Run the SAM tower with an explicit parameter bundle over a `[3, H, W]`
@@ -364,29 +478,14 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     // ── patch embed: Conv2d(3->768, k16, s16), then permute B,C,H,W->B,H,W,C.
     // conv2d kernel wants pre-padded NCHW; patch embed has no padding.
     let dim = w.patch_embed.out_ch;
-    let conv_out = nn::conv2d(
-        &image.data,
-        &w.patch_embed.w,
-        w.patch_embed.b.as_deref(),
-        1,
-        3,
-        h,
-        win,
-        PATCH,
-        PATCH,
-        gh,
-        gw,
-        PATCH,
-        PATCH,
-        dim,
-    );
+    let conv_out = conv_apply(&w.patch_embed, &image.data, h, win, 0, PATCH)?;
+    ensure_flat_len("vision_sam patch_embed output", &conv_out, dim, gh, gw)?;
     // conv_out is [1, dim, gh, gw] (channel-major). Tokens we carry as
     // [gh*gw, dim] (spatial-major rows) for the transformer (NHWC flattened).
     let mut x = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
 
     // ── abs pos-embed (added once before the blocks; bicubic-interp if needed).
-    let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw);
-    debug_assert_eq!(pos.len(), x.data.len());
+    let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw)?;
     for (xv, pv) in x.data.iter_mut().zip(pos.iter()) {
         *xv += *pv;
     }
@@ -402,17 +501,21 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
 
     // neck conv1: 768 -> 256, k1, no pad.
     let nc1 = conv_apply(&w.neck_conv1, &x_nchw, gh, gw, 0, 1)?;
-    let nc1 = layer_norm_2d(&nc1, &w.neck_ln1, NECK_CH, gh, gw);
+    ensure_flat_len("vision_sam neck_conv1 output", &nc1, NECK_CH, gh, gw)?;
+    let nc1 = layer_norm_2d(&nc1, &w.neck_ln1, NECK_CH, gh, gw)?;
     // neck conv2: 256 -> 256, k3, pad1.
     let nc2 = conv_apply(&w.neck_conv2, &nc1, gh, gw, 1, 1)?;
-    let neck = layer_norm_2d(&nc2, &w.neck_ln2, NECK_CH, gh, gw);
+    ensure_flat_len("vision_sam neck_conv2 output", &nc2, NECK_CH, gh, gw)?;
+    let neck = layer_norm_2d(&nc2, &w.neck_ln2, NECK_CH, gh, gw)?;
 
     // net_2: 256 -> 512, k3, s2, p1 -> grid /2.
     let (gh2, gw2) = (gh.div_ceil(2), gw.div_ceil(2));
     let x2 = conv_apply(&w.net2, &neck, gh, gw, 1, 2)?;
+    ensure_flat_len("vision_sam net2 output", &x2, NET2_CH, gh2, gw2)?;
     // net_3: 512 -> 1024, k3, s2, p1 -> grid /2 again.
     let (gh3, gw3) = (gh2.div_ceil(2), gw2.div_ceil(2));
     let x3 = conv_apply(&w.net3, &x2, gh2, gw2, 1, 2)?;
+    ensure_flat_len("vision_sam net3 output", &x3, OUT_CH, gh3, gw3)?;
 
     // x3 is [OUT_CH, gh3*gw3] NCHW flat — exactly flatten(2) layout.
     Ok(Mat::from_vec(OUT_CH, gh3 * gw3, x3))
@@ -638,6 +741,20 @@ fn ensure_mat_shape(mat: &Mat, rows: usize, cols: usize, context: &str) -> FocrR
     )))
 }
 
+fn ensure_flat_len(context: &str, data: &[f32], ch: usize, h: usize, w: usize) -> FocrResult<()> {
+    let expected = checked_nchw_len(context, ch, h, w, "ch*h*w")?;
+    if data.len() == expected {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: len {} != ch*h*w {}*{}*{} ({expected})",
+        data.len(),
+        ch,
+        h,
+        w
+    )))
+}
+
 fn ensure_same_shape(context: &str, actual: &Mat, expected: &Mat) -> FocrResult<()> {
     if actual.shape() == expected.shape() {
         return Ok(());
@@ -786,10 +903,36 @@ fn layer_norm_rows(x: &Mat, ln: &LayerNormP) -> FocrResult<Mat> {
 /// `LayerNorm2d` over an NCHW-flat `[C, H*W]` buffer: normalize across the
 /// CHANNEL axis at each spatial location, then per-channel affine
 /// (`deepencoder.py:590-602`: `mean(1)`/`var(1)` over channels).
-fn layer_norm_2d(x: &[f32], ln: &LayerNormP, ch: usize, gh: usize, gw: usize) -> Vec<f32> {
-    let hw = gh * gw;
-    debug_assert_eq!(x.len(), ch * hw);
-    let mut out = vec![0.0f32; ch * hw];
+fn layer_norm_2d(
+    x: &[f32],
+    ln: &LayerNormP,
+    ch: usize,
+    gh: usize,
+    gw: usize,
+) -> FocrResult<Vec<f32>> {
+    if ch == 0 || gh == 0 || gw == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam layer_norm_2d: channels and grid dims must be non-zero (ch={ch}, gh={gh}, gw={gw})"
+        )));
+    }
+    ensure_flat_len("vision_sam layer_norm_2d input", x, ch, gh, gw)?;
+    if ln.w.len() != ch {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam layer_norm_2d: weight len {} != channels {}",
+            ln.w.len(),
+            ch
+        )));
+    }
+    if ln.b.len() != ch {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam layer_norm_2d: bias len {} != channels {}",
+            ln.b.len(),
+            ch
+        )));
+    }
+    let hw = checked_shape_mul("vision_sam layer_norm_2d", gh, gw, "gh*gw")?;
+    let out_len = checked_shape_mul("vision_sam layer_norm_2d", ch, hw, "ch*gh*gw")?;
+    let mut out = vec![0.0f32; out_len];
     for s in 0..hw {
         // mean over channels at spatial location s.
         let mut mean = 0.0f32;
@@ -809,7 +952,7 @@ fn layer_norm_2d(x: &[f32], ln: &LayerNormP, ch: usize, gh: usize, gw: usize) ->
             out[c * hw + s] = ln.w[c] * norm + ln.b[c];
         }
     }
-    out
+    Ok(out)
 }
 
 // ── conv + layout helpers ──────────────────────────────────────────────────
@@ -824,11 +967,73 @@ fn conv_apply(
     pad: usize,
     stride: usize,
 ) -> FocrResult<Vec<f32>> {
-    let ph = gh + 2 * pad;
-    let pw = gw + 2 * pad;
-    let padded = pad_nchw(input, conv.in_ch, gh, gw, pad);
-    let oh = (ph - conv.kh) / stride + 1;
-    let ow = (pw - conv.kw) / stride + 1;
+    if gh == 0 || gw == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: input grid ({gh},{gw}) must be non-zero"
+        )));
+    }
+    if stride == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: stride must be non-zero"
+        )));
+    }
+    if conv.in_ch == 0 || conv.out_ch == 0 || conv.kh == 0 || conv.kw == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: channels and kernel dims must be non-zero (out={}, in={}, kh={}, kw={})",
+            conv.out_ch,
+            conv.in_ch,
+            conv.kh,
+            conv.kw
+        )));
+    }
+    let expected_input =
+        checked_nchw_len("vision_sam conv input", conv.in_ch, gh, gw, "in_ch*gh*gw")?;
+    if input.len() != expected_input {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: input len {} != in_ch*gh*gw {}",
+            input.len(),
+            expected_input
+        )));
+    }
+    let expected_weight = checked_conv_weight_len(
+        "vision_sam conv weight",
+        conv.out_ch,
+        conv.in_ch,
+        conv.kh,
+        conv.kw,
+    )?;
+    if conv.w.len() != expected_weight {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: weight len {} != out_ch*in_ch*kh*kw {}",
+            conv.w.len(),
+            expected_weight
+        )));
+    }
+    if let Some(bias) = &conv.b
+        && bias.len() != conv.out_ch
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: bias len {} != out_ch {}",
+            bias.len(),
+            conv.out_ch
+        )));
+    }
+
+    let two_pad = checked_shape_mul("vision_sam conv", 2, pad, "2*pad")?;
+    let ph = checked_shape_add("vision_sam conv", gh, two_pad, "gh+2*pad")?;
+    let pw = checked_shape_add("vision_sam conv", gw, two_pad, "gw+2*pad")?;
+    let oh_base = checked_shape_sub("vision_sam conv", ph, conv.kh, "padded_h-kh")?;
+    let ow_base = checked_shape_sub("vision_sam conv", pw, conv.kw, "padded_w-kw")?;
+    let oh = checked_shape_add("vision_sam conv", oh_base / stride, 1, "output_h+1")?;
+    let ow = checked_shape_add("vision_sam conv", ow_base / stride, 1, "output_w+1")?;
+    let expected_out = checked_nchw_len(
+        "vision_sam conv output",
+        conv.out_ch,
+        oh,
+        ow,
+        "out_ch*oh*ow",
+    )?;
+    let padded = pad_nchw(input, conv.in_ch, gh, gw, pad)?;
     let out = nn::conv2d(
         &padded,
         &conv.w,
@@ -845,19 +1050,35 @@ fn conv_apply(
         stride,
         conv.out_ch,
     );
-    debug_assert_eq!(out.len(), conv.out_ch * oh * ow);
+    if out.len() != expected_out {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam conv: kernel output len {} != out_ch*oh*ow {}",
+            out.len(),
+            expected_out
+        )));
+    }
     Ok(out)
 }
 
 /// Zero-pad an NCHW-flat `[ch, gh*gw]` buffer by `pad` on every spatial side ->
 /// `[ch, (gh+2p)*(gw+2p)]`.
-fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> Vec<f32> {
-    if pad == 0 {
-        return input.to_vec();
+fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> FocrResult<Vec<f32>> {
+    let expected_input = checked_nchw_len("vision_sam pad_nchw input", ch, gh, gw, "ch*gh*gw")?;
+    if input.len() != expected_input {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam pad_nchw: input len {} != ch*gh*gw {}",
+            input.len(),
+            expected_input
+        )));
     }
-    let ph = gh + 2 * pad;
-    let pw = gw + 2 * pad;
-    let mut out = vec![0.0f32; ch * ph * pw];
+    if pad == 0 {
+        return Ok(input.to_vec());
+    }
+    let two_pad = checked_shape_mul("vision_sam pad_nchw", 2, pad, "2*pad")?;
+    let ph = checked_shape_add("vision_sam pad_nchw", gh, two_pad, "gh+2*pad")?;
+    let pw = checked_shape_add("vision_sam pad_nchw", gw, two_pad, "gw+2*pad")?;
+    let out_len = checked_nchw_len("vision_sam pad_nchw output", ch, ph, pw, "ch*ph*pw")?;
+    let mut out = vec![0.0f32; out_len];
     for c in 0..ch {
         for y in 0..gh {
             for x in 0..gw {
@@ -867,7 +1088,7 @@ fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> Vec<f
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// `[1, ch, gh, gw]` channel-major conv output -> NHWC token rows
@@ -929,14 +1150,39 @@ fn transpose_contiguous_stores(m: &[f32], rows: usize, cols: usize) -> Vec<f32> 
 /// learned `[src_h, src_w, dim]` table, bicubic-interpolating if the runtime
 /// grid differs (matches `get_abs_pos_sam`). Returns NHWC token-row order
 /// `[gh*gw, dim]` flattened.
-fn abs_pos(pos: &[f32], src_h: usize, src_w: usize, dim: usize, gh: usize, gw: usize) -> Vec<f32> {
+fn abs_pos(
+    pos: &[f32],
+    src_h: usize,
+    src_w: usize,
+    dim: usize,
+    gh: usize,
+    gw: usize,
+) -> FocrResult<Vec<f32>> {
+    if src_h == 0 || src_w == 0 || dim == 0 || gh == 0 || gw == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam abs_pos: source ({src_h},{src_w}), target ({gh},{gw}), and dim {dim} must be non-zero"
+        )));
+    }
+    let src_hw = checked_shape_mul("vision_sam abs_pos", src_h, src_w, "src_h*src_w")?;
+    let expected_pos_len = checked_shape_mul("vision_sam abs_pos", src_hw, dim, "src_h*src_w*dim")?;
+    if pos.len() != expected_pos_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam abs_pos: pos_embed len {} != src_h*src_w*dim {}*{}*{} ({expected_pos_len})",
+            pos.len(),
+            src_h,
+            src_w,
+            dim
+        )));
+    }
+    let tgt_hw = checked_shape_mul("vision_sam abs_pos", gh, gw, "gh*gw")?;
+    let out_len = checked_shape_mul("vision_sam abs_pos", tgt_hw, dim, "gh*gw*dim")?;
     if src_h == gh && src_w == gw {
-        return pos.to_vec(); // already [gh*gw, dim] NHWC rows
+        return Ok(pos.to_vec()); // already [gh*gw, dim] NHWC rows
     }
     // Interpolate per-channel over the spatial grid (bicubic, align_corners=
     // False). pos is [src_h, src_w, dim] (channel-last); we resample each
     // channel independently into [gh, gw].
-    let mut out = vec![0.0f32; gh * gw * dim];
+    let mut out = vec![0.0f32; out_len];
     let scale_y = src_h as f32 / gh as f32;
     let scale_x = src_w as f32 / gw as f32;
     for oy in 0..gh {
@@ -949,7 +1195,7 @@ fn abs_pos(pos: &[f32], src_h: usize, src_w: usize, dim: usize, gh: usize, gw: u
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Bicubic sample of channel `c` from a `[src_h, src_w, dim]` channel-last
@@ -1029,6 +1275,8 @@ fn clamp_idx(i: isize, n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::focrq::{FocrqBuilder, WriteDType};
+    use half::bf16;
     use serde_json::json;
     use std::time::Instant;
 
@@ -1058,6 +1306,86 @@ mod tests {
             message.contains(needle),
             "error {message:?} did not contain {needle:?}"
         );
+    }
+
+    fn bf16_zeros(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|_| bf16::from_f32(0.0).to_le_bytes())
+            .collect()
+    }
+
+    fn add_minimal_patch_embed(b: &mut FocrqBuilder) {
+        let p = "model.sam_model";
+        b.add_tensor(
+            format!("{p}.patch_embed.proj.weight"),
+            WriteDType::Bf16,
+            vec![1, 1, 1, 1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+        b.add_tensor(
+            format!("{p}.patch_embed.proj.bias"),
+            WriteDType::Bf16,
+            vec![1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+    }
+
+    // ── weight hydration error paths ───────────────────────────────────────
+
+    #[test]
+    fn sam_weights_from_rejects_rank1_patch_embed_without_panic() {
+        let p = "model.sam_model";
+        let mut b = FocrqBuilder::new();
+        b.add_tensor(
+            format!("{p}.patch_embed.proj.weight"),
+            WriteDType::Bf16,
+            vec![4],
+            bf16_zeros(4),
+        )
+        .unwrap();
+        let weights = Weights::from_bytes(b.build()).unwrap();
+        assert_err_contains(sam_weights_from(&weights), "rank 1");
+    }
+
+    #[test]
+    fn sam_weights_from_rejects_rank1_pos_embed_without_panic() {
+        let p = "model.sam_model";
+        let mut b = FocrqBuilder::new();
+        add_minimal_patch_embed(&mut b);
+        b.add_tensor(
+            format!("{p}.pos_embed"),
+            WriteDType::Bf16,
+            vec![4],
+            bf16_zeros(4),
+        )
+        .unwrap();
+        let weights = Weights::from_bytes(b.build()).unwrap();
+        assert_err_contains(sam_weights_from(&weights), "rank 1");
+    }
+
+    #[test]
+    fn sam_weights_from_rejects_rank1_block_qkv_without_panic() {
+        let p = "model.sam_model";
+        let mut b = FocrqBuilder::new();
+        add_minimal_patch_embed(&mut b);
+        b.add_tensor(
+            format!("{p}.pos_embed"),
+            WriteDType::Bf16,
+            vec![1, 1, 1, 1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+        b.add_tensor(
+            format!("{p}.blocks.0.attn.qkv.weight"),
+            WriteDType::Bf16,
+            vec![4],
+            bf16_zeros(4),
+        )
+        .unwrap();
+        let weights = Weights::from_bytes(b.build()).unwrap();
+        assert_err_contains(sam_weights_from(&weights), "rank 1");
     }
 
     #[test]
@@ -1123,10 +1451,10 @@ mod tests {
     }
 
     #[test]
-    fn pad_nchw_zeros_border() {
+    fn pad_nchw_zeros_border() -> FocrResult<()> {
         // single channel 2x2 = [[1,2],[3,4]], pad=1 -> 4x4 with zero border.
         let input = vec![1.0, 2.0, 3.0, 4.0];
-        let out = pad_nchw(&input, 1, 2, 2, 1);
+        let out = pad_nchw(&input, 1, 2, 2, 1)?;
         assert_eq!(out.len(), 16);
         // center 2x2 holds the original
         assert_eq!(out[4 + 1], 1.0);
@@ -1136,6 +1464,7 @@ mod tests {
         // corners are zero
         assert_eq!(out[0], 0.0);
         assert_eq!(out[15], 0.0);
+        Ok(())
     }
 
     #[test]
@@ -1168,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_norm_2d_normalizes_channels() {
+    fn layer_norm_2d_normalizes_channels() -> FocrResult<()> {
         // ch=2, grid 1x2 (hw=2). At spatial 0 channels=[1,3] -> mean 2, var 1.
         // normalized = [-1, 1]; affine w=[1,1], b=[0,0].
         let x = vec![1.0, 9.0, 3.0, 11.0]; // c0=[1,9], c1=[3,11] over hw=2
@@ -1176,13 +1505,55 @@ mod tests {
             w: vec![1.0, 1.0],
             b: vec![0.0, 0.0],
         };
-        let out = layer_norm_2d(&x, &ln, 2, 1, 2);
+        let out = layer_norm_2d(&x, &ln, 2, 1, 2)?;
         // spatial 0: channels [1,3], mean 2, var 1 -> [-1, 1]
         assert!((out[0] - (-1.0)).abs() < 1e-3); // c0,s0
         assert!((out[2] - 1.0).abs() < 1e-3); // c1,s0
         // spatial 1: channels [9,11], mean 10, var 1 -> [-1, 1]
         assert!((out[1] - (-1.0)).abs() < 1e-3); // c0,s1
         assert!((out[3] - 1.0).abs() < 1e-3); // c1,s1
+        Ok(())
+    }
+
+    #[test]
+    fn layer_norm_2d_rejects_malformed_affine_without_panic() {
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        assert_err_contains(
+            layer_norm_2d(
+                &x,
+                &LayerNormP {
+                    w: vec![1.0],
+                    b: vec![0.0, 0.0],
+                },
+                2,
+                1,
+                2,
+            ),
+            "weight len",
+        );
+        assert_err_contains(
+            layer_norm_2d(
+                &x,
+                &LayerNormP {
+                    w: vec![1.0, 1.0],
+                    b: vec![0.0],
+                },
+                2,
+                1,
+                2,
+            ),
+            "bias len",
+        );
+    }
+
+    #[test]
+    fn layer_norm_2d_rejects_malformed_input_without_panic() {
+        let ln = LayerNormP {
+            w: vec![1.0, 1.0],
+            b: vec![0.0, 0.0],
+        };
+        assert_err_contains(layer_norm_2d(&[1.0, 2.0, 3.0], &ln, 2, 1, 2), "input");
+        assert_err_contains(layer_norm_2d(&[], &ln, 0, 1, 2), "non-zero");
     }
 
     #[test]
@@ -1196,6 +1567,65 @@ mod tests {
     }
 
     #[test]
+    fn conv_apply_rejects_malformed_geometry_without_panic() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let conv = identity_conv1(1);
+        assert_err_contains(conv_apply(&conv, &input, 2, 2, 0, 0), "stride");
+
+        let oversized_kernel = Conv {
+            w: vec![1.0; 25],
+            b: None,
+            out_ch: 1,
+            in_ch: 1,
+            kh: 5,
+            kw: 5,
+        };
+        assert_err_contains(
+            conv_apply(&oversized_kernel, &input, 2, 2, 0, 1),
+            "padded_h-kh",
+        );
+    }
+
+    #[test]
+    fn conv_apply_rejects_buffer_mismatches_without_panic() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+
+        let short_weight = Conv {
+            w: vec![1.0],
+            b: None,
+            out_ch: 2,
+            in_ch: 1,
+            kh: 1,
+            kw: 1,
+        };
+        assert_err_contains(conv_apply(&short_weight, &input, 2, 2, 0, 1), "weight len");
+
+        let bad_bias = Conv {
+            w: vec![1.0],
+            b: Some(vec![0.0, 1.0]),
+            out_ch: 1,
+            in_ch: 1,
+            kh: 1,
+            kw: 1,
+        };
+        assert_err_contains(conv_apply(&bad_bias, &input, 2, 2, 0, 1), "bias len");
+
+        assert_err_contains(
+            conv_apply(&identity_conv1(1), &input[..3], 2, 2, 0, 1),
+            "input len",
+        );
+    }
+
+    #[test]
+    fn conv_apply_rejects_padding_overflow_before_allocating() {
+        let input = vec![1.0];
+        assert_err_contains(
+            conv_apply(&identity_conv1(1), &input, 1, 1, usize::MAX / 2 + 1, 1),
+            "2*pad",
+        );
+    }
+
+    #[test]
     fn cubic_weights_sum_to_one() {
         // The cubic-convolution kernel taps sum to 1 for any fractional t.
         for &t in &[0.0f32, 0.25, 0.5, 0.75, 0.99] {
@@ -1206,24 +1636,38 @@ mod tests {
     }
 
     #[test]
-    fn abs_pos_identity_when_grid_matches() {
+    fn abs_pos_identity_when_grid_matches() -> FocrResult<()> {
         // src grid == target grid -> passthrough.
         let pos = vec![1.0, 2.0, 3.0, 4.0]; // 2x2x1
-        let out = abs_pos(&pos, 2, 2, 1, 2, 2);
+        let out = abs_pos(&pos, 2, 2, 1, 2, 2)?;
         assert_eq!(out, pos);
+        Ok(())
     }
 
     #[test]
-    fn abs_pos_bicubic_constant_field_is_constant() {
+    fn abs_pos_bicubic_constant_field_is_constant() -> FocrResult<()> {
         // A constant field must remain constant under bicubic resample
         // (partition-of-unity weights). src 4x4 of 7.0 -> target 6x6.
         let dim = 1;
         let pos = vec![7.0f32; 4 * 4 * dim];
-        let out = abs_pos(&pos, 4, 4, dim, 6, 6);
+        let out = abs_pos(&pos, 4, 4, dim, 6, 6)?;
         assert_eq!(out.len(), 6 * 6);
         for &v in &out {
             assert!((v - 7.0).abs() < 1e-3, "got {v}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn abs_pos_rejects_malformed_source_len_without_panic() {
+        assert_err_contains(abs_pos(&[1.0, 2.0, 3.0], 2, 2, 1, 2, 2), "pos_embed len");
+        assert_err_contains(abs_pos(&[1.0, 2.0, 3.0], 2, 2, 1, 3, 3), "pos_embed len");
+    }
+
+    #[test]
+    fn abs_pos_rejects_invalid_geometry_without_panic() {
+        assert_err_contains(abs_pos(&[], 0, 2, 1, 2, 2), "must be non-zero");
+        assert_err_contains(abs_pos(&[], usize::MAX, 2, 1, 2, 2), "src_h*src_w");
     }
 
     #[test]

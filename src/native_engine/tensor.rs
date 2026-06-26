@@ -27,6 +27,15 @@ pub struct Mat {
     pub data: Vec<f32>,
 }
 
+fn shape_len(context: &str, rows: usize, cols: usize) -> usize {
+    let len = rows.checked_mul(cols);
+    assert!(
+        len.is_some(),
+        "{context}: rows*cols overflow ({rows} * {cols})"
+    );
+    len.unwrap_or(0)
+}
+
 impl Mat {
     /// Construct from an explicit shape + backing vector.
     ///
@@ -35,12 +44,13 @@ impl Mat {
     /// violation is a programming error, caught early).
     #[must_use]
     pub fn from_vec(rows: usize, cols: usize, data: Vec<f32>) -> Self {
+        let len = shape_len("Mat::from_vec", rows, cols);
         assert_eq!(
             data.len(),
-            rows * cols,
+            len,
             "Mat::from_vec: data len {} != rows*cols {}",
             data.len(),
-            rows * cols
+            len
         );
         Self { rows, cols, data }
     }
@@ -48,10 +58,11 @@ impl Mat {
     /// An uninitialized-shaped matrix filled with zeros.
     #[must_use]
     pub fn zeros(rows: usize, cols: usize) -> Self {
+        let len = shape_len("Mat::zeros", rows, cols);
         Self {
             rows,
             cols,
-            data: vec![0.0f32; rows * cols],
+            data: vec![0.0f32; len],
         }
     }
 
@@ -154,7 +165,8 @@ impl QInt8 {
     /// `scales.len() != n`).
     #[must_use]
     pub fn new(w: Vec<i8>, scales: Vec<f32>, n: usize, k: usize) -> Self {
-        assert_eq!(w.len(), n * k, "QInt8: w len {} != n*k {}", w.len(), n * k);
+        let len = shape_len("QInt8::new", n, k);
+        assert_eq!(w.len(), len, "QInt8: w len {} != n*k {}", w.len(), len);
         assert_eq!(
             scales.len(),
             n,
@@ -239,6 +251,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Mat::from_vec: rows*cols overflow")]
+    fn mat_from_vec_rejects_shape_overflow() {
+        let _ = Mat::from_vec(usize::MAX, 2, Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "Mat::zeros: rows*cols overflow")]
+    fn mat_zeros_rejects_shape_overflow_before_allocating() {
+        let _ = Mat::zeros(usize::MAX, 2);
+    }
+
+    #[test]
     fn qint8_new_validates_shape() {
         let q = QInt8::new(vec![1i8, 2, 3, 4, 5, 6], vec![0.1, 0.2], 2, 3);
         assert_eq!(q.n, 2);
@@ -254,14 +278,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "QInt8::new: rows*cols overflow")]
+    fn qint8_rejects_shape_overflow() {
+        let _ = QInt8::new(Vec::new(), Vec::new(), usize::MAX, 2);
+    }
+
+    #[test]
     fn qint4_placeholder_constructs() {
-        // group_size 2 over k=4 => 2 groups/row * n=2 = 4 scales; k/2=2 bytes/row.
+        // group_size 16 over k=16 => 1 group/row * n=2 = 2 scales; k/2=8 bytes/row.
         let q = QInt4 {
-            packed: vec![0x21, 0x43, 0x65, 0x87],
-            scales: vec![0.1, 0.2, 0.3, 0.4],
+            packed: (0u8..16).collect(),
+            scales: vec![0.1, 0.2],
             n: 2,
-            k: 4,
-            group_size: 2,
+            k: 16,
+            group_size: 16,
             tier: 1,
         };
         assert_eq!(q.packed.len(), q.n * (q.k / 2));

@@ -45,6 +45,26 @@ fn checked_shape_sub(context: &str, lhs: usize, rhs: usize, expression: &str) ->
     })
 }
 
+fn checked_shape_add(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} + {rhs})"
+        ))
+    })
+}
+
+fn ensure_mat_data_len(mat: &Mat, context: &str) -> FocrResult<()> {
+    let expected_len = checked_shape_mul(context, mat.rows, mat.cols, "rows*cols")?;
+    if mat.data.len() == expected_len {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: data len {} != rows*cols {}",
+        mat.data.len(),
+        expected_len
+    )))
+}
+
 /// CLIP-L/14 build parameters ([SPEC-047], `deepencoder.py:514-532`).
 #[derive(Debug, Clone, Copy)]
 pub struct ClipConfig {
@@ -165,9 +185,10 @@ pub struct ClipWeights {
 /// whatever [`forward_with`] returns.
 pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResult<Mat> {
     let cfg = ClipConfig::default();
+    ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
     // SAM `x3` is [OUT_CH, num_patches] channel-major; CLIP consumes
     // [num_patches, hidden] (flatten(2).transpose(1,2)), so transpose it.
-    let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols);
+    let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols)?;
     let sam_mat = Mat::from_vec(sam_features.cols, sam_features.rows, sam_t);
     let cw = clip_weights_from(weights)?;
     forward_with(&cfg, &cw, &sam_mat)
@@ -184,15 +205,18 @@ fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
         })
     };
     let lin = |n: &str| -> FocrResult<LinearParams> {
-        let d = weights.tensor(&format!("{n}.weight"))?.shape.to_vec();
+        let weight_name = format!("{n}.weight");
+        let (out_features, in_features) = tensor_rank2_shape(weights, &weight_name)?;
         Ok(LinearParams {
-            weight: weights.vec(&format!("{n}.weight"))?,
+            weight: weights.vec(&weight_name)?,
             bias: Some(weights.vec(&format!("{n}.bias"))?),
-            out_features: d[0],
-            in_features: d[1],
+            out_features,
+            in_features,
         })
     };
     let cfg = ClipConfig::default();
+    let pos_name = format!("{p}.embeddings.position_embedding.weight");
+    let (num_positions, _pos_dim) = tensor_rank2_shape(weights, &pos_name)?;
     let mut blocks = Vec::with_capacity(cfg.num_layers);
     for l in 0..cfg.num_layers {
         let b = format!("{p}.transformer.layers.{l}");
@@ -205,17 +229,24 @@ fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
             fc2: lin(&format!("{b}.mlp.fc2"))?,
         });
     }
-    let pos_dims = weights
-        .tensor(&format!("{p}.embeddings.position_embedding.weight"))?
-        .shape
-        .to_vec();
     Ok(ClipWeights {
         class_embedding: weights.vec(&format!("{p}.embeddings.class_embedding"))?,
-        position_embedding: weights.vec(&format!("{p}.embeddings.position_embedding.weight"))?,
-        num_positions: pos_dims[0],
+        position_embedding: weights.vec(&pos_name)?,
+        num_positions,
         pre_layernorm: ln(&format!("{p}.pre_layrnorm"))?,
         blocks,
     })
+}
+
+fn tensor_rank2_shape(weights: &Weights, name: &str) -> FocrResult<(usize, usize)> {
+    let view = weights.tensor(name)?;
+    let [rows, cols] = view.shape else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 2 ([rows, cols])",
+            view.shape.len()
+        )));
+    };
+    Ok((*rows, *cols))
 }
 
 /// Run the CLIP tower with explicit weights ([SPEC-048..050]).
@@ -245,6 +276,7 @@ pub fn forward_with(
             dim
         )));
     }
+    ensure_mat_data_len(sam_features, "vision_clip forward_with sam_features")?;
     if weights.class_embedding.len() != dim {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip: class_embedding len {} != hidden_size {}",
@@ -262,7 +294,7 @@ pub fn forward_with(
 
     // ── Embeddings ([SPEC-048]) ────────────────────────────────────────────
     // Prepend the class token, then add the (interpolated) abs-pos embedding.
-    let mut x = prepend_class_token(&weights.class_embedding, sam_features);
+    let mut x = prepend_class_token(&weights.class_embedding, sam_features)?;
     let seq = x.rows; // num_patches + 1
     let pos = abs_pos_for_len(&weights.position_embedding, weights.num_positions, dim, seq)?;
     add_in_place(&mut x, &pos)?;
@@ -335,18 +367,32 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
             dim
         )));
     }
+    ensure_mat_data_len(x, "vision_clip self_attention input")?;
     let hd = dim / heads;
+    let three_dim = checked_shape_mul("vision_clip self_attention", 3, dim, "3*hidden_size")?;
+    let head_span = checked_shape_mul("vision_clip self_attention", seq, hd, "seq*head_dim")?;
+    let qkv_buffer_len = checked_shape_mul(
+        "vision_clip self_attention",
+        heads,
+        head_span,
+        "heads*seq*head_dim",
+    )?;
 
     // Fused qkv projection -> [seq, 3*dim].
     let qkv = linear(&w.qkv_proj, x)?;
-    ensure_mat_shape(&qkv, seq, 3 * dim, "vision_clip self_attention qkv output")?;
+    ensure_mat_shape(
+        &qkv,
+        seq,
+        three_dim,
+        "vision_clip self_attention qkv output",
+    )?;
 
     // Repack into head-major flat buffers [heads, seq, hd] for q, k, v.
     // PyTorch view: xqkv.view(bsz, seq, 3, heads, hd) — so within a row the
     // layout is [t (3), head, hd]: column index = t*dim + head*hd + d.
-    let mut q = vec![0.0f32; heads * seq * hd];
-    let mut k = vec![0.0f32; heads * seq * hd];
-    let mut v = vec![0.0f32; heads * seq * hd];
+    let mut q = vec![0.0f32; qkv_buffer_len];
+    let mut k = vec![0.0f32; qkv_buffer_len];
+    let mut v = vec![0.0f32; qkv_buffer_len];
     for s in 0..seq {
         let row = qkv.row(s);
         for hh in 0..heads {
@@ -355,7 +401,7 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
                 let q_src = hh * hd + d;
                 let k_src = dim + hh * hd + d;
                 let v_src = 2 * dim + hh * hd + d;
-                let dst = hh * (seq * hd) + s * hd + d;
+                let dst = hh * head_span + s * hd + d;
                 q[dst] = row[q_src];
                 k[dst] = row[k_src];
                 v[dst] = row[v_src];
@@ -366,7 +412,7 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
     // Full (non-causal) SDPA. num_bh = batch(1) * heads.
     let scale = 1.0f32 / (hd as f32).sqrt();
     let ctx = nn::sdpa(&q, &k, &v, heads, seq, seq, hd, hd, scale, false);
-    let expected_ctx_len = heads * seq * hd;
+    let expected_ctx_len = qkv_buffer_len;
     if ctx.len() != expected_ctx_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip self_attention: sdpa context len {} != expected {}",
@@ -376,11 +422,12 @@ fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult
     }
 
     // Repack [heads, seq, hd] -> [seq, dim] (permute(0,2,1,3).reshape).
-    let mut merged = Mat::zeros(seq, dim);
+    let merged_len = checked_shape_mul("vision_clip self_attention", seq, dim, "seq*hidden_size")?;
+    let mut merged = Mat::from_vec(seq, dim, vec![0.0f32; merged_len]);
     for hh in 0..heads {
         for s in 0..seq {
             for d in 0..hd {
-                let src = hh * (seq * hd) + s * hd + d;
+                let src = hh * head_span + s * hd + d;
                 let dst = s * dim + hh * hd + d;
                 merged.data[dst] = ctx[src];
             }
@@ -430,6 +477,7 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
             w.in_features
         )));
     }
+    ensure_mat_data_len(x, "vision_clip linear input")?;
     let expected_weight_len = checked_shape_mul(
         "vision_clip linear",
         w.out_features,
@@ -443,7 +491,7 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
             expected_weight_len
         )));
     }
-    let wt = transpose(&w.weight, w.out_features, w.in_features);
+    let wt = transpose(&w.weight, w.out_features, w.in_features)?;
     let wt_mat = Mat::from_vec(w.in_features, w.out_features, wt);
     let mut y = nn::matmul(x, &wt_mat)?;
     if let Some(b) = &w.bias {
@@ -465,25 +513,42 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
 }
 
 /// Transpose a row-major `[rows, cols]` flat matrix into `[cols, rows]`.
-fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * cols];
+fn transpose(src: &[f32], rows: usize, cols: usize) -> FocrResult<Vec<f32>> {
+    let expected_len = checked_shape_mul("vision_clip transpose", rows, cols, "rows*cols")?;
+    if src.len() != expected_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip transpose: source len {} != rows*cols {}",
+            src.len(),
+            expected_len
+        )));
+    }
+    let mut out = vec![0.0f32; expected_len];
     for c in 0..cols {
         let dst = &mut out[c * rows..(c + 1) * rows];
         for (r, slot) in dst.iter_mut().enumerate() {
             *slot = src[r * cols + c];
         }
     }
-    out
+    Ok(out)
 }
 
 /// Prepend the class token as a new row 0, returning a `[patches+1, dim]` matrix.
-fn prepend_class_token(class_embedding: &[f32], patches: &Mat) -> Mat {
+fn prepend_class_token(class_embedding: &[f32], patches: &Mat) -> FocrResult<Mat> {
     let dim = patches.cols;
-    let seq = patches.rows + 1;
-    let mut data = Vec::with_capacity(seq * dim);
+    if class_embedding.len() != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip class token: class_embedding len {} != patch dim {}",
+            class_embedding.len(),
+            dim
+        )));
+    }
+    ensure_mat_data_len(patches, "vision_clip class token patches")?;
+    let seq = checked_shape_add("vision_clip class token", patches.rows, 1, "patch_rows+1")?;
+    let out_len = checked_shape_mul("vision_clip class token", seq, dim, "seq*dim")?;
+    let mut data = Vec::with_capacity(out_len);
     data.extend_from_slice(class_embedding);
     data.extend_from_slice(&patches.data);
-    Mat::from_vec(seq, dim, data)
+    Ok(Mat::from_vec(seq, dim, data))
 }
 
 /// Build the position embedding for a runtime sequence length `seq`
@@ -661,6 +726,8 @@ fn add(a: &Mat, b: &Mat) -> FocrResult<Mat> {
             b.cols
         )));
     }
+    ensure_mat_data_len(a, "vision_clip add lhs")?;
+    ensure_mat_data_len(b, "vision_clip add rhs")?;
     let data = a
         .data
         .iter()
@@ -681,6 +748,8 @@ fn add_in_place(a: &mut Mat, b: &Mat) -> FocrResult<()> {
             b.cols
         )));
     }
+    ensure_mat_data_len(a, "vision_clip add_in_place lhs")?;
+    ensure_mat_data_len(b, "vision_clip add_in_place rhs")?;
     for (x, y) in a.data.iter_mut().zip(&b.data) {
         *x += *y;
     }
@@ -690,6 +759,8 @@ fn add_in_place(a: &mut Mat, b: &Mat) -> FocrResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::focrq::{FocrqBuilder, WriteDType};
+    use half::bf16;
 
     /// A tiny but structurally-faithful CLIP config: dim 4, 2 heads, ffn 8.
     fn tiny_cfg() -> ClipConfig {
@@ -793,15 +864,86 @@ mod tests {
         );
     }
 
+    fn bf16_zeros(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|_| bf16::from_f32(0.0).to_le_bytes())
+            .collect()
+    }
+
+    // ── weight hydration error paths ───────────────────────────────────────
+
+    #[test]
+    fn clip_weights_from_rejects_rank1_linear_weight_without_panic() {
+        let p = "model.vision_model";
+        let layer0 = format!("{p}.transformer.layers.0");
+        let mut b = FocrqBuilder::new();
+        b.add_tensor(
+            format!("{p}.embeddings.position_embedding.weight"),
+            WriteDType::Bf16,
+            vec![1, 1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+        b.add_tensor(
+            format!("{layer0}.layer_norm1.weight"),
+            WriteDType::Bf16,
+            vec![1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+        b.add_tensor(
+            format!("{layer0}.layer_norm1.bias"),
+            WriteDType::Bf16,
+            vec![1],
+            bf16_zeros(1),
+        )
+        .unwrap();
+        b.add_tensor(
+            format!("{layer0}.self_attn.qkv_proj.weight"),
+            WriteDType::Bf16,
+            vec![4],
+            bf16_zeros(4),
+        )
+        .unwrap();
+        let weights = Weights::from_bytes(b.build()).unwrap();
+        assert_err_contains(clip_weights_from(&weights), "rank 1");
+    }
+
+    #[test]
+    fn clip_weights_from_rejects_rank1_position_embedding_without_panic() {
+        let p = "model.vision_model";
+        let mut b = FocrqBuilder::new();
+        b.add_tensor(
+            format!("{p}.embeddings.position_embedding.weight"),
+            WriteDType::Bf16,
+            vec![4],
+            bf16_zeros(4),
+        )
+        .unwrap();
+        let weights = Weights::from_bytes(b.build()).unwrap();
+        assert_err_contains(clip_weights_from(&weights), "rank 1");
+    }
+
     // ── transpose / linear ─────────────────────────────────────────────────
 
     #[test]
-    fn transpose_roundtrips() {
+    fn transpose_roundtrips() -> FocrResult<()> {
         // [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
         let src = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let t = transpose(&src, 2, 3);
+        let t = transpose(&src, 2, 3)?;
         assert_eq!(t, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-        assert_eq!(transpose(&t, 3, 2), src);
+        assert_eq!(transpose(&t, 3, 2)?, src);
+        Ok(())
+    }
+
+    #[test]
+    fn transpose_rejects_malformed_len_without_panic() {
+        assert_err_contains(transpose(&[1.0], 2, 2), "source len");
+    }
+
+    #[test]
+    fn transpose_rejects_shape_product_overflow_without_panic() {
+        assert_err_contains(transpose(&[], usize::MAX, 2), "rows*cols");
     }
 
     #[test]
@@ -840,16 +982,62 @@ mod tests {
         assert_err_contains(linear(&w, &x), "out*in");
     }
 
+    #[test]
+    fn linear_rejects_malformed_input_mat_without_panic() {
+        let w = LinearParams {
+            weight: vec![1.0, 1.0],
+            bias: None,
+            out_features: 1,
+            in_features: 2,
+        };
+        let x = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0],
+        };
+        assert_err_contains(linear(&w, &x), "data len");
+    }
+
     // ── class token + abs pos ──────────────────────────────────────────────
 
     #[test]
-    fn class_token_prepended_as_row0() {
+    fn class_token_prepended_as_row0() -> FocrResult<()> {
         let patches = Mat::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let out = prepend_class_token(&[7.0, 8.0, 9.0], &patches);
+        let out = prepend_class_token(&[7.0, 8.0, 9.0], &patches)?;
         assert_eq!(out.shape(), (3, 3));
         assert_eq!(out.row(0), &[7.0, 8.0, 9.0]);
         assert_eq!(out.row(1), &[1.0, 2.0, 3.0]);
         assert_eq!(out.row(2), &[4.0, 5.0, 6.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn prepend_class_token_rejects_bad_class_len_without_panic() {
+        let patches = Mat::zeros(2, 3);
+        assert_err_contains(
+            prepend_class_token(&[1.0, 2.0], &patches),
+            "class_embedding len",
+        );
+    }
+
+    #[test]
+    fn prepend_class_token_rejects_malformed_patch_data_without_panic() {
+        let patches = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert_err_contains(prepend_class_token(&[7.0, 8.0, 9.0], &patches), "data len");
+    }
+
+    #[test]
+    fn prepend_class_token_rejects_seq_overflow_without_panic() {
+        let patches = Mat {
+            rows: usize::MAX,
+            cols: 0,
+            data: Vec::new(),
+        };
+        assert_err_contains(prepend_class_token(&[], &patches), "patch_rows+1");
     }
 
     #[test]
@@ -990,6 +1178,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn self_attention_rejects_malformed_input_mat_without_panic() {
+        let cfg = tiny_cfg();
+        let block = block_identity(cfg.hidden_size, cfg.ffn_hidden_size);
+        let x = Mat {
+            rows: 2,
+            cols: cfg.hidden_size,
+            data: vec![0.0; cfg.hidden_size],
+        };
+        assert_err_contains(self_attention(&cfg, &block, &x), "data len");
+    }
+
     /// With q=k=v=x and identity out_proj, attention is a softmax-weighted
     /// average of the value rows — every output row stays inside the convex hull
     /// of the inputs (each column bounded by per-column min/max).
@@ -1043,6 +1243,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn add_rejects_malformed_backing_data_without_panic() {
+        let malformed_lhs = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0],
+        };
+        let good = Mat::zeros(2, 2);
+        assert_err_contains(add(&malformed_lhs, &good), "add lhs");
+
+        let malformed_rhs = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0],
+        };
+        assert_err_contains(add(&good, &malformed_rhs), "add rhs");
+    }
+
+    #[test]
+    fn add_in_place_rejects_malformed_backing_data_before_mutating() {
+        let mut malformed_lhs = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0],
+        };
+        let good = Mat::zeros(2, 2);
+        let lhs_before = malformed_lhs.data.clone();
+        assert_err_contains(add_in_place(&mut malformed_lhs, &good), "add_in_place lhs");
+        assert_eq!(malformed_lhs.data, lhs_before);
+
+        let mut good_lhs = Mat::from_vec(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+        let malformed_rhs = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![10.0, 20.0],
+        };
+        let good_before = good_lhs.data.clone();
+        assert_err_contains(
+            add_in_place(&mut good_lhs, &malformed_rhs),
+            "add_in_place rhs",
+        );
+        assert_eq!(good_lhs.data, good_before);
+    }
+
     // ── full tower forward_with ─────────────────────────────────────────────
 
     fn tiny_weights(cfg: &ClipConfig, num_patches: usize) -> ClipWeights {
@@ -1093,6 +1337,31 @@ mod tests {
         w.blocks.pop(); // now num_layers-1 blocks
         let sam = Mat::zeros(4, cfg.hidden_size);
         assert!(forward_with(&cfg, &w, &sam).is_err());
+    }
+
+    #[test]
+    fn forward_rejects_malformed_sam_features_before_weight_hydration() -> FocrResult<()> {
+        let weights = Weights::from_bytes(FocrqBuilder::new().build())?;
+        let image = Mat::zeros(1, 1);
+        let sam = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![0.0],
+        };
+        assert_err_contains(forward(&weights, &image, &sam), "sam_features");
+        Ok(())
+    }
+
+    #[test]
+    fn forward_with_rejects_malformed_sam_features_without_panic() {
+        let cfg = tiny_cfg();
+        let w = tiny_weights(&cfg, 2);
+        let sam = Mat {
+            rows: 2,
+            cols: cfg.hidden_size,
+            data: vec![0.0; cfg.hidden_size],
+        };
+        assert_err_contains(forward_with(&cfg, &w, &sam), "data len");
     }
 
     /// Residual identity check: with all-zero norms-gamma... not applicable;
