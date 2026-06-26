@@ -5,7 +5,10 @@
 //! can validate against a stable contract. This is the Phase-0 seed; event
 //! payloads are finalized + contract-tested in Phase 5.
 
-use crate::error::{EXIT_CODE_TABLE, FocrError};
+use crate::{
+    FOCR_MODEL_LICENSE_NOTICE,
+    error::{EXIT_CODE_TABLE, FocrError},
+};
 use serde_json::{Value, json};
 
 /// The robot event-stream schema version. Bumped on any breaking contract change.
@@ -20,6 +23,7 @@ pub fn robot_schema() -> Value {
         "schema_version": ROBOT_SCHEMA_VERSION,
         "events": EVENT_KINDS,
         "exit_codes": EXIT_CODE_TABLE,
+        "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
         "status": "skeleton — run_start/run_error are wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
     })
 }
@@ -68,6 +72,7 @@ mod tests {
             s["exit_codes"].as_array().map(Vec::len),
             Some(EXIT_CODE_TABLE.len())
         );
+        assert_eq!(s["model_license_notice"], FOCR_MODEL_LICENSE_NOTICE);
     }
 
     #[test]

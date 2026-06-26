@@ -35,6 +35,7 @@ pub use error::{FocrError, FocrResult};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use native_engine::OcrModel;
@@ -44,11 +45,24 @@ use native_engine::OcrModel;
 /// [`DEFAULT_MODEL_PATH`].
 pub const MODEL_PATH_ENV: &str = "FOCR_MODEL_PATH";
 
+/// Source-code license notice for this crate, surfaced in the long version
+/// report separately from the model-weights notice.
+pub const FOCR_PROJECT_LICENSE_NOTICE: &str =
+    "franken_ocr - Copyright (c) 2026 The franken_ocr authors, MIT License";
+
+/// Baidu Unlimited-OCR model-weights notice. This is the single source of truth
+/// for the notice that must travel with redistributed `.focrq` artifacts and
+/// agent-facing provenance surfaces (plan §2.2 / §11).
+pub const FOCR_MODEL_LICENSE_NOTICE: &str =
+    "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License";
+
 /// Default model artifact location when [`MODEL_PATH_ENV`] is unset (plan §7.5).
 /// A relative `models/unlimited-ocr.focrq` next to the working directory; the
 /// model-gated e2e tests deliberately point this at `/nonexistent` to prove the
 /// native path's clean [`FocrError::ModelNotFound`].
 pub const DEFAULT_MODEL_PATH: &str = "models/unlimited-ocr.focrq";
+
+const DEFAULT_FORWARD_STAGE_BUDGET_MS: u64 = 10 * 60 * 1000;
 
 /// The OCR engine handle.
 ///
@@ -180,15 +194,94 @@ impl OcrEngine {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
         // One owned runtime; the per-page forward is the only blocking work and
-        // is driven sequentially (no nested runtime, no concurrent forwards).
-        self.runtime
-            .block_on(async move { model.recognize(&image_path) })
+        // is driven sequentially on the runtime blocking pool, never inline on
+        // the async polling thread (no nested runtime, no concurrent forwards).
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize(&image_path),
+        )
+    }
+
+    fn stage_budget(stage: &str, default_ms: u64) -> Duration {
+        let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
+        let millis = std::env::var(&key)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(default_ms);
+        Duration::from_millis(millis)
+    }
+
+    fn run_blocking_stage_with_budget<T, F>(
+        &self,
+        stage: &'static str,
+        budget: Duration,
+        op: F,
+    ) -> FocrResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> FocrResult<T> + Send + 'static,
+    {
+        self.runtime.block_on(async move {
+            match asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                budget,
+                asupersync::runtime::spawn_blocking(op),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(FocrError::Timeout(format!(
+                    "{stage} stage exceeded {}ms budget",
+                    budget.as_millis()
+                ))),
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempModel(std::path::PathBuf);
+
+    impl TempModel {
+        fn write_focrq(bytes: &[u8]) -> std::io::Result<Self> {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "franken_ocr_engine_format_mismatch_{}_{}.focrq",
+                std::process::id(),
+                nanos
+            ));
+            std::fs::write(&path, bytes)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempModel {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn future_focrq_preamble() -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(native_engine::weights::FOCRQ_MAGIC);
+        blob.extend_from_slice(&(native_engine::weights::FOCRQ_FORMAT_VERSION + 1).to_le_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(&0u64.to_le_bytes());
+        blob
+    }
 
     /// The engine constructs (its single owned runtime builds) without touching
     /// the model blob — construction is cheap and lazy.
@@ -268,5 +361,70 @@ mod tests {
             let err = engine.recognize_with_model(p, img).expect_err("absent");
             assert!(matches!(err, FocrError::ModelNotFound(_)));
         }
+    }
+
+    #[test]
+    fn blocking_stage_runs_on_runtime_blocking_pool() {
+        let engine = OcrEngine::new().expect("runtime builds");
+        let thread_name = engine
+            .run_blocking_stage_with_budget("test", Duration::from_secs(1), || {
+                let thread = std::thread::current();
+                Ok(thread.name().unwrap_or("<unnamed>").to_string())
+            })
+            .expect("stage should complete");
+        assert!(
+            thread_name.contains("-blocking-"),
+            "stage ran on {thread_name:?}, not the runtime blocking pool"
+        );
+    }
+
+    #[test]
+    fn blocking_stage_timeout_maps_to_stable_error() {
+        let engine = OcrEngine::new().expect("runtime builds");
+        let started = std::time::Instant::now();
+        let err = engine
+            .run_blocking_stage_with_budget("test-timeout", Duration::from_millis(10), || {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            })
+            .expect_err("slow blocking stage must time out");
+        assert!(
+            matches!(err, FocrError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), error::EXIT_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "timeout wrapper waited for the whole blocking closure"
+        );
+    }
+
+    /// A recognized but too-new `.focrq` must stay a public FormatMismatch
+    /// through the engine entrypoint and robot event, not be collapsed into the
+    /// Phase-0 generic/NotImplemented resolver path.
+    #[test]
+    fn public_engine_preserves_focrq_format_mismatch_robot_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model = TempModel::write_focrq(&future_focrq_preamble())?;
+        let engine = OcrEngine::new()?;
+        let result = engine.recognize_with_model(model.path(), Path::new("/some/document.png"));
+        let Err(err) = result else {
+            return Err(std::io::Error::other(
+                "future .focrq version unexpectedly succeeded before forward",
+            )
+            .into());
+        };
+
+        assert!(
+            matches!(err, FocrError::FormatMismatch(_)),
+            "expected FormatMismatch, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), error::EXIT_FORMAT_MISMATCH);
+
+        let event = robot::run_error_event(&err);
+        assert_eq!(event["event"], "run_error");
+        assert_eq!(event["error_kind"], "format_mismatch");
+        assert_eq!(event["code"], error::EXIT_FORMAT_MISMATCH);
+        Ok(())
     }
 }

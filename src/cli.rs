@@ -1,9 +1,11 @@
 //! The `focr` clap-derive CLI surface (plan §7.2).
 //!
 //! Subcommands are Phase-0 skeleton stubs: the diagnostics (`robot
-//! schema/health/backends`) work today; the real work (`ocr`, `convert`,
-//! `doctor`) returns a clear `NotImplemented` pointing at the plan phase that
-//! lands it. PDF input is intentionally absent — v1 is image-only (plan §7.7).
+//! schema/health/backends`) work today; `ocr` routes through the native model
+//! resolver/engine skeleton and then fails cleanly at the first unimplemented
+//! stage, while `convert` and `doctor` return clear `NotImplemented` errors
+//! pointing at the plan phase that lands them. PDF input is intentionally absent
+//! — v1 is image-only (plan §7.7).
 //!
 //! This module lives in the **library** so the single CLI entrypoint
 //! ([`cli_main`]) is shared by both binaries (`focr` and `franken_ocr`) without
@@ -11,9 +13,26 @@
 //! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
 //! doctrine #9.
 
-use crate::{FocrError, FocrResult, robot, simd};
-use clap::{Parser, Subcommand, ValueEnum};
+use crate::{
+    FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine,
+    native_engine, robot, simd,
+};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+// Debug/test-only producer seam for process-level exit-code conformance while
+// the Phase-1 forward is not able to naturally emit every terminal error kind.
+#[cfg(debug_assertions)]
+const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
+
+const DEFAULT_BASE_SIZE: i64 = 1024;
+const DEFAULT_IMAGE_SIZE: i64 = 640;
+const DEFAULT_MAX_LENGTH: i64 = 32_768;
+const DEFAULT_TEMPERATURE: f32 = 0.0;
+const DEFAULT_NO_REPEAT_NGRAM: i64 = 35;
+const DEFAULT_NGRAM_WINDOW: i64 = 128;
 
 /// The shared process entrypoint for both binaries (`focr` and `franken_ocr`).
 ///
@@ -22,6 +41,11 @@ use std::process::ExitCode;
 /// the whole process. This parses, dispatches, and maps errors to the stable
 /// exit codes documented in [`crate::error`].
 pub fn cli_main() -> ExitCode {
+    if is_exact_long_version_request(std::env::args_os()) {
+        print!("{}", long_version_report());
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
     let error_mode = ErrorMode::from_cli(&cli);
     match run(cli) {
@@ -41,41 +65,241 @@ pub struct Cli {
     pub command: Command,
 }
 
+fn is_exact_long_version_request<I>(mut args: I) -> bool
+where
+    I: Iterator<Item = OsString>,
+{
+    let _program = args.next();
+    matches!(
+        (args.next().as_deref(), args.next()),
+        (Some(arg), None) if arg == "--version"
+    )
+}
+
+/// Long, attribution-bearing version report. The short `-V` surface remains
+/// Clap's script-friendly `focr <semver>` output.
+#[must_use]
+pub fn long_version_report() -> String {
+    format!(
+        "focr {}\nsource_license: {}\nmodel_license: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        FOCR_PROJECT_LICENSE_NOTICE,
+        FOCR_MODEL_LICENSE_NOTICE
+    )
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Parse a document image into structured markdown (or `--json`).
-    Ocr {
-        /// Input image path (v1 is image-only; PDFs are rasterized out-of-band — plan §7.7).
-        image: std::path::PathBuf,
-        /// Emit machine-readable JSON instead of human markdown.
-        #[arg(long)]
-        json: bool,
-        /// Stream NDJSON robot events as pages complete.
-        #[arg(long)]
-        robot: bool,
-    },
+    Ocr(OcrArgs),
     /// Offline weight transformation: safetensors → `.focrq` (plan §5).
-    Convert {
-        /// Source `model-00001-of-000001.safetensors`.
-        input: std::path::PathBuf,
-        /// Destination `.focrq`.
-        #[arg(short, long)]
-        output: std::path::PathBuf,
-        /// Quantization target.
-        #[arg(long, value_enum)]
-        quant: Option<QuantTarget>,
-    },
+    Convert(ConvertArgs),
     /// Agent-facing diagnostics and the machine contract.
     Robot {
         #[command(subcommand)]
         cmd: RobotCmd,
     },
+    /// Query durable run history (fsqlite-backed store lands with plan §7.2).
+    Runs(RunsArgs),
+    /// Export/import the append-only run audit stream.
+    Sync(SyncArgs),
     /// Idempotent self-check / repair.
-    Doctor,
+    Doctor(DoctorArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OcrArgs {
+    #[command(flatten)]
+    pub request: OcrRequestArgs,
+    /// Emit machine-readable JSON instead of human markdown.
+    #[arg(long)]
+    pub json: bool,
+    /// Stream NDJSON robot events as pages complete.
+    #[arg(long)]
+    pub robot: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RobotRunArgs {
+    #[command(flatten)]
+    pub request: OcrRequestArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OcrRequestArgs {
+    /// Input document image path (v1 image-only; rasterization is out-of-band).
+    pub image: PathBuf,
+    /// Explicit model artifact path for diagnostics and model-gated runs.
+    #[arg(long)]
+    pub model: Option<PathBuf>,
+    /// Reference global-view size from `infer(..., base_size=1024)`.
+    #[arg(long, default_value_t = DEFAULT_BASE_SIZE)]
+    pub base_size: i64,
+    /// Reference local tile size from `infer(..., image_size=640)`.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_SIZE)]
+    pub image_size: i64,
+    /// Vision preprocessing mode: reference Gundam tiling or base global view.
+    #[arg(long, value_enum, default_value_t = CropMode::Gundam)]
+    pub crop_mode: CropMode,
+    /// Maximum generated sequence length.
+    #[arg(long, default_value_t = DEFAULT_MAX_LENGTH)]
+    pub max_length: i64,
+    /// Decode temperature; 0.0 means greedy.
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
+    pub temperature: f32,
+    /// Sliding no-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM).
+    #[arg(
+        long,
+        env = "FOCR_NO_REPEAT_NGRAM",
+        default_value_t = DEFAULT_NO_REPEAT_NGRAM
+    )]
+    pub no_repeat_ngram: i64,
+    /// Sliding no-repeat n-gram lookback window.
+    #[arg(long, default_value_t = DEFAULT_NGRAM_WINDOW)]
+    pub ngram_window: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OcrRequest {
+    pub image: PathBuf,
+    pub model: Option<PathBuf>,
+    pub base_size: u32,
+    pub image_size: u32,
+    pub crop_mode: CropMode,
+    pub max_length: u32,
+    pub temperature: f32,
+    pub no_repeat_ngram: u32,
+    pub ngram_window: u32,
+}
+
+impl OcrArgs {
+    fn to_request(&self) -> FocrResult<OcrRequest> {
+        self.request.to_request()
+    }
+}
+
+impl RobotRunArgs {
+    fn into_ocr_args(self) -> OcrArgs {
+        OcrArgs {
+            request: self.request,
+            json: false,
+            robot: true,
+        }
+    }
+}
+
+impl OcrRequestArgs {
+    fn to_request(&self) -> FocrResult<OcrRequest> {
+        Ok(OcrRequest {
+            image: self.image.clone(),
+            model: self.model.clone(),
+            base_size: positive_u32("base-size", self.base_size)?,
+            image_size: positive_u32("image-size", self.image_size)?,
+            crop_mode: self.crop_mode,
+            max_length: positive_u32("max-length", self.max_length)?,
+            temperature: non_negative_finite_f32("temperature", self.temperature)?,
+            no_repeat_ngram: non_negative_u32("no-repeat-ngram", self.no_repeat_ngram)?,
+            ngram_window: non_negative_u32("ngram-window", self.ngram_window)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CropMode {
+    /// Reference dynamic-resolution tiling (`crop_mode=true`).
+    Gundam,
+    /// Single global view (`crop_mode=false`).
+    Base,
+}
+
+impl std::fmt::Display for CropMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gundam => "gundam",
+            Self::Base => "base",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ConvertArgs {
+    /// Source `model-00001-of-000001.safetensors`.
+    pub input: PathBuf,
+    /// Destination `.focrq`.
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// Quantization target.
+    #[arg(long, value_enum, default_value_t = QuantTarget::Int8)]
+    pub quant: QuantTarget,
+    /// Offline pre-packing target recorded in the `.focrq` header.
+    #[arg(long, value_enum, default_value_t = ArchTarget::Generic)]
+    pub arch: ArchTarget,
+    /// Emit machine-readable scaffold JSON before the Phase-2 NotImplemented.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunsArgs {
+    /// Specific run id to inspect.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Maximum number of runs to list.
+    #[arg(long, default_value_t = 20)]
+    pub limit: i64,
+    /// Output format for run history.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+    pub format: OutputFormat,
+    /// Alias for `--format json`.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SyncArgs {
+    /// Emit machine-readable scaffold JSON before the Phase-0 NotImplemented.
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub cmd: SyncCmd,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DoctorArgs {
+    /// Emit the scaffold capability/check contract as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Plain,
+    Json,
+    Ndjson,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Plain => "plain",
+            Self::Json => "json",
+            Self::Ndjson => "ndjson",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+pub enum SyncCmd {
+    /// Export run-state audit records as JSONL.
+    ExportJsonl,
+    /// Import run-state audit records from JSONL.
+    ImportJsonl,
 }
 
 #[derive(Subcommand)]
 pub enum RobotCmd {
+    /// Stream OCR pipeline events as NDJSON.
+    Run(RobotRunArgs),
     /// Self-describing event/contract schema (versioned).
     Schema,
     /// Diagnostics: model present? arch features? threads?
@@ -84,15 +308,61 @@ pub enum RobotCmd {
     Backends,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum QuantTarget {
     Int8,
     Int4,
 }
 
+impl QuantTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Int8 => "int8",
+            Self::Int4 => "int4",
+        }
+    }
+}
+
+impl std::fmt::Display for QuantTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ArchTarget {
+    Generic,
+    Aarch64Smmla,
+    X86Vnni,
+    X86Amx,
+}
+
+impl ArchTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Aarch64Smmla => "aarch64-smmla",
+            Self::X86Vnni => "x86-vnni",
+            Self::X86Amx => "x86-amx",
+        }
+    }
+}
+
+impl std::fmt::Display for ArchTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> FocrResult<()> {
     match cli.command {
+        Command::Robot {
+            cmd: RobotCmd::Run(args),
+        } => {
+            emit(&robot::run_start_event("ocr"));
+            run_ocr(args.into_ocr_args(), true)
+        }
         Command::Robot {
             cmd: RobotCmd::Schema,
         } => {
@@ -102,15 +372,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::Robot {
             cmd: RobotCmd::Health,
         } => {
-            // Phase 0: minimal health. The full report (model resolution, arch
-            // features, thread budget) lands in Phase 5 (plan §7.3).
-            emit(&serde_json::json!({
-                "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                "status": "scaffold",
-                "ready": false,
-                "phase": "pre-Phase-0 skeleton",
-                "model_present": false
-            }));
+            emit(&robot_health_payload());
             Ok(())
         }
         Command::Robot {
@@ -119,24 +381,244 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             emit(&robot_backends_payload());
             Ok(())
         }
-        Command::Ocr { robot: true, .. } => {
+        Command::Ocr(args) if args.robot => {
             emit(&robot::run_start_event("ocr"));
-            Err(ocr_not_implemented())
+            run_ocr(args, true)
         }
-        Command::Ocr { .. } => Err(ocr_not_implemented()),
-        Command::Convert { .. } => Err(FocrError::NotImplemented(
-            "focr convert — the weight transformer lands in Phase 2 (see plan §5)".into(),
-        )),
-        Command::Doctor => Err(FocrError::NotImplemented(
-            "focr doctor — lands in Phase 5 (see plan §7)".into(),
-        )),
+        Command::Ocr(args) => run_ocr(args, false),
+        Command::Convert(args) => run_convert(&args),
+        Command::Runs(args) => run_runs(&args),
+        Command::Sync(args) => run_sync(&args),
+        Command::Doctor(args) => run_doctor(&args),
     }
 }
 
-fn ocr_not_implemented() -> FocrError {
-    FocrError::NotImplemented(
-        "focr ocr — the model forward lands in Phase 1 (see COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md §10)".into(),
-    )
+fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
+    let request = args.to_request()?;
+    if let Some(err) = forced_test_error()? {
+        return Err(err);
+    }
+
+    let engine = OcrEngine::new()?;
+    let markdown = match request.model.as_deref() {
+        Some(model) => engine.recognize_with_model(model, &request.image)?,
+        None => engine.recognize(&request.image)?,
+    };
+    if robot_mode {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "event": "run_complete",
+        }));
+    } else if args.json {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "markdown": markdown,
+        }));
+    } else {
+        println!("{markdown}");
+    }
+    Ok(())
+}
+
+fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
+    if args.json {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "convert",
+            "status": "scaffold",
+            "implemented": false,
+            "landing_phase": "Phase 2",
+            "plan_section": "§5",
+            "input": args.input,
+            "output": args.output,
+            "quant": args.quant.as_str(),
+            "arch": args.arch.as_str(),
+        }));
+    }
+    Err(FocrError::NotImplemented(
+        "focr convert — the weight transformer lands in Phase 2 (see plan §5)".into(),
+    ))
+}
+
+fn run_runs(args: &RunsArgs) -> FocrResult<()> {
+    let _limit = non_negative_u32("limit", args.limit)?;
+    if args.json || args.format != OutputFormat::Plain {
+        let format = if args.json {
+            "json".to_owned()
+        } else {
+            args.format.to_string()
+        };
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "runs",
+            "status": "scaffold",
+            "implemented": false,
+            "landing_phase": "Phase 0",
+            "plan_section": "§7.2",
+            "id": args.id,
+            "format": format,
+        }));
+    }
+    Err(FocrError::NotImplemented(
+        "focr runs — durable run history lands with the fsqlite RunStore in Phase 0 (see plan §7.2)".into(),
+    ))
+}
+
+fn run_sync(args: &SyncArgs) -> FocrResult<()> {
+    if args.json {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "sync",
+            "subcommand": match args.cmd {
+                SyncCmd::ExportJsonl => "export-jsonl",
+                SyncCmd::ImportJsonl => "import-jsonl",
+            },
+            "status": "scaffold",
+            "implemented": false,
+            "landing_phase": "Phase 0",
+            "plan_section": "§7.2",
+        }));
+    }
+    Err(FocrError::NotImplemented(
+        "focr sync — JSONL audit export/import lands with the fsqlite RunStore in Phase 0 (see plan §7.2)".into(),
+    ))
+}
+
+fn run_doctor(args: &DoctorArgs) -> FocrResult<()> {
+    if args.json {
+        emit(&doctor_scaffold_payload());
+    }
+    Err(FocrError::NotImplemented(
+        "focr doctor — lands in Phase 5 (see plan §7)".into(),
+    ))
+}
+
+fn forced_test_error() -> FocrResult<Option<FocrError>> {
+    #[cfg(debug_assertions)]
+    {
+        let Some(raw) = std::env::var_os(FORCE_TEST_ERROR_ENV) else {
+            return Ok(None);
+        };
+        if raw.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let value = raw.to_string_lossy();
+        let err = match value.as_ref() {
+            "input_decode" => {
+                FocrError::InputDecode(format!("forced by {FORCE_TEST_ERROR_ENV}=input_decode"))
+            }
+            "timeout" => FocrError::Timeout(format!("forced by {FORCE_TEST_ERROR_ENV}=timeout")),
+            "cancelled" => FocrError::Cancelled,
+            other => {
+                return Err(FocrError::Usage(format!(
+                    "invalid {FORCE_TEST_ERROR_ENV}={other:?}; expected input_decode, timeout, \
+                     or cancelled"
+                )));
+            }
+        };
+        Ok(Some(err))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(None)
+    }
+}
+
+fn positive_u32(name: &str, value: i64) -> FocrResult<u32> {
+    if value <= 0 {
+        return Err(FocrError::Usage(format!("{name} must be > 0, got {value}")));
+    }
+    u32::try_from(value)
+        .map_err(|_| FocrError::Usage(format!("{name} is too large for u32: {value}")))
+}
+
+fn non_negative_u32(name: &str, value: i64) -> FocrResult<u32> {
+    if value < 0 {
+        return Err(FocrError::Usage(format!(
+            "{name} must be >= 0, got {value}"
+        )));
+    }
+    u32::try_from(value)
+        .map_err(|_| FocrError::Usage(format!("{name} is too large for u32: {value}")))
+}
+
+fn non_negative_finite_f32(name: &str, value: f32) -> FocrResult<f32> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(FocrError::Usage(format!(
+            "{name} must be finite and >= 0, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn doctor_scaffold_payload() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": robot::ROBOT_SCHEMA_VERSION,
+        "command": "doctor",
+        "status": "scaffold",
+        "capabilities": [
+            {
+                "name": "model_resolution",
+                "phase": "Phase 5",
+                "idempotent": true,
+                "reversible": true,
+                "implemented": false
+            },
+            {
+                "name": "format_version",
+                "phase": "Phase 5",
+                "idempotent": true,
+                "reversible": true,
+                "implemented": false
+            },
+            {
+                "name": "permissions",
+                "phase": "Phase 5",
+                "idempotent": true,
+                "reversible": true,
+                "implemented": false
+            }
+        ],
+        "checks": [
+            {
+                "name": "model_available",
+                "status": "not_run",
+                "landing_phase": "Phase 5"
+            },
+            {
+                "name": "format_supported",
+                "status": "not_run",
+                "landing_phase": "Phase 5"
+            },
+            {
+                "name": "paths_writable",
+                "status": "not_run",
+                "landing_phase": "Phase 5"
+            }
+        ]
+    })
+}
+
+fn robot_health_payload() -> serde_json::Value {
+    let model_spec = OcrEngine::model_path();
+    let model_present = native_engine::native_model_available(&model_spec);
+    let model_search_dirs: Vec<_> = native_engine::model_resolution_search_dirs()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    // Phase 0: minimal health. The expanded report (arch features, thread
+    // budget) lands with the rest of plan §7.3.
+    serde_json::json!({
+        "schema_version": robot::ROBOT_SCHEMA_VERSION,
+        "status": "scaffold",
+        "ready": false,
+        "phase": "pre-Phase-0 skeleton",
+        "model_present": model_present,
+        "model_spec": model_spec.display().to_string(),
+        "model_search_dirs": model_search_dirs,
+        "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
+    })
 }
 
 fn emit(value: &serde_json::Value) {
@@ -180,7 +662,10 @@ enum ErrorMode {
 impl ErrorMode {
     fn from_cli(cli: &Cli) -> Self {
         match &cli.command {
-            Command::Ocr { robot: true, .. } => Self::Robot,
+            Command::Ocr(args) if args.robot => Self::Robot,
+            Command::Robot {
+                cmd: RobotCmd::Run(_),
+            } => Self::Robot,
             _ => Self::Human,
         }
     }
@@ -230,15 +715,129 @@ mod tests {
     }
 
     #[test]
+    fn long_version_carries_project_and_model_license_notices() {
+        let report = long_version_report();
+        assert!(report.contains("focr "));
+        assert!(report.contains(FOCR_PROJECT_LICENSE_NOTICE));
+        assert!(report.contains(&format!("model_license: {FOCR_MODEL_LICENSE_NOTICE}")));
+    }
+
+    #[test]
+    fn exact_long_version_detection_only_matches_top_level_long_flag() {
+        assert!(is_exact_long_version_request(
+            ["focr", "--version"].into_iter().map(OsString::from)
+        ));
+        assert!(!is_exact_long_version_request(
+            ["focr", "-V"].into_iter().map(OsString::from)
+        ));
+        assert!(!is_exact_long_version_request(
+            ["focr", "--version", "robot"]
+                .into_iter()
+                .map(OsString::from)
+        ));
+    }
+
+    #[test]
+    fn robot_health_carries_single_source_model_license_notice() {
+        let payload = robot_health_payload();
+        assert_eq!(
+            payload["model_license_notice"],
+            serde_json::json!(FOCR_MODEL_LICENSE_NOTICE)
+        );
+    }
+
+    #[test]
     fn ocr_robot_flag_selects_robot_error_mode() {
         let cli = Cli {
-            command: Command::Ocr {
-                image: std::path::PathBuf::from("scan.png"),
+            command: Command::Ocr(OcrArgs {
+                request: OcrRequestArgs {
+                    image: PathBuf::from("scan.png"),
+                    model: None,
+                    base_size: DEFAULT_BASE_SIZE,
+                    image_size: DEFAULT_IMAGE_SIZE,
+                    crop_mode: CropMode::Gundam,
+                    max_length: DEFAULT_MAX_LENGTH,
+                    temperature: DEFAULT_TEMPERATURE,
+                    no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
+                    ngram_window: DEFAULT_NGRAM_WINDOW,
+                },
                 json: false,
                 robot: true,
+            }),
+        };
+        assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
+    }
+
+    #[test]
+    fn robot_run_selects_robot_error_mode() {
+        let cli = Cli {
+            command: Command::Robot {
+                cmd: RobotCmd::Run(RobotRunArgs {
+                    request: OcrRequestArgs {
+                        image: PathBuf::from("scan.png"),
+                        model: None,
+                        base_size: DEFAULT_BASE_SIZE,
+                        image_size: DEFAULT_IMAGE_SIZE,
+                        crop_mode: CropMode::Gundam,
+                        max_length: DEFAULT_MAX_LENGTH,
+                        temperature: DEFAULT_TEMPERATURE,
+                        no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
+                        ngram_window: DEFAULT_NGRAM_WINDOW,
+                    },
+                }),
             },
         };
         assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
+    }
+
+    #[test]
+    fn ocr_args_validate_rejects_negative_size() {
+        let args = OcrArgs {
+            request: OcrRequestArgs {
+                image: PathBuf::from("scan.png"),
+                model: None,
+                base_size: -1,
+                image_size: DEFAULT_IMAGE_SIZE,
+                crop_mode: CropMode::Gundam,
+                max_length: DEFAULT_MAX_LENGTH,
+                temperature: DEFAULT_TEMPERATURE,
+                no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
+                ngram_window: DEFAULT_NGRAM_WINDOW,
+            },
+            json: false,
+            robot: false,
+        };
+        let err = args.to_request().expect_err("negative base-size is usage");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn convert_arch_enum_parses() {
+        let parsed = Cli::try_parse_from([
+            "focr",
+            "convert",
+            "in.safetensors",
+            "-o",
+            "out.focrq",
+            "--arch",
+            "x86-vnni",
+        ]);
+        let parse_error = parsed
+            .as_ref()
+            .err()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+        assert!(parsed.is_ok(), "convert --arch parses: {parse_error}");
+        let Ok(cli) = parsed else {
+            return;
+        };
+        let is_convert = matches!(cli.command, Command::Convert(_));
+        assert!(is_convert, "expected convert command");
+        if let Command::Convert(args) = cli.command {
+            assert_eq!(args.quant, QuantTarget::Int8);
+            assert_eq!(args.arch, ArchTarget::X86Vnni);
+        };
     }
 
     #[test]
