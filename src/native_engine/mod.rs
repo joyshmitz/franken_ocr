@@ -109,6 +109,13 @@ const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
 /// R-SWA ring window, before any generated-tail eviction).
 const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
 
+/// Use the int8 (per-output-channel symmetric S8S8, NEON SDOT / x86 VNNI) weight
+/// cache + prefill + decode instead of the f32 cache. Present ⇒ int8. ~4x less
+/// weight memory traffic at decode and ~2.8 GB cache (vs ~10.5 GB f32); accuracy
+/// verified against the f32 path + baidu CER. Off by default until the int8 CER
+/// sweep is locked in; flip the default once proven across the 20-page gauntlet.
+const DECODE_INT8_ENV: &str = "FOCR_DECODE_INT8";
+
 /// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
 fn timing_log(msg: &str) {
     if std::env::var_os("FOCR_TIMING").is_some() {
@@ -720,6 +727,8 @@ impl OcrModel {
     fn generate(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
         if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
             self.generate_stateless(inputs_embeds, prompt_ids)
+        } else if std::env::var_os(DECODE_INT8_ENV).is_some() {
+            self.generate_cached_i8(inputs_embeds, prompt_ids)
         } else {
             self.generate_cached(inputs_embeds, prompt_ids)
         }
@@ -802,6 +811,78 @@ impl OcrModel {
         }
         timing_log(&format!(
             "decode {:.2}s ({} tokens, {:.3}s/tok)",
+            td.elapsed().as_secs_f64(),
+            emitted.len(),
+            td.elapsed().as_secs_f64() / (emitted.len().max(1) as f64)
+        ));
+        Ok(emitted)
+    }
+
+    /// Int8 twin of [`Self::generate_cached`] (`FOCR_DECODE_INT8`): identical O(n)
+    /// R-SWA cached greedy decode, but prefill + decode run off the
+    /// [`decoder::DecoderWeightCacheI8`] (per-output-channel symmetric S8S8, NEON
+    /// SDOT / x86 VNNI). ~4x less weight traffic at decode and ~2.8 GB cache; the
+    /// emitted tokens are verified to match the f32 path / baidu (CER) — int8 is a
+    /// throughput lever, not an accuracy change within proven tolerance.
+    ///
+    /// # Errors
+    /// As [`Self::generate_cached`].
+    fn generate_cached_i8(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
+        let params = &self.decode_params;
+        let hidden_dim = inputs_embeds.cols;
+        let prefill_len = inputs_embeds.rows;
+
+        let table = self.weights.mat("model.embed_tokens.weight")?;
+        let vocab = table.rows;
+        if table.cols != hidden_dim {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate_cached_i8: embed table hidden {} != inputs_embeds hidden {}",
+                table.cols,
+                hidden_dim
+            )));
+        }
+
+        // Quantize the decoder weights to int8 ONCE; prefill + every decode step
+        // then run off the owned int8 cache (~2.8 GB, 4x less traffic than f32).
+        let tb = std::time::Instant::now();
+        let wc = decoder::DecoderWeightCacheI8::build(&self.weights)?;
+        timing_log(&format!("weight_cache_build_i8 {:.2}s", tb.elapsed().as_secs_f64()));
+
+        let tp = std::time::Instant::now();
+        let (hidden, mut caches) = decoder::prefill_with_cache_i8(&wc, &inputs_embeds)?;
+        let mut last_hidden = Self::last_hidden_row(&hidden)?;
+        timing_log(&format!(
+            "prefill_i8 {:.2}s ({} tokens)",
+            tp.elapsed().as_secs_f64(),
+            prefill_len
+        ));
+        let td = std::time::Instant::now();
+
+        let mut generated: Vec<u32> = prompt_ids.to_vec();
+        let mut emitted: Vec<u32> = Vec::new();
+
+        while emitted.len() < params.max_length {
+            let logits = decoder::lm_head_cached_i8(&wc, &last_hidden)?;
+            let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+            let next = step.token_id as usize;
+            if next >= vocab {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::generate_cached_i8: decoded token id {next} outside embed vocab {vocab}"
+                )));
+            }
+            let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
+            let token_embed = Mat::from_vec(1, hidden_dim, row);
+            let position = prefill_len + (emitted.len() - 1);
+            let h = decoder::decode_step_with_cache_i8(&wc, &mut caches, &token_embed, position)?;
+            last_hidden = Self::last_hidden_row(&h)?;
+        }
+        timing_log(&format!(
+            "decode_i8 {:.2}s ({} tokens, {:.3}s/tok)",
             td.elapsed().as_secs_f64(),
             emitted.len(),
             td.elapsed().as_secs_f64() / (emitted.len().max(1) as f64)
