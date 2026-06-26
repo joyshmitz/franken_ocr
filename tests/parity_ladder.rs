@@ -193,7 +193,7 @@ fn l1_per_op_cosine() {
                     // on the real loaded oracle tensor (self-compare ⇒ cosine 1.0)
                     // so the read+normalize+compare path is proven once fixtures land.
                     let c = cosine(&oracle.data, &oracle.data);
-                    log.parity(
+                    log.diagnostic_parity(
                         "L1",
                         "cosine",
                         c,
@@ -201,7 +201,7 @@ fn l1_per_op_cosine() {
                         stage,
                         entry.sha256.as_deref().unwrap_or(""),
                         json!({"note": "DIAGNOSTIC self-compare (oracle vs oracle): proves the read+comparator path runs on real fixtures; subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                        false,
+                        "oracle_self_compare",
                     );
                 }
                 Err(e) => log.error("ActivationLoad", 1, &format!("{stage}: {e}")),
@@ -274,7 +274,7 @@ fn l2_per_layer_cosine_and_ledger() {
             if let Ok(oracle) = loader.load_activation(&doc_stem, stage, entry) {
                 let c = cosine(&oracle.data, &oracle.data);
                 let mad = max_abs_diff(&oracle.data, &oracle.data);
-                log.parity(
+                log.diagnostic_parity(
                     "L2",
                     "max_abs_diff",
                     mad,
@@ -282,7 +282,7 @@ fn l2_per_layer_cosine_and_ledger() {
                     stage,
                     "",
                     json!({"cosine": c, "ledger": "per-layer max-abs (cross-layer drift)", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                    false,
+                    "oracle_self_compare",
                 );
             }
         }
@@ -367,7 +367,7 @@ fn l3_logits_measured_budget_and_argmax() {
             Some(entry) => {
                 if let Ok(logits) = loader.load_activation(&doc_stem, "lm_head_logits", entry) {
                     let report = ulp_compare(&logits.data, &logits.data, OpFamily::MatmulF32);
-                    log.parity(
+                    log.diagnostic_parity(
                         "L3",
                         "max_abs_diff",
                         report.max_abs_diff,
@@ -375,7 +375,7 @@ fn l3_logits_measured_budget_and_argmax() {
                         "lm_head_logits",
                         entry.sha256.as_deref().unwrap_or(""),
                         json!({"budget_source": "oracle_floor §2", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                        false,
+                        "oracle_self_compare",
                     );
                 }
             }
@@ -502,7 +502,7 @@ fn l5_end_to_end_cer_budget() {
         let bar = golden.decoded_text.clone().unwrap_or_default();
         // Self-compare the bar to itself (CER 0) to prove the read + metric path.
         let cer = char_error_rate(&bar, &bar);
-        log.parity(
+        log.diagnostic_parity(
             "L5",
             "cer",
             cer,
@@ -510,7 +510,7 @@ fn l5_end_to_end_cer_budget() {
             &golden.doc,
             golden.decoded_text_sha256.as_deref().unwrap_or(""),
             json!({"note": "DIAGNOSTIC self-compare (bar vs bar); subject forward pending ⇒ NOT a parity pass (audit rank 1)"}),
-            false,
+            "golden_text_self_compare",
         );
     }
     // No subject (engine) decode exists yet — the loop ran the read+CER path on the

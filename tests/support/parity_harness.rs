@@ -559,15 +559,7 @@ impl FixtureLoader {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let shape = entry
-                    .get("shape")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_u64().map(|n| n as usize))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let shape = parse_activation_shape(stage, entry.get("shape"))?;
                 let dtype = entry
                     .get("dtype")
                     .and_then(Value::as_str)
@@ -667,6 +659,23 @@ impl Default for FixtureLoader {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn parse_activation_shape(stage: &str, value: Option<&Value>) -> Result<Vec<usize>, String> {
+    let dims = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("activation {stage} missing array `shape`"))?;
+    let mut shape = Vec::with_capacity(dims.len());
+    for (index, dim) in dims.iter().enumerate() {
+        let raw = dim.as_u64().ok_or_else(|| {
+            format!("activation {stage} shape dim {index} must be an unsigned integer, got {dim}")
+        })?;
+        let dim = usize::try_from(raw).map_err(|_| {
+            format!("activation {stage} shape dim {index}={raw} exceeds usize::MAX")
+        })?;
+        shape.push(dim);
+    }
+    Ok(shape)
 }
 
 fn activation_from_manifest_bytes(
@@ -1087,6 +1096,35 @@ impl Logger {
         );
     }
 
+    /// Diagnostic `parity` event for oracle-only/self-compare scaffolding.
+    ///
+    /// This keeps fixture-read/comparator smoke coverage visible while making it
+    /// structurally impossible to record the event as a real subject-vs-oracle
+    /// parity pass before the subject engine seam is wired.
+    #[allow(clippy::too_many_arguments)]
+    pub fn diagnostic_parity(
+        &mut self,
+        gate: &str,
+        metric: &str,
+        value: f64,
+        tolerance: f64,
+        oracle_fixture: &str,
+        oracle_sha256: &str,
+        nondeterminism_envelope: Value,
+        comparison: &str,
+    ) {
+        self.parity(
+            gate,
+            metric,
+            value,
+            tolerance,
+            oracle_fixture,
+            oracle_sha256,
+            diagnostic_parity_envelope(nondeterminism_envelope, comparison),
+            false,
+        );
+    }
+
     /// `assert` event — a structural (non-parity) assertion with its description.
     pub fn assertion(&mut self, assertion: &str, pass: bool) {
         self.emit(
@@ -1145,6 +1183,18 @@ fn map(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
         .iter()
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect()
+}
+
+/// Mark a parity envelope as diagnostic-only, never release proof.
+pub fn diagnostic_parity_envelope(envelope: Value, comparison: &str) -> Value {
+    let mut obj = match envelope {
+        Value::Object(map) => map,
+        other => map(&[("details", other)]),
+    };
+    obj.insert("diagnostic_only".into(), json!(true));
+    obj.insert("comparison".into(), json!(comparison));
+    obj.insert("counts_as_parity_proof".into(), json!(false));
+    Value::Object(obj)
 }
 
 fn now_micros() -> u64 {
@@ -1448,6 +1498,33 @@ mod tests {
     }
 
     #[test]
+    fn golden_from_value_rejects_malformed_activation_shape() {
+        let non_integer_dim = json!({
+            "doc": "doc01.png",
+            "activations": {
+                "sam_output": { "file": "sam_output.npy", "shape": [1, "bad", 1280] }
+            }
+        });
+        assert!(
+            FixtureLoader::golden_from_value(non_integer_dim)
+                .unwrap_err()
+                .contains("shape dim 1 must be an unsigned integer")
+        );
+
+        let missing_shape = json!({
+            "doc": "doc01.png",
+            "activations": {
+                "sam_output": { "file": "sam_output.npy" }
+            }
+        });
+        assert!(
+            FixtureLoader::golden_from_value(missing_shape)
+                .unwrap_err()
+                .contains("missing array `shape`")
+        );
+    }
+
+    #[test]
     fn check_provenance_rejects_wrong_commit() {
         let raw = json!({
             "doc": "x",
@@ -1592,6 +1669,38 @@ mod tests {
             "event": "parity", "result": "pass", "metric": "cosine"
         });
         assert!(validate_event(&schema, &bad).unwrap_err().contains("gate"));
+    }
+
+    #[test]
+    fn diagnostic_parity_events_are_non_proof_failures() {
+        let schema = load_log_schema().expect("load frozen log schema");
+        let envelope = diagnostic_parity_envelope(
+            json!({"note": "oracle fixture self-compare smoke"}),
+            "oracle_self_compare",
+        );
+        let parity = json!({
+            "schema_version": 1, "ts": 0, "test": "L1", "case": "doc01", "run_seq": 0,
+            "event": "parity", "result": "fail",
+            "gate": "L1", "metric": "cosine", "value": 1.0, "tolerance": 0.9999,
+            "oracle_fixture": "sam_output.npy", "oracle_sha256": "aa",
+            "nondeterminism_envelope": envelope, "pass": false
+        });
+        validate_event(&schema, &parity).expect("diagnostic parity event conforms");
+
+        assert_eq!(parity["pass"].as_bool(), Some(false));
+        assert_eq!(parity["result"].as_str(), Some("fail"));
+        assert_eq!(
+            parity["nondeterminism_envelope"]["diagnostic_only"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parity["nondeterminism_envelope"]["comparison"].as_str(),
+            Some("oracle_self_compare")
+        );
+        assert_eq!(
+            parity["nondeterminism_envelope"]["counts_as_parity_proof"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
