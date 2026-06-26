@@ -35,11 +35,9 @@
 //! the crate root is `#![forbid(unsafe_code)]`, so a test cannot call the
 //! `unsafe` `std::env::set_var`), the stable exit-code contract in
 //! `src/error.rs`, and the `focr robot schema` / `focr ocr` CLI via
-//! `std::process::Command` on the built binary. Surfaces still in flux (the CLI
-//! `--model` flag, the real forward) are exercised as **tripwires**: a result
-//! that does not yet match the *documented target* is logged as `XFAIL` with the
-//! exact observed-vs-expected, never a silent pass — the test tightens to a hard
-//! assertion the moment the surface lands.
+//! `std::process::Command` on the built binary. The path-explicit CLI model
+//! resolver is a hard assertion; the real forward remains a phase-gated tripwire
+//! that logs XFAIL when it reaches a documented NotImplemented stage.
 //!
 //! Every test emits structured `e2e` lines on **stderr** (TL1/TL2: data-only on
 //! stdout, diagnostics on stderr) describing what it exercised, the inputs, the
@@ -50,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
 use franken_ocr::{DEFAULT_MODEL_PATH, FocrError, MODEL_PATH_ENV, OcrEngine};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -83,10 +82,10 @@ fn log_success(test: &str, case: &str, why: &str) {
 }
 
 /// An `XFAIL` line — a documented divergence from the *target* behavior that is
-/// expected in the current phase (e.g. the CLI `--model` flag has not landed, or
-/// the real forward is still `NotImplemented`). Per the conformance discipline
-/// we **XFAIL, never SKIP**: the line records exactly what diverged so the test
-/// tightens to a hard assertion when the surface lands. NOT a failure.
+/// expected in the current phase (currently the real forward still returning
+/// `NotImplemented`). Per the conformance discipline we **XFAIL, never SKIP**:
+/// the line records exactly what diverged so the test tightens to a hard
+/// assertion when the surface lands. NOT a failure.
 fn log_xfail(test: &str, case: &str, observed: &str, expected_target: &str) {
     eprintln!(
         "E2E XFAIL test={test} case={case} :: observed[{observed}] != target[{expected_target}] \
@@ -231,6 +230,31 @@ fn write_tiny_png() -> PathBuf {
     path
 }
 
+fn future_focrq_preamble() -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(FOCRQ_MAGIC);
+    blob.extend_from_slice(&(FOCRQ_FORMAT_VERSION + 1).to_le_bytes());
+    blob.push(0);
+    blob.extend_from_slice(&[0u8; 32]);
+    blob.extend_from_slice(&0u64.to_le_bytes());
+    blob
+}
+
+/// Write a deliberately future-version `.focrq` preamble. The loader rejects the
+/// version before parsing a tensor directory, so this tiny file is sufficient to
+/// exercise the public FormatMismatch contract through the CLI.
+fn write_future_focrq() -> PathBuf {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("focr_e2e_future_{pid}_{nanos}.focrq"));
+    std::fs::write(&path, future_focrq_preamble()).expect("write future .focrq fixture");
+    path
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // CLI driver: locate and run the built `focr` binary.
 //
@@ -238,8 +262,8 @@ fn write_tiny_png() -> PathBuf {
 // bin. We discover the binary via `CARGO_BIN_EXE_focr` (cargo sets it for
 // integration tests that share the package's bin targets); if it is absent we
 // fall back to scanning target/{debug,release}. When neither resolves the binary
-// (no build yet), the CLI-driven cases XFAIL-with-explanation rather than fail —
-// the library-level guards still run unconditionally and are load-bearing.
+// (no build yet), the CLI-driven cases report a visible SUCCESS deferral; the
+// library-level guards still run unconditionally and are load-bearing.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Locate the built `focr` binary, or `None` if it has not been built.
@@ -394,12 +418,9 @@ fn native_path_nonexistent_model_is_clean_model_not_found() {
 /// The same exit-code contract proven through the **real CLI process**
 /// (LOGGING_AND_E2E.md §4.5): `focr ocr <img> --model /nonexistent` must exit
 /// **3** (ModelNotFound) — the §7.4 exit-code mapping a downstream agent
-/// branches on. The `--model` flag is the *documented target* of the CLI surface
-/// (recorded in `api_assumed`); it is mid-flux, so this is a **tripwire**:
-///   * exit 3 ⇒ hard PASS (the target landed);
-///   * clap usage error / `NotImplemented` exit ⇒ XFAIL with observed-vs-target
-///     (the flag/wiring has not landed) — still SUCCESS, tightens later.
-/// Either way the test never silently passes on the wrong code.
+/// branches on. This is the process-level counterpart to the library guard above:
+/// a clap usage error, NotImplemented scaffold, fabricated success, or signal is a
+/// real regression because the path-explicit diagnostic lane is now wired.
 #[test]
 fn cli_ocr_nonexistent_model_exits_model_not_found() {
     let test = "cli_ocr_nonexistent_model_exits_model_not_found";
@@ -443,60 +464,116 @@ fn cli_ocr_nonexistent_model_exits_model_not_found() {
         ),
     );
 
-    match code {
-        Some(3) => {
-            log_line(
-                test,
-                case,
-                "result",
-                "pass",
-                "exit=3 error_kind=ModelNotFound note=\"CLI --model wired to clean ModelNotFound\"",
-            );
-        }
-        // clap rejects an unknown `--model` flag with exit 2 (Usage); the
-        // skeleton `ocr` returns NotImplemented (exit 1). Both mean the
-        // documented target (--model → ModelNotFound exit 3) has not landed yet.
-        Some(2) | Some(1) => {
-            log_xfail(
-                test,
-                case,
-                &format!("exit={}", code.unwrap()),
-                "exit=3 (ModelNotFound via `focr ocr --model /nonexistent`)",
-            );
-            log_success(
-                test,
-                case,
-                "CLI `--model` flag + ModelNotFound wiring is mid-flux (Phase 0/1); the \
-                 library-level recognize_with_model(/nonexistent) guard proves the contract \
-                 today and this CLI tripwire tightens to a hard exit-3 assertion when the flag \
-                 lands",
-            );
-        }
-        other => {
-            // exit 0 (fabricated output) or any other unexpected code is a real
-            // failure — never a skip.
-            log_line(
-                test,
-                case,
-                "result",
-                "fail",
-                &format!(
-                    "diag={{\"error_kind\":\"unexpected_exit\",\"focr_exit_code\":{},\
-                     \"message\":\"focr ocr --model /nonexistent neither exited 3 (target) nor \
-                     1/2 (documented skeleton)\"}} stdout={:?} stderr={:?}",
-                    other
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    out.stdout,
-                    out.stderr
-                ),
-            );
-            panic!(
-                "focr ocr {img} --model {model} exited {other:?}; expected 3 (target) or \
-                 1/2 (documented skeleton). stdout={:?} stderr={:?}",
-                out.stdout, out.stderr
-            );
-        }
+    if code == Some(3) {
+        log_line(
+            test,
+            case,
+            "result",
+            "pass",
+            "exit=3 error_kind=ModelNotFound note=\"CLI --model wired to clean ModelNotFound\"",
+        );
+    } else {
+        log_line(
+            test,
+            case,
+            "result",
+            "fail",
+            &format!(
+                "diag={{\"error_kind\":\"unexpected_exit\",\"focr_exit_code\":{},\
+                 \"message\":\"focr ocr --model /nonexistent must exit 3 via ModelNotFound\"}} \
+                 stdout={:?} stderr={:?}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                out.stdout,
+                out.stderr
+            ),
+        );
+        panic!(
+            "focr ocr {img} --model {model} exited {code:?}; expected 3 \
+             (ModelNotFound). stdout={:?} stderr={:?}",
+            out.stdout, out.stderr
+        );
+    }
+}
+
+/// Future `.focrq` versions must fail as FormatMismatch (exit 7) through the real
+/// CLI process, not collapse into NotImplemented or a generic error.
+#[test]
+fn cli_ocr_future_focrq_exits_format_mismatch() {
+    let test = "cli_ocr_future_focrq_exits_format_mismatch";
+    let case = "focr_ocr_--model_future_focrq";
+
+    let Some(bin) = focr_bin() else {
+        log_success(
+            test,
+            case,
+            "focr binary not built in this `cargo test` invocation; the library-level \
+             public_engine_preserves_focrq_format_mismatch_robot_code guard covers this \
+             contract until the process binary is available",
+        );
+        return;
+    };
+
+    let img = "/some/document.png";
+    let model = write_future_focrq();
+    log_line(
+        test,
+        case,
+        "setup",
+        "pass",
+        &format!(
+            "bin={} args=[ocr {img} --model {}] expect_exit=7",
+            bin.display(),
+            model.display()
+        ),
+    );
+
+    let model_arg = model.to_string_lossy().into_owned();
+    let out = run_focr(&bin, &["ocr", img, "--model", &model_arg]);
+    let code = out.code;
+    log_line(
+        test,
+        case,
+        "stage",
+        "pass",
+        &format!(
+            "exit={code:?} stdout_len={} stderr_first={:?}",
+            out.stdout.len(),
+            out.stderr.lines().next().unwrap_or("")
+        ),
+    );
+
+    if code == Some(7) {
+        log_line(
+            test,
+            case,
+            "result",
+            "pass",
+            "exit=7 error_kind=FormatMismatch note=\"CLI --model preserves future .focrq format mismatch\"",
+        );
+    } else {
+        log_line(
+            test,
+            case,
+            "result",
+            "fail",
+            &format!(
+                "diag={{\"error_kind\":\"unexpected_exit\",\"focr_exit_code\":{},\
+                 \"message\":\"focr ocr --model future .focrq must exit 7 via FormatMismatch\"}} \
+                 stdout={:?} stderr={:?}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                out.stdout,
+                out.stderr
+            ),
+        );
+        panic!(
+            "focr ocr {img} --model {} exited {code:?}; expected 7 \
+             (FormatMismatch). stdout={:?} stderr={:?}",
+            model.display(),
+            out.stdout,
+            out.stderr
+        );
     }
 }
 

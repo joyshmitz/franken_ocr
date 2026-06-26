@@ -1,5 +1,10 @@
 {
+  "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "model_present": false,
+  "model_search_dirs": [
+    "[model-search-dir]"
+  ],
+  "model_spec": "models/unlimited-ocr.focrq",
   "phase": "pre-Phase-0 skeleton",
   "ready": false,
   "schema_version": 1,

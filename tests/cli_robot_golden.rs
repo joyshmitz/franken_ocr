@@ -28,17 +28,19 @@
 //!   [R8] `ocr --robot` errors emit run_start then run_error.code from
 //!        FocrError::exit_code.                                                -> ocr_robot_error_stream_matches_exit_code
 //! CLI surface (`src/cli.rs`):
-//!   [C1] `--help` (root) renders the frozen help golden.                       -> cli_root_help_golden
+//!   [C1] `--help` (root/tree) renders the frozen help golden and excludes pdf. -> cli_root_help_golden / full_help_tree_has_no_pdf
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
-//!   [C3] `ocr`    -> NotImplemented, exit 1, message points at the plan phase. -> exit_code_conformance / ocr_not_implemented_golden
+//!   [C3] `ocr`    -> env/default model resolver; missing default exits 3.      -> exit_code_conformance / ocr_default_model_not_found_golden
 //!   [C4] `convert`-> NotImplemented, exit 1.                                   -> exit_code_conformance / convert_not_implemented_golden
 //!   [C5] `doctor` -> NotImplemented, exit 1.                                   -> exit_code_conformance / doctor_not_implemented_golden
 //! Stable exit codes (`src/error.rs`, plan §7.4):
 //!   [E2] usage error  -> 2   (bad flag / missing subcommand / unknown subcmd). -> exit_code_conformance
-//!   [E3] model-not-found -> 3 (documented; asserted at the FocrError boundary
-//!        in `src/lib.rs` — the CLI path that reaches it lands with `ocr` in
-//!        Phase 1, so it is XFAIL-documented here, not silently skipped).       -> exit_code_conformance (xfail row)
-//!   [E1] not-implemented -> 1 (ocr/convert/doctor today).                      -> exit_code_conformance
+//!   [E3] model-not-found -> 3 (`ocr` default + path-explicit missing model).   -> exit_code_conformance / ocr_robot_missing_model_stream_matches_exit_code
+//!   [E4] input-decode -> 4 (debug/test forced producer through `ocr`).         -> exit_code_conformance / ocr_robot_forced_error_stream_matches_exit_code
+//!   [E5] timeout -> 5      (debug/test forced producer through `ocr`).         -> exit_code_conformance / ocr_robot_forced_error_stream_matches_exit_code
+//!   [E6] cancelled -> 6    (debug/test forced producer through `ocr`).         -> exit_code_conformance / ocr_robot_forced_error_stream_matches_exit_code
+//!   [E7] format-mismatch -> 7 (future `.focrq` through path-explicit OCR).     -> ocr_robot_future_focrq_stream_matches_exit_code
+//!   [E1] not-implemented -> 1 (convert/doctor today).                          -> exit_code_conformance
 //!   [E0] success -> 0  (robot schema/health/backends, --help, --version).      -> exit_code_conformance
 //! Golden-suite discipline guards (`docs/conformance/GOLDEN.md` §4/§5):
 //!   [G1] `UPDATE_GOLDENS` is unset when the suite runs in compare mode (CI
@@ -55,6 +57,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use franken_ocr::FOCR_MODEL_LICENSE_NOTICE;
+use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
+
+const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
+const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Structured NDJSON test logging (docs/conformance/GOLDEN.md §6; the shape mirrors
@@ -89,23 +97,112 @@ fn focr_bin() -> &'static str {
     env!("CARGO_BIN_EXE_focr")
 }
 
+fn fail_test(message: String) -> ! {
+    std::panic::panic_any(message)
+}
+
+fn run_focr_command(mut command: Command, _args: &[&str]) -> Output {
+    command.output().expect("failed to spawn focr binary")
+}
+
 /// Run `focr <args...>` with a hermetic environment (no `FOCR_*` / golden-update
 /// leakage from the dev shell into the captured output) and return the raw output.
 fn run_focr(args: &[&str]) -> Output {
-    Command::new(focr_bin())
+    let mut command = Command::new(focr_bin());
+    command
         .args(args)
-        // Hermetic: a stray FOCR_MODEL_PATH or FOCR_FORCE_ARCH must not perturb a
-        // golden. The exit-code rows that need an env set it explicitly.
         .env_remove("FOCR_MODEL_PATH")
+        .env_remove(MODEL_DIR_ENV)
         .env_remove("FOCR_FORCE_ARCH")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {} {:?}: {e}", focr_bin(), args))
+        .env_remove(FORCE_TEST_ERROR_ENV);
+    run_focr_command(command, args)
+}
+
+fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
+    let mut command = Command::new(focr_bin());
+    command
+        .args(args)
+        .env("FOCR_MODEL_PATH", model_path.as_os_str())
+        .env_remove(MODEL_DIR_ENV)
+        .env_remove("FOCR_FORCE_ARCH")
+        .env_remove(FORCE_TEST_ERROR_ENV);
+    run_focr_command(command, args)
+}
+
+fn run_focr_with_model_dir(args: &[&str], model_dir: &Path) -> Output {
+    let mut command = Command::new(focr_bin());
+    command
+        .args(args)
+        .env_remove("FOCR_MODEL_PATH")
+        .env(MODEL_DIR_ENV, model_dir.as_os_str())
+        .env_remove("FOCR_FORCE_ARCH")
+        .env_remove(FORCE_TEST_ERROR_ENV);
+    run_focr_command(command, args)
+}
+
+fn run_focr_with_forced_error(args: &[&str], forced_error: &str) -> Output {
+    let mut command = Command::new(focr_bin());
+    command
+        .args(args)
+        .env_remove("FOCR_MODEL_PATH")
+        .env_remove(MODEL_DIR_ENV)
+        .env_remove("FOCR_FORCE_ARCH")
+        .env(FORCE_TEST_ERROR_ENV, forced_error);
+    run_focr_command(command, args)
+}
+
+fn future_focrq_preamble() -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(FOCRQ_MAGIC);
+    blob.extend_from_slice(&(FOCRQ_FORMAT_VERSION + 1).to_le_bytes());
+    blob.push(0);
+    blob.extend_from_slice(&[0u8; 32]);
+    blob.extend_from_slice(&0u64.to_le_bytes());
+    blob
+}
+
+fn write_future_focrq() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "focr_golden_future_{}_{}.focrq",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::write(&path, future_focrq_preamble()).expect("write future .focrq fixture");
+    path
+}
+
+fn write_future_focrq_in_temp_model_dir(file_name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!(
+        "focr_golden_model_dir_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).expect("create model dir fixture");
+    std::fs::write(dir.join(file_name), future_focrq_preamble())
+        .expect("write future .focrq fixture in model dir");
+    dir
 }
 
 /// `stdout` of `focr <args...>` as a UTF-8 string (lossy is fine; these surfaces
 /// are ASCII/UTF-8 by contract).
 fn stdout_of(args: &[&str]) -> String {
     String::from_utf8_lossy(&run_focr(args).stdout).into_owned()
+}
+
+fn stdout_of_with_model_path(args: &[&str], model_path: &Path) -> String {
+    String::from_utf8_lossy(&run_focr_with_model_path(args, model_path).stdout).into_owned()
+}
+
+fn stdout_of_with_model_dir(args: &[&str], model_dir: &Path) -> String {
+    String::from_utf8_lossy(&run_focr_with_model_dir(args, model_dir).stdout).into_owned()
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -131,7 +228,29 @@ fn scrub(s: &str) -> String {
     out = out.replace(pkg_version(), "[version]");
     // host logical-cpu count in `robot backends` -> [cpus]
     out = scrub_json_int_field(&out, "logical_cpus");
+    // host-specific model search paths in model-not-found stderr -> stable token
+    out = scrub_model_search_dirs(&out);
     out
+}
+
+fn scrub_model_search_dirs(s: &str) -> String {
+    const START: &str = "searched directories: ";
+    const END: &str = "; set FOCR_MODEL_DIR";
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find(START) {
+        let (head, tail) = rest.split_at(start + START.len());
+        result.push_str(head);
+        if let Some(end) = tail.find(END) {
+            result.push_str("[model-search-dirs]");
+            rest = &tail[end..];
+        } else {
+            result.push_str(tail);
+            return result;
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 /// Replace the integer value of a top-level-ish JSON field `"<name>": <int>` with
@@ -229,6 +348,24 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
     );
 }
 
+fn scrub_robot_health_paths(v: &mut serde_json::Value) {
+    assert_nonempty_string(v.get("model_spec"), "robot health model_spec");
+    let Some(dirs) = v
+        .get_mut("model_search_dirs")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        fail_test("robot health model_search_dirs must be an array".to_string());
+    };
+    assert!(
+        !dirs.is_empty(),
+        "robot health model_search_dirs must list the configured search roots"
+    );
+    for (idx, dir) in dirs.iter_mut().enumerate() {
+        assert_nonempty_string(Some(dir), &format!("robot health model_search_dirs[{idx}]"));
+        *dir = serde_json::json!("[model-search-dir]");
+    }
+}
+
 fn assert_nonempty_string(value: Option<&serde_json::Value>, field: &str) {
     assert!(
         value
@@ -273,8 +410,11 @@ fn sort_value(v: &serde_json::Value) -> serde_json::Value {
 /// failure (so a malformed robot line is self-diagnosing).
 fn parse_json_line(raw: &str, ctx: &str) -> serde_json::Value {
     let trimmed = raw.trim_end_matches(['\n', '\r']);
-    serde_json::from_str(trimmed)
-        .unwrap_or_else(|e| panic!("{ctx}: emitted line is not valid JSON ({e}):\n{raw:?}"))
+    serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        fail_test(format!(
+            "{ctx}: emitted line is not valid JSON ({e}):\n{raw:?}"
+        ))
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -377,7 +517,7 @@ fn assert_golden_inner(test: &str, name: &str, actual: &str, bless_on_missing: b
                     ),
                 },
             );
-            panic!(
+            fail_test(format!(
                 "MISSING GOLDEN {}\n\
                  The frozen baseline has not been captured yet. A toolchain-equipped run must bless it:\n\
                    UPDATE_GOLDENS=1 cargo test --test cli_robot_golden\n\
@@ -385,7 +525,7 @@ fn assert_golden_inner(test: &str, name: &str, actual: &str, bless_on_missing: b
                 golden_path.display(),
                 actual_path.display(),
                 actual,
-            );
+            ));
         }
     };
 
@@ -417,7 +557,7 @@ fn assert_golden_inner(test: &str, name: &str, actual: &str, bless_on_missing: b
             ),
         },
     );
-    panic!(
+    fail_test(format!(
         "GOLDEN MISMATCH for `{name}` ({})\n\
          observed written to {}\n\
          If this change is intended: review the diff, then\n\
@@ -426,7 +566,7 @@ fn assert_golden_inner(test: &str, name: &str, actual: &str, bless_on_missing: b
         golden_path.display(),
         actual_path.display(),
         diff,
-    );
+    ));
 }
 
 /// A tiny line-oriented diff (no `similar`/`difflib` dep): emits `-`/`+`/` `
@@ -511,7 +651,7 @@ fn robot_schema_matches_frozen_contract_fixture() {
     let emitted_line = emitted_raw
         .lines()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or_else(|| panic!("robot schema emitted no output:\n{emitted_raw:?}"));
+        .unwrap_or_else(|| fail_test(format!("robot schema emitted no output:\n{emitted_raw:?}")));
     let emitted_val = parse_json_line(emitted_line, "robot schema");
     let emitted_canon = canonical_json(&emitted_val);
 
@@ -528,17 +668,13 @@ fn robot_schema_matches_frozen_contract_fixture() {
         return;
     }
 
-    let frozen_raw = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
-        panic!(
-            "cannot read frozen contract fixture {}: {e}",
-            fixture_path.display()
-        )
-    });
+    let frozen_raw =
+        std::fs::read_to_string(&fixture_path).expect("frozen contract fixture should be readable");
     // canonicalize the FIXTURE too, so whitespace/key-order in the committed file
     // is irrelevant — the comparison is on canonical bytes (byte-for-byte after
     // canonicalization, GOLDEN.md §2E).
-    let frozen_val: serde_json::Value = serde_json::from_str(&frozen_raw)
-        .unwrap_or_else(|e| panic!("frozen contract fixture is not valid JSON: {e}"));
+    let frozen_val: serde_json::Value =
+        serde_json::from_str(&frozen_raw).expect("frozen contract fixture is valid JSON");
     let frozen_canon = canonical_json(&frozen_val);
 
     let matched = emitted_canon == frozen_canon;
@@ -555,7 +691,7 @@ fn robot_schema_matches_frozen_contract_fixture() {
     if !matched {
         let actual_path = fixture_path.with_extension("json.actual");
         std::fs::write(&actual_path, format!("{emitted_canon}\n")).ok();
-        panic!(
+        fail_test(format!(
             "ROBOT SCHEMA CONTRACT BROKEN\n\
              `focr robot schema` no longer matches the frozen contract fixture {}.\n\
              observed canonical written to {}.\n\
@@ -565,7 +701,7 @@ fn robot_schema_matches_frozen_contract_fixture() {
             fixture_path.display(),
             actual_path.display(),
             unified_diff(&frozen_canon, &emitted_canon),
-        );
+        ));
     }
 }
 
@@ -601,7 +737,7 @@ fn robot_schema_advertises_version_and_all_events() {
     // every EVENT_KIND present
     let events: Vec<String> = v["events"]
         .as_array()
-        .unwrap_or_else(|| panic!("`events` must be an array; line: {line}"))
+        .expect("`events` must be an array")
         .iter()
         .map(|e| e.as_str().unwrap_or_default().to_string())
         .collect();
@@ -643,12 +779,23 @@ fn robot_health_golden() {
         .lines()
         .find(|l| !l.trim().is_empty())
         .expect("health line");
-    let v = parse_json_line(line, "robot health");
+    let mut v = parse_json_line(line, "robot health");
     assert_eq!(
         v["schema_version"].as_u64(),
         Some(EXPECTED_SCHEMA_VERSION),
         "robot health must carry schema_version; line: {line}"
     );
+    assert_eq!(
+        v["model_license_notice"].as_str(),
+        Some(FOCR_MODEL_LICENSE_NOTICE),
+        "robot health must carry the single-source Baidu MIT model notice; line: {line}"
+    );
+    assert_eq!(
+        v["model_spec"].as_str(),
+        Some("models/unlimited-ocr.focrq"),
+        "robot health must report the default model spec in hermetic goldens; line: {line}"
+    );
+    scrub_robot_health_paths(&mut v);
     // freeze the canonical JSON so a field add/drop/rename is a reviewed diff.
     let canon = canonical_json(&v);
     tlog!(test,
@@ -660,6 +807,99 @@ fn robot_health_golden() {
         "detail": "freezing canonical robot-health payload",
     );
     assert_golden(test, "robot_health", &format!("{canon}\n"));
+}
+
+#[test]
+fn robot_health_reports_model_present_for_sniffable_model_path() {
+    let test = "robot_health_reports_model_present_for_sniffable_model_path";
+    let model = write_future_focrq();
+    let raw = stdout_of_with_model_path(&["robot", "health"], &model);
+    let line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("health line");
+    let v = parse_json_line(line, "robot health with model");
+    tlog!(test,
+        "case": "robot_health_model_present",
+        "event": "stage",
+        "stage": "robot_health",
+        "inputs": {"argv": ["robot", "health"], "model": "[temp-focrq]"},
+        "result": "pass",
+        "detail": "health model_present is driven by cheap header sniff, not full load",
+    );
+    assert_eq!(
+        v["model_present"].as_bool(),
+        Some(true),
+        "robot health should report model_present=true for sniffable local model; line: {line}"
+    );
+}
+
+#[test]
+fn robot_health_reports_model_present_for_model_dir_direct_artifact() {
+    let test = "robot_health_reports_model_present_for_model_dir_direct_artifact";
+    let model = write_future_focrq();
+    let raw = stdout_of_with_model_dir(&["robot", "health"], &model);
+    let line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("health line");
+    let v = parse_json_line(line, "robot health with model dir artifact");
+    tlog!(test,
+        "case": "robot_health_model_dir_direct_artifact",
+        "event": "stage",
+        "stage": "robot_health",
+        "inputs": {"argv": ["robot", "health"], "model_dir": "[temp-focrq]"},
+        "result": "pass",
+        "detail": "FOCR_MODEL_DIR may point directly at a local artifact",
+    );
+    assert_eq!(
+        v["model_present"].as_bool(),
+        Some(true),
+        "robot health should report model_present=true for direct FOCR_MODEL_DIR artifact; line: {line}"
+    );
+    let dirs = v["model_search_dirs"]
+        .as_array()
+        .expect("robot health model_search_dirs must be an array");
+    let model_display = model.display().to_string();
+    assert!(
+        dirs.iter()
+            .any(|d| d.as_str() == Some(model_display.as_str())),
+        "robot health should include direct FOCR_MODEL_DIR artifact in model_search_dirs; line: {line}"
+    );
+}
+
+#[test]
+fn robot_health_reports_model_present_for_model_dir_default_basename() {
+    let test = "robot_health_reports_model_present_for_model_dir_default_basename";
+    let dir = write_future_focrq_in_temp_model_dir("unlimited-ocr.focrq");
+    let raw = stdout_of_with_model_dir(&["robot", "health"], &dir);
+    let line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("health line");
+    let v = parse_json_line(line, "robot health with model dir basename");
+    tlog!(test,
+        "case": "robot_health_model_dir_default_basename",
+        "event": "stage",
+        "stage": "robot_health",
+        "inputs": {"argv": ["robot", "health"], "model_dir": "[tempdir]"},
+        "result": "pass",
+        "detail": "default models/unlimited-ocr.focrq can resolve via basename inside FOCR_MODEL_DIR",
+    );
+    assert_eq!(
+        v["model_present"].as_bool(),
+        Some(true),
+        "robot health should report model_present=true for default basename in FOCR_MODEL_DIR; line: {line}"
+    );
+    let dirs = v["model_search_dirs"]
+        .as_array()
+        .expect("robot health model_search_dirs must be an array");
+    let dir_display = dir.display().to_string();
+    assert!(
+        dirs.iter()
+            .any(|d| d.as_str() == Some(dir_display.as_str())),
+        "robot health should include FOCR_MODEL_DIR search root in model_search_dirs; line: {line}"
+    );
 }
 
 /// [R6] `robot backends` golden. `logical_cpus` and the selected/available SIMD
@@ -751,7 +991,7 @@ fn ocr_robot_error_stream_matches_exit_code() {
     let code = out.status.code();
     let pass = code == run_error["code"].as_i64().map(|n| n as i32);
     tlog!(test,
-        "case": "ocr_not_implemented_robot_error",
+        "case": "ocr_default_model_not_found_robot_error",
         "event": "assert",
         "assertion": "run_start precedes run_error; run_error.code equals process exit code and stderr stays human-decoration-free",
         "inputs": {"argv": ["ocr", "/some/document.png", "--robot"]},
@@ -772,18 +1012,217 @@ fn ocr_robot_error_stream_matches_exit_code() {
         Some(EXPECTED_SCHEMA_VERSION)
     );
     assert_eq!(run_error["event"].as_str(), Some("run_error"));
-    assert_eq!(run_error["error_kind"].as_str(), Some("not_implemented"));
+    assert_eq!(run_error["error_kind"].as_str(), Some("model_not_found"));
     assert!(
         run_error["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("not yet implemented")
+            .contains("model not found")
     );
+    assert_eq!(run_error["code"].as_i64(), Some(3));
     assert_eq!(run_error["code"].as_i64(), code.map(i64::from));
     assert!(
         stderr.trim().is_empty(),
         "robot-mode command errors must not write human decoration to stderr: {stderr:?}"
     );
+}
+
+/// [R9] `ocr --robot --model /nonexistent` must exercise the path-explicit model
+/// resolver through the real binary, yielding ModelNotFound in both the process
+/// status and terminal robot event.
+#[test]
+fn ocr_robot_missing_model_stream_matches_exit_code() {
+    let test = "ocr_robot_missing_model_stream_matches_exit_code";
+    let model = "/nonexistent/franken_ocr/model.focrq";
+    let out = run_focr(&["ocr", "/some/document.png", "--robot", "--model", model]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "ocr --robot --model missing error must emit run_start then run_error NDJSON lines; stdout:\n{stdout}"
+    );
+    let run_start = parse_json_line(lines[0], "ocr --robot --model run_start");
+    let run_error = parse_json_line(lines[1], "ocr --robot --model run_error");
+    let code = out.status.code();
+    let pass = code == Some(3) && run_error["code"].as_i64() == Some(3);
+    tlog!(test,
+        "case": "ocr_missing_model_robot_error",
+        "event": "assert",
+        "assertion": "path-explicit missing model exits 3 and emits run_error.code=3",
+        "inputs": {"argv": ["ocr", "/some/document.png", "--robot", "--model", model]},
+        "exit_code": code,
+        "robot_code": run_error["code"],
+        "error_kind": run_error["error_kind"],
+        "stderr": stderr.trim(),
+        "pass": pass && stderr.trim().is_empty(),
+        "result": if pass && stderr.trim().is_empty() { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        run_start["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION)
+    );
+    assert_eq!(run_start["event"].as_str(), Some("run_start"));
+    assert_eq!(run_start["command"].as_str(), Some("ocr"));
+    assert_eq!(
+        code,
+        Some(3),
+        "missing explicit model must exit 3; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        run_error["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION)
+    );
+    assert_eq!(run_error["event"].as_str(), Some("run_error"));
+    assert_eq!(run_error["error_kind"].as_str(), Some("model_not_found"));
+    assert_eq!(run_error["code"].as_i64(), Some(3));
+    assert!(
+        run_error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(model)
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "robot-mode command errors must not write human decoration to stderr: {stderr:?}"
+    );
+}
+
+/// [R10] A recognized but too-new `.focrq` must preserve FormatMismatch through
+/// the real robot process path, with exit status and `run_error.code` both equal
+/// to the frozen public code 7.
+#[test]
+fn ocr_robot_future_focrq_stream_matches_exit_code() {
+    let test = "ocr_robot_future_focrq_stream_matches_exit_code";
+    let model = write_future_focrq();
+    let model_arg = model.to_string_lossy().into_owned();
+    let out = run_focr(&[
+        "ocr",
+        "/some/document.png",
+        "--robot",
+        "--model",
+        &model_arg,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "ocr --robot --model future .focrq error must emit run_start then run_error NDJSON lines; stdout:\n{stdout}"
+    );
+    let run_start = parse_json_line(lines[0], "ocr --robot --model future run_start");
+    let run_error = parse_json_line(lines[1], "ocr --robot --model future run_error");
+    let code = out.status.code();
+    let pass = code == Some(7) && run_error["code"].as_i64() == Some(7);
+    tlog!(test,
+        "case": "ocr_future_focrq_robot_error",
+        "event": "assert",
+        "assertion": "path-explicit future .focrq exits 7 and emits run_error.code=7",
+        "inputs": {"argv": ["ocr", "/some/document.png", "--robot", "--model", model_arg]},
+        "exit_code": code,
+        "robot_code": run_error["code"],
+        "error_kind": run_error["error_kind"],
+        "stderr": stderr.trim(),
+        "pass": pass && stderr.trim().is_empty(),
+        "result": if pass && stderr.trim().is_empty() { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        run_start["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION)
+    );
+    assert_eq!(run_start["event"].as_str(), Some("run_start"));
+    assert_eq!(run_start["command"].as_str(), Some("ocr"));
+    assert_eq!(
+        code,
+        Some(7),
+        "future .focrq must exit 7; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        run_error["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION)
+    );
+    assert_eq!(run_error["event"].as_str(), Some("run_error"));
+    assert_eq!(run_error["error_kind"].as_str(), Some("format_mismatch"));
+    assert_eq!(run_error["code"].as_i64(), Some(7));
+    assert!(
+        run_error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("format_version")
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "robot-mode command errors must not write human decoration to stderr: {stderr:?}"
+    );
+}
+
+/// [R11] The remaining stable error variants that need a live forward in
+/// production are still process-covered in Phase 0 through a debug/test-only
+/// producer. This exercises the real binary, robot-mode dispatch, process exit
+/// mapping, and `run_error` payload without fabricating OCR output.
+#[test]
+fn ocr_robot_forced_error_stream_matches_exit_code() {
+    let test = "ocr_robot_forced_error_stream_matches_exit_code";
+    let cases = [
+        ("input_decode", 4, "input_decode"),
+        ("timeout", 5, "timeout"),
+        ("cancelled", 6, "cancelled"),
+    ];
+
+    for (forced_error, expected_code, expected_kind) in cases {
+        let out =
+            run_focr_with_forced_error(&["ocr", "/some/document.png", "--robot"], forced_error);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "forced {forced_error} robot error must emit run_start then run_error NDJSON lines; stdout:\n{stdout}"
+        );
+        let run_start = parse_json_line(lines[0], "ocr --robot forced run_start");
+        let run_error = parse_json_line(lines[1], "ocr --robot forced run_error");
+        let code = out.status.code();
+        let pass = code == Some(expected_code)
+            && run_error["code"].as_i64() == Some(i64::from(expected_code));
+        tlog!(test,
+            "case": format!("forced_{forced_error}"),
+            "event": "assert",
+            "assertion": "debug/test forced producer exits with stable code and emits matching robot run_error.code",
+            "inputs": {"argv": ["ocr", "/some/document.png", "--robot"], "env": {FORCE_TEST_ERROR_ENV: forced_error}},
+            "exit_code": code,
+            "expected_exit": expected_code,
+            "robot_code": run_error["code"],
+            "error_kind": run_error["error_kind"],
+            "stderr": stderr.trim(),
+            "pass": pass && stderr.trim().is_empty(),
+            "result": if pass && stderr.trim().is_empty() { "pass" } else { "fail" },
+        );
+        assert_eq!(
+            run_start["schema_version"].as_u64(),
+            Some(EXPECTED_SCHEMA_VERSION)
+        );
+        assert_eq!(run_start["event"].as_str(), Some("run_start"));
+        assert_eq!(run_start["command"].as_str(), Some("ocr"));
+        assert_eq!(
+            code,
+            Some(expected_code),
+            "forced {forced_error} must exit {expected_code}; stdout:\n{stdout}"
+        );
+        assert_eq!(
+            run_error["schema_version"].as_u64(),
+            Some(EXPECTED_SCHEMA_VERSION)
+        );
+        assert_eq!(run_error["event"].as_str(), Some("run_error"));
+        assert_eq!(run_error["error_kind"].as_str(), Some(expected_kind));
+        assert_eq!(run_error["code"].as_i64(), Some(i64::from(expected_code)));
+        assert!(
+            stderr.trim().is_empty(),
+            "robot-mode forced errors must not write human decoration to stderr: {stderr:?}"
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -817,7 +1256,7 @@ fn cli_root_help_golden() {
     // Always-on content invariants (real coverage even BEFORE the byte-golden is
     // blessed): every documented subcommand MUST be listed in root --help, so a
     // dropped subcommand fails immediately regardless of golden state.
-    for sub in ["ocr", "convert", "robot", "doctor"] {
+    for sub in ["ocr", "convert", "robot", "runs", "sync", "doctor"] {
         let present = scrubbed.contains(sub);
         tlog!(test,
             "case": format!("help_lists:{sub}"),
@@ -838,9 +1277,91 @@ fn cli_root_help_golden() {
     assert_golden_capture(test, "cli_help_root", &scrubbed);
 }
 
-/// [C2] `--version` golden. Renders `focr <version>`; version is scrubbed so the
-/// golden is `focr [version]` and a `Cargo.toml` bump does not flap it (a DROPPED
-/// version line still fails, since the line must remain present).
+/// The CLI surface is v1 image-only. Plan §7.7 explicitly says the excluded
+/// document format must not appear anywhere in the help tree until native
+/// rasterization is deliberately scoped and parity-tested.
+#[test]
+fn full_help_tree_has_no_pdf() {
+    let test = "full_help_tree_has_no_pdf";
+    let help_cases: &[&[&str]] = &[
+        &["--help"],
+        &["ocr", "--help"],
+        &["convert", "--help"],
+        &["robot", "--help"],
+        &["robot", "run", "--help"],
+        &["runs", "--help"],
+        &["sync", "--help"],
+        &["sync", "export-jsonl", "--help"],
+        &["sync", "import-jsonl", "--help"],
+        &["doctor", "--help"],
+    ];
+
+    for argv in help_cases {
+        let out = run_focr(argv);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        let lower = combined.to_ascii_lowercase();
+        let pass = out.status.code() == Some(0) && !lower.contains("pdf");
+        tlog!(test,
+            "case": format!("help:{argv:?}"),
+            "event": "assert",
+            "assertion": "help exits 0 and does not mention the excluded document format",
+            "inputs": {"argv": argv},
+            "exit_code": out.status.code(),
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{argv:?} --help must exit 0; stderr:\n{stderr}"
+        );
+        assert!(
+            !lower.contains("pdf"),
+            "{argv:?} help must not contain the excluded document format token; output:\n{combined}"
+        );
+    }
+}
+
+/// `focr ocr --help` must expose the Phase-1 request parameters from the pinned
+/// reference `infer(...)` signature, even though the body is still a stub.
+#[test]
+fn ocr_help_lists_reference_infer_args() {
+    let test = "ocr_help_lists_reference_infer_args";
+    let out = run_focr(&["ocr", "--help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let required = [
+        "--base-size",
+        "--image-size",
+        "--crop-mode",
+        "--max-length",
+        "--temperature",
+        "--no-repeat-ngram",
+        "--ngram-window",
+        "--json",
+        "--robot",
+    ];
+    for flag in required {
+        let present = stdout.contains(flag);
+        tlog!(test,
+            "case": flag,
+            "event": "assert",
+            "assertion": "ocr help lists the reference infer/surface flag",
+            "inputs": {"argv": ["ocr", "--help"]},
+            "pass": present,
+            "result": if present { "pass" } else { "fail" },
+        );
+        assert!(present, "ocr --help missing {flag}; help:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("1024") && stdout.contains("640"),
+        "ocr --help should show the reference default sizes; help:\n{stdout}"
+    );
+}
+
+/// [C2] `--version` golden. Renders a long, attribution-bearing report; the
+/// package version is scrubbed so a `Cargo.toml` bump does not flap it.
 #[test]
 fn cli_version_golden() {
     let test = "cli_version_golden";
@@ -850,7 +1371,7 @@ fn cli_version_golden() {
     tlog!(test,
         "case": "cli_version",
         "event": "assert",
-        "assertion": "--version prints `focr [version]` and exits 0",
+        "assertion": "--version prints version plus parseable license notices and exits 0",
         "inputs": {"argv": ["--version"]},
         "raw": stdout.trim(),
         "scrubbed": scrubbed.trim(),
@@ -863,14 +1384,48 @@ fn cli_version_golden() {
         scrubbed.contains("[version]"),
         "--version output must contain the (scrubbed) version; got: {scrubbed:?}"
     );
+    assert!(
+        stdout.contains(&format!("model_license: {FOCR_MODEL_LICENSE_NOTICE}")),
+        "--version output must contain parseable model_license from the single source; got: {stdout:?}"
+    );
     assert_golden(test, "cli_version", &scrubbed);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// [C3]–[C5] NOT-IMPLEMENTED SURFACE GOLDENS — ocr / convert / doctor.
+// [C3]–[C5] CLI ERROR SURFACE GOLDENS — ocr / convert / doctor.
 // The error text goes to STDERR (cli_main: `eprintln!("focr: {err}")`); we freeze
-// the scrubbed stderr so the "points-at-the-plan-phase" message is contract.
+// the scrubbed stderr so resolver / "points-at-the-plan-phase" messages remain
+// reviewed contracts.
 // ════════════════════════════════════════════════════════════════════════════
+
+fn assert_model_not_found_golden(test: &str, name: &str, argv: &[&str]) {
+    let out = run_focr(argv);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let scrubbed = scrub(&stderr);
+    let code = out.status.code();
+    let says_model_not_found = scrubbed.contains("model not found / not resolvable");
+    tlog!(test,
+        "case": name,
+        "event": "assert",
+        "assertion": "ModelNotFound surface: exit 3, stderr reports the resolver search",
+        "inputs": {"argv": argv},
+        "exit_code": code,
+        "stderr": scrubbed.trim(),
+        "pass": code == Some(3) && says_model_not_found,
+        "result": if code == Some(3) && says_model_not_found { "pass" } else { "fail" },
+        "detail": "ModelNotFound maps to exit code 3 (src/error.rs)",
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "{argv:?} must exit 3 (ModelNotFound); stderr:\n{scrubbed}"
+    );
+    assert!(
+        says_model_not_found,
+        "{argv:?} stderr must report model-not-found resolver output; got:\n{scrubbed}"
+    );
+    assert_golden(test, name, &scrubbed);
+}
 
 /// Freeze the scrubbed STDERR of a command that is expected to fail with
 /// `NotImplemented` (exit 1), and assert the exit code + the message shape.
@@ -903,13 +1458,50 @@ fn assert_not_implemented_golden(test: &str, name: &str, argv: &[&str]) {
     assert_golden(test, name, &scrubbed);
 }
 
-/// [C3] `focr ocr <img>` -> NotImplemented golden (message points at Phase 1).
+/// [C3] `focr ocr <img>` routes through env/default model resolution; with the
+/// hermetic missing default it exits ModelNotFound (3), not the old scaffold
+/// NotImplemented shortcut.
 #[test]
-fn ocr_not_implemented_golden() {
-    assert_not_implemented_golden(
-        "ocr_not_implemented_golden",
+fn ocr_default_model_not_found_golden() {
+    assert_model_not_found_golden(
+        "ocr_default_model_not_found_golden",
         "ocr_not_implemented",
         &["ocr", "/some/document.png"],
+    );
+}
+
+/// `FOCR_MODEL_PATH` must be honored even when the user omits `--model`.
+/// A future-version `.focrq` reaches the native loader and fails as
+/// FormatMismatch (exit 7), proving the CLI did not take the missing-model
+/// default path and did not stop at the old OCR scaffold.
+#[test]
+fn ocr_env_model_path_without_cli_model_reaches_resolver() {
+    let test = "ocr_env_model_path_without_cli_model_reaches_resolver";
+    let model = write_future_focrq();
+    let out = run_focr_with_model_path(&["ocr", "/some/document.png"], &model);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    let pass = code == Some(7) && stderr.contains("format/version mismatch");
+    tlog!(test,
+        "case": "ocr_env_model_path",
+        "event": "assert",
+        "assertion": "omitted --model still honors FOCR_MODEL_PATH and reaches .focrq loader",
+        "inputs": {"argv": ["ocr", "/some/document.png"], "FOCR_MODEL_PATH": "[future-focrq]"},
+        "exit_code": code,
+        "stdout_len": stdout.len(),
+        "stderr_head": stderr.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "FOCR_MODEL_PATH future .focrq without --model must exit 7; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("format/version mismatch"),
+        "stderr must preserve FormatMismatch, got:\n{stderr}"
     );
 }
 
@@ -923,6 +1515,44 @@ fn convert_not_implemented_golden() {
     );
 }
 
+/// `focr convert` accepts the planned quantization + arch-packing enum surface.
+#[test]
+fn convert_arch_json_surface_accepts_targets() {
+    let test = "convert_arch_json_surface_accepts_targets";
+    let out = run_focr(&[
+        "convert",
+        "in.safetensors",
+        "-o",
+        "out.focrq",
+        "--quant",
+        "int4",
+        "--arch",
+        "x86-vnni",
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("convert --json scaffold line");
+    let v = parse_json_line(line, "convert --json");
+    let pass = out.status.code() == Some(1)
+        && v["status"].as_str() == Some("scaffold")
+        && v["quant"].as_str() == Some("int4")
+        && v["arch"].as_str() == Some("x86-vnni");
+    tlog!(test,
+        "case": "convert_arch",
+        "event": "assert",
+        "assertion": "convert --json accepts int4 + x86-vnni and still exits NotImplemented",
+        "inputs": {"argv": ["convert", "in.safetensors", "-o", "out.focrq", "--quant", "int4", "--arch", "x86-vnni", "--json"]},
+        "exit_code": out.status.code(),
+        "payload": v,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected convert --json result; stdout:\n{stdout}");
+}
+
 /// [C5] `focr doctor` -> NotImplemented golden (message points at Phase 5).
 #[test]
 fn doctor_not_implemented_golden() {
@@ -933,8 +1563,132 @@ fn doctor_not_implemented_golden() {
     );
 }
 
+/// Phase 0 exposes the future doctor contract shape under `--json` while the
+/// actual repair/check body remains a Phase-5 NotImplemented.
+#[test]
+fn doctor_json_emits_scaffold_contract() {
+    let test = "doctor_json_emits_scaffold_contract";
+    let out = run_focr(&["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("doctor --json scaffold line");
+    let v = parse_json_line(line, "doctor --json");
+    let capabilities = v["capabilities"].as_array().map(Vec::len).unwrap_or(0);
+    let checks = v["checks"].as_array().map(Vec::len).unwrap_or(0);
+    let pass = out.status.code() == Some(1)
+        && v["status"].as_str() == Some("scaffold")
+        && capabilities >= 3
+        && checks >= 3
+        && stderr.contains("Phase 5");
+    tlog!(test,
+        "case": "doctor_json",
+        "event": "assert",
+        "assertion": "doctor --json emits scaffold capabilities/checks and exits NotImplemented",
+        "inputs": {"argv": ["doctor", "--json"]},
+        "exit_code": out.status.code(),
+        "capabilities": capabilities,
+        "checks": checks,
+        "stderr": stderr.trim(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(
+        pass,
+        "unexpected doctor --json result; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `focr robot run <image>` is the agent-facing alias for `focr ocr <image>
+/// --robot`: it routes through env/default model resolution and reports the
+/// terminal engine error as robot NDJSON.
+#[test]
+fn robot_run_routes_to_streaming() {
+    let test = "robot_run_routes_to_streaming";
+    let out = run_focr(&["robot", "run", "/some/document.png"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "robot run must emit run_start then run_error; stdout:\n{stdout}"
+    );
+    let run_start = parse_json_line(lines[0], "robot run run_start");
+    let run_error = parse_json_line(lines[1], "robot run run_error");
+    let pass = out.status.code() == Some(3)
+        && run_start["event"].as_str() == Some("run_start")
+        && run_start["command"].as_str() == Some("ocr")
+        && run_error["event"].as_str() == Some("run_error")
+        && run_error["error_kind"].as_str() == Some("model_not_found")
+        && stderr.trim().is_empty();
+    tlog!(test,
+        "case": "robot_run",
+        "event": "assert",
+        "assertion": "robot run routes through the streaming NDJSON path and default model resolver",
+        "inputs": {"argv": ["robot", "run", "/some/document.png"]},
+        "exit_code": out.status.code(),
+        "stderr": stderr.trim(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(
+        pass,
+        "unexpected robot run result; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// The run-history / audit-sync scaffold surfaces already obey the Phase-0
+/// exit-category split: malformed args are Usage(exit 2), valid but unlanded
+/// bodies are NotImplemented(exit 1).
+#[test]
+fn runs_and_sync_args_obey_exit_categories() {
+    let test = "runs_and_sync_args_obey_exit_categories";
+    let cases: &[(&str, &[&str], i32)] = &[
+        ("runs_negative_limit", &["runs", "--limit=-1"], 2),
+        ("runs_json_stub", &["runs", "--format", "json"], 1),
+        ("sync_unknown_subcommand", &["sync", "frobnicate"], 2),
+        (
+            "sync_export_json_stub",
+            &["sync", "--json", "export-jsonl"],
+            1,
+        ),
+        (
+            "sync_import_json_stub",
+            &["sync", "--json", "import-jsonl"],
+            1,
+        ),
+    ];
+    for (name, argv, expected) in cases {
+        let out = run_focr(argv);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let code = out.status.code();
+        let pass = code == Some(*expected);
+        tlog!(test,
+            "case": name,
+            "event": "assert",
+            "assertion": "runs/sync exit code matches Usage-vs-NotImplemented split",
+            "inputs": {"argv": argv},
+            "expected_exit": expected,
+            "actual_exit": code,
+            "stdout_head": stdout.lines().next().unwrap_or_default(),
+            "stderr_head": stderr.lines().next().unwrap_or_default(),
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(
+            code,
+            Some(*expected),
+            "{name} expected exit {expected}; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-// [E0]–[E3] EXIT-CODE CONFORMANCE — table-driven (src/error.rs, plan §7.4).
+// [E0]–[E7] EXIT-CODE CONFORMANCE — table-driven (src/error.rs, plan §7.4).
 // Each row drives the binary with an input that triggers a FocrError variant (or
 // a success) and asserts `.code()` is the documented stable exit code.
 // ════════════════════════════════════════════════════════════════════════════
@@ -953,6 +1707,23 @@ struct ExitRow {
     /// wired in this phase, so we DON'T assert the code yet but log a SUCCESS
     /// skip explaining why (conformance discipline: XFAIL, never silent SKIP).
     xfail: Option<&'static str>,
+}
+
+fn forced_error_for_clause(clause: &str) -> Option<&'static str> {
+    match clause {
+        "E4" => Some("input_decode"),
+        "E5" => Some("timeout"),
+        "E6" => Some("cancelled"),
+        _ => None,
+    }
+}
+
+fn run_exit_row(row: &ExitRow) -> Output {
+    if let Some(forced_error) = forced_error_for_clause(row.clause) {
+        run_focr_with_forced_error(row.argv, forced_error)
+    } else {
+        run_focr(row.argv)
+    }
 }
 
 #[test]
@@ -1033,14 +1804,16 @@ fn exit_code_conformance() {
             clause: "E2",
             xfail: None,
         },
-        // [E1] not-implemented -> 1
+        // [E3] model-not-found -> 3: the default/env-resolved CLI OCR lane reaches
+        // the native resolver instead of stopping at the old NotImplemented scaffold.
         ExitRow {
-            label: "ocr -> 1 (NotImplemented)",
+            label: "ocr -> 3 (model-not-found)",
             argv: &["ocr", "/some/document.png"],
-            expect: 1,
-            clause: "E1",
+            expect: 3,
+            clause: "E3",
             xfail: None,
         },
+        // [E1] not-implemented -> 1
         ExitRow {
             label: "convert -> 1 (NotImplemented)",
             argv: &["convert", "in.safetensors", "-o", "out.focrq"],
@@ -1055,52 +1828,45 @@ fn exit_code_conformance() {
             clause: "E1",
             xfail: None,
         },
-        // [E3] model-not-found -> 3: documented + asserted at the FocrError
-        // boundary in src/lib.rs, but the CLI `ocr` path returns NotImplemented
-        // BEFORE it reaches model resolution in this phase, so the CLI cannot yet
-        // surface code 3. XFAIL with a SUCCESS skip line (not a silent skip).
+        // [E3] model-not-found -> 3: the path-explicit CLI diagnostic lane reaches
+        // model resolution without pretending the default OCR forward is complete.
         ExitRow {
-            label: "ocr (absent model) -> 3 (model-not-found)",
-            argv: &["ocr", "/some/document.png"],
+            label: "ocr --model /nonexistent -> 3 (model-not-found)",
+            argv: &[
+                "ocr",
+                "/some/document.png",
+                "--model",
+                "/nonexistent/franken_ocr/model.focrq",
+            ],
             expect: 3,
             clause: "E3",
-            xfail: Some(
-                "CLI `ocr` returns NotImplemented(exit 1) before model resolution in \
-                 this phase; code 3 is proven at the FocrError boundary in src/lib.rs's \
-                 unit tests (recognize_missing_model_is_clean_model_not_found). Wires up \
-                 when the Phase-1 forward lands.",
-            ),
+            xfail: None,
         },
-        // The remaining documented codes (4 input-decode, 5 timeout, 6 cancelled,
-        // 7 format-mismatch) are likewise only reachable once the ocr/convert
-        // forward lands; documented here as XFAIL rows so the COVERAGE map is
-        // honest and the rows flip to live assertions when the path exists.
+        // The forward-dependent documented codes are process-covered in Phase 0
+        // through the debug/test producer seam that feeds the real CLI
+        // dispatcher and robot error path. Convert-side format mismatch is still
+        // blocked on `convert`, while the `.focrq` reader path itself is
+        // live-covered by ocr_robot_future_focrq_stream_matches_exit_code.
         ExitRow {
-            label: "input-decode -> 4",
+            label: "forced input-decode -> 4",
             argv: &["ocr", "/some/document.png"],
             expect: 4,
             clause: "E4",
-            xfail: Some(
-                "InputDecode(exit 4) is reachable only after the Phase-1 ocr forward decodes an image; today `ocr` short-circuits to NotImplemented.",
-            ),
+            xfail: None,
         },
         ExitRow {
-            label: "timeout -> 5",
+            label: "forced timeout -> 5",
             argv: &["ocr", "/some/document.png"],
             expect: 5,
             clause: "E5",
-            xfail: Some(
-                "Timeout(exit 5) is a per-stage budget breach inside the forward; unreachable from the CLI until the forward lands.",
-            ),
+            xfail: None,
         },
         ExitRow {
-            label: "cancelled -> 6",
+            label: "forced cancelled -> 6",
             argv: &["ocr", "/some/document.png"],
             expect: 6,
             clause: "E6",
-            xfail: Some(
-                "Cancelled(exit 6) requires a running forward to cancel (Ctrl+C / cooperative); unreachable until the forward lands.",
-            ),
+            xfail: None,
         },
         ExitRow {
             label: "format-mismatch -> 7",
@@ -1108,14 +1874,14 @@ fn exit_code_conformance() {
             expect: 7,
             clause: "E7",
             xfail: Some(
-                "FormatMismatch(exit 7) is raised by the .focrq reader/converter; today `convert` short-circuits to NotImplemented.",
+                "Convert-side FormatMismatch(exit 7) is unreachable until `convert` lands; the path-explicit .focrq reader coverage lives in ocr_robot_future_focrq_stream_matches_exit_code.",
             ),
         },
     ];
 
     let mut failures = Vec::new();
     for row in rows {
-        let out = run_focr(row.argv);
+        let out = run_exit_row(row);
         let code = out.status.code();
         let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1130,6 +1896,7 @@ fn exit_code_conformance() {
                 "result": "xfail",
                 "clause": row.clause,
                 "argv": row.argv,
+                "forced_error": forced_error_for_clause(row.clause),
                 "expected_exit": row.expect,
                 "actual_exit": code,
                 "reason": reason,
@@ -1149,6 +1916,7 @@ fn exit_code_conformance() {
             "assertion": "exit code matches the documented stable code (src/error.rs)",
             "clause": row.clause,
             "argv": row.argv,
+            "forced_error": forced_error_for_clause(row.clause),
             "expected_exit": row.expect,
             "actual_exit": code,
             "stderr": stderr.trim(),
@@ -1297,14 +2065,10 @@ fn golden_fixtures_have_provenance() {
 
     // the frozen contract fixture itself must exist and be valid JSON.
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/robot_schema_v1.json");
-    let frozen = std::fs::read_to_string(&fixture).unwrap_or_else(|e| {
-        panic!(
-            "frozen contract fixture {} unreadable: {e}",
-            fixture.display()
-        )
-    });
-    let v: serde_json::Value = serde_json::from_str(&frozen)
-        .unwrap_or_else(|e| panic!("frozen contract fixture is not valid JSON: {e}"));
+    let frozen =
+        std::fs::read_to_string(&fixture).expect("frozen contract fixture should be readable");
+    let v: serde_json::Value =
+        serde_json::from_str(&frozen).expect("frozen contract fixture is valid JSON");
     assert_eq!(
         v["schema_version"].as_u64(),
         Some(EXPECTED_SCHEMA_VERSION),

@@ -1,1 +1,1 @@
-focr: not yet implemented: focr ocr — the model forward lands in Phase 1 (see COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md §10)
+focr: model not found / not resolvable: no model artifact named models/unlimited-ocr.focrq (searched directories: [model-search-dirs]; set FOCR_MODEL_DIR or pass an explicit path)
