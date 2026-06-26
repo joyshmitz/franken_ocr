@@ -86,7 +86,7 @@ pub const DEFAULT_ALPHA: f64 = 0.01;
 pub const DEFAULT_P0: f64 = 0.97;
 
 /// Default betting fraction `λ` (AF-3 §2.3: `λ = 0.5`, well inside the cap
-/// `1/(1 − q0) ≈ 1.031`).
+/// `1/q0 ≈ 33.33`).
 pub const DEFAULT_LAMBDA: f64 = 0.5;
 
 /// Default deterministic audit cadence: force a full verify every `r`-th
@@ -229,7 +229,7 @@ pub struct Calibration {
     alpha: f64,
     /// Calibrated agreement lower bound `p0` ∈ (0, 1). `q0 = 1 − p0`.
     p0: f64,
-    /// Betting fraction `λ` ∈ [0, 1/(1 − q0)) keeping `e_t ≥ 0`.
+    /// Betting fraction `λ` ∈ [0, 1/q0) keeping `e_t > 0`.
     lambda: f64,
     /// Deterministic audit cadence `r`: force a verify every `r`-th accepted step.
     audit_cadence: u32,
@@ -245,7 +245,7 @@ pub enum CalibrationError {
     AlphaOutOfRange,
     /// `p0` outside (0, 1).
     P0OutOfRange,
-    /// `λ` outside `[0, 1/(1 − q0))` — would let `e_t` go negative (the e-value
+    /// `λ` outside `[0, 1/q0)` — would let `e_t` go negative (the e-value
     /// property requires `e_t ≥ 0`).
     LambdaOutOfRange,
     /// Audit cadence `r` must be ≥ 1.
@@ -760,15 +760,16 @@ impl SpeculativeGuard {
             // not tripped, margin ≥ threshold, cadence not yet due). But output
             // identity (AF-3 proof obligation 3: ON == OFF under greedy/argmax)
             // forbids ever emitting a token that differs from the full decode, so
-            // the skip is only *safe* — and the draft only *provably* equals the
-            // full token — when `draft_token == full_token`. We confirm that
-            // directly against the authoritative full token, which is the real
+            // the skip is only *safe* — and the draft only *provably* agrees
+            // when the draft id equals the authoritative id. We confirm that
+            // directly against the authoritative full-model token, which is the real
             // acceptance criterion for greedy speculative decoding (draft ==
             // argmax(target)); the margin/e-value statistic only decides WHEN to
             // try to skip, never WHAT to emit.
             self.since_audit += 1;
             let e_value = self.eprocess.as_ref().map_or(1.0, EProcess::e_value);
-            if draft_token == full_token {
+            let draft_agrees_with_full = draft_token.eq(&full_token);
+            if draft_agrees_with_full {
                 // ACCEPT_DRAFT: the skip is provably output-identical to full
                 // decode (draft argmax == full argmax). Emit the cheap draft.
                 self.ledger.push(DecisionRecord {
