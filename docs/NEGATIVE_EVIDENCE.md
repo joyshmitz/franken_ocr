@@ -330,6 +330,77 @@ claims.
   agent: opus-4.8 (int4/int8 blend sweep)
   evidence dir: artifacts/perf/bd-attn-serial/
 
+2026-06-27 | WIN | fused [3*1280,1280] q/k/v decode GEMV (`decoder::fuse_qkv` + `FOCR_QKV_FUSED`; one `simd::igemm_s8s8` over a stacked [3840,1280] weight instead of three [1280,1280] calls)
+  claim_id: CLAIM-bd-1waa-qkv-fused-decode-gemv   evidence_id: artifacts/perf/bd-1waa/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    q/k/v_proj.weight from the real model-00001-of-000001.safetensors shard (work-dir `model/`), per-output-channel symmetric int8 (`quant_oc`); the fused cache stacks the three [1280,1280] weights into one [3840,1280] QInt8 with concatenated per-row scales — same bytes, same scales, one tensor
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier); fused path = one block-parallel `simd::igemm_s8s8` over [3840,1280]
+  exact command + env:
+    scratchpad/bench_config.sh on page_0023 (821 decode tokens) for perf, 20-page ocr-batch for CER:
+    env FOCR_DECODE_INT8=1 FOCR_QKV_FUSED=1 FOCR_PROFILE_DECODE=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 focr ocr page_0023.png --model <work>/model
+    (baseline row: FOCR_QKV_FUSED unset. RAYON pool = default physical cores; allocator=system)
+  fallback / kill-switch state: FOCR_QKV_FUSED unset → `cl.qkv = None` → the original three separate `gemv_i8` q/k/v calls (the default). FOCR_DECODE_INT8=1 active; no FOCR_FORCE_ARCH (native SDOT)
+  measured before -> after vs reference:
+    M4 (aarch64+neon+dotprod): local focr-only decode profile (no torch reference ratio yet): whole-decode 16.55 s / 0.020 s-tok -> 15.08 s / 0.018 s-tok = ~8.9% faster decode; attn phase 5671 ms -> 4929 ms (the rest drifts run-to-run on the untouched phases).
+    CROSS-ARCH (trj = AMD Threadripper PRO 5995WX, Zen3, x86_64+avx2, NO VNNI, 128 threads): whole-decode 233.68 s / 0.285 s-tok -> 184.66 s / 0.225 s-tok = ~21% faster decode — a BIGGER relative win than M4, because AVX2 has no native int8 dot so per-GEMV dispatch + activation-reload overhead is higher and collapsing 3 GEMVs→1 saves more (decode attn phase 83581 -> 59767 ms). PERF_LEDGER-ineligible (no pinned CPU reference row).
+  bit-exact correctness proof:
+    PROVABLY byte-identical to the three-call path — unit test `fused_qkv_gemv_is_byte_identical_to_three_calls` (per-output-row i32 SDOT accumulation is independent of whether q/k/v are one stacked tensor or three), AND end-to-end on the worst page: `focr ocr page_0590` (the longest, runaway-prone table page) with FOCR_QKV_FUSED=1 is byte-identical to scalar base — both 8756 chars, sha256 63c55f7da9fd9918bbb90acbb10384243d468f73edb675451aef2c6e344a20a1; 20-page content CER 0.2116 == base 0.2116
+  disposition: KEEP
+  do-not-retry: "this is the KEPT lossless attention-projection lever — exactly the fuse-q/k/v-into-one-wide-GEMV move the bd-attn-serial retry predicate called for (fewer dispatches while KEEPING block-parallelism). Do not replace it with serial-single-core qkv (bd-attn-serial: +19%) or int4 qkv (bd-int4-lmhead: unpack kernel, 5.8x). The next attention lever is the f32 `rswa::decode_attention` itself — but ONLY bit-exactly: the non-bit-exact GEMM/int8-KV variants in this same bead both degenerate on page_0590 (the two REVERT entries below)."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: opus-4.8 (decode-attention lever sweep)
+  evidence dir: artifacts/perf/bd-1waa/
+
+2026-06-27 | NEGATIVE(reverted) | batched per-head GEMM decode attention (`rswa::decode_attention_gemm` + `FOCR_ATTN_GEMM`: QK^T / softmax / probs@V as blocked GEMMs)
+  claim_id: CLAIM-bd-1waa-gemm-decode-attention   evidence_id: artifacts/perf/bd-1waa/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    R-SWA decode attention over the live KV ring (≤277 ref + 128 window keys × 10 heads × 12 layers); f32 throughout, no weight tensor (operates on cached K/V activations)
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier); GEMM path = frankentorch f32 GEMM for per-head QK^T and probs@V (reorders the f32 accumulation vs the scalar per-key loop)
+  exact command + env:
+    scratchpad/bench_config.sh / CER gate on page_0023 (perf) + 20-page ocr-batch (CER):
+    env FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1 [FOCR_QKV_FUSED=1] FOCR_PROFILE_DECODE=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 focr ocr page_0023.png --model <work>/model
+    (baseline row: FOCR_ATTN_GEMM unset → scalar. RAYON pool = default physical cores; allocator=system)
+  fallback / kill-switch state: FOCR_ATTN_GEMM unset → `decode_attention_scalar` (the default bit-exact per-key loop). FOCR_INT8_KV unset. FOCR_DECODE_INT8=1 active; no FOCR_FORCE_ARCH (native SDOT)
+  measured before -> after vs reference:
+    PERF (M4): whole-decode 16.55 s / 0.020 s-tok -> 14.60 s (gemm) / 14.08 s (gemm+qkv) / ~0.018 s-tok; attn phase 5671 ms -> 4970 (gemm) / 4341 (gemm+qkv) ms — a real ~12–15% decode win.
+    PERF (x86 trj, Zen3/avx2): the GEMM attention does NOT pay on AVX2 — gemm 211.45 s (−9.5% vs base) and gemm+qkv 230.68 s (only −1.3%, i.e. WORSE than the lossless qkv-alone's 184.66 s / −21%). The frankentorch f32 batched GEMM is not well-served on AVX2; on x86 the GEMM attention actively regresses the qkv win.
+    ACCURACY: 20-page content CER 0.2116 -> 1.3030 — CATASTROPHIC, and ENTIRELY one page: 19/20 stay bit-near-exact (4 byte-exact, rest CER < 0.04), but page_0590 (the longest, a repetitive ship-loss TABLE) RUNS AWAY 8755 -> 91243 chars (CER 4.23 that page; gemmqkv_perpage_cer.txt). Rejected on ACCURACY regardless of the perf win; PERF_LEDGER-ineligible (no pinned CPU reference row).
+  bit-exact correctness proof:
+    NOT bit-exact by construction (the batched GEMM reorders f32 accumulation in QK^T / softmax / probs@V). The drift is tiny per-token but on page_0590 it tips the autoregressive sampler past the EOS-emission tipping point into a degenerate `<tr><td>..Hornet..David Comin..</td></tr>` row-repeat that never terminates (page_0590_runaway_tail.txt). This is the SAME f32-reorder as the SAM vision GEMM (bd-3n16, KEPT) — harmless there because vision attention feeds a projector; disqualifying here because decode attention feeds a token sampler whose EOS timing is fragile on long repetitive pages.
+  disposition: REVERT
+  do-not-retry: "do not enable FOCR_ATTN_GEMM (non-bit-exact decode attention) unless decode is first made robust to f32-accumulation drift on long repetitive pages — e.g. a bit-exact blocked GEMM that matches the scalar per-key accumulation order, OR a repetition/no-EOS stop guard in the sampler (a semantics change that must clear its own 20-page CER gate). The ~12–15% decode win is real but is already captured LOSSLESSLY by FOCR_QKV_FUSED (the WIN above); the marginal extra (~3–6%) is not worth a page-killing runaway. Bit-exactness is mandatory for decode attention, optional for vision attention."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: opus-4.8 (decode-attention lever sweep)
+  evidence dir: artifacts/perf/bd-1waa/
+
+2026-06-27 | NEGATIVE(reverted) | int8-quantized KV cache + int8 QK decode attention (`rswa::decode_attention_int8` + `FOCR_INT8_KV`)
+  claim_id: CLAIM-bd-1waa-int8-kv-decode-attention   evidence_id: artifacts/perf/bd-1waa/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    R-SWA decode KV ring quantized per-row to int8 (K and V); int8 QK via `simd::igemm_s8s8` (i32 accum, 127²·128 = 2.06M per dot < i32::MAX), f32 softmax, int8 V dequant per row; ≤277 ref + 128 window keys × 10 heads × 12 layers
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier); int8 QK = `simd::igemm_s8s8`
+  exact command + env:
+    scratchpad/bench_config.sh / CER gate on page_0023 (perf) + 20-page ocr-batch (CER):
+    env FOCR_DECODE_INT8=1 FOCR_INT8_KV=1 FOCR_PROFILE_DECODE=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 focr ocr page_0023.png --model <work>/model
+    (baseline row: FOCR_INT8_KV unset → scalar f32 KV. RAYON pool = default physical cores; allocator=system)
+  fallback / kill-switch state: FOCR_INT8_KV unset → `decode_attention_scalar` (default f32 KV). FOCR_ATTN_GEMM unset. FOCR_DECODE_INT8=1 active; no FOCR_FORCE_ARCH (native SDOT)
+  measured before -> after vs reference:
+    PERF (M4): whole-decode 16.55 s / 0.020 s-tok -> 13.97 s / 0.017 s-tok — the FASTEST variant on M4 (~15% decode win; int8 KV halves KV bandwidth + uses SDOT QK).
+    PERF (x86 trj, Zen3/avx2): does NOT carry to x86 — int8kv decode 230.51 s / 0.281 s-tok = only −1.3% vs base, far behind the lossless qkv-alone (184.66 s / −21%). The int8-KV dequant + AVX2-emulated int8 QK overhead eats the bandwidth saving; the int8-KV speedup is an M4-only effect.
+    ACCURACY: 20-page content CER 0.2116 -> 0.3277 (+55% relative). Not a 1.30 blow-up like FOCR_ATTN_GEMM, but the SAME root cause on the SAME page: int8 KV is lossier than the f32-GEMM reorder, so page_0590 degenerates into the same no-EOS runaway; under the CER-gate forward budget that page's int8-KV decode does not finish -> empty output -> CER 1.0 on that page, which drives the entire +0.116 aggregate (an unbudgeted single-page int8-KV run was still grinding the page_0590 runaway at 7+ min when killed). The other 19 pages are unaffected. PERF_LEDGER-ineligible.
+  bit-exact correctness proof:
+    NOT bit-exact by construction (int8 quantization of the KV cache is lossy). Same EOS-fragility failure as FOCR_ATTN_GEMM on page_0590, manifesting as a budget-timeout empty page rather than a 91k runaway because the int8-KV decode is slower per runaway token. int8 QK i32-accumulation exactness (no overflow at head_dim=128) is independently covered by the `simd::igemm_s8s8` oracle tests; this entry is an end-to-end ACCURACY rejection.
+  disposition: REVERT
+  do-not-retry: "do not enable FOCR_INT8_KV unless decode is first made robust to long-page degeneration (same predicate as FOCR_ATTN_GEMM) AND the int8-KV 20-page CER is shown within budget vs base 0.2116. Even then the ceiling is small: int8-KV's only marginal gain over the LOSSLESS FOCR_QKV_FUSED is ~6% decode, not worth a lossy KV cache that fails the hardest page. The attention here (≤405 keys × 10 heads) is not the decode bottleneck — experts (~44%) + the f32 element-wise attention overhead are; a KV-bytes lever cannot move them."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: opus-4.8 (decode-attention lever sweep)
+  evidence dir: artifacts/perf/bd-1waa/
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a

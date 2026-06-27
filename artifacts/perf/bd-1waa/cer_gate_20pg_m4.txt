@@ -1,0 +1,19 @@
+=== 20-page CER gate for the applied levers (accuracy is the keep-gate) ===
+int4_lmhead_g16  0.032             REJECTED-perf                 FOCR_DECODE_INT8=1 FOCR_LMHEAD_INT4=16
+attn_serial      0.019             bit-identical(REJECTED-perf)  FOCR_DECODE_INT8=1 FOCR_ATTN_SERIAL=1
+base_v2          0.020             0.2116                        FOCR_DECODE_INT8=1
+attn_serial      0.019             bit-identical(REJECTED-perf)  FOCR_DECODE_INT8=1 FOCR_ATTN_SERIAL=1
+base_v2          0.020             0.2116                        FOCR_DECODE_INT8=1
+gemmqkv          0.018             1.3030                        FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1 FOCR_QKV_FUSED=1
+base_v2          0.020             0.2116                        FOCR_DECODE_INT8=1
+gemmqkv          0.018             1.3030                        FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1 FOCR_QKV_FUSED=1
+int8kv           0.017             0.3277                        FOCR_DECODE_INT8=1 FOCR_INT8_KV=1
+================ CER GATE RESULTS ================
+label            decode_s_per_tok  content_CER_20pg              env
+int8_baseline    0.020             0.2116                        FOCR_DECODE_INT8=1
+int4_lmhead_g32  0.031             REJECTED-perf                 FOCR_DECODE_INT8=1 FOCR_LMHEAD_INT4=1
+int4_lmhead_g16  0.032             REJECTED-perf                 FOCR_DECODE_INT8=1 FOCR_LMHEAD_INT4=16
+attn_serial      0.019             bit-identical(REJECTED-perf)  FOCR_DECODE_INT8=1 FOCR_ATTN_SERIAL=1
+base_v2          0.020             0.2116                        FOCR_DECODE_INT8=1
+gemmqkv          0.018             1.3030                        FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1 FOCR_QKV_FUSED=1
+int8kv           0.017             0.3277                        FOCR_DECODE_INT8=1 FOCR_INT8_KV=1

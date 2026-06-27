@@ -1,0 +1,10 @@
+trj host: AMD Ryzen Threadripper PRO 5995WX, 64-core / 128-thread, Zen3.
+/proc/cpuinfo int8-relevant flags: avx2 fma  (NO avx512f, NO avx_vnni/avx512_vnni)
+focr robot backends: {"simd_tiers":{"selected":"avx2","selected_feature":"x86_64+avx2",
+  "available":[{"tag":"avx2"},{"tag":"scalar"}]},"logical_cpus":128}
+=> int8 GEMM dispatches to the AVX2 tier (no native VPDPBUSD dot); decode is ~14x
+   slower per token than M4's native SDOT (0.285 vs 0.020 s/tok). 128 cores do not
+   help: decode is per-token latency/bandwidth-bound, not throughput-bound.
+Lever deltas (decode s/tok vs base 0.285): qkv 0.225 (-21%, lossless WIN),
+   gemm 0.258 (-9.5%), gemmqkv 0.281 (-1.3%), int8kv 0.281 (-1.3%) -- qkv alone wins;
+   the non-bit-exact levers do not beat it on x86 (and fail the accuracy gate everywhere).

@@ -1,0 +1,14 @@
+=== page_0590 single-page lever check 00:14:01 ===
+base: 8756 chars
+qkv: 8756 chars
+int8kv RUN-FAIL
+int8kv: 0 chars
+=== compare to base_v2 reference (8755) ===
+base==base_v2_hyp? DIFFERS
+qkv ==base_v2_hyp? DIFFERS
+=== DONE 00:25:13 ===
+
+=== DIRECT byte-comparison (same focr ocr invocation, FOCR_QKV_FUSED the only variable) ===
+base.md  sha256: 63c55f7da9fd9918bbb90acbb10384243d468f73edb675451aef2c6e344a20a1 (8756 chars)
+qkv.md   sha256: 63c55f7da9fd9918bbb90acbb10384243d468f73edb675451aef2c6e344a20a1 (8756 chars)
+=> BYTE-IDENTICAL on page_0590 (the longest, runaway-prone table page).

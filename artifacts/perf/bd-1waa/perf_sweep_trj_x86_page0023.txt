@@ -1,0 +1,28 @@
+==== TRJ PERF SWEEP (page_0023, 128 threads) 00:10:57 ====
+isa tier: ?
+--- base ---
+[focr-timing] vision_tower 49.23s
+[focr-timing] prefill_i8 11.22s (277 tokens)
+[focr-timing] decode_i8 233.68s (821 tokens, 0.285s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 32914  attn 83581  experts 106215  route 9924
+--- qkv ---
+[focr-timing] vision_tower 41.78s
+[focr-timing] prefill_i8 6.49s (277 tokens)
+[focr-timing] decode_i8 184.66s (821 tokens, 0.225s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 30843  attn 59767  experts 87621  route 5584
+--- gemm ---
+[focr-timing] vision_tower 41.18s
+[focr-timing] prefill_i8 8.39s (277 tokens)
+[focr-timing] decode_i8 211.45s (821 tokens, 0.258s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 31494  attn 74843  experts 95686  route 8519
+--- gemmqkv ---
+[focr-timing] vision_tower 39.94s
+[focr-timing] prefill_i8 8.54s (277 tokens)
+[focr-timing] decode_i8 230.68s (821 tokens, 0.281s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 32496  attn 82941  experts 105949  route 8286
+--- int8kv ---
+[focr-timing] vision_tower 83.93s
+[focr-timing] prefill_i8 9.80s (277 tokens)
+[focr-timing] decode_i8 230.51s (821 tokens, 0.281s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 33593  attn 59459  experts 122074  route 14133
+==== TRJ PERF SWEEP DONE 00:39:56 ====

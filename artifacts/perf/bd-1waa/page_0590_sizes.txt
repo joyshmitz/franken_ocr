@@ -1,0 +1,19 @@
+page_0590 output length per decode-attention path (M4, FOCR_DECODE_INT8=1).
+page_0590 is the longest fixture (a multi-page repetitive ship-loss TABLE) and is
+the discriminator: it already dominates the baseline aggregate CER, and it is where
+non-bit-exact decode attention degenerates.
+
+  path                         page_0590 chars   note
+  baidu reference (ground truth)        19021    full table
+  base_v2  (scalar, bit-exact)           8755    bounded graceful truncation; deterministic
+  int8_baseline (orig scalar int8)       8755    identical to base_v2
+  FOCR_QKV_FUSED (bit-identical)          8756    == base (+1 trailing newline from stdout); NO runaway
+  FOCR_ATTN_GEMM                         91243    RUNAWAY: <tr><td>..Hornet..David Comin..</td></tr> repeat, never emits EOS
+  FOCR_INT8_KV                          (empty)   batch hit forward budget on the runaway -> empty page (CER 1.0);
+                                                  unbudgeted single-page still grinding the runaway at 7+ min when killed
+
+Aggregate 20-page content CER (span-stripped):
+  base_v2          0.2116
+  FOCR_QKV_FUSED   0.2116  (bit-identical)
+  FOCR_ATTN_GEMM   1.3030  (page_0590 91k runaway)
+  FOCR_INT8_KV     0.3277  (page_0590 empty/degenerate -> CER 1.0 that page)

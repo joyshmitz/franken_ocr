@@ -1,0 +1,49 @@
+binary mtime: 26 23:22:40 2026
+BUILD_OK 23:22:41
+=== serial perf sweep (page_0023, 821 tok) ===
+==== PERF L_base (env: FOCR_DECODE_INT8=1) ====
+[focr-timing] vision_tower 7.24s
+[focr-timing] prefill_i8 0.52s (277 tokens)
+[focr-timing] decode_i8 16.55s (821 tokens, 0.020s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2449  attn 5671  experts 7248  route 747
+==== PERF L_qkv (env: FOCR_DECODE_INT8=1 FOCR_QKV_FUSED=1) ====
+[focr-timing] vision_tower 7.23s
+[focr-timing] prefill_i8 0.54s (277 tokens)
+[focr-timing] decode_i8 15.08s (821 tokens, 0.018s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2114  attn 4929  experts 6837  route 762
+==== PERF L_gemm (env: FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1) ====
+[focr-timing] vision_tower 7.15s
+[focr-timing] prefill_i8 0.55s (277 tokens)
+[focr-timing] decode_i8 14.60s (821 tokens, 0.018s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2012  attn 4970  experts 6447  route 735
+==== PERF L_gemmqkv (env: FOCR_DECODE_INT8=1 FOCR_ATTN_GEMM=1 FOCR_QKV_FUSED=1) ====
+[focr-timing] vision_tower 7.13s
+[focr-timing] prefill_i8 0.51s (277 tokens)
+[focr-timing] decode_i8 14.08s (821 tokens, 0.017s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2003  attn 4341  experts 6550  route 743
+==== PERF L_int8kv (env: FOCR_DECODE_INT8=1 FOCR_INT8_KV=1) ====
+[focr-timing] vision_tower 7.19s
+[focr-timing] prefill_i8 0.52s (277 tokens)
+[focr-timing] decode_i8 13.97s (821 tokens, 0.017s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 1977  attn 4303  experts 6514  route 736
+================ PERF SWEEP SUMMARY ================
+--- L_base ---
+[focr-timing] vision_tower 7.24s
+[focr-timing] decode_i8 16.55s (821 tokens, 0.020s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2449  attn 5671  experts 7248  route 747
+--- L_qkv ---
+[focr-timing] vision_tower 7.23s
+[focr-timing] decode_i8 15.08s (821 tokens, 0.018s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2114  attn 4929  experts 6837  route 762
+--- L_gemm ---
+[focr-timing] vision_tower 7.15s
+[focr-timing] decode_i8 14.60s (821 tokens, 0.018s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2012  attn 4970  experts 6447  route 735
+--- L_gemmqkv ---
+[focr-timing] vision_tower 7.13s
+[focr-timing] decode_i8 14.08s (821 tokens, 0.017s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2003  attn 4341  experts 6550  route 743
+--- L_int8kv ---
+[focr-timing] vision_tower 7.19s
+[focr-timing] decode_i8 13.97s (821 tokens, 0.017s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 1977  attn 4303  experts 6514  route 736
