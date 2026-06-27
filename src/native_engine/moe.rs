@@ -438,6 +438,98 @@ pub fn moe_block_default(
     )
 }
 
+// ── bd-1azu.6: batched MoE decode dispatch (Phase-6 continuous-batch spine) ──
+
+/// Split a `[B, hidden]` batched MoE result into B per-stream `[1, hidden]`
+/// outputs in input (stream-row) order — the "returns B outputs" half of the
+/// batched dispatch. Pure reshaping; each `combined.row(s)` is copied, so the
+/// returned [`Mat`]s own their data and alias nothing.
+fn split_stream_rows(combined: &Mat) -> Vec<Mat> {
+    let h = combined.cols;
+    (0..combined.rows)
+        .map(|s| Mat::from_vec(1, h, combined.row(s).to_vec()))
+        .collect()
+}
+
+/// Batched MoE decode dispatch over B in-flight page-streams (bd-1azu.6 — the
+/// MoE stage of the Phase-6 continuous-batch decode spine, bd-1azu).
+///
+/// `hidden` is the B streams' decode hidden states stacked row-major as
+/// `[B, HIDDEN]` (row `s` is stream `s`'s single decode token). Runs ONE batched
+/// MoE pass over the whole stack via the tested [`moe_block`] — a SINGLE f32
+/// router GEMM over all B rows, the per-expert counting-sort grouping already
+/// inside [`moe_block`] (each ACTIVE expert runs its SwiGLU GEMM ONCE over the
+/// grouped rows that selected it, instead of B separate per-stream passes), the
+/// per-token router-weighted combine scattered back to stream order, and the
+/// shared experts — then splits the `[B, HIDDEN]` result into B per-stream
+/// `[1, HIDDEN]` outputs ([`split_stream_rows`]).
+///
+/// ## Losslessness (Doctrine #1 — the bd-1azu parity invariant)
+///
+/// Output `s` is **byte-for-byte identical** to running stream `s` alone through
+/// [`moe_block`] (`batched_moe_block(stack)[s] == moe_block(row s)`), so the
+/// grouping is the real Lever B throughput win **and** bit-exact:
+///
+/// * the router GEMM ([`linear_no_bias`] -> [`nn::matmul`]) is M-independent —
+///   each output row's per-key reduction order is fixed regardless of how many
+///   rows are stacked (the same property the int8 spine proves in
+///   `tests/batched_igemm_parity.rs`, bd-1azu.2), and `softmax_rows` + the greedy
+///   top-k are per-row;
+/// * each expert's [`expert_mlp`] is likewise M-independent, so a stream's
+///   grouped row yields the same output whether it shares the expert's group with
+///   other streams' rows or runs alone;
+/// * the per-token weighted combine accumulates a token's 6 routed contributions
+///   in ascending-expert-index order — identical batched vs. standalone — and the
+///   shared add follows, so the f32 reduction order is preserved exactly
+///   (bd-1waa).
+///
+/// The per-stream parity is the executing proof in `tests/batched_moe_parity.rs`.
+/// Wiring this into the decode driver is gated by the `FOCR_BATCHED_MOE`
+/// kill-switch at the call site (default OFF); the function itself is a pure,
+/// lossless API.
+///
+/// # Errors
+/// [`FocrError::Other`] on a wrong expert count or any dimension mismatch,
+/// propagated from [`moe_block`].
+pub fn batched_moe_block(
+    hidden: &Mat,
+    gate: &[f32],
+    experts: &[MlpWeights<'_>],
+    shared: &MlpWeights<'_>,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
+) -> FocrResult<Vec<Mat>> {
+    let combined = moe_block(
+        hidden,
+        gate,
+        experts,
+        shared,
+        norm_topk_prob,
+        routed_scaling_factor,
+    )?;
+    Ok(split_stream_rows(&combined))
+}
+
+/// [`batched_moe_block`] with the pinned-config gate defaults ([SPEC-013/077]).
+///
+/// # Errors
+/// Propagates [`batched_moe_block`].
+pub fn batched_moe_block_default(
+    hidden: &Mat,
+    gate: &[f32],
+    experts: &[MlpWeights<'_>],
+    shared: &MlpWeights<'_>,
+) -> FocrResult<Vec<Mat>> {
+    batched_moe_block(
+        hidden,
+        gate,
+        experts,
+        shared,
+        config::NORM_TOPK_PROB,
+        config::ROUTED_SCALING_FACTOR,
+    )
+}
+
 // ── `Weights`-backed shims (now wired to the safetensors/`.focrq` accessors) ──
 
 /// Run the MoE block (layers 1..11) over a layer's `post_attention_layernorm`'d
@@ -522,6 +614,29 @@ pub fn dense_forward(weights: &Weights, hidden: &Mat) -> FocrResult<Mat> {
         intermediate: config::DENSE_INTERMEDIATE_SIZE,
     };
     dense_mlp(hidden, &w)
+}
+
+/// `Weights`-backed batched MoE dispatch (layers 1..11) over B stacked stream
+/// hidden states — the decode-spine entry point that loads the per-layer router /
+/// 64 routed experts / fused shared expert ONCE and runs them grouped over all B
+/// streams (bd-1azu.6).
+///
+/// `hidden` is `[B, HIDDEN]` (one decode token per in-flight stream); `layer` is
+/// the **absolute** decoder layer index (1..=11; dense layer 0 uses
+/// [`dense_forward`]). Delegates to [`forward`] (identical tensor wiring and the
+/// tested [`moe_block_default`]) and splits the `[B, HIDDEN]` result into B
+/// per-stream `[1, HIDDEN]` outputs, so `batched_forward(w, stack, L)[s]` is
+/// byte-for-byte `forward(w, row s, L)` (the M-independence argument on
+/// [`batched_moe_block`]). Wiring into the decode driver is gated by the
+/// `FOCR_BATCHED_MOE` kill-switch at the call site (default OFF).
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if any tensor is absent / wrong-shaped, or
+/// [`FocrError::Other`] on a kernel dimension mismatch — propagated from
+/// [`forward`].
+pub fn batched_forward(weights: &Weights, hidden: &Mat, layer: usize) -> FocrResult<Vec<Mat>> {
+    let combined = forward(weights, hidden, layer)?;
+    Ok(split_stream_rows(&combined))
 }
 
 #[cfg(test)]
