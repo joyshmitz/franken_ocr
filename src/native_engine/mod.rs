@@ -897,6 +897,7 @@ impl OcrModel {
             prefill_len
         ));
         let td = std::time::Instant::now();
+        decoder::prof::reset();
 
         let mut generated: Vec<u32> = prompt_ids.to_vec();
         let mut emitted: Vec<u32> = Vec::new();
@@ -927,6 +928,12 @@ impl OcrModel {
             emitted.len(),
             td.elapsed().as_secs_f64() / (emitted.len().max(1) as f64)
         ));
+        if decoder::prof::enabled() {
+            let (lmhead, attn, experts, route) = decoder::prof::snapshot_ms();
+            timing_log(&format!(
+                "decode_i8 phases (ms): lm_head {lmhead:.0}  attn {attn:.0}  experts {experts:.0}  route {route:.0}"
+            ));
+        }
         Ok(emitted)
     }
 

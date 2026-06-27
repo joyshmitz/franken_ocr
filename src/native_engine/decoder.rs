@@ -934,6 +934,46 @@ fn cached_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Mat> {
     }
 }
 
+// ── Decode phase profiler (FOCR_PROFILE_DECODE) ──────────────────────────────
+//
+// Accumulates wall-nanoseconds per decode phase across all tokens so the
+// throughput bottleneck is attributable (lm_head vs attention vs MoE experts vs
+// routing). A handful of `Instant::now()` (~20 ns) + `fetch_add` per token —
+// negligible vs the ~23 ms/token it measures, and entirely skipped when off.
+pub mod prof {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Final RMSNorm + `lm_head` GEMV.
+    pub static LMHEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Attention sub-block: q/k/v/o projections + RoPE + ring + R-SWA attention.
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    /// MoE/MLP routed + shared experts (the SwiGLU GEMVs), excluding routing.
+    pub static EXPERTS_NS: AtomicU64 = AtomicU64::new(0);
+    /// MoE top-k router (softmax over the 64-expert gate).
+    pub static ROUTE_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var_os("FOCR_PROFILE_DECODE").is_some())
+    }
+    #[inline]
+    pub fn add(c: &AtomicU64, ns: u64) {
+        c.fetch_add(ns, Ordering::Relaxed);
+    }
+    /// Reset all counters (call before a timed decode loop).
+    pub fn reset() {
+        for c in [&LMHEAD_NS, &ATTN_NS, &EXPERTS_NS, &ROUTE_NS] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    /// `(lmhead, attn, experts, route)` accumulated milliseconds.
+    pub fn snapshot_ms() -> (f64, f64, f64, f64) {
+        let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
+        (ms(&LMHEAD_NS), ms(&ATTN_NS), ms(&EXPERTS_NS), ms(&ROUTE_NS))
+    }
+}
+
 // ── Bespoke single-token (m=1) decode GEMV — the decode-throughput kernel ────
 //
 // Decode is one token at a time: every projection is a matrix·vector product
@@ -1290,7 +1330,8 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
 }
 
 /// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x)
-/// * (up·x))`. The int8 twin of [`expert_gemv`].
+/// * (up·x))`. The int8 twin of [`expert_gemv`]. Internally parallel (used for the
+/// big dense layer-0 MLP + the shared expert).
 fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32> {
     let g = gemv_i8(x, gate);
     let u = gemv_i8(x, up);
@@ -1300,6 +1341,41 @@ fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32>
         act[i] = silu(g[i]) * u[i];
     }
     gemv_i8(&act, down)
+}
+
+/// SERIAL int8 GEMV from a pre-quantized activation — a single `simd::igemm_s8s8`
+/// SDOT/VNNI call over all `n` rows, NO rayon. Used inside the per-expert rayon
+/// tasks below, where parallelism is ACROSS experts (one task each) rather than
+/// within: 6 routed experts is the right granularity to saturate the pool with
+/// ONE dispatch, vs the 18 tiny internally-parallel GEMVs the per-row `gemv_i8`
+/// would spawn (measured: MoE experts were 56% of decode, ~10% of SDOT peak —
+/// dispatch-bound, not compute-bound).
+fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(xq.len(), k);
+    let mut acc = vec![0i32; n];
+    simd::igemm_s8s8(xq, &qw.w, 1, k, n, &mut acc);
+    let mut y = vec![0.0f32; n];
+    for (o, slot) in y.iter_mut().enumerate() {
+        *slot = acc[o] as f32 * a_scale * qw.scales[o];
+    }
+    y
+}
+
+/// One SwiGLU expert, fully SERIAL (the input is quantized ONCE and reused for
+/// gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert parallelism.
+fn expert_gemv_i8_serial(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32> {
+    let (xq, a_scale) = quantize_row_i8(x);
+    let g = gemv_i8_serial(&xq, a_scale, gate);
+    let u = gemv_i8_serial(&xq, a_scale, up);
+    let inter = gate.n;
+    let mut act = vec![0.0f32; inter];
+    for i in 0..inter {
+        act[i] = silu(g[i]) * u[i];
+    }
+    let (aq, a_scale2) = quantize_row_i8(&act);
+    gemv_i8_serial(&aq, a_scale2, down)
 }
 
 /// Quantize a `[out, in]` row-major f32 weight to per-output-channel symmetric
@@ -1493,22 +1569,64 @@ fn prefill_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
 fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
     let hidden = config::HIDDEN_SIZE;
     let row = normed.row(0);
+    let profiling = prof::enabled();
     match mlp {
-        CachedMlpI8::Dense { gate, up, down } => Ok(expert_gemv_i8(row, gate, up, down)),
+        CachedMlpI8::Dense { gate, up, down } => {
+            let t = profiling.then(std::time::Instant::now);
+            let y = expert_gemv_i8(row, gate, up, down);
+            if let Some(t) = t {
+                prof::add(&prof::EXPERTS_NS, t.elapsed().as_nanos() as u64);
+            }
+            Ok(y)
+        }
         CachedMlpI8::Moe { gate, experts, shared } => {
+            let tr = profiling.then(std::time::Instant::now);
             let routing = moe::route_default(normed, gate)?;
+            if let Some(t) = tr {
+                prof::add(&prof::ROUTE_NS, t.elapsed().as_nanos() as u64);
+            }
+            let te = profiling.then(std::time::Instant::now);
+            // Fan the 6 routed experts across the pool as FULLY SERIAL tasks (one
+            // dispatch, no nested parallelism), CONCURRENTLY with the larger shared
+            // expert (inter 1792), which keeps its own internal parallelism via
+            // `rayon::join`. Measured best of the schemes tried: the shared expert
+            // gets the spare cores while the 6 routed saturate the rest, vs an
+            // all-serial fan-out where the shared becomes a single-core long pole.
+            let idx = routing.indices[0];
+            let wts = routing.weights[0];
+            let (partials, s) = rayon::join(
+                || {
+                    (0..moe::config::NUM_EXPERTS_PER_TOK)
+                        .into_par_iter()
+                        .map(|j| {
+                            let e = idx[j];
+                            let w = wts[j];
+                            let mut y = expert_gemv_i8_serial(
+                                row,
+                                &experts[e][0],
+                                &experts[e][1],
+                                &experts[e][2],
+                            );
+                            for v in y.iter_mut() {
+                                *v *= w;
+                            }
+                            y
+                        })
+                        .collect::<Vec<Vec<f32>>>()
+                },
+                || expert_gemv_i8(row, &shared[0], &shared[1], &shared[2]),
+            );
             let mut out = vec![0.0f32; hidden];
-            for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
-                let e = routing.indices[0][j];
-                let w = routing.weights[0][j];
-                let y = expert_gemv_i8(row, &experts[e][0], &experts[e][1], &experts[e][2]);
+            for p in &partials {
                 for c in 0..hidden {
-                    out[c] += w * y[c];
+                    out[c] += p[c];
                 }
             }
-            let s = expert_gemv_i8(row, &shared[0], &shared[1], &shared[2]);
             for c in 0..hidden {
                 out[c] += s[c];
+            }
+            if let Some(t) = te {
+                prof::add(&prof::EXPERTS_NS, t.elapsed().as_nanos() as u64);
             }
             Ok(out)
         }
@@ -1527,8 +1645,12 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
             hidden.rows
         )));
     }
+    let t = prof::enabled().then(std::time::Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let logits = gemv_i8(normed.row(0), &wc.lm_head);
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
 }
 
@@ -1625,9 +1747,11 @@ pub fn decode_step_with_cache_i8(
         )));
     }
     let rope = RopeTable::build(&[position], config::HEAD_DIM, config::ROPE_THETA);
+    let profiling = prof::enabled();
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
+        let t_attn = profiling.then(std::time::Instant::now);
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let nrow = normed.row(0);
         let mut q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
@@ -1639,6 +1763,9 @@ pub fn decode_step_with_cache_i8(
         let context = rswa::decode_attention(&caches[layer], &q.data)?;
         let attn_out = Mat::from_vec(1, hidden, gemv_i8(&context.data, &cl.o_proj));
         let h = add_residual(&x, &attn_out)?;
+        if let Some(t) = t_attn {
+            prof::add(&prof::ATTN_NS, t.elapsed().as_nanos() as u64);
+        }
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
         let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
         x = add_residual(&h, &mlp_out)?;
