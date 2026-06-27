@@ -451,6 +451,150 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
+/// Batched R-SWA KV cache: `B` in-flight page-streams, each owning its own
+/// `n_layers` per-layer [`RingCache`]s (bd-1azu.4 — the Phase-6 continuous-batch
+/// decode spine, bd-1azu).
+///
+/// Every `(stream, layer)` is an INDEPENDENT [`RingCache`], byte-for-byte the
+/// single-page structure, so a stream's KV state is bit-exact to running that
+/// page ALONE — the lossless default. The batched decode step consumes the `B`
+/// streams' K/V from the batched GEMM (batched-decode-gemm) and writes each into
+/// ITS OWN ring via [`BatchedRingCache::write_decode_step`]; the
+/// score/softmax/value attention stays per-stream (per [`decode_attention`],
+/// bd-1waa-safe), NEVER cross-stream key-batching. Streams that share a prefix
+/// can later be made to point at ONE shared reference block — that is the
+/// prefix-kv-share seam (bd-1azu.12), OFF by default here.
+///
+/// **KV working-set arithmetic** (the figure the L3-residency budget in
+/// `l3-layer-sync-engine` / `ccd-expert-service` depends on). For the default
+/// f32 path, per stream per layer the live K+V bytes are
+/// `2 * NUM_HEADS * (ref_capacity + RING_WINDOW) * HEAD_DIM * size_of::<f32>()`,
+/// so the whole batched working set is that summed over the `B` streams' layers
+/// — see [`BatchedRingCache::kv_f32_bytes`]. At the int8 baseline ~12 MB/page the
+/// f32 default is 4× that (~48 MB/page → ~12 GB for 256 streams, trivial in
+/// 499 GB), NOT 3 GB. With the int8-KV lever (`FOCR_INT8_KV`, bd-1waa,
+/// gated/lossy) each stream additionally carries an int8 mirror; the default path
+/// allocates none.
+#[derive(Debug)]
+pub struct BatchedRingCache {
+    /// `streams[s]` holds page-stream `s`'s `n_layers` per-layer caches.
+    streams: Vec<Vec<RingCache>>,
+    /// Layers per stream (every stream has the same count).
+    n_layers: usize,
+}
+
+impl BatchedRingCache {
+    /// Build `B = prefill_caps.len()` page-streams, each with `n_layers` per-layer
+    /// [`RingCache`]s sized to that stream's worst-case prefill (`prefill_caps[s]`,
+    /// the reference-block capacity `m`). Pre-allocated and allocation-free
+    /// thereafter, exactly like the single-page path.
+    ///
+    /// # Panics
+    /// Panics if `n_layers == 0` or `prefill_caps` is empty (a batched forward
+    /// always has ≥1 layer and ≥1 stream — a programming error otherwise).
+    #[must_use]
+    pub fn new(prefill_caps: &[usize], n_layers: usize) -> Self {
+        assert!(n_layers > 0, "BatchedRingCache: n_layers must be > 0");
+        assert!(
+            !prefill_caps.is_empty(),
+            "BatchedRingCache: needs at least one stream"
+        );
+        let streams = prefill_caps
+            .iter()
+            .map(|&cap| (0..n_layers).map(|_| RingCache::new(cap)).collect())
+            .collect();
+        Self { streams, n_layers }
+    }
+
+    /// Number of in-flight page-streams `B`.
+    #[must_use]
+    pub fn num_streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Layers per stream.
+    #[must_use]
+    pub fn num_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    /// Stream `s`'s per-layer caches (read-only).
+    ///
+    /// # Panics
+    /// Panics if `s >= num_streams()`.
+    #[must_use]
+    pub fn stream(&self, s: usize) -> &[RingCache] {
+        &self.streams[s]
+    }
+
+    /// One `(stream, layer)` cache (read-only) — e.g. for [`decode_attention`].
+    ///
+    /// # Panics
+    /// Panics if `s >= num_streams()` or `layer >= num_layers()`.
+    #[must_use]
+    pub fn layer(&self, s: usize, layer: usize) -> &RingCache {
+        &self.streams[s][layer]
+    }
+
+    /// One `(stream, layer)` cache (mutable) — for prefill / decode writes.
+    ///
+    /// # Panics
+    /// Panics if `s >= num_streams()` or `layer >= num_layers()`.
+    pub fn layer_mut(&mut self, s: usize, layer: usize) -> &mut RingCache {
+        &mut self.streams[s][layer]
+    }
+
+    /// Record stream `s` layer `layer`'s prefill reference block. Per-stream
+    /// independent; delegates to [`RingCache::record_prefill`].
+    ///
+    /// # Errors
+    /// Propagates [`RingCache::record_prefill`]'s errors.
+    pub fn record_prefill(
+        &mut self,
+        s: usize,
+        layer: usize,
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+    ) -> FocrResult<()> {
+        self.streams[s][layer].record_prefill(k, v, seq)
+    }
+
+    /// Write one decode token's K/V for stream `s` layer `layer` into ITS ring.
+    /// Returns the physical ring slot written. Delegates to
+    /// [`RingCache::write_decode_step`].
+    ///
+    /// # Errors
+    /// Propagates [`RingCache::write_decode_step`]'s errors.
+    pub fn write_decode_step(
+        &mut self,
+        s: usize,
+        layer: usize,
+        k_step: &[f32],
+        v_step: &[f32],
+    ) -> FocrResult<usize> {
+        self.streams[s][layer].write_decode_step(k_step, v_step)
+    }
+
+    /// Total default-path (f32) KV working-set bytes across all streams/layers —
+    /// the auditable figure for the L3-residency budget. Sums the live K+V
+    /// reference + ring regions: `Σ_s Σ_layer 2 * NUM_HEADS * (ref_capacity_s +
+    /// RING_WINDOW) * HEAD_DIM * size_of::<f32>()`. The int8 mirror, when present,
+    /// is extra and intentionally not counted here (this is the f32 baseline).
+    #[must_use]
+    pub fn kv_f32_bytes(&self) -> usize {
+        const F32: usize = core::mem::size_of::<f32>();
+        let mut bytes = 0usize;
+        for stream in &self.streams {
+            for cache in stream {
+                let rows = cache.ref_capacity() + RING_WINDOW;
+                bytes += 2 * NUM_HEADS * rows * HEAD_DIM * F32;
+            }
+        }
+        bytes
+    }
+}
+
 /// One R-SWA **decode** attention step (`q_len == 1`) over the layer's
 /// [`RingCache`].
 ///
@@ -1395,5 +1539,199 @@ mod tests {
             decode_attention_int8(&cache, &q),
             "without an int8 KV mirror",
         );
+    }
+}
+
+/// Batched R-SWA KV cache tests (bd-1azu.4): per-stream bit-exactness vs the
+/// single-page path, bounded-KV / reference-unwritten invariants at `B` up to
+/// 256, and the f32 KV-budget arithmetic the L3-residency beads depend on.
+#[cfg(test)]
+mod batched_ring_tests {
+    use super::{BatchedRingCache, HEAD_DIM, NUM_HEADS, RING_WINDOW, RingCache, decode_attention};
+
+    /// Deterministic value in `[-1, 1)` per `(stream, layer, head, row, dim)` so
+    /// every stream's K/V is distinct yet reproducible without a dependency.
+    fn val(stream: usize, layer: usize, h: usize, r: usize, d: usize) -> f32 {
+        let mut x = (stream as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (layer as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (h as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
+            ^ (r as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ (d as u64).wrapping_mul(0x27D4_EB2F_1656_67C5);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^= x >> 33;
+        ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// Head-major `[NUM_HEADS, seq, HEAD_DIM]` prefill K and V (V offset by one
+    /// dim so K != V).
+    fn build_prefill(stream: usize, layer: usize, seq: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut k = vec![0.0f32; NUM_HEADS * seq * HEAD_DIM];
+        let mut v = vec![0.0f32; NUM_HEADS * seq * HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for r in 0..seq {
+                for d in 0..HEAD_DIM {
+                    let idx = h * seq * HEAD_DIM + r * HEAD_DIM + d;
+                    k[idx] = val(stream, layer, h, r, d);
+                    v[idx] = val(stream, layer, h, r, d + 1);
+                }
+            }
+        }
+        (k, v)
+    }
+
+    /// One decode token's `[NUM_HEADS, HEAD_DIM]` K/V at logical step `t` (row
+    /// space offset so it never collides with prefill rows).
+    fn build_step(stream: usize, layer: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut k = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+        let mut v = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for d in 0..HEAD_DIM {
+                let idx = h * HEAD_DIM + d;
+                k[idx] = val(stream, layer, h, 1_000 + t, d);
+                v[idx] = val(stream, layer, h, 1_000 + t, d + 1);
+            }
+        }
+        (k, v)
+    }
+
+    /// One decode query `[NUM_HEADS, HEAD_DIM]`.
+    fn build_q(stream: usize, layer: usize, t: usize) -> Vec<f32> {
+        let mut q = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for d in 0..HEAD_DIM {
+                q[h * HEAD_DIM + d] = val(stream, layer, h, 2_000 + t, d);
+            }
+        }
+        q
+    }
+
+    /// THE invariant the spine rests on: stream `s`'s `(layer)` KV state is
+    /// byte-for-byte identical to driving that page alone through a standalone
+    /// `Vec<RingCache>` — including the decode-attention output. Covers warm-up
+    /// (`< RING_WINDOW`) and steady-state (`>= RING_WINDOW`) regimes.
+    #[test]
+    fn per_stream_independent_and_bit_exact() {
+        let n_layers = 2usize;
+        let caps = [5usize, 9, 16, 4, 7, 20, 3, 11]; // B=8, distinct prefill caps
+        let mut bc = BatchedRingCache::new(&caps, n_layers);
+        assert_eq!(bc.num_streams(), caps.len());
+        assert_eq!(bc.num_layers(), n_layers);
+
+        for (s, &cap) in caps.iter().enumerate() {
+            for l in 0..n_layers {
+                let (k, v) = build_prefill(s, l, cap);
+                bc.record_prefill(s, l, &k, &v, cap).expect("prefill");
+            }
+        }
+
+        // Standalone mirror of one chosen stream, driven with identical inputs.
+        let st = 5usize;
+        let mut standalone: Vec<RingCache> =
+            (0..n_layers).map(|_| RingCache::new(caps[st])).collect();
+        for (l, cache) in standalone.iter_mut().enumerate() {
+            let (k, v) = build_prefill(st, l, caps[st]);
+            cache
+                .record_prefill(&k, &v, caps[st])
+                .expect("standalone prefill");
+        }
+
+        let steps = 200usize; // crosses RING_WINDOW=128 into steady state
+        for t in 0..steps {
+            for (s, _) in caps.iter().enumerate() {
+                for l in 0..n_layers {
+                    let (k, v) = build_step(s, l, t);
+                    bc.write_decode_step(s, l, &k, &v).expect("batched step");
+                }
+            }
+            for (l, cache) in standalone.iter_mut().enumerate() {
+                let (k, v) = build_step(st, l, t);
+                cache.write_decode_step(&k, &v).expect("standalone step");
+            }
+
+            if t == 0 || t == RING_WINDOW - 1 || t == RING_WINDOW || t == steps - 1 {
+                for l in 0..n_layers {
+                    let bcl = bc.layer(st, l);
+                    let sal = &standalone[l];
+                    assert_eq!(
+                        bcl.prefill_len(),
+                        sal.prefill_len(),
+                        "prefill_len l{l} t{t}"
+                    );
+                    assert_eq!(bcl.ring_len(), sal.ring_len(), "ring_len l{l} t{t}");
+                    assert_eq!(bcl.ring_pos(), sal.ring_pos(), "ring_pos l{l} t{t}");
+                    assert_eq!(
+                        bcl.effective_len(),
+                        sal.effective_len(),
+                        "eff_len l{l} t{t}"
+                    );
+                    assert_eq!(bcl.is_warm(), sal.is_warm(), "is_warm l{l} t{t}");
+                    let q = build_q(st, l, t);
+                    let a = decode_attention(bcl, &q).expect("batched attn");
+                    let b = decode_attention(sal, &q).expect("standalone attn");
+                    assert_eq!(a.rows, b.rows);
+                    assert_eq!(a.cols, b.cols);
+                    assert_eq!(
+                        a.data, b.data,
+                        "stream {st} layer {l} step {t}: attention differs"
+                    );
+                }
+            }
+        }
+    }
+
+    /// At `B = 256` in-flight streams: every stream's KV stays bounded
+    /// (`effective_len <= prefill_len + RING_WINDOW`), the ring saturates, and the
+    /// reference block is NEVER written by decode (`prefill_len` constant).
+    #[test]
+    fn large_batch_invariants_bounded_and_reference_unwritten() {
+        let b = 256usize;
+        let seq = 4usize;
+        let caps = vec![seq; b];
+        let mut bc = BatchedRingCache::new(&caps, 1);
+        assert_eq!(bc.num_streams(), b);
+
+        for s in 0..b {
+            let (k, v) = build_prefill(s, 0, seq);
+            bc.record_prefill(s, 0, &k, &v, seq).expect("prefill");
+        }
+        let steps = 200usize; // > RING_WINDOW → steady state
+        for t in 0..steps {
+            for s in 0..b {
+                let (k, v) = build_step(s, 0, t);
+                bc.write_decode_step(s, 0, &k, &v).expect("step");
+            }
+        }
+        for s in 0..b {
+            let c = bc.layer(s, 0);
+            assert_eq!(
+                c.prefill_len(),
+                Some(seq),
+                "stream {s}: reference block must be untouched by decode"
+            );
+            assert_eq!(c.ring_len(), RING_WINDOW, "stream {s}: ring saturates");
+            assert!(c.is_warm(), "stream {s}: warm after {steps} steps");
+            assert_eq!(c.effective_len(), seq + RING_WINDOW, "stream {s}");
+            assert!(
+                c.effective_len() <= c.prefill_len().expect("prefilled") + RING_WINDOW,
+                "stream {s}: generated-token KV is bounded"
+            );
+        }
+    }
+
+    /// The f32 KV working-set figure (the L3-residency budget) equals the
+    /// per-stream-per-layer formula summed over streams/layers.
+    #[test]
+    fn kv_f32_bytes_matches_budget_arithmetic() {
+        let caps = [10usize, 20, 30];
+        let n_layers = 12usize;
+        let bc = BatchedRingCache::new(&caps, n_layers);
+        let f32sz = core::mem::size_of::<f32>();
+        let expect: usize = caps
+            .iter()
+            .map(|&cap| n_layers * 2 * NUM_HEADS * (cap + RING_WINDOW) * HEAD_DIM * f32sz)
+            .sum();
+        assert_eq!(bc.kv_f32_bytes(), expect);
+        assert!(bc.kv_f32_bytes() > 0);
     }
 }
