@@ -740,6 +740,50 @@ mod tests {
         }
     }
 
+    /// Batched-decode invariant (bd-1azu.2): an `M=B` GEMM row `r` is
+    /// byte-identical to running that row alone as an `m=1` GEMV, on EACH
+    /// accelerated tier directly — covering the M-block REMAINDER when `B` is not
+    /// a multiple of the register-block height (SDOT MR=4, SMMLA 8-row panels).
+    /// This is the property the Phase-6 batched spine rests on; checked here
+    /// in-process per tier (the public-dispatch + `FOCR_FORCE_ARCH` re-exec sweep
+    /// lives in `tests/batched_igemm_parity.rs`).
+    #[test]
+    fn batched_m_equals_per_row_gemv_per_tier() {
+        let mut rng = Rng(0x0a1b_2c3d_4e5f_6071);
+        let m_sweep = [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 64, 65, 128, 129];
+        let k = 320usize; // several 16-wide K-blocks; cheap.
+        let n = 13usize; // straddles NR=4.
+        let b = rand_i8(&mut rng, n * k);
+        for &m in &m_sweep {
+            let a = rand_i8(&mut rng, m * k);
+            let want = oracle_s8s8(&a, &b, m, k, n);
+            if let Some(batched) = run_sdot_s8s8(&a, &b, m, k, n) {
+                assert_eq!(batched, want, "SDOT M=B vs oracle (m={m})");
+                for r in 0..m {
+                    let row = &a[r * k..(r + 1) * k];
+                    let single = run_sdot_s8s8(row, &b, 1, k, n).expect("dotprod present");
+                    assert_eq!(
+                        &batched[r * n..(r + 1) * n],
+                        &single[..],
+                        "SDOT batched row {r} != standalone m=1 GEMV (m={m})"
+                    );
+                }
+            }
+            if let Some(batched) = run_smmla_s8s8(&a, &b, m, k, n) {
+                assert_eq!(batched, want, "SMMLA M=B vs oracle (m={m})");
+                for r in 0..m {
+                    let row = &a[r * k..(r + 1) * k];
+                    let single = run_smmla_s8s8(row, &b, 1, k, n).expect("i8mm present");
+                    assert_eq!(
+                        &batched[r * n..(r + 1) * n],
+                        &single[..],
+                        "SMMLA batched row {r} != standalone m=1 GEMV (m={m})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn accelerated_paths_add_into_seeded_out() {
         let (m, k, n) = (2usize, 17usize, 3usize);
