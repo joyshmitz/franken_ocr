@@ -48,6 +48,40 @@ fn scale() -> f32 {
     1.0 / (HEAD_DIM as f32).sqrt()
 }
 
+// ── decode-attention kill-switches (AGENTS.md doctrine: default path is the
+//    bit-exact scalar online-softmax loop; both levers are opt-in via env). ───
+
+/// Env kill-switch: reformulate the decode-attention `QK^T` / `probs@V` as a
+/// batched GEMV over the contiguous reference/ring key/value blocks (one pass
+/// over all keys per head, with the `exp` lifted out of the dot loop) instead of
+/// the per-key interleaved online-softmax fold. f32 accumulation reorders vs the
+/// scalar path, so it is **not** bit-exact — gated, parity-checked at `2e-6`.
+const ATTN_GEMM_ENV: &str = "FOCR_ATTN_GEMM";
+
+/// Env kill-switch (ACCURACY-RISKY, needs a measured-CER gate): additionally
+/// store the reference/ring K/V as per-row symmetric int8 and run the `QK` dot
+/// in int8 (`simd::igemm_s8s8` / SDOT), dequantizing `V` per row in the `PV`
+/// pass. Implies (and overrides) the f32 GEMM path. Default keeps f32.
+const INT8_KV_ENV: &str = "FOCR_INT8_KV";
+
+/// Read `FOCR_ATTN_GEMM` ONCE into a process-global bool (doctrine: not per
+/// token). The int8-KV path subsumes the GEMM path, so it is dispatched ahead of
+/// this flag in [`decode_attention`].
+fn attn_gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(ATTN_GEMM_ENV).is_some())
+}
+
+/// Read `FOCR_INT8_KV` ONCE into a process-global bool. Also gates whether
+/// [`RingCache::new`] allocates the int8 K/V mirror buffers (so the default path
+/// pays zero extra memory).
+fn int8_kv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(INT8_KV_ENV).is_some())
+}
+
 fn checked_cache_region_elems(rows: usize) -> usize {
     rows.checked_mul(HEAD_DIM)
         .expect("rswa: cache rows*HEAD_DIM overflow")
@@ -99,6 +133,76 @@ pub struct RingCache {
     /// Next ring slot to write (`0..RING_WINDOW`). Only advances modulo `W` at
     /// steady state; during warm-up it tracks `ring_len`.
     ring_pos: usize,
+    /// Per-row symmetric int8 mirror of the K/V regions — `Some` iff
+    /// [`FOCR_INT8_KV`](INT8_KV_ENV) was set when this cache was built (so the
+    /// default path allocates nothing). Populated in lock-step with the f32 K/V
+    /// by [`RingCache::record_prefill`] / [`RingCache::write_decode_step`].
+    int8: Option<Int8Kv>,
+}
+
+/// Per-row symmetric int8 mirror of one layer's K/V regions (built only under
+/// [`FOCR_INT8_KV`](INT8_KV_ENV)). Each `_i8` buffer mirrors the corresponding
+/// f32 region byte-for-byte in shape (`rows * HEAD_DIM` per head); each `_scale`
+/// holds one f32 `max(|row|)/127` per row. The f32 regions remain the source of
+/// truth and the parity oracle; these are a bandwidth-reduced read path for the
+/// hot `QK`/`PV` dots.
+#[derive(Debug, Clone)]
+struct Int8Kv {
+    /// Reference K int8, one `Vec` per head (each `ref_capacity * HEAD_DIM`).
+    ref_k: Vec<Vec<i8>>,
+    /// Reference K per-row scales, one `Vec` per head (each `ref_capacity`).
+    ref_k_scale: Vec<Vec<f32>>,
+    /// Reference V int8, one `Vec` per head.
+    ref_v: Vec<Vec<i8>>,
+    /// Reference V per-row scales, one `Vec` per head.
+    ref_v_scale: Vec<Vec<f32>>,
+    /// Ring K int8, one `Vec` per head (each `RING_WINDOW * HEAD_DIM`).
+    ring_k: Vec<Vec<i8>>,
+    /// Ring K per-row scales, one `Vec` per head (each `RING_WINDOW`).
+    ring_k_scale: Vec<Vec<f32>>,
+    /// Ring V int8, one `Vec` per head.
+    ring_v: Vec<Vec<i8>>,
+    /// Ring V per-row scales, one `Vec` per head.
+    ring_v_scale: Vec<Vec<f32>>,
+}
+
+impl Int8Kv {
+    /// Allocate zeroed int8 mirrors sized exactly like the f32 K/V regions.
+    fn new(ref_capacity: usize) -> Self {
+        let ref_elems = checked_cache_region_elems(ref_capacity);
+        let ring_elems = checked_cache_region_elems(RING_WINDOW);
+        let i8_ref = || (0..NUM_HEADS).map(|_| vec![0i8; ref_elems]).collect();
+        let sc_ref = || (0..NUM_HEADS).map(|_| vec![0.0f32; ref_capacity]).collect();
+        let i8_ring = || (0..NUM_HEADS).map(|_| vec![0i8; ring_elems]).collect();
+        let sc_ring = || (0..NUM_HEADS).map(|_| vec![0.0f32; RING_WINDOW]).collect();
+        Self {
+            ref_k: i8_ref(),
+            ref_k_scale: sc_ref(),
+            ref_v: i8_ref(),
+            ref_v_scale: sc_ref(),
+            ring_k: i8_ring(),
+            ring_k_scale: sc_ring(),
+            ring_v: i8_ring(),
+            ring_v_scale: sc_ring(),
+        }
+    }
+}
+
+/// Per-row symmetric int8 quantization of a `HEAD_DIM`-length f32 row into `q`,
+/// returning the row scale `max(|row|)/127` (or `1.0` for an all-zero row).
+///
+/// Values are rounded then clamped to `[-127, 127]`, so the int8 `QK` dot
+/// accumulates at most `127 * 127 * HEAD_DIM = 2_064_512` in i32 — three orders
+/// of magnitude under `i32::MAX`, regardless of head_dim/key count (the
+/// contraction is fixed at `HEAD_DIM`). See `int8_qk_i32_accumulation_cannot_overflow`.
+fn quantize_row_i8(row: &[f32], q: &mut [i8]) -> f32 {
+    let maxabs = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    let scale = if maxabs > 0.0 { maxabs / 127.0 } else { 1.0 };
+    let inv = 1.0 / scale;
+    for (qd, &x) in q.iter_mut().zip(row.iter()) {
+        *qd = (x * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
 }
 
 impl RingCache {
@@ -109,6 +213,14 @@ impl RingCache {
     /// Everything is zero-filled up front so the decode loop is allocation-free.
     #[must_use]
     pub fn new(prefill_capacity: usize) -> Self {
+        Self::new_inner(prefill_capacity, int8_kv_enabled())
+    }
+
+    /// [`RingCache::new`] with the int8-mirror decision made explicit (so the
+    /// unit tests can build an int8-enabled cache without setting the process
+    /// env). `with_int8` allocates the [`Int8Kv`] side buffers.
+    #[must_use]
+    fn new_inner(prefill_capacity: usize, with_int8: bool) -> Self {
         let ref_elems = checked_cache_region_elems(prefill_capacity);
         let ring_elems = checked_cache_region_elems(RING_WINDOW);
         Self {
@@ -120,6 +232,7 @@ impl RingCache {
             prefill_len: None,
             ring_len: 0,
             ring_pos: 0,
+            int8: with_int8.then(|| Int8Kv::new(prefill_capacity)),
         }
     }
 
@@ -194,6 +307,23 @@ impl RingCache {
             let src = &v[h * stride..(h + 1) * stride];
             self.ref_v[h][..stride].copy_from_slice(src);
         }
+        // Mirror the whole reference block into int8 once (amortized over the
+        // entire decode) when the int8-KV lever is active.
+        if let Some(i8kv) = self.int8.as_mut() {
+            for h in 0..NUM_HEADS {
+                for r in 0..seq {
+                    let off = r * HEAD_DIM;
+                    i8kv.ref_k_scale[h][r] = quantize_row_i8(
+                        &self.ref_k[h][off..off + HEAD_DIM],
+                        &mut i8kv.ref_k[h][off..off + HEAD_DIM],
+                    );
+                    i8kv.ref_v_scale[h][r] = quantize_row_i8(
+                        &self.ref_v[h][off..off + HEAD_DIM],
+                        &mut i8kv.ref_v[h][off..off + HEAD_DIM],
+                    );
+                }
+            }
+        }
         self.prefill_len = Some(seq);
         self.ring_len = 0;
         self.ring_pos = 0;
@@ -260,6 +390,20 @@ impl RingCache {
             self.ring_pos = (self.ring_pos + 1) % RING_WINDOW;
             slot
         };
+        // Mirror the freshly-written ring row into int8 at the same physical slot.
+        if let Some(i8kv) = self.int8.as_mut() {
+            let off = slot * HEAD_DIM;
+            for h in 0..NUM_HEADS {
+                i8kv.ring_k_scale[h][slot] = quantize_row_i8(
+                    &self.ring_k[h][off..off + HEAD_DIM],
+                    &mut i8kv.ring_k[h][off..off + HEAD_DIM],
+                );
+                i8kv.ring_v_scale[h][slot] = quantize_row_i8(
+                    &self.ring_v[h][off..off + HEAD_DIM],
+                    &mut i8kv.ring_v[h][off..off + HEAD_DIM],
+                );
+            }
+        }
         Ok(slot)
     }
 
@@ -318,11 +462,13 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///   weights = softmax(scores)               (over the union)
 ///   out     = sum_j weights[j] * (referenceV ++ ringV)[j]
 /// ```
-/// The reference block is folded with an **online (streaming) softmax** so the
-/// large `m` score row is never materialized: we accumulate a running max `m*`,
-/// a running denominator `l`, and a running weighted-V accumulator, rescaling on
-/// each new running-max. The ring (`<= 128` keys) is folded into the same
-/// accumulators.
+///
+/// Dispatch (env read ONCE into a bool — doctrine):
+///  * default — [`decode_attention_scalar`], the bit-exact online-softmax fold;
+///  * [`FOCR_INT8_KV`](INT8_KV_ENV) — [`decode_attention_int8`] (int8 `QK` SDOT +
+///    int8 `V` dequant), overriding the f32 GEMM path;
+///  * [`FOCR_ATTN_GEMM`](ATTN_GEMM_ENV) — [`decode_attention_gemm`], the f32
+///    batched-GEMV path (`exp` lifted out of the dot loop).
 ///
 /// Returns the decode context as a `[1, NUM_HEADS * HEAD_DIM]` [`Mat`] (the
 /// concatenated per-head outputs, ready for `o_proj`).
@@ -331,6 +477,18 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// [`FocrError::Other`] if prefill was never recorded, `q` has the wrong length,
 /// or the effective key set is empty.
 pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
+    if int8_kv_enabled() && cache.int8.is_some() {
+        decode_attention_int8(cache, q)
+    } else if attn_gemm_enabled() {
+        decode_attention_gemm(cache, q)
+    } else {
+        decode_attention_scalar(cache, q)
+    }
+}
+
+/// Shared validation prologue for the three decode-attention paths: returns
+/// `(prefill_len, ring_len)` or the same errors the original kernel raised.
+fn decode_dims(cache: &RingCache, q: &[f32]) -> FocrResult<(usize, usize)> {
     let Some(prefill_len) = cache.prefill_len else {
         return Err(FocrError::Other(anyhow::anyhow!(
             "rswa: decode_attention before record_prefill"
@@ -350,7 +508,14 @@ pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
             "rswa: empty attention key set (prefill_len=0, ring_len=0)"
         )));
     }
+    Ok((prefill_len, ring_len))
+}
 
+/// Default (bit-exact) decode attention: per-head online (streaming) softmax
+/// fold over the union `reference ++ ring`, never materializing the score row.
+/// This is the parity oracle for the GEMM / int8-KV levers.
+fn decode_attention_scalar(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
+    let (prefill_len, ring_len) = decode_dims(cache, q)?;
     let s = scale();
     let mut out = vec![0.0f32; NUM_HEADS * HEAD_DIM];
 
@@ -387,6 +552,207 @@ pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
 
         // Normalize: out_h = acc / run_den.
         let inv = if run_den > 0.0 { 1.0 / run_den } else { 0.0 };
+        let dst = &mut out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+        for i in 0..HEAD_DIM {
+            dst[i] = acc[i] * inv;
+        }
+    }
+
+    Ok(Mat::from_vec(1, NUM_HEADS * HEAD_DIM, out))
+}
+
+/// `scores[r] = scale * (q · keys[r])` for `r in 0..rows`, where `keys` is the
+/// contiguous `[rows, HEAD_DIM]` row-major key block. The inner dot runs in the
+/// SAME order (`d = 0..HEAD_DIM`) as [`dot`], so each per-key score is
+/// bit-identical to the scalar path; only the *softmax* and *PV* accumulation
+/// reorder. A clean, branch-free, autovectorizable loop (doctrine #3 — no
+/// hand-rolled wide SIMD over an autovectorizable scalar loop).
+#[inline]
+fn block_scores(q: &[f32], keys: &[f32], rows: usize, scale: f32, out: &mut [f32]) {
+    for r in 0..rows {
+        let krow = &keys[r * HEAD_DIM..(r + 1) * HEAD_DIM];
+        let mut acc = 0.0f32;
+        for d in 0..HEAD_DIM {
+            acc += q[d] * krow[d];
+        }
+        out[r] = acc * scale;
+    }
+}
+
+/// `acc[d] += sum_r probs[r] * vals[r*HEAD_DIM + d]` over the contiguous
+/// `[rows, HEAD_DIM]` value block — the `probs @ V` GEMV, broadcast-scalar inner.
+#[inline]
+fn block_accumulate(probs: &[f32], vals: &[f32], rows: usize, acc: &mut [f32; HEAD_DIM]) {
+    for r in 0..rows {
+        let vrow = &vals[r * HEAD_DIM..(r + 1) * HEAD_DIM];
+        let p = probs[r];
+        for d in 0..HEAD_DIM {
+            acc[d] += p * vrow[d];
+        }
+    }
+}
+
+/// Numerically-stable softmax over the first `total` entries of `scores`,
+/// IN PLACE: subtract the row max, exponentiate, and return the denominator
+/// (the un-normalized weights stay in `scores`, mirroring how the scalar path
+/// defers the `1/run_den` normalization to the output).
+#[inline]
+fn softmax_inplace(scores: &mut [f32]) -> f32 {
+    let mut mx = f32::NEG_INFINITY;
+    for &sc in scores.iter() {
+        if sc > mx {
+            mx = sc;
+        }
+    }
+    let mut den = 0.0f32;
+    for sc in scores.iter_mut() {
+        let w = (*sc - mx).exp();
+        *sc = w;
+        den += w;
+    }
+    den
+}
+
+/// f32 batched-GEMV decode attention (`FOCR_ATTN_GEMM`): per head, compute ALL
+/// scores over the contiguous reference + ring key blocks in one branch-free
+/// pass ([`block_scores`]), softmax the materialized row, then `probs @ V` in one
+/// pass over the value blocks ([`block_accumulate`]). Same R-SWA semantics as
+/// [`decode_attention_scalar`]; the per-key dots are bit-identical, only the
+/// softmax/PV accumulation reorders (f32, so NOT bit-exact — parity-checked at
+/// `2e-6`).
+fn decode_attention_gemm(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
+    let (prefill_len, ring_len) = decode_dims(cache, q)?;
+    let total = prefill_len + ring_len;
+    let s = scale();
+    let mut out = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+    let mut scores = vec![0.0f32; total];
+
+    for h in 0..NUM_HEADS {
+        let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+
+        // QK^T over the two contiguous key blocks → materialized score row.
+        block_scores(
+            qh,
+            &cache.ref_k[h][..prefill_len * HEAD_DIM],
+            prefill_len,
+            s,
+            &mut scores[..prefill_len],
+        );
+        block_scores(
+            qh,
+            &cache.ring_k[h][..ring_len * HEAD_DIM],
+            ring_len,
+            s,
+            &mut scores[prefill_len..total],
+        );
+
+        let den = softmax_inplace(&mut scores[..total]);
+
+        // probs @ V over the two contiguous value blocks.
+        let mut acc = [0.0f32; HEAD_DIM];
+        block_accumulate(
+            &scores[..prefill_len],
+            &cache.ref_v[h][..prefill_len * HEAD_DIM],
+            prefill_len,
+            &mut acc,
+        );
+        block_accumulate(
+            &scores[prefill_len..total],
+            &cache.ring_v[h][..ring_len * HEAD_DIM],
+            ring_len,
+            &mut acc,
+        );
+
+        let inv = if den > 0.0 { 1.0 / den } else { 0.0 };
+        let dst = &mut out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+        for i in 0..HEAD_DIM {
+            dst[i] = acc[i] * inv;
+        }
+    }
+
+    Ok(Mat::from_vec(1, NUM_HEADS * HEAD_DIM, out))
+}
+
+/// int8-KV decode attention (`FOCR_INT8_KV`, ACCURACY-RISKY — needs a measured
+/// CER gate). The query is dynamically quantized per head; the `QK` dot runs in
+/// int8 (`simd::igemm_s8s8` / SDOT) over the int8 K mirror with an i32
+/// accumulator (worst case `127*127*HEAD_DIM = 2_064_512`, far under `i32::MAX`),
+/// dequantized by `qscale * k_scale[r]`. Softmax is identical f32. `PV` reads the
+/// int8 V mirror (4× less bandwidth) and dequantizes per row. R-SWA semantics
+/// unchanged; f32 stays the default + the parity oracle.
+fn decode_attention_int8(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
+    let (prefill_len, ring_len) = decode_dims(cache, q)?;
+    let Some(i8kv) = cache.int8.as_ref() else {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: decode_attention_int8 without an int8 KV mirror (FOCR_INT8_KV)"
+        )));
+    };
+    let total = prefill_len + ring_len;
+    let s = scale();
+    let mut out = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+    let mut scores = vec![0.0f32; total];
+    let mut qi8 = [0i8; HEAD_DIM];
+    let mut acc_i32 = vec![0i32; total];
+
+    for h in 0..NUM_HEADS {
+        let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+        let qscale = quantize_row_i8(qh, &mut qi8);
+
+        // int8 QK over the reference K mirror.
+        if prefill_len > 0 {
+            let dst = &mut acc_i32[..prefill_len];
+            dst.fill(0);
+            crate::simd::igemm_s8s8(
+                &qi8,
+                &i8kv.ref_k[h][..prefill_len * HEAD_DIM],
+                1,
+                HEAD_DIM,
+                prefill_len,
+                dst,
+            );
+            let k_scale = &i8kv.ref_k_scale[h];
+            for r in 0..prefill_len {
+                scores[r] = acc_i32[r] as f32 * qscale * k_scale[r] * s;
+            }
+        }
+        // int8 QK over the ring K mirror.
+        if ring_len > 0 {
+            let dst = &mut acc_i32[..ring_len];
+            dst.fill(0);
+            crate::simd::igemm_s8s8(
+                &qi8,
+                &i8kv.ring_k[h][..ring_len * HEAD_DIM],
+                1,
+                HEAD_DIM,
+                ring_len,
+                dst,
+            );
+            let k_scale = &i8kv.ring_k_scale[h];
+            for r in 0..ring_len {
+                scores[prefill_len + r] = acc_i32[r] as f32 * qscale * k_scale[r] * s;
+            }
+        }
+
+        let den = softmax_inplace(&mut scores[..total]);
+
+        // PV: read int8 V (1 B/elem), dequantize per row.
+        let mut acc = [0.0f32; HEAD_DIM];
+        for r in 0..prefill_len {
+            let vrow = &i8kv.ref_v[h][r * HEAD_DIM..(r + 1) * HEAD_DIM];
+            let pw = scores[r] * i8kv.ref_v_scale[h][r];
+            for d in 0..HEAD_DIM {
+                acc[d] += pw * f32::from(vrow[d]);
+            }
+        }
+        for r in 0..ring_len {
+            let vrow = &i8kv.ring_v[h][r * HEAD_DIM..(r + 1) * HEAD_DIM];
+            let pw = scores[prefill_len + r] * i8kv.ring_v_scale[h][r];
+            for d in 0..HEAD_DIM {
+                acc[d] += pw * f32::from(vrow[d]);
+            }
+        }
+
+        let inv = if den > 0.0 { 1.0 / den } else { 0.0 };
         let dst = &mut out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
         for i in 0..HEAD_DIM {
             dst[i] = acc[i] * inv;
@@ -828,5 +1194,201 @@ mod tests {
             "attention expects k [1",
         );
         assert_eq!(cache.ring_len(), 0, "malformed k must not write K/V");
+    }
+
+    // ── decode-attention lever parity (FOCR_ATTN_GEMM / FOCR_INT8_KV) ──────────
+
+    fn max_abs_diff(a: &Mat, b: &Mat) -> f32 {
+        assert_eq!(a.shape(), b.shape(), "shape mismatch in max_abs_diff");
+        a.data
+            .iter()
+            .zip(b.data.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Build a cache (optionally int8-mirrored) with a `pf`-row reference block
+    /// and `ring` decode steps, filling K/V via the supplied closures.
+    fn build_cache(
+        pf: usize,
+        ring: usize,
+        int8: bool,
+        kf: impl Fn(usize, usize) -> f32,
+        vf: impl Fn(usize, usize) -> f32,
+        rk: impl Fn(usize, usize, usize) -> f32,
+        rv: impl Fn(usize, usize, usize) -> f32,
+    ) -> RingCache {
+        let mut cache = RingCache::new_inner(pf + ring + 8, int8);
+        let k = fill_head_major(pf, &kf);
+        let v = fill_head_major(pf, &vf);
+        cache.record_prefill(&k, &v, pf).unwrap();
+        for step in 0..ring {
+            let kt = one_token(|h, d| rk(step, h, d));
+            let vt = one_token(|h, d| rv(step, h, d));
+            cache.write_decode_step(&kt, &vt).unwrap();
+        }
+        cache
+    }
+
+    /// The f32 batched-GEMV path (`FOCR_ATTN_GEMM`) tracks the scalar online-
+    /// softmax oracle within the SAM-style `2e-6` reorder tolerance over a
+    /// reference block + ring tail with non-uniform, non-degenerate scores.
+    #[test]
+    fn gemm_attention_matches_scalar_reference() {
+        let cache = build_cache(
+            7,
+            5,
+            false,
+            |r, d| ((r * 13 + d * 7) % 17) as f32 * 0.11 - 0.9,
+            |r, d| ((r * 5 + d * 3) % 11) as f32 * 0.07 - 0.3,
+            |s, h, d| ((h * 3 + d * 2 + s) % 13) as f32 * 0.05 - 0.31,
+            |s, h, d| ((h + d * 4 + s) % 9) as f32 * 0.06 - 0.2,
+        );
+        let q = one_token(|h, d| ((h * 2 + d) % 7) as f32 * 0.2 - 0.6);
+        let gemm = decode_attention_gemm(&cache, &q).unwrap();
+        let scalar = decode_attention_scalar(&cache, &q).unwrap();
+        let max_abs = max_abs_diff(&gemm, &scalar);
+        assert!(max_abs <= 2.0e-6, "gemm vs scalar max_abs={max_abs}");
+    }
+
+    /// The public dispatcher with no env set IS the scalar path (default,
+    /// bit-exact). Guards against a future dispatch regression.
+    #[test]
+    fn default_dispatch_is_bit_exact_scalar() {
+        let cache = build_cache(
+            4,
+            3,
+            false,
+            |r, d| ((r + d) % 5) as f32 * 0.13 - 0.3,
+            |r, d| ((r * 2 + d) % 6) as f32 * 0.09 - 0.2,
+            |s, h, d| ((h + d + s) % 7) as f32 * 0.04 - 0.1,
+            |s, h, d| ((h * 2 + d + s) % 5) as f32 * 0.05 - 0.1,
+        );
+        let q = one_token(|h, d| ((h + d) % 9) as f32 * 0.1 - 0.4);
+        let public = decode_attention(&cache, &q).unwrap();
+        let scalar = decode_attention_scalar(&cache, &q).unwrap();
+        // Default (no FOCR_* env): dispatcher routes to the scalar oracle exactly.
+        assert_eq!(public.data, scalar.data);
+    }
+
+    /// int8 i32-accumulation overflow proof (doctrine #2). The `QK` dot contracts
+    /// over `HEAD_DIM` with both operands clamped to `[-127, 127]`, so the i32
+    /// accumulator tops out three orders of magnitude under `i32::MAX`.
+    #[test]
+    fn int8_qk_i32_accumulation_cannot_overflow() {
+        let worst = 127i64 * 127 * HEAD_DIM as i64;
+        assert_eq!(worst, 2_064_512);
+        assert!(
+            worst <= i64::from(i32::MAX),
+            "worst-case int8 QK accumulation {worst} overflows i32"
+        );
+    }
+
+    /// The int8 mirror buffers are allocated iff requested (the env gate keeps the
+    /// default path at zero extra memory).
+    #[test]
+    fn int8_mirror_allocated_only_when_enabled() {
+        assert!(RingCache::new_inner(8, false).int8.is_none());
+        let c = RingCache::new_inner(8, true);
+        let i8kv = c.int8.as_ref().expect("int8 mirror present");
+        assert_eq!(i8kv.ref_k.len(), NUM_HEADS);
+        assert_eq!(i8kv.ring_k[0].len(), RING_WINDOW * HEAD_DIM);
+        assert_eq!(i8kv.ref_k_scale[0].len(), 8);
+    }
+
+    /// With **lossless-quantizable** K/V/q (integer entries, per-row max-abs
+    /// pinned to 127 so `scale == 1`), the int8-KV path reproduces the f32 GEMM
+    /// path to f32 precision — isolating the int8 QK-SDOT + V-dequant *kernel*
+    /// correctness from the quantization error itself (which the 20-page CER gate
+    /// measures). The d=0 anchor (127) pins the scale; the small d>=1 integers
+    /// keep the softmax non-degenerate.
+    #[test]
+    fn int8_kv_attention_matches_gemm_when_losslessly_quantizable() {
+        // Per-row: entry 0 = 127 (pins max-abs => scale 1), rest small integers.
+        let anchor = |base: usize| {
+            move |r: usize, d: usize| -> f32 {
+                if d == 0 {
+                    127.0
+                } else {
+                    (((r * base + d * 3) % 7) as i32 - 3) as f32
+                }
+            }
+        };
+        let ranchor = |base: usize| {
+            move |s: usize, h: usize, d: usize| -> f32 {
+                if d == 0 {
+                    127.0
+                } else {
+                    (((h * base + d * 5 + s * 2) % 7) as i32 - 3) as f32
+                }
+            }
+        };
+        let cache = build_cache(6, 4, true, anchor(31), anchor(17), ranchor(13), ranchor(11));
+        let q = one_token(|_h, d| {
+            if d == 0 {
+                127.0
+            } else {
+                ((d % 7) as i32 - 3) as f32
+            }
+        });
+
+        let int8 = decode_attention_int8(&cache, &q).unwrap();
+        let gemm = decode_attention_gemm(&cache, &q).unwrap();
+        let scalar = decode_attention_scalar(&cache, &q).unwrap();
+
+        // Lossless quantization => int8 reproduces the GEMM path essentially to
+        // the bit (only f32 multiply by the unit scales intervenes).
+        let i8_vs_gemm = max_abs_diff(&int8, &gemm);
+        assert!(i8_vs_gemm <= 1.0e-6, "int8 vs gemm max_abs={i8_vs_gemm}");
+        // And the whole int8 pipeline tracks the scalar oracle within the
+        // online-vs-batched softmax reorder tolerance. The lossless construction
+        // pins V's max-abs at 127, so the outputs are O(127); use a
+        // MAGNITUDE-RELATIVE 2e-6 bound (1 ULP at mag 127 is ~1.5e-5 absolute).
+        let i8_vs_scalar = max_abs_diff(&int8, &scalar);
+        let out_mag = scalar.data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let rel = i8_vs_scalar / out_mag.max(1.0);
+        assert!(
+            rel <= 2.0e-6,
+            "int8 vs scalar rel={rel} (abs={i8_vs_scalar}, out_mag={out_mag})"
+        );
+    }
+
+    /// int8-KV degrades GRACEFULLY (no panic, finite output, right shape) on
+    /// arbitrary lossy f32 K/V — the realistic regime the CER gate evaluates.
+    #[test]
+    fn int8_kv_attention_runs_on_lossy_inputs() {
+        let cache = build_cache(
+            5,
+            3,
+            true,
+            |r, d| ((r * 7 + d * 3) % 19) as f32 * 0.013 - 0.12,
+            |r, d| ((r * 11 + d) % 23) as f32 * 0.009 - 0.1,
+            |s, h, d| ((h * 5 + d * 2 + s) % 17) as f32 * 0.011 - 0.09,
+            |s, h, d| ((h + d * 3 + s) % 13) as f32 * 0.012 - 0.07,
+        );
+        let q = one_token(|h, d| ((h * 3 + d) % 11) as f32 * 0.02 - 0.1);
+        let int8 = decode_attention_int8(&cache, &q).unwrap();
+        assert_eq!(int8.shape(), (1, NUM_HEADS * HEAD_DIM));
+        assert!(int8.data.iter().all(|x| x.is_finite()));
+    }
+
+    /// int8 dispatch without an int8 mirror surfaces a clear error rather than
+    /// panicking (defends the dispatcher precondition).
+    #[test]
+    fn int8_path_without_mirror_errors() {
+        let cache = build_cache(
+            3,
+            0,
+            false, // no int8 mirror
+            |_, _| 0.5,
+            |_, _| 0.5,
+            |_, _, _| 0.0,
+            |_, _, _| 0.0,
+        );
+        let q = one_token(|_, _| 0.5);
+        assert_err_contains(
+            decode_attention_int8(&cache, &q),
+            "without an int8 KV mirror",
+        );
     }
 }
