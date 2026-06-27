@@ -1384,6 +1384,45 @@ fn quant_oc(w: &[f32], out: usize) -> QInt8 {
     nn::quantize_int8(w, out, w.len() / out)
 }
 
+/// `FOCR_QKV_FUSED`: at cache-build, STACK q/k/v into ONE `[3*qkv_dim, hidden]`
+/// int8 weight so each decode token runs a SINGLE block-parallel [`gemv_i8`]
+/// (one activation quantize, one rayon dispatch wave) instead of three. The
+/// default path (flag unset) is byte-for-byte unchanged.
+const QKV_FUSED_ENV: &str = "FOCR_QKV_FUSED";
+
+/// Read [`QKV_FUSED_ENV`] ONCE into a process-wide bool (build-time only; never
+/// touched per-token).
+fn qkv_fused_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(QKV_FUSED_ENV).is_some())
+}
+
+/// Stack three same-shaped `[n, k]` per-output-channel int8 weights into ONE
+/// `[3n, k]` weight: int8 rows concatenated (q then k then v), per-channel
+/// `scales` concatenated in the same order. Feeding the result to one
+/// block-parallel [`gemv_i8`] yields output rows `[0,n)`, `[n,2n)`, `[2n,3n)`
+/// that are BYTE-IDENTICAL to three separate `gemv_i8(x, {q,k,v})` calls: the
+/// activation is quantized once to the same `(xq, a_scale)`, and each output row
+/// `o` is an independent i32 SDOT of the SAME `xq` against the SAME `w[o,:]`
+/// dequantized by the SAME `scales[o]` — the rayon row-chunking only changes
+/// which rows share a task, never a per-row reduction.
+fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
+    debug_assert_eq!(q.k, k.k, "fuse_qkv: k contraction dim mismatch");
+    debug_assert_eq!(q.k, v.k, "fuse_qkv: k contraction dim mismatch");
+    debug_assert_eq!(q.n, k.n, "fuse_qkv: q/k output dim mismatch");
+    debug_assert_eq!(q.n, v.n, "fuse_qkv: q/v output dim mismatch");
+    let (n, kk) = (q.n, q.k);
+    let mut w = Vec::with_capacity(n * kk * 3);
+    w.extend_from_slice(&q.w);
+    w.extend_from_slice(&k.w);
+    w.extend_from_slice(&v.w);
+    let mut scales = Vec::with_capacity(n * 3);
+    scales.extend_from_slice(&q.scales);
+    scales.extend_from_slice(&k.scales);
+    scales.extend_from_slice(&v.scales);
+    QInt8::new(w, scales, 3 * n, kk)
+}
+
 /// A layer's int8 MLP weights — dense (layer 0) or MoE (layers 1..11). Mirrors
 /// [`CachedMlp`] but every projection is a [`QInt8`]; the MoE router `gate` stays
 /// f32 (top-k routing is precision-sensitive and the gate is tiny: `[64,1280]`).
@@ -1408,6 +1447,11 @@ struct CachedLayerI8 {
     q_proj: QInt8,
     k_proj: QInt8,
     v_proj: QInt8,
+    /// Optional fused `[3*qkv_dim, hidden]` stack of `q_proj`/`k_proj`/`v_proj`,
+    /// built ONLY when [`QKV_FUSED_ENV`] is set (the separate three are always
+    /// retained for prefill). When present, decode runs one block-parallel GEMV
+    /// over all `3*qkv_dim` output rows instead of three; byte-identical output.
+    qkv: Option<QInt8>,
     o_proj: QInt8,
     mlp: CachedMlpI8,
 }
@@ -1441,6 +1485,9 @@ impl DecoderWeightCacheI8 {
             let k_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?.data, qkv_dim);
             let v_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?.data, qkv_dim);
             let o_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?.data, hidden);
+            // Fused q/k/v stack (FOCR_QKV_FUSED): built ONCE here so decode runs a
+            // single block-parallel GEMV. Byte-identical to the 3 separate calls.
+            let qkv = qkv_fused_enabled().then(|| fuse_qkv(&q_proj, &k_proj, &v_proj));
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
@@ -1475,6 +1522,7 @@ impl DecoderWeightCacheI8 {
                 q_proj,
                 k_proj,
                 v_proj,
+                qkv,
                 o_proj,
                 mlp,
             });
@@ -1754,9 +1802,21 @@ pub fn decode_step_with_cache_i8(
         let t_attn = profiling.then(std::time::Instant::now);
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let nrow = normed.row(0);
-        let mut q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
-        let mut k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
-        let v = gemv_i8(nrow, &cl.v_proj);
+        let (mut q, mut k, v) = if let Some(qkv) = &cl.qkv {
+            // FOCR_QKV_FUSED: ONE quantize of `nrow`, ONE block-parallel GEMV over
+            // all 3*qkv_dim output rows, then slice into q/k/v. Byte-identical to
+            // the three-call `else` branch (each output row is an independent dot).
+            let out = gemv_i8(nrow, qkv);
+            let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
+            let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
+            let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
+            (q, k, v)
+        } else {
+            let q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
+            let k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
+            let v = gemv_i8(nrow, &cl.v_proj);
+            (q, k, v)
+        };
         apply_rope(&mut q, &rope)?;
         apply_rope(&mut k, &rope)?;
         caches[layer].write_decode_step(&k.data, &v)?;
@@ -1776,6 +1836,62 @@ pub fn decode_step_with_cache_i8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Fused q/k/v GEMV bit-identity (FOCR_QKV_FUSED, bd-241s) ──────────────────
+
+    /// The fused `[3*qkv_dim, hidden]` GEMV must reproduce, BYTE-FOR-BYTE, the q/k/v
+    /// that three separate [`gemv_i8`] calls produce. `qkv_dim` is deliberately NOT
+    /// a multiple of [`I8_GEMV_BLOCK`] (64) so the fused output's rayon row-chunks
+    /// straddle the q|k|v seams — proving each output row is an independent dot
+    /// product whose value is invariant to how rows are grouped into tasks.
+    #[test]
+    fn fused_qkv_gemv_is_byte_identical_to_three_calls() {
+        let qkv_dim = 70usize; // crosses a 64-row block boundary, not a multiple of 64
+        let hidden = 96usize;
+        // Deterministic int8 weights (full [-127,127] range) + per-channel scales.
+        let mk = |salt: i32| -> QInt8 {
+            let mut w = vec![0i8; qkv_dim * hidden];
+            for o in 0..qkv_dim {
+                for i in 0..hidden {
+                    let raw = ((o as i32 * 31 + i as i32 * 7 + salt * 101) % 255) - 127;
+                    w[o * hidden + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..qkv_dim)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, qkv_dim, hidden)
+        };
+        let q_proj = mk(0);
+        let k_proj = mk(1);
+        let v_proj = mk(2);
+        // Deterministic activation row spanning negatives/positives (exercises the
+        // dynamic per-row quantize: amax, clamp, round).
+        let nrow: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32 * 0.37).sin() * 2.5 - 0.4)
+            .collect();
+
+        // Default path: three separate GEMVs (each re-quantizes `nrow`).
+        let q_sep = gemv_i8(&nrow, &q_proj);
+        let k_sep = gemv_i8(&nrow, &k_proj);
+        let v_sep = gemv_i8(&nrow, &v_proj);
+
+        // Fused path: one stacked weight, one GEMV, sliced back.
+        let fused = fuse_qkv(&q_proj, &k_proj, &v_proj);
+        assert_eq!(fused.n, 3 * qkv_dim);
+        assert_eq!(fused.k, hidden);
+        let y = gemv_i8(&nrow, &fused);
+
+        // Compare RAW BIT PATTERNS (not approximate) — this is a bit-exact lever.
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(bits(&q_sep), bits(&y[0..qkv_dim]), "q mismatch");
+        assert_eq!(bits(&k_sep), bits(&y[qkv_dim..2 * qkv_dim]), "k mismatch");
+        assert_eq!(
+            bits(&v_sep),
+            bits(&y[2 * qkv_dim..3 * qkv_dim]),
+            "v mismatch"
+        );
+    }
 
     fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
         let message = match res {
