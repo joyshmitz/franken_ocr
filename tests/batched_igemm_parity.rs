@@ -159,7 +159,7 @@ fn batched_m_equals_per_row_gemv_s8s8() {
 
 #[test]
 fn batched_m_equals_per_row_gemv_u8s8() {
-    let mut rng = Rng(0xa11ce_0bad_f00d_42);
+    let mut rng = Rng(0xa11c_e0ba_df00_d042);
     for &k in K_SWEEP {
         for &n in N_SWEEP {
             let b = rng.fill_i8(n * k);
@@ -197,7 +197,7 @@ fn batched_m_equals_per_row_gemv_u8s8() {
 /// driver accumulates bias/residual into the same buffer).
 #[test]
 fn batched_accumulates_into_seeded_out_s8s8() {
-    let mut rng = Rng(0x0ddba11_c0ffee_99);
+    let mut rng = Rng(0x0ddb_a11c_0ffe_e099);
     let (k, n) = (96usize, 13usize);
     let b = rng.fill_i8(n * k);
     for &m in &[1usize, 4, 7, 33, 128] {
