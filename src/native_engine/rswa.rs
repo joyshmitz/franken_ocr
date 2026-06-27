@@ -985,6 +985,84 @@ pub fn attention(
     decode_attention(cache, &q.data)
 }
 
+/// Batched R-SWA **decode** attention stage (bd-1azu.5 — the Phase-6
+/// continuous-batch attention stage, bd-1azu): run all `B` in-flight
+/// page-streams' decode queries for ONE `layer` and return the `B` per-stream
+/// decode contexts.
+///
+/// `queries` is the `B` streams' decode queries STACKED head-major flat as
+/// `[B, NUM_HEADS * HEAD_DIM]` — one `q` row per stream in `cache` order (row `s`
+/// is stream `s`'s `[NUM_HEADS, HEAD_DIM]` query, already RoPE'd by the caller at
+/// its TRUE absolute position, [SPEC-095]). Each stream's K/V for this step must
+/// already be in its ring (call [`BatchedRingCache::write_decode_step`] for every
+/// stream first, exactly as the single-page path writes before it attends —
+/// OQ-3). Returns one `[1, NUM_HEADS * HEAD_DIM]` context [`Mat`] per stream, in
+/// stream order, ready for the batched `o_proj`.
+///
+/// **LOSSLESS by construction** (Doctrine #1). `result[s]` is byte-for-byte the
+/// single-page [`decode_attention`] applied to `cache.layer(s, layer)` with
+/// stream `s`'s query: the attention is run PER STREAM over its OWN
+/// `reference ++ ring` union — never key-batching across streams, because each
+/// stream's key set, effective length, and ring regime (warm-up vs steady-state)
+/// are independent. This preserves both the per-key f32 reduction order
+/// (bd-1waa) AND the env-gated per-stream dispatch (`FOCR_ATTN_GEMM` /
+/// `FOCR_INT8_KV`) identically to the single-page call. The future bit-exact
+/// cross-stream QUERY-dimension batching lands at the clearly-marked SEAM in the
+/// body (OFF here — Wave-1 ships the correct per-stream loop).
+///
+/// # Errors
+/// [`FocrError::Other`] if `layer >= num_layers()` or `queries.len() != B *
+/// NUM_HEADS * HEAD_DIM`; propagates [`decode_attention`]'s per-stream errors
+/// (e.g. a stream whose prefill was never recorded, or an empty key set).
+pub fn batched_decode_attention(
+    cache: &BatchedRingCache,
+    layer: usize,
+    queries: &[f32],
+) -> FocrResult<Vec<Mat>> {
+    if layer >= cache.num_layers() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: batched_decode_attention layer {layer} >= num_layers {}",
+            cache.num_layers()
+        )));
+    }
+    let b = cache.num_streams();
+    let per_stream = NUM_HEADS * HEAD_DIM;
+    let expect = b * per_stream;
+    if queries.len() != expect {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: batched_decode_attention queries len {} != B*NUM_HEADS*HEAD_DIM {} \
+             (B={b})",
+            queries.len(),
+            expect
+        )));
+    }
+
+    // ── SEAM (bd-1waa-safe — bit-exact QUERY-dimension batching; OFF by default) ─
+    // The future optimization regroups the OUTER (stream × head) query/key-row
+    // iteration of the loop below into fewer kernel launches WITHOUT touching the
+    // inner per-key math. Because every (stream, head) shares the same `HEAD_DIM`
+    // contraction and `scale`:
+    //   * streams pointing at ONE shared reference block (the prefix-kv-share seam,
+    //     bd-1azu.12) collapse their `QK^T` over that block into a single
+    //     `M = Σ q-rows` GEMM (the bd-1azu.2 batched-M int8 gate already proves
+    //     M=B GEMM == m=1 GEMV bit-for-bit); and
+    //   * even without sharing, the per-(stream,head) score rows can be tiled into
+    //     one batched-GEMV launch.
+    // The hard invariant that keeps this lossless: the regrouping may ONLY reorder
+    // the outer query/key-row loop — NEVER the inner `HEAD_DIM` reduction or the
+    // per-key online-softmax fold order that `decode_attention` (and its `FOCR_*`
+    // levers) fix. Until that lands proven-bit-exact, this stage is the correct
+    // per-stream loop over the existing kernel.
+    let mut contexts = Vec::with_capacity(b);
+    for s in 0..b {
+        let q_s = &queries[s * per_stream..(s + 1) * per_stream];
+        // Per-stream, bit-exact to the single-page path: stream `s` attends over
+        // ITS OWN reference ++ ring union via the existing kernel + dispatch.
+        contexts.push(decode_attention(cache.layer(s, layer), q_s)?);
+    }
+    Ok(contexts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
