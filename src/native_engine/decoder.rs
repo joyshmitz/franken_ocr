@@ -39,7 +39,7 @@
 
 use super::moe;
 use super::nn;
-use super::rswa::{self, RingCache};
+use super::rswa::{self, BatchedRingCache, RingCache};
 use super::tensor::{Mat, QInt8};
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
@@ -828,10 +828,18 @@ impl DecoderWeightCache {
             let prefix = format!("model.layers.{layer}");
             let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
             let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?.data;
-            let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?.data;
-            let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?.data;
-            let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?.data;
+            let q_proj = weights
+                .mat(&format!("{prefix}.self_attn.q_proj.weight"))?
+                .data;
+            let k_proj = weights
+                .mat(&format!("{prefix}.self_attn.k_proj.weight"))?
+                .data;
+            let v_proj = weights
+                .mat(&format!("{prefix}.self_attn.v_proj.weight"))?
+                .data;
+            let o_proj = weights
+                .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
+                .data;
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
                 CachedMlp::Dense {
@@ -845,15 +853,27 @@ impl DecoderWeightCache {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        weights.mat(&format!("{p}.experts.{e}.gate_proj.weight"))?.data,
-                        weights.mat(&format!("{p}.experts.{e}.up_proj.weight"))?.data,
-                        weights.mat(&format!("{p}.experts.{e}.down_proj.weight"))?.data,
+                        weights
+                            .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
+                            .data,
+                        weights
+                            .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
+                            .data,
+                        weights
+                            .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
+                            .data,
                     ]);
                 }
                 let shared = [
-                    weights.mat(&format!("{p}.shared_experts.gate_proj.weight"))?.data,
-                    weights.mat(&format!("{p}.shared_experts.up_proj.weight"))?.data,
-                    weights.mat(&format!("{p}.shared_experts.down_proj.weight"))?.data,
+                    weights
+                        .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
+                        .data,
+                    weights
+                        .mat(&format!("{p}.shared_experts.up_proj.weight"))?
+                        .data,
+                    weights
+                        .mat(&format!("{p}.shared_experts.down_proj.weight"))?
+                        .data,
                 ];
                 CachedMlp::Moe {
                     gate,
@@ -1022,15 +1042,13 @@ fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; n];
     // Chunked parallelism keeps per-task work well above rayon's dispatch cost
     // even for the small projections; the huge lm_head row-splits across cores.
-    y.par_chunks_mut(64)
-        .enumerate()
-        .for_each(|(blk, ys)| {
-            let base = blk * 64;
-            for (j, slot) in ys.iter_mut().enumerate() {
-                let o = base + j;
-                *slot = dot_f32(x, &w[o * k..o * k + k]);
-            }
-        });
+    y.par_chunks_mut(64).enumerate().for_each(|(blk, ys)| {
+        let base = blk * 64;
+        for (j, slot) in ys.iter_mut().enumerate() {
+            let o = base + j;
+            *slot = dot_f32(x, &w[o * k..o * k + k]);
+        }
+    });
     y
 }
 
@@ -1042,7 +1060,14 @@ fn silu(x: f32) -> f32 {
 
 /// One SwiGLU expert over a single decode row `x[hidden]`, off cached weights:
 /// `down( silu(gate·x) * (up·x) )`. `inter` is the expert's intermediate width.
-fn expert_gemv(x: &[f32], gate_w: &[f32], up_w: &[f32], down_w: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+fn expert_gemv(
+    x: &[f32],
+    gate_w: &[f32],
+    up_w: &[f32],
+    down_w: &[f32],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
     let g = gemv(x, gate_w, inter, hidden);
     let u = gemv(x, up_w, inter, hidden);
     let mut act = vec![0.0f32; inter];
@@ -1079,7 +1104,14 @@ fn decode_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Vec<f32>> {
             for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
                 let e = routing.indices[0][j];
                 let w = routing.weights[0][j];
-                let y = expert_gemv(row, &experts[e][0], &experts[e][1], &experts[e][2], hidden, inter);
+                let y = expert_gemv(
+                    row,
+                    &experts[e][0],
+                    &experts[e][1],
+                    &experts[e][2],
+                    hidden,
+                    inter,
+                );
                 for c in 0..hidden {
                     out[c] += w * y[c];
                 }
@@ -1115,7 +1147,12 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
         )));
     }
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
-    let logits = gemv(normed.row(0), &wc.lm_head, config::VOCAB_SIZE, config::HIDDEN_SIZE);
+    let logits = gemv(
+        normed.row(0),
+        &wc.lm_head,
+        config::VOCAB_SIZE,
+        config::HIDDEN_SIZE,
+    );
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
 }
 
@@ -1143,8 +1180,12 @@ pub fn prefill_with_cache(
     let hidden = config::HIDDEN_SIZE;
     let num_heads = config::NUM_ATTENTION_HEADS;
     let head_dim = config::HEAD_DIM;
-    let qkv_dim =
-        checked_shape_mul("decoder::prefill_with_cache", num_heads, head_dim, "num_heads*head_dim")?;
+    let qkv_dim = checked_shape_mul(
+        "decoder::prefill_with_cache",
+        num_heads,
+        head_dim,
+        "num_heads*head_dim",
+    )?;
     let eps = config::RMS_NORM_EPS;
     if inputs_embeds.cols != hidden {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -1486,10 +1527,30 @@ impl DecoderWeightCacheI8 {
             let prefix = format!("model.layers.{layer}");
             let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
             let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let q_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?.data, qkv_dim);
-            let k_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?.data, qkv_dim);
-            let v_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?.data, qkv_dim);
-            let o_proj = quant_oc(&weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?.data, hidden);
+            let q_proj = quant_oc(
+                &weights
+                    .mat(&format!("{prefix}.self_attn.q_proj.weight"))?
+                    .data,
+                qkv_dim,
+            );
+            let k_proj = quant_oc(
+                &weights
+                    .mat(&format!("{prefix}.self_attn.k_proj.weight"))?
+                    .data,
+                qkv_dim,
+            );
+            let v_proj = quant_oc(
+                &weights
+                    .mat(&format!("{prefix}.self_attn.v_proj.weight"))?
+                    .data,
+                qkv_dim,
+            );
+            let o_proj = quant_oc(
+                &weights
+                    .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
+                    .data,
+                hidden,
+            );
             // Fused q/k/v stack (FOCR_QKV_FUSED): built ONCE here so decode runs a
             // single block-parallel GEMV. Byte-identical to the 3 separate calls.
             let qkv = qkv_fused_enabled().then(|| fuse_qkv(&q_proj, &k_proj, &v_proj));
@@ -1508,18 +1569,52 @@ impl DecoderWeightCacheI8 {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_oc(&weights.mat(&format!("{p}.experts.{e}.gate_proj.weight"))?.data, inter),
-                        quant_oc(&weights.mat(&format!("{p}.experts.{e}.up_proj.weight"))?.data, inter),
-                        quant_oc(&weights.mat(&format!("{p}.experts.{e}.down_proj.weight"))?.data, hidden),
+                        quant_oc(
+                            &weights
+                                .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
+                                .data,
+                            inter,
+                        ),
+                        quant_oc(
+                            &weights
+                                .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
+                                .data,
+                            inter,
+                        ),
+                        quant_oc(
+                            &weights
+                                .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
+                                .data,
+                            hidden,
+                        ),
                     ]);
                 }
                 let si = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_oc(&weights.mat(&format!("{p}.shared_experts.gate_proj.weight"))?.data, si),
-                    quant_oc(&weights.mat(&format!("{p}.shared_experts.up_proj.weight"))?.data, si),
-                    quant_oc(&weights.mat(&format!("{p}.shared_experts.down_proj.weight"))?.data, hidden),
+                    quant_oc(
+                        &weights
+                            .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
+                            .data,
+                        si,
+                    ),
+                    quant_oc(
+                        &weights
+                            .mat(&format!("{p}.shared_experts.up_proj.weight"))?
+                            .data,
+                        si,
+                    ),
+                    quant_oc(
+                        &weights
+                            .mat(&format!("{p}.shared_experts.down_proj.weight"))?
+                            .data,
+                        hidden,
+                    ),
                 ];
-                CachedMlpI8::Moe { gate, experts, shared }
+                CachedMlpI8::Moe {
+                    gate,
+                    experts,
+                    shared,
+                }
             };
             layers.push(CachedLayerI8 {
                 input_ln,
@@ -1612,7 +1707,11 @@ fn moe_block_i8(
 fn prefill_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
     match mlp {
         CachedMlpI8::Dense { gate, up, down } => expert_mlp_i8(normed, gate, up, down),
-        CachedMlpI8::Moe { gate, experts, shared } => moe_block_i8(normed, gate, experts, shared),
+        CachedMlpI8::Moe {
+            gate,
+            experts,
+            shared,
+        } => moe_block_i8(normed, gate, experts, shared),
     }
 }
 
@@ -1632,7 +1731,11 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
             }
             Ok(y)
         }
-        CachedMlpI8::Moe { gate, experts, shared } => {
+        CachedMlpI8::Moe {
+            gate,
+            experts,
+            shared,
+        } => {
             let tr = profiling.then(std::time::Instant::now);
             let routing = moe::route_default(normed, gate)?;
             if let Some(t) = tr {
@@ -1718,7 +1821,10 @@ pub fn prefill_with_cache_i8(
     wc: &DecoderWeightCacheI8,
     inputs_embeds: &Mat,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
-    checked_mat_len("decoder::prefill_with_cache_i8 inputs_embeds", inputs_embeds)?;
+    checked_mat_len(
+        "decoder::prefill_with_cache_i8 inputs_embeds",
+        inputs_embeds,
+    )?;
     let hidden = config::HIDDEN_SIZE;
     let num_heads = config::NUM_ATTENTION_HEADS;
     let head_dim = config::HEAD_DIM;
@@ -1838,6 +1944,303 @@ pub fn decode_step_with_cache_i8(
     Ok(x)
 }
 
+// ── Phase-6 batched continuous-decode spine (bd-1azu.3) ──────────────────────
+//
+// One decode step over `B` in-flight page-streams. Per layer, the LINEAR
+// projections that share a single weight panel across streams — the fused q/k/v
+// stack, `o_proj`, and the final `lm_head` — become ONE `M=B` int8 GEMM that
+// reads each weight row once and reuses it across all `B` activation rows (the
+// decode-throughput win). This is LOSSLESS by construction: the per-output i32
+// contraction `acc[r,o] = Σ_p xq[r,p]·w[o,p]` is independent of `M`, so row `r`
+// of the `M=B` GEMM is BYTE-FOR-BYTE the row a standalone `m=1` GEMV produces
+// (proven across every tier/shape in `tests/batched_igemm_parity.rs`, bd-1azu.2).
+// Everything genuinely per-stream — RoPE at each stream's TRUE absolute position,
+// the R-SWA ring write, `decode_attention`, and the MoE top-k dispatch — stays a
+// faithful per-stream loop over the existing single-stream kernels, so each
+// stream's output equals `decode_step_with_cache_i8` run for that stream alone
+// (Doctrine #1: correctness first).
+
+/// `FOCR_BATCH_SPINE`: kill-switch that ARMS the Phase-6 batched continuous-decode
+/// spine ([`batched_decode_step_i8`]). DEFAULT OFF — the spine is an additive
+/// throughput path; the single-stream [`decode_step_with_cache_i8`] stays the
+/// default decode. Consulted ONCE by the (future) batched driver, never inside the
+/// math, exactly like [`QKV_FUSED_ENV`].
+const BATCH_SPINE_ENV: &str = "FOCR_BATCH_SPINE";
+
+/// `FOCR_BATCH_SIZE`: the maximum number of in-flight page-streams (`B`) the spine
+/// admits per batched step. Parsed ONCE; defaults to [`DEFAULT_BATCH_SIZE`] when
+/// unset, empty, unparseable, or `0`.
+const BATCH_SIZE_ENV: &str = "FOCR_BATCH_SIZE";
+
+/// Fallback in-flight stream cap `B` when [`BATCH_SIZE_ENV`] is unset/invalid.
+const DEFAULT_BATCH_SIZE: usize = 8;
+
+/// Whether the batched decode spine is armed (the [`BATCH_SPINE_ENV`] kill-switch,
+/// read ONCE into a process-wide bool — never touched per-token). The batched
+/// kernels themselves are pure and testable regardless of this flag; only the
+/// driver's decision to route through them is gated here.
+#[must_use]
+pub fn batch_spine_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(BATCH_SPINE_ENV).is_some())
+}
+
+/// The configured in-flight stream cap `B` ([`BATCH_SIZE_ENV`], read ONCE).
+/// Always `>= 1`.
+#[must_use]
+pub fn batch_size_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var(BATCH_SIZE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_BATCH_SIZE)
+    })
+}
+
+/// Batched (`M=B`) int8 GEMV: run ONE int8 GEMM of `B` stacked activation rows
+/// against the shared `[n, k]` weight panel `qw`, returning `B` output rows each
+/// length `n`. The `r`-th returned row is BYTE-FOR-BYTE identical to
+/// [`gemv_i8`]`(rows[r], qw)`:
+///
+///  * each activation row is dynamically int8-quantized on its OWN
+///    [`quantize_row_i8`] `a_scale` (exactly as the per-row GEMV);
+///  * the i32 contraction `acc[r,o] = Σ_p xq[r,p]·w[o,p]` from one `M=B`
+///    [`simd::igemm_s8s8`] equals the `m=1` contraction for row `r` (M-independent
+///    — bd-1azu.2);
+///  * the dequant `acc as f32 * a_scale[r] * scales[o]` uses the SAME operands in
+///    the SAME left-associative order as [`gemv_i8`].
+///
+/// Output channels are fanned across the rayon pool in [`I8_GEMV_BLOCK`] chunks
+/// (mirroring [`gemv_i8`]'s 64-row blocking); the row-block grouping never changes
+/// a per-output reduction, so the result is invariant to it. Each chunk writes a
+/// contiguous, disjoint slice of a channel-major `[n, b]` scratch (data-race-free
+/// without `unsafe`), then we transpose into the per-stream rows the decode loop
+/// slices for RoPE / attention.
+fn gemv_i8_batched(rows: &[&[f32]], qw: &QInt8) -> Vec<Vec<f32>> {
+    let b = rows.len();
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.scales.len(), n);
+    if b == 0 {
+        return Vec::new();
+    }
+    // Quantize each activation row ONCE (per-row symmetric int8), packed `[b, k]`.
+    let mut xq = vec![0i8; b * k];
+    let mut a_scales = vec![0.0f32; b];
+    for (r, &row) in rows.iter().enumerate() {
+        debug_assert_eq!(row.len(), k);
+        let (q, a_scale) = quantize_row_i8(row);
+        xq[r * k..(r + 1) * k].copy_from_slice(&q);
+        a_scales[r] = a_scale;
+    }
+    // Channel-major output `[n, b]`: each `I8_GEMV_BLOCK`-channel chunk is a
+    // contiguous, disjoint slice, so the rayon fan-out has no aliasing.
+    let mut ycm = vec![0.0f32; n * b];
+    ycm.par_chunks_mut(I8_GEMV_BLOCK * b)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len() / b;
+            let mut acc = vec![0i32; b * cnt];
+            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], b, k, cnt, &mut acc);
+            for j in 0..cnt {
+                let scale_o = qw.scales[base + j];
+                for r in 0..b {
+                    ys[j * b + r] = acc[r * cnt + j] as f32 * a_scales[r] * scale_o;
+                }
+            }
+        });
+    // Transpose channel-major `[n, b]` -> per-stream rows `[b][n]`.
+    let mut out: Vec<Vec<f32>> = (0..b).map(|_| vec![0.0f32; n]).collect();
+    for o in 0..n {
+        let col = o * b;
+        for r in 0..b {
+            out[r][o] = ycm[col + r];
+        }
+    }
+    out
+}
+
+/// One int8 incremental decode step over `B` in-flight page-streams — the Phase-6
+/// batched twin of [`decode_step_with_cache_i8`]. Returns `B` hidden rows, each a
+/// `[1, hidden]` [`Mat`]; the `s`-th row is BYTE-FOR-BYTE identical to
+/// [`decode_step_with_cache_i8`] run for stream `s` alone (the lossless contract,
+/// bd-1azu.3 — the per-projection invariant is proven by
+/// `tests/batched_forward_parity.rs`, the kernel invariant by
+/// `tests/batched_igemm_parity.rs`).
+///
+/// Per layer the q/k/v stack and `o_proj` run as ONE `M=B` [`gemv_i8_batched`]
+/// each (the shared weight panel is read once and reused across all `B` rows),
+/// while RoPE at each stream's true absolute `positions[s]`, the
+/// [`BatchedRingCache`] ring write, [`rswa::decode_attention`], and the per-stream
+/// MoE dispatch ([`decode_mlp_i8`]) stay a faithful per-stream loop over the
+/// existing single-stream kernels. Each stream's K/V land in ITS OWN ring and the
+/// score/softmax/value reduction is never cross-stream (bd-1waa-safe).
+///
+/// The MoE expert GEMMs deliberately STAY per-stream: the routed top-k experts
+/// differ per stream, so there is no single shared weight panel to batch
+/// losslessly. The dense layer-0 MLP and the per-layer shared expert DO share a
+/// panel across streams — batching those is the (OFF-by-default) optimization
+/// seam left for a later bead and intentionally not taken here (Doctrine #7:
+/// lossless-but-unoptimized first).
+///
+/// `token_embeds[s]` is stream `s`'s `[1, hidden]` input embedding and
+/// `positions[s]` its true absolute decode position; both slices must have length
+/// `caches.num_streams()`. Holds NO model-cache lock (the caller owns `wc`); one
+/// live forward (Doctrine #5).
+///
+/// # Errors
+/// [`FocrError::Other`] on any shape/length mismatch, or as
+/// [`decode_step_with_cache_i8`].
+pub fn batched_decode_step_i8(
+    wc: &DecoderWeightCacheI8,
+    caches: &mut BatchedRingCache,
+    token_embeds: &[Mat],
+    positions: &[usize],
+) -> FocrResult<Vec<Mat>> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::batched_decode_step_i8",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    let b = caches.num_streams();
+    if token_embeds.len() != b || positions.len() != b {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::batched_decode_step_i8: token_embeds {} / positions {} != streams {b}",
+            token_embeds.len(),
+            positions.len()
+        )));
+    }
+    if caches.num_layers() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::batched_decode_step_i8: {} cache layers != {} layers",
+            caches.num_layers(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+    for (s, te) in token_embeds.iter().enumerate() {
+        if te.rows != 1 || te.cols != hidden {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "decoder::batched_decode_step_i8: token_embeds[{s}] shape [{}, {}] != [1, {hidden}]",
+                te.rows,
+                te.cols
+            )));
+        }
+    }
+    let profiling = prof::enabled();
+    // Per-stream running hidden `x[s]` (`[1, hidden]`), seeded from the embeds.
+    let mut x: Vec<Mat> = token_embeds.to_vec();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let cl = &wc.layers[layer];
+        let t_attn = profiling.then(std::time::Instant::now);
+        // 1. Per-stream pre-attention RMSNorm.
+        let mut normed: Vec<Mat> = Vec::with_capacity(b);
+        for s in 0..b {
+            normed.push(nn::rms_norm(&x[s], Some(&cl.input_ln), eps)?);
+        }
+        let nrows: Vec<&[f32]> = normed.iter().map(|m| m.row(0)).collect();
+        // 2. ONE `M=B` int8 GEMM per q/k/v projection (the fused stack when armed,
+        //    else three) — byte-identical per stream to the matching branch of
+        //    `decode_step_with_cache_i8`.
+        let (mut q_mats, mut k_mats, v_rows): (Vec<Mat>, Vec<Mat>, Vec<Vec<f32>>) =
+            if let Some(qkv) = &cl.qkv {
+                let outs = gemv_i8_batched(&nrows, qkv);
+                let mut qm = Vec::with_capacity(b);
+                let mut km = Vec::with_capacity(b);
+                let mut vr = Vec::with_capacity(b);
+                for row in outs {
+                    qm.push(Mat::from_vec(1, qkv_dim, row[0..qkv_dim].to_vec()));
+                    km.push(Mat::from_vec(
+                        1,
+                        qkv_dim,
+                        row[qkv_dim..2 * qkv_dim].to_vec(),
+                    ));
+                    vr.push(row[2 * qkv_dim..3 * qkv_dim].to_vec());
+                }
+                (qm, km, vr)
+            } else {
+                let q_out = gemv_i8_batched(&nrows, &cl.q_proj);
+                let k_out = gemv_i8_batched(&nrows, &cl.k_proj);
+                let v_out = gemv_i8_batched(&nrows, &cl.v_proj);
+                let qm: Vec<Mat> = q_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                let km: Vec<Mat> = k_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                (qm, km, v_out)
+            };
+        // 3. Per-stream: RoPE at the stream's TRUE absolute position, ring write,
+        //    R-SWA decode attention (never cross-stream).
+        let mut context_rows: Vec<Mat> = Vec::with_capacity(b);
+        for s in 0..b {
+            let rope = RopeTable::build(&[positions[s]], config::HEAD_DIM, config::ROPE_THETA);
+            apply_rope(&mut q_mats[s], &rope)?;
+            apply_rope(&mut k_mats[s], &rope)?;
+            caches.write_decode_step(s, layer, &k_mats[s].data, &v_rows[s])?;
+            context_rows.push(rswa::decode_attention(
+                caches.layer(s, layer),
+                &q_mats[s].data,
+            )?);
+        }
+        // 4. ONE `M=B` `o_proj` over the stacked per-stream contexts.
+        let ctx_refs: Vec<&[f32]> = context_rows.iter().map(|m| m.row(0)).collect();
+        let attn_rows = gemv_i8_batched(&ctx_refs, &cl.o_proj);
+        if let Some(t) = t_attn {
+            prof::add(&prof::ATTN_NS, t.elapsed().as_nanos() as u64);
+        }
+        // 5. Per-stream residual, post-attn RMSNorm, MoE/MLP dispatch, residual.
+        for (s, attn) in attn_rows.into_iter().enumerate() {
+            let attn_out = Mat::from_vec(1, hidden, attn);
+            let h = add_residual(&x[s], &attn_out)?;
+            let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+            let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+            x[s] = add_residual(&h, &mlp_out)?;
+        }
+    }
+    Ok(x)
+}
+
+/// Batched (`M=B`) final RMSNorm + int8 `lm_head` over `B` decode hidden rows —
+/// the Phase-6 twin of [`lm_head_cached_i8`]. Returns `B` logit rows, each
+/// `[1, VOCAB_SIZE]`; row `s` is BYTE-FOR-BYTE identical to [`lm_head_cached_i8`]
+/// for stream `s` (per-stream final RMSNorm, then ONE shared-panel `M=B`
+/// [`gemv_i8_batched`] over the `lm_head`).
+///
+/// # Errors
+/// [`FocrError::Other`] if any `hiddens[s]` is not a single `[1, hidden]` row.
+pub fn batched_lm_head_i8(wc: &DecoderWeightCacheI8, hiddens: &[Mat]) -> FocrResult<Vec<Mat>> {
+    let t = prof::enabled().then(std::time::Instant::now);
+    let mut normed: Vec<Mat> = Vec::with_capacity(hiddens.len());
+    for (s, h) in hiddens.iter().enumerate() {
+        if h.rows != 1 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "decoder::batched_lm_head_i8: hiddens[{s}] has {} rows, expected 1",
+                h.rows
+            )));
+        }
+        normed.push(nn::rms_norm(h, Some(&wc.final_norm), config::RMS_NORM_EPS)?);
+    }
+    let rows: Vec<&[f32]> = normed.iter().map(|m| m.row(0)).collect();
+    let outs = gemv_i8_batched(&rows, &wc.lm_head);
+    let logits = outs
+        .into_iter()
+        .map(|y| Mat::from_vec(1, config::VOCAB_SIZE, y))
+        .collect();
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
+    Ok(logits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,6 +2299,66 @@ mod tests {
             bits(&y[2 * qkv_dim..3 * qkv_dim]),
             "v mismatch"
         );
+    }
+
+    // ── Batched M=B projection GEMV bit-identity (bd-1azu.3) ─────────────────────
+
+    /// [`gemv_i8_batched`] row `r` must reproduce, BYTE-FOR-BYTE, what the
+    /// single-row [`gemv_i8`] produces for that activation row — the lossless claim
+    /// the batched decode spine rests on. Exercises the REAL functions (not a
+    /// replicated model) over decode-shaped panels: an `o_proj`-like square, a
+    /// fused-qkv-like non-64-multiple width, and a wide panel whose `n` crosses
+    /// many [`I8_GEMV_BLOCK`] (64) boundaries and is not a multiple of 64.
+    #[test]
+    fn batched_gemv_i8_is_byte_identical_to_per_row() {
+        let mk = |n: usize, k: usize, salt: i32| -> QInt8 {
+            let mut w = vec![0i8; n * k];
+            for o in 0..n {
+                for i in 0..k {
+                    let raw = ((o as i32 * 17 + i as i32 * 5 + salt * 101) % 255) - 127;
+                    w[o * k + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..n)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, n, k)
+        };
+        let mkrow = |k: usize, seed: f32| -> Vec<f32> {
+            (0..k)
+                .map(|i| ((i as f32 + seed) * 0.37).sin() * 2.5 - 0.4)
+                .collect()
+        };
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        for &(n, k) in &[(96usize, 96usize), (3 * 70, 96), (130, 70)] {
+            let w = mk(n, k, 3);
+            for b in 1..=3usize {
+                let rows_owned: Vec<Vec<f32>> = (0..b).map(|s| mkrow(k, s as f32 * 1.7)).collect();
+                let rows: Vec<&[f32]> = rows_owned.iter().map(|r| r.as_slice()).collect();
+                let batched = gemv_i8_batched(&rows, &w);
+                assert_eq!(batched.len(), b);
+                for r in 0..b {
+                    let single = gemv_i8(&rows_owned[r], &w);
+                    assert_eq!(
+                        bits(&single),
+                        bits(&batched[r]),
+                        "batched row {r} != per-row gemv_i8 (n={n} k={k} b={b})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The batched env kill-switch defaults OFF and the size cap defaults to a
+    /// positive value when the environment is unset — the spine is additive,
+    /// default-OFF (Doctrine #3). Guards the kill-switch assertion behind the env
+    /// so a host that exports `FOCR_BATCH_SPINE` does not flake.
+    #[test]
+    fn batch_spine_defaults_off_with_positive_cap() {
+        if std::env::var_os("FOCR_BATCH_SPINE").is_none() {
+            assert!(!batch_spine_enabled());
+        }
+        assert!(batch_size_cap() >= 1);
     }
 
     fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
