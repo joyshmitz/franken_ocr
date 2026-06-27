@@ -286,6 +286,50 @@ claims.
   agent: WhiteCave
   evidence dir: artifacts/perf/bd-3n16/
 
+2026-06-26 | NEGATIVE(reverted) | int4 `lm_head` decode GEMV (`decoder::gemv_i4` + `FOCR_LMHEAD_INT4` packed-int4 cache via `simd::int4::igemm_s4s8`)
+  claim_id: CLAIM-int4-lmhead-decode-gemv   evidence_id: artifacts/perf/bd-int4-lmhead/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    lm_head.weight from the real model-00001-of-000001.safetensors shard (work-dir `model/`), packed per-group int4 (g32 and g16) IN-PROCESS at cache build — no `.focrq` written for this throwaway experiment
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier). int4 path = `simd::int4::igemm_s4s8`, which nibble-unpacks to an int8 buffer (`unpack_nibbles_neon`) then runs the int8 SDOT on it
+  exact command + env:
+    scratchpad/perfonly.sh on page_0023 (821 decode tokens), profiling on:
+    env FOCR_DECODE_INT8=1 FOCR_LMHEAD_INT4=1 FOCR_PROFILE_DECODE=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 focr ocr page_0023.png --model <work>/model
+    (g16 row: FOCR_LMHEAD_INT4=16; baseline row: FOCR_LMHEAD_INT4 unset. RAYON pool = default physical cores; allocator=system)
+  fallback / kill-switch state: FOCR_LMHEAD_INT4 unset → `lm_head_i4 = None` → int8 `gemv_i8` (the default, unaffected by this experiment). FOCR_DECODE_INT8=1 active throughout; no FOCR_FORCE_ARCH override (native SDOT tier)
+  measured before -> after vs reference:
+    local focr-only decode profile (no torch reference ratio yet): lm_head phase 2130 ms (int8) -> 12278 ms (int4 g32) / 12720 ms (int4 g16) = ~5.8x SLOWER; whole-decode 15.75 s / 0.019 s-tok -> 25.85 s / 0.031 (g32), 26.12 s / 0.032 (g16). PERF_LEDGER-ineligible (no pinned CPU reference row exists).
+  bit-exact correctness proof:
+    not run — REJECTED ON PERF ALONE (a 5.8x lm_head regression; no 20-page CER spent on a reverted path). int4 round-trip + GEMM correctness is independently covered by the bit-exact oracle tests in src/quant/int4.rs and src/simd/int4.rs; this entry is purely a throughput rejection.
+  disposition: REVERT
+  do-not-retry: "do not retry int4 for ANY decode GEMV (lm_head, experts, q/k/v/o) while `simd::int4::igemm_s4s8` unpacks nibbles to an int8 buffer in memory before the dot — that costs ~2.5x int8's memory traffic (read 0.5 B/wt packed + write 1 B/wt int8 + read 1 B/wt int8) and is strictly slower than int8 on this CPU decode. Retry ONLY after a NATIVE packed-int4 dot exists (nibbles consumed in-register straight into the SDOT/SMMLA MAC, NO int8 materialization). Even then the ceiling is tiny: lm_head is ~14% of decode (perfect int4 ≤ ~4% of a full page); experts 45% + attn 37% are overhead/dispatch-bound (~1-3 GB/s, far below bandwidth), where a weight-BYTES lever cannot help. The decode lever is dispatch/alloc-overhead reduction, not byte reduction. This single most-favorable (bandwidth-bound) tensor regressing closes the int4-EXPERTS arm of the blend too (same unpack kernel, less-favorable regime)."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: opus-4.8 (int4/int8 blend sweep)
+  evidence dir: artifacts/perf/bd-int4-lmhead/
+
+2026-06-26 | NEGATIVE(reverted) | serial/quantize-once decode attn projections (`FOCR_ATTN_SERIAL` in `decoder::decode_step_with_cache_i8`)
+  claim_id: CLAIM-attn-serial-qkv-projections   evidence_id: artifacts/perf/bd-attn-serial/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    q/k/v/o_proj.weight from the real model-00001-of-000001.safetensors shard (work-dir `model/`), per-output-channel symmetric int8 (`quant_oc`) — same weights as the default path
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier). serial path = `gemv_i8_serial` (single `simd::igemm_s8s8` over all n, no rayon); default = `gemv_i8` (par_chunks_mut(64) → ~20 SDOT tasks)
+  exact command + env:
+    scratchpad/perfonly.sh on page_0023 (821 decode tokens), profiling on:
+    env FOCR_DECODE_INT8=1 FOCR_ATTN_SERIAL=1 FOCR_PROFILE_DECODE=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 focr ocr page_0023.png --model <work>/model
+    (baseline row: FOCR_ATTN_SERIAL unset. RAYON pool = default physical cores; allocator=system)
+  fallback / kill-switch state: FOCR_ATTN_SERIAL unset → default parallel `gemv_i8` q/k/v/o (unaffected). FOCR_DECODE_INT8=1 active; no FOCR_FORCE_ARCH (native SDOT)
+  measured before -> after vs reference:
+    local focr-only decode profile (no torch reference ratio yet): attn phase 5436 ms (default) -> 6456 ms (serial) = +19% REGRESSION; whole-decode 15.15 s / 0.018 s-tok -> 15.73 s / 0.019. The untouched lm_head/experts/route phases drifted +-370 ms run-to-run; the +1020 ms attn move is ~2.7x that noise band. PERF_LEDGER-ineligible (no pinned CPU reference row).
+  bit-exact correctness proof:
+    PROVABLY bit-identical to the default path — same `quantize_row_i8(nrow)` (shared across q/k/v) and the same EXACT i32 SDOT accumulation per output row regardless of the per-64-block split, so q/k/v/o outputs are byte-for-byte equal. No CER run needed; rejected on PERF alone.
+  disposition: REVERT
+  do-not-retry: "do not re-serialize the decode attn projections (q/k/v/o) — they are NOT dispatch-bound; the rayon block-parallel `gemv_i8` (1280-wide m=1 GEMV across ~20 cores) genuinely beats single-core serial SDOT, so serializing loses more to single-threading than it saves on dispatch + the one extra quantize. The attn-phase time is dominated by the f32 `rswa::decode_attention` (R-SWA over ~277 ref + 128 ring keys x 10 heads x 12 layers), NOT the int8 projections — that f32 attention is the real attn lever. Retry a projection change ONLY if it FUSES q/k/v into one wide [3*1280,1280] GEMV (fewer dispatches while KEEPING block-parallelism), never serial-single-core."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: opus-4.8 (int4/int8 blend sweep)
+  evidence dir: artifacts/perf/bd-attn-serial/
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a

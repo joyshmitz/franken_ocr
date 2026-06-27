@@ -1,0 +1,9 @@
+[focr-timing] preprocess 0.03s
+[focr-timing]   vision.sam 5.72s
+[focr-timing]   vision.clip 1.38s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.11s
+[focr-timing] weight_cache_build_i8 1.29s
+[focr-timing] prefill_i8 0.55s (277 tokens)
+[focr-timing] decode_i8 15.15s (821 tokens, 0.018s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2010  attn 5436  experts 6530  route 739

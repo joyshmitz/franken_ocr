@@ -1,0 +1,9 @@
+[focr-timing] preprocess 5.98s
+[focr-timing]   vision.sam 5.83s
+[focr-timing]   vision.clip 1.40s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.24s
+[focr-timing] weight_cache_build_i8 1.21s
+[focr-timing] prefill_i8 0.55s (277 tokens)
+[focr-timing] decode_i8 15.75s (821 tokens, 0.019s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 2130  attn 5565  experts 6855  route 762
