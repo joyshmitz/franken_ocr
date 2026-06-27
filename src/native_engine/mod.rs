@@ -633,7 +633,10 @@ impl OcrModel {
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
             let tb = std::time::Instant::now();
             let projected = vision_bridge::forward(&self.weights, &clip, &sam)?;
-            timing_log(&format!("  vision.bridge {:.2}s", tb.elapsed().as_secs_f64()));
+            timing_log(&format!(
+                "  vision.bridge {:.2}s",
+                tb.elapsed().as_secs_f64()
+            ));
             features.push(projected);
         }
         Ok(features)
@@ -798,7 +801,10 @@ impl OcrModel {
         // borrow the owned f32 cache (the per-token re-dequant was the bottleneck).
         let tb = std::time::Instant::now();
         let wc = decoder::DecoderWeightCache::build(&self.weights)?;
-        timing_log(&format!("weight_cache_build {:.2}s", tb.elapsed().as_secs_f64()));
+        timing_log(&format!(
+            "weight_cache_build {:.2}s",
+            tb.elapsed().as_secs_f64()
+        ));
 
         // Prefill once, capturing each layer's reference K/V; `last_hidden` is the
         // final prefill position, which predicts the FIRST generated token.
@@ -887,7 +893,10 @@ impl OcrModel {
                 self.decoder_cache_i8.get().expect("just set")
             }
         };
-        timing_log(&format!("weight_cache_build_i8 {:.2}s", tb.elapsed().as_secs_f64()));
+        timing_log(&format!(
+            "weight_cache_build_i8 {:.2}s",
+            tb.elapsed().as_secs_f64()
+        ));
 
         let tp = std::time::Instant::now();
         let (hidden, mut caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
