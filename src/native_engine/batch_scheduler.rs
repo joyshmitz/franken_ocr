@@ -74,6 +74,48 @@ pub fn spine_enabled() -> bool {
     decoder::batch_spine_enabled()
 }
 
+/// Env kill-switch for Lever-F submodular batch-packing. When PRESENT (any
+/// value, even empty) the scheduler admits pending streams in length-grouped
+/// order — similar [`PageStream::prefill_len`] co-batched — so each batch window
+/// has lower length variance and fewer streams idle while a longer neighbour
+/// keeps decoding (cutting wasted decode steps). UNSET reproduces today's exact
+/// submission-order admission, byte-for-byte.
+///
+/// LOSSLESS: packing is a PURE REORDERING of *which* streams share a batch. The
+/// active-set cap is unchanged and [`BatchScheduler::run`] re-sorts outputs to
+/// [`PageStream::input_index`]; each stream's tokens depend only on its OWN state
+/// (the batched kernels are `M`-independent / per-stream — see module docs), so
+/// no stream's emitted token sequence changes.
+const BATCH_PACK_ENV: &str = "FOCR_BATCH_PACK";
+
+/// Whether Lever-F batch-packing is armed ([`BATCH_PACK_ENV`], read ONCE into a
+/// process-wide bool — never touched per-stream).
+#[must_use]
+pub fn batch_pack_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(BATCH_PACK_ENV).is_some())
+}
+
+/// Compute the pending-admission order over `streams`.
+///
+/// With `pack` OFF this is submission order `0..streams.len()` — today's exact
+/// behaviour. With `pack` ON (Lever-F) it is a STABLE sort of the stream indices
+/// by [`PageStream::prefill_len`] (ties keep submission order), so similar-length
+/// pages are admitted — and thus co-batched — together, shrinking each batch
+/// window's length variance. Either way the result is a BIJECTION over
+/// `0..streams.len()`: every stream appears exactly once, so admission is only
+/// reordered, never adding / dropping / duplicating a stream.
+#[must_use]
+fn admission_order(streams: &[PageStream], pack: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..streams.len()).collect();
+    if pack {
+        // Stable sort: equal `prefill_len` keep submission order, so the unset
+        // path is the identity and packing is a minimal length-grouping perturbation.
+        order.sort_by_key(|&i| streams[i].prefill_len);
+    }
+    order
+}
+
 /// One in-flight page-stream: its decode state plus the slot of identity needed
 /// to restore input order. Per-layer KV lives in the shared [`BatchedRingCache`]
 /// (indexed by the stream's active slot), never duplicated here.
@@ -244,20 +286,40 @@ impl BatchScheduler {
     /// Continuous batching: up to `batch_size` streams are active in any single
     /// forward; a stream retires on EOS or `max_length` and the active set is
     /// backfilled from the pending tail (admission of *new* pages mid-batch is
-    /// bd-1azu.9). LOSSLESS: each stream's tokens equal its single-stream
-    /// sequence (the step composes `M`-independent kernels).
+    /// bd-1azu.9). When the [`FOCR_BATCH_PACK`](BATCH_PACK_ENV) kill-switch is
+    /// armed, pending streams are admitted in length-grouped order (Lever-F) so
+    /// similar-`prefill_len` pages co-batch — a PURE reordering of admission.
+    /// LOSSLESS either way: each stream's tokens equal its single-stream sequence
+    /// (the step composes `M`-independent kernels) and the output is re-sorted to
+    /// input order regardless of which streams shared a batch.
     ///
     /// # Errors
     /// Propagates the first [`BatchStep`] error.
     pub fn run<S: BatchStep>(
         &mut self,
-        mut streams: Vec<PageStream>,
+        streams: Vec<PageStream>,
         step: &mut S,
     ) -> FocrResult<Vec<Vec<u32>>> {
-        let total = streams.len();
-        // Indices into `streams`, in submission order. Active = currently
+        self.run_with_pack(streams, step, batch_pack_enabled())
+    }
+
+    /// Core of [`run`](Self::run) with the Lever-F packing decision injected, so
+    /// the lossless "packing only reorders admission" property is unit-testable
+    /// without mutating the process env. `pack == false` is today's exact
+    /// submission-order driver, byte-for-byte.
+    fn run_with_pack<S: BatchStep>(
+        &mut self,
+        mut streams: Vec<PageStream>,
+        step: &mut S,
+        pack: bool,
+    ) -> FocrResult<Vec<Vec<u32>>> {
+        // Indices into `streams`. Admission order is submission order, or
+        // length-grouped when Lever-F packing is armed; either way it is a
+        // BIJECTION over the streams (see [`admission_order`]). PURE reordering of
+        // admission — the active-set cap below and the final input-order re-sort
+        // are unchanged, so no stream's tokens change. Active = currently
         // decoding; pending = awaiting an open slot.
-        let mut pending: VecDeque<usize> = (0..total).collect();
+        let mut pending: VecDeque<usize> = admission_order(&streams, pack).into();
         let mut active: Vec<usize> = Vec::with_capacity(self.batch_size);
         Self::admit(&mut active, &mut pending, self.batch_size);
 
@@ -667,5 +729,158 @@ mod tests {
             vec![vec![0usize, 1], vec![1, 2], vec![3], vec![3]],
             "slot_index must track stable stream identity, not active position"
         );
+    }
+
+    // ── Lever-F: submodular batch-packing (FOCR_BATCH_PACK) ──────────────────
+
+    /// Like [`stream`] but with an explicit `prefill_len` — the packing sort key.
+    /// `eos_after` still drives how many tokens the mock emits.
+    fn stream_len(input_index: usize, prefill_len: usize, eos_after: usize) -> PageStream {
+        let hidden = Mat::from_vec(1, 2, vec![input_index as f32, eos_after as f32]);
+        PageStream::new(input_index, prefill_len, /*prompt*/ &[], hidden)
+    }
+
+    /// Mean per-window variance of `prefill_len` when `order` is chunked into the
+    /// consecutive co-batch windows of size `width` it would be admitted in.
+    fn mean_window_len_variance(streams: &[PageStream], order: &[usize], width: usize) -> f64 {
+        let mut total = 0.0_f64;
+        let mut windows = 0_usize;
+        for chunk in order.chunks(width) {
+            let n = chunk.len() as f64;
+            let mean = chunk
+                .iter()
+                .map(|&i| streams[i].prefill_len as f64)
+                .sum::<f64>()
+                / n;
+            let var = chunk
+                .iter()
+                .map(|&i| {
+                    let d = streams[i].prefill_len as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n;
+            total += var;
+            windows += 1;
+        }
+        if windows == 0 {
+            0.0
+        } else {
+            total / windows as f64
+        }
+    }
+
+    /// (a) The packed admission order is a BIJECTION over the stream set: every
+    /// stream is admitted exactly once — none lost, none duplicated — so packing
+    /// can only reorder admission, never change the multiset of streams.
+    #[test]
+    fn packed_admission_order_is_a_bijection_over_the_streams() {
+        let streams = vec![
+            stream_len(0, 30, 2),
+            stream_len(1, 5, 2),
+            stream_len(2, 30, 2), // duplicate length → must not collapse
+            stream_len(3, 12, 2),
+            stream_len(4, 5, 2),
+            stream_len(5, 99, 2),
+        ];
+        let order = admission_order(&streams, true);
+        assert_eq!(order.len(), streams.len(), "no stream lost or duplicated");
+        let mut seen = order;
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..streams.len()).collect::<Vec<_>>(),
+            "packed order is a permutation of 0..n (every stream admitted exactly once)"
+        );
+    }
+
+    /// (b) On a synthetic pool of interleaved short/long pages, the packed order's
+    /// mean per-window length-variance is <= (and here strictly <) the naive
+    /// order's — i.e. the packing actually GROUPS similar lengths so each
+    /// co-batch window straddles a smaller length spread.
+    #[test]
+    fn packing_reduces_mean_window_length_variance() {
+        // Interleaved so naive windows straddle the short/long gap; packed don't.
+        let streams = vec![
+            stream_len(0, 10, 2),
+            stream_len(1, 100, 2),
+            stream_len(2, 12, 2),
+            stream_len(3, 98, 2),
+            stream_len(4, 11, 2),
+            stream_len(5, 105, 2),
+            stream_len(6, 9, 2),
+            stream_len(7, 101, 2),
+        ];
+        let width = 2;
+        let naive_var =
+            mean_window_len_variance(&streams, &admission_order(&streams, false), width);
+        let packed_var =
+            mean_window_len_variance(&streams, &admission_order(&streams, true), width);
+        assert!(
+            packed_var <= naive_var,
+            "packing must never increase window length variance (packed {packed_var} > naive {naive_var})"
+        );
+        assert!(
+            packed_var < naive_var,
+            "on a varied pool packing should strictly group similar lengths (packed {packed_var} vs naive {naive_var})"
+        );
+    }
+
+    /// (c) With `FOCR_BATCH_PACK` unset (pack == false), the admission order is
+    /// byte-identical to today's exact `(0..total)` submission order.
+    #[test]
+    fn unpacked_admission_order_is_byte_identical_to_submission_order() {
+        let streams = vec![
+            stream_len(0, 30, 2),
+            stream_len(1, 5, 2),
+            stream_len(2, 99, 2),
+            stream_len(3, 12, 2),
+        ];
+        assert_eq!(
+            admission_order(&streams, false),
+            (0..streams.len()).collect::<Vec<_>>(),
+            "pack-off admission order must equal today's submission order, byte-for-byte"
+        );
+    }
+
+    /// LOSSLESSNESS (the heart of Lever-F): packing changes only WHICH streams
+    /// co-batch; every stream's emitted token sequence — re-sorted to input order
+    /// — is byte-identical with packing ON vs OFF. Proven directly through the
+    /// scheduler core with the pack flag injected (no process-env mutation), so it
+    /// is deterministic and order-independent.
+    #[test]
+    fn packing_does_not_change_any_stream_output() {
+        // Varied prefill_len AND varied emission lengths so packing genuinely
+        // reshuffles the co-batch windows yet must not perturb any output.
+        let make = || {
+            vec![
+                stream_len(0, 10, 3),
+                stream_len(1, 100, 1),
+                stream_len(2, 12, 5),
+                stream_len(3, 98, 2),
+                stream_len(4, 11, 4),
+                stream_len(5, 105, 1),
+            ]
+        };
+
+        let mut sched_off = BatchScheduler::new(2, 100);
+        let mut step_off = MockStep::new();
+        let out_off = sched_off
+            .run_with_pack(make(), &mut step_off, false)
+            .expect("run pack off");
+
+        let mut sched_on = BatchScheduler::new(2, 100);
+        let mut step_on = MockStep::new();
+        let out_on = sched_on
+            .run_with_pack(make(), &mut step_on, true)
+            .expect("run pack on");
+
+        assert_eq!(
+            out_on, out_off,
+            "packed admission must not change any stream's emitted tokens (lossless)"
+        );
+        // And the active-set cap is unchanged by packing.
+        assert!(sched_on.stats().max_active <= 2);
+        assert_eq!(sched_on.stats().max_concurrent_forwards, 1);
     }
 }
