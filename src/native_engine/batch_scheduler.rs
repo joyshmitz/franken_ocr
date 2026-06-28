@@ -103,7 +103,12 @@ impl PageStream {
     /// New stream seeded from prefill: `last_hidden` is prefill's final row,
     /// `prompt_ids` is the reference/prompt context already in the KV cache.
     #[must_use]
-    pub fn new(input_index: usize, prefill_len: usize, prompt_ids: &[u32], last_hidden: Mat) -> Self {
+    pub fn new(
+        input_index: usize,
+        prefill_len: usize,
+        prompt_ids: &[u32],
+        last_hidden: Mat,
+    ) -> Self {
         Self {
             input_index,
             prefill_len,
@@ -251,8 +256,7 @@ impl BatchScheduler {
         Self::admit(&mut active, &mut pending, self.batch_size);
 
         while !active.is_empty() {
-            self.max_active
-                .fetch_max(active.len(), Ordering::SeqCst);
+            self.max_active.fetch_max(active.len(), Ordering::SeqCst);
 
             // Build the read-only slot views for THIS single forward.
             let slots: Vec<StreamSlot<'_>> = active
@@ -380,7 +384,8 @@ impl BatchStep for DecoderBatchStep<'_> {
             token_embeds.push(Mat::from_vec(1, hidden_dim, row));
             positions.push(slot.position);
         }
-        let new_hiddens = decoder::batched_decode_step_i8(self.wc, self.caches, &token_embeds, &positions)?;
+        let new_hiddens =
+            decoder::batched_decode_step_i8(self.wc, self.caches, &token_embeds, &positions)?;
 
         // 4. Assemble per-stream results.
         Ok(decoded
@@ -411,7 +416,9 @@ mod tests {
 
     impl MockStep {
         fn new() -> Self {
-            Self { batch_sizes: Vec::new() }
+            Self {
+                batch_sizes: Vec::new(),
+            }
         }
     }
 
@@ -440,7 +447,12 @@ mod tests {
     /// Build a stream whose mock will emit `eos_after` tokens (0 ⇒ unbounded).
     fn stream(input_index: usize, eos_after: usize) -> PageStream {
         let hidden = Mat::from_vec(1, 2, vec![input_index as f32, eos_after as f32]);
-        PageStream::new(input_index, /*prefill_len*/ 4, /*prompt*/ &[], hidden)
+        PageStream::new(
+            input_index,
+            /*prefill_len*/ 4,
+            /*prompt*/ &[],
+            hidden,
+        )
     }
 
     #[test]
@@ -494,8 +506,14 @@ mod tests {
         let mut step = MockStep::new();
         let _ = sched.run(streams, &mut step).expect("run");
         let st = sched.stats();
-        assert_eq!(st.max_concurrent_forwards, 1, "exactly one live forward per step");
-        assert!(!st.guard_held_during_fanout, "model-cache guard never held during fan-out");
+        assert_eq!(
+            st.max_concurrent_forwards, 1,
+            "exactly one live forward per step"
+        );
+        assert!(
+            !st.guard_held_during_fanout,
+            "model-cache guard never held during fan-out"
+        );
     }
 
     #[test]
@@ -518,7 +536,11 @@ mod tests {
         assert_eq!(out[3].len(), 1);
         assert_eq!(out[4].len(), 4);
         let st = sched.stats();
-        assert!(st.max_active <= 2, "active set bounded by batch_size (got {})", st.max_active);
+        assert!(
+            st.max_active <= 2,
+            "active set bounded by batch_size (got {})",
+            st.max_active
+        );
         assert_eq!(st.max_concurrent_forwards, 1);
         // every mock call saw <= 2 active streams
         assert!(step.batch_sizes.iter().all(|&n| n <= 2));
