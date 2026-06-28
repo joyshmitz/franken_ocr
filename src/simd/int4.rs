@@ -267,6 +267,199 @@ fn igemm_s4s8_unpacked(
     }
 }
 
+// ── native packed-int4 GEMM (bd-1azu.22): nibbles consumed CONTIGUOUSLY ──────
+//
+// `igemm_s4s8` above first materializes the WHOLE B into a dense `[n, k]` i8 Vec
+// ([`unpack_to_i8`]) and then runs the int8 GEMM over it — the "unpack-then-int8"
+// path the negative-evidence ledger clocked at ~5.8x slower than int8 (the full
+// dense int8 buffer defeats the very bandwidth win int4 is for). The functions
+// below are the **native packed** alternative (bd-1azu.22): B is *never*
+// materialized. The accelerated ARM kernels (`arm::igemm_s4s8_packed_sdot` /
+// `_smmla`) mask/shift the packed nibbles in-register, 16 K-elements at a time,
+// and feed them straight to the SDOT/SMMLA int8 MAC; the scalar reference here
+// reads each nibble directly out of `b_packed`.
+//
+// Every backend is **bit-identical** to this scalar reference *and* to
+// `igemm_s4s8`: the per-group contraction is the same i32 dot (order-independent
+// for integer addition, so the SIMD lane order is irrelevant), then the same f32
+// dequant-and-sum in increasing group order. Whether the native-packed kernel
+// BEATS int8 throughput is a separate, honestly-reported bench outcome
+// (`benches/int4_packed_tier.rs`); correctness is held here.
+//
+// int4 stays behind its existing tier — this adds a *parallel* entrypoint and
+// changes no default code path.
+
+/// The native packed-int4 contraction (the shared inner loop, no shape asserts).
+///
+/// Reads each int4 weight straight from the packed `b_packed[ni*(k/2) + kk/2]`
+/// (low nibble for even `kk`, high for odd) — never materializing a dense i8 B —
+/// accumulates the per-group dot in i32, then dequant-and-sums in f32 in
+/// increasing group order. **Overwrites** `out` (`out[mi*n+ni] = Σ_g …`), exactly
+/// as [`igemm_s4s8`] does (NOT the `+=` of the int8 kernels). Structurally
+/// identical to [`igemm_s4s8_unpacked`], so the two cannot drift.
+///
+/// Preconditions (the caller guarantees them; the public wrappers assert): `k`
+/// even, `group ∈ {16,32}` divides `k`, and the four buffers match `m/k/n/group`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn s4s8_packed_kernel_scalar(
+    a: &[i8],
+    b_packed: &[u8],
+    scales: &[f32],
+    group: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    let groups = k / group;
+    let kbytes = k / 2;
+    for mi in 0..m {
+        let a_row = &a[mi * k..mi * k + k];
+        for ni in 0..n {
+            let wbase = ni * kbytes;
+            let sbase = ni * groups;
+            let mut acc_f = 0.0f32;
+            for g in 0..groups {
+                let lo = g * group;
+                let hi = lo + group;
+                // i32 group accumulator: the int8 dot over exactly one group.
+                // group ≤ 32, |term| ≤ 8*127 → ≤ 260_096 ≪ i32::MAX (doctrine #6).
+                let mut acc_i: i32 = 0;
+                for kk in lo..hi {
+                    let byte = b_packed[wbase + kk / 2];
+                    // even kk → low nibble (first weight), odd kk → high nibble.
+                    let w = if kk & 1 == 0 {
+                        sign_extend_nibble(byte & 0x0F)
+                    } else {
+                        sign_extend_nibble(byte >> 4)
+                    };
+                    acc_i += i32::from(a_row[kk]) * i32::from(w);
+                }
+                acc_f += scales[sbase + g] * acc_i as f32;
+            }
+            out[mi * n + ni] = acc_f;
+        }
+    }
+}
+
+/// Validate the packed-GEMM shape contract (shared by both public packed
+/// entrypoints). Mirrors the [`igemm_s4s8`] asserts but tagged `igemm_s4s8_packed`;
+/// kept separate so the native-packed path does not touch the existing
+/// `igemm_s4s8` default code path.
+#[allow(clippy::too_many_arguments)]
+fn assert_packed_shapes(
+    a: &[i8],
+    b_packed: &[u8],
+    scales: &[f32],
+    group: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &[f32],
+) {
+    assert!(k.is_multiple_of(2), "igemm_s4s8_packed: k {k} must be even");
+    assert!(
+        VALID_GROUP_SIZES.contains(&group),
+        "igemm_s4s8_packed: group {group} must be 16 or 32"
+    );
+    assert!(
+        k.is_multiple_of(group),
+        "igemm_s4s8_packed: group {group} must divide k {k}"
+    );
+    let groups = k / group;
+    let a_len = super::scalar::checked_len("igemm_s4s8_packed", m, k, "m*k");
+    let packed_len = super::scalar::checked_len("igemm_s4s8_packed", n, k / 2, "n*k/2");
+    let scales_len = super::scalar::checked_len("igemm_s4s8_packed", n, groups, "n*(k/group)");
+    let out_len = super::scalar::checked_len("igemm_s4s8_packed", m, n, "m*n");
+    assert_eq!(
+        a.len(),
+        a_len,
+        "igemm_s4s8_packed: a len {} != m*k {}",
+        a.len(),
+        a_len
+    );
+    assert_eq!(
+        b_packed.len(),
+        packed_len,
+        "igemm_s4s8_packed: b_packed len {} != n*k/2 {}",
+        b_packed.len(),
+        packed_len
+    );
+    assert_eq!(
+        scales.len(),
+        scales_len,
+        "igemm_s4s8_packed: scales len {} != n*(k/group) {}",
+        scales.len(),
+        scales_len
+    );
+    assert_eq!(
+        out.len(),
+        out_len,
+        "igemm_s4s8_packed: out len {} != m*n {}",
+        out.len(),
+        out_len
+    );
+}
+
+/// The native packed-int4 GEMM **scalar reference** — the bit-identical oracle
+/// every accelerated packed kernel must match (and the parity gate's ground
+/// truth). Same f32 result as [`igemm_s4s8`], computed without materializing B.
+///
+/// # Panics
+/// As [`igemm_s4s8`] (any `k`/`group`/buffer-length contract violation).
+#[allow(clippy::too_many_arguments)]
+pub fn igemm_s4s8_packed_scalar(
+    a: &[i8],
+    b_packed: &[u8],
+    scales: &[f32],
+    group: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    assert_packed_shapes(a, b_packed, scales, group, m, k, n, out);
+    s4s8_packed_kernel_scalar(a, b_packed, scales, group, m, k, n, out);
+}
+
+/// Native packed-int4 GEMM — the public, runtime-dispatched entrypoint
+/// (bd-1azu.22). Routes to the best ARM tier (`SDOT > SMMLA > scalar` per
+/// [`crate::simd::arm::detect_tier`] — SDOT on Apple Silicon) which consumes the
+/// packed nibbles **directly**, never building a dense int8 B; on every other
+/// target it runs [`s4s8_packed_kernel_scalar`]. Bit-identical to
+/// [`igemm_s4s8_packed_scalar`] (hence to [`igemm_s4s8`]) on every backend.
+///
+/// `out` is **overwritten** (`= C`), as in [`igemm_s4s8`].
+///
+/// # Panics
+/// As [`igemm_s4s8`].
+#[allow(clippy::too_many_arguments)]
+pub fn igemm_s4s8_packed(
+    a: &[i8],
+    b_packed: &[u8],
+    scales: &[f32],
+    group: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    assert_packed_shapes(a, b_packed, scales, group, m, k, n, out);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The ARM backend owns the audited `unsafe` island; it picks SDOT/SMMLA
+        // (or falls back to `s4s8_packed_kernel_scalar` for `ArmTier::None`).
+        super::arm::igemm_s4s8_packed(a, b_packed, scales, group, m, k, n, out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // x86 / other: no native int4 MAC kernel is implemented — the scalar
+        // reference is the path (the parity test skips-with-success on x86: the
+        // packed entrypoint simply equals the oracle, which is what it asserts).
+        s4s8_packed_kernel_scalar(a, b_packed, scales, group, m, k, n, out);
+    }
+}
+
 // ── audited unsafe island: accelerated nibble unpack ────────────────────────
 //
 // The ONLY accelerated step is the nibble extract (int4 → i8). The int8 MAC and

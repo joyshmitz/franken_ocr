@@ -289,6 +289,50 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     scalar::igemm_u8s8(a, b, m, k, n, out);
 }
 
+/// Native packed-int4 GEMM (bd-1azu.22) — the ARM tier dispatch.
+///
+/// Routes to the SDOT or SMMLA **packed** kernel (each consumes the packed int4
+/// nibbles *directly* — mask/shift in-register, no dense-i8 materialization, the
+/// distinction from the `unpack-then-int8` `int4::igemm_s4s8`) per [`detect_tier`]
+/// (SDOT on Apple Silicon; SMMLA where i8mm is full-rate), or to the scalar
+/// packed reference for [`ArmTier::None`]. Output is bit-identical to
+/// [`crate::simd::int4::igemm_s4s8_packed_scalar`] and **overwrites** `out`
+/// (`= C`, like `igemm_s4s8`, NOT the `+=` of the int8 kernels).
+///
+/// Shape/contract preconditions are asserted by the public caller
+/// [`crate::simd::int4::igemm_s4s8_packed`]; this function only routes.
+#[allow(clippy::too_many_arguments)]
+pub fn igemm_s4s8_packed(
+    a: &[i8],
+    b_packed: &[u8],
+    scales: &[f32],
+    group: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    match detect_tier() {
+        ArmTier::Sdot => {
+            // SAFETY: reached only when `dotprod` was runtime-detected in
+            // `detect_tier`; the buffers satisfy the packed GEMM shape (caller
+            // asserted in `int4::igemm_s4s8_packed`).
+            unsafe {
+                aarch64_impl::igemm_s4s8_packed_sdot(a, b_packed, scales, group, m, k, n, out);
+            }
+        }
+        ArmTier::Smmla => {
+            // SAFETY: reached only when `i8mm` was runtime-detected; shapes valid.
+            unsafe {
+                aarch64_impl::igemm_s4s8_packed_smmla(a, b_packed, scales, group, m, k, n, out);
+            }
+        }
+        ArmTier::None => {
+            super::int4::s4s8_packed_kernel_scalar(a, b_packed, scales, group, m, k, n, out);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The audited unsafe SIMD island.
 //
@@ -300,7 +344,9 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 mod aarch64_impl {
     use core::arch::aarch64::{
-        int8x16_t, int32x4_t, vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8, vmmlaq_s32,
+        int8x8_t, int8x16_t, int32x4_t, vaddvq_s32, vand_u8, vcombine_s8, vdotq_s32, vdup_n_u8,
+        vdupq_n_s32, vld1_u8, vld1q_s8, vld2_s8, vmmlaq_s32, vreinterpret_s8_u8, vshl_n_s8,
+        vshr_n_s8, vshr_n_u8, vzip_s8,
     };
 
     /// Load a 16-byte window `[off, off+16)` of `s` as an `int8x16_t`.
@@ -618,6 +664,252 @@ mod aarch64_impl {
             unsafe { core::arch::aarch64::vreinterpretq_s8_s32(self) }
         }
     }
+
+    // ── native packed-int4 nibble unpack + SDOT/SMMLA kernels (bd-1azu.22) ────
+    //
+    // The packed-int4 path (`int4::igemm_s4s8_packed`) routes here. Unlike
+    // `int4::igemm_s4s8` (which materializes the WHOLE B to a dense `[n,k]` i8
+    // buffer — the ~5.8x-slower "unpack-then-int8" path in the negative-evidence
+    // ledger), these kernels consume the packed nibbles IN-REGISTER: each 8-byte
+    // chunk is masked/shifted to its two int8x8 nibble streams ([`unpack8`]) and
+    // fed straight to SDOT/SMMLA. No dense B is ever built. Output is f32 (the
+    // per-group scale is folded after the integer dot) and OVERWRITES `out`,
+    // bit-identical to `int4::s4s8_packed_kernel_scalar`.
+
+    /// Unpack 8 packed int4 bytes (16 nibbles) at `wptr` into `(lo, hi)` int8x8:
+    /// `lo` = the even-K weights (each byte's low nibble, the first/even-index
+    /// weight), `hi` = the odd-K weights (high nibble), both sign-extended from 4
+    /// bits via the `(x << 4) >> 4` 8-bit-lane trick (identical codes to the
+    /// scalar `sign_extend_nibble`, gathered 8 at a time).
+    ///
+    /// # Safety
+    /// `wptr` must point at ≥ 8 readable bytes (`vld1_u8` is an unaligned 8-byte
+    /// load). Reached only with `neon` enabled.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn unpack8(wptr: *const u8) -> (int8x8_t, int8x8_t) {
+        // SAFETY: caller guarantees 8 readable bytes at `wptr`; unaligned u8 load.
+        let v = vld1_u8(wptr);
+        // low nibble = v & 0x0F, then sign-extend bit 3 (shift left 4, arith right 4).
+        let lo_u = vand_u8(v, vdup_n_u8(0x0F));
+        let lo_s = vshr_n_s8(vshl_n_s8(vreinterpret_s8_u8(lo_u), 4), 4);
+        // high nibble = v >> 4 (logical), then sign-extend.
+        let hi_u = vshr_n_u8(v, 4);
+        let hi_s = vshr_n_s8(vshl_n_s8(vreinterpret_s8_u8(hi_u), 4), 4);
+        (lo_s, hi_s)
+    }
+
+    /// Native packed-int4 GEMM via **SDOT**. Register-blocked over a 4×4 output
+    /// tile (like `igemm_s8s8_sdot`); the K loop walks 16-element sub-blocks (8
+    /// packed bytes), `vzip`-ing the two nibble streams back to natural K order so
+    /// a single `vdotq_s32` consumes 16 weights against 16 contiguous activations.
+    /// Per group the i32 lane-accumulator is horizontal-reduced (`vaddvq_s32`),
+    /// dequantized by that group's f32 scale, and summed in increasing group order
+    /// — bit-identical to `int4::s4s8_packed_kernel_scalar`. `out` is OVERWRITTEN.
+    ///
+    /// `group ∈ {16,32}` ⇒ `group/16 ∈ {1,2}` whole 16-K sub-blocks per group, and
+    /// `k` is a multiple of `group` (hence of 16), so the K walk has no tail.
+    ///
+    /// # Safety
+    /// Caller ensures `dotprod` is present and the buffers satisfy the packed
+    /// GEMM shape (`a=m*k`, `b_packed=n*k/2`, `scales=n*(k/group)`, `out=m*n`,
+    /// `group∈{16,32}` dividing `k`, `k` even).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn igemm_s4s8_packed_sdot(
+        a: &[i8],
+        b_packed: &[u8],
+        scales: &[f32],
+        group: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) {
+        let groups = k / group;
+        let sub_per_group = group / 16; // 16→1, 32→2 sub-blocks per group
+        let kbytes = k / 2;
+
+        let mut r = 0;
+        while r < m {
+            let mr = (m - r).min(4);
+            let mut c = 0;
+            while c < n {
+                let nr = (n - c).min(4);
+                // f32 tile accumulator, summed across groups (overwrite semantics).
+                let mut out_acc = [[0.0f32; 4]; 4];
+
+                for g in 0..groups {
+                    // 4×4 i32x4 accumulator grid for THIS group only.
+                    // SAFETY: `vdupq_n_s32` is a pure constant splat.
+                    let mut acc = [[vdupq_n_s32(0); 4]; 4];
+
+                    for sub in 0..sub_per_group {
+                        let sb = g * sub_per_group + sub; // global 16-K sub-block
+
+                        // Unpack nr weight rows for this sub-block → natural K order.
+                        let mut nat = [vdupq_n_s32(0).into_i8(); 4];
+                        // indexed loop mirrors SIMD lane layout
+                        #[allow(clippy::needless_range_loop)]
+                        for j in 0..nr {
+                            // SAFETY: (c+j)<n and sb*8+8 ≤ kbytes ⇒
+                            //   (c+j)*kbytes + sb*8 + 8 ≤ (c+j+1)*kbytes ≤ b_packed.len().
+                            let (lo, hi) =
+                                unpack8(b_packed.as_ptr().add((c + j) * kbytes + sb * 8));
+                            // zip(lo,hi) → [w(16sb+0), w(16sb+1), …, w(16sb+15)].
+                            let zz = vzip_s8(lo, hi);
+                            nat[j] = vcombine_s8(zz.0, zz.1);
+                        }
+
+                        // Load mr activation rows (16 contiguous int8 = natural K).
+                        let mut act = [vdupq_n_s32(0).into_i8(); 4];
+                        // indexed loop mirrors SIMD lane layout
+                        #[allow(clippy::needless_range_loop)]
+                        for i in 0..mr {
+                            // SAFETY: (r+i)<m and sb*16+16 ≤ k ⇒
+                            //   (r+i)*k + sb*16 + 16 ≤ (r+i+1)*k ≤ a.len().
+                            act[i] = vld1q_s8(a.as_ptr().add((r + i) * k + sb * 16));
+                        }
+
+                        for i in 0..mr {
+                            for j in 0..nr {
+                                // SAFETY: vdotq_s32 is register-only; inputs valid.
+                                acc[i][j] = vdotq_s32(acc[i][j], act[i], nat[j]);
+                            }
+                        }
+                    }
+
+                    // Dequant this group's i32 sums and fold into the f32 tile.
+                    for i in 0..mr {
+                        for j in 0..nr {
+                            // SAFETY: vaddvq_s32 is a register-only horizontal add.
+                            let gi = vaddvq_s32(acc[i][j]);
+                            out_acc[i][j] += scales[(c + j) * groups + g] * gi as f32;
+                        }
+                    }
+                }
+
+                for i in 0..mr {
+                    for j in 0..nr {
+                        out[(r + i) * n + (c + j)] = out_acc[i][j];
+                    }
+                }
+                c += nr;
+            }
+            r += mr;
+        }
+    }
+
+    /// Native packed-int4 GEMM via **SMMLA** / i8mm. Same packed-nibble
+    /// consumption as the SDOT path, but the int8 MAC is `vmmlaq_s32` over 2×2
+    /// output tiles: per 16-K sub-block the even-K nibbles (`lo`) pair with the
+    /// even-indexed activations (`vld2_s8` de-interleave) in one SMMLA and the
+    /// odd-K nibbles (`hi`) with the odd activations in a second — the SMMLA
+    /// matched-lane contraction never needs the nibbles re-interleaved. The 2×2
+    /// i32 tile is dequantized by the two B-rows' per-group scales (lane layout
+    /// `[c00,c01,c10,c11]`: col `2q`=lanes{0,2}, col `2q+1`=lanes{1,3}) and summed
+    /// in increasing group order — bit-identical to `s4s8_packed_kernel_scalar`.
+    /// `out` is OVERWRITTEN.
+    ///
+    /// Doctrine #4: SMMLA is half-rate on Apple Silicon, so on macOS `detect_tier`
+    /// prefers SDOT and this is reached only via `FOCR_FORCE_ARCH=smmla` or on
+    /// i8mm-preferring cores. The 2×2 tile is intentionally un-deeply-blocked
+    /// (correctness-first; the bench reports its throughput honestly). A missing
+    /// row/col at an odd `m`/`n` edge is fed a zero panel (a zero nibble/activation
+    /// contributes a zero product) and its output cell is skipped.
+    ///
+    /// # Safety
+    /// Caller ensures `i8mm` is present and the buffers satisfy the packed GEMM
+    /// shape (as [`igemm_s4s8_packed_sdot`]).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn igemm_s4s8_packed_smmla(
+        a: &[i8],
+        b_packed: &[u8],
+        scales: &[f32],
+        group: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) {
+        let groups = k / group;
+        let sub_per_group = group / 16;
+        let kbytes = k / 2;
+        // SAFETY: register-only zero splat, padding a missing row/col panel.
+        let zero8 = vreinterpret_s8_u8(vdup_n_u8(0));
+
+        let mut rp = 0;
+        while rp < m {
+            // A-row pair (rp, rp+1); rp is always valid, rp+1 maybe past the edge.
+            let mut cp = 0;
+            while cp < n {
+                // B-col pair (cp, cp+1); cp always valid, cp+1 maybe past the edge.
+                // out_acc for [ (rp,cp), (rp,cp+1), (rp+1,cp), (rp+1,cp+1) ].
+                let mut lane = [0.0f32; 4];
+
+                for g in 0..groups {
+                    // SAFETY: constant splat.
+                    let mut acc = vdupq_n_s32(0);
+                    for sub in 0..sub_per_group {
+                        let sb = g * sub_per_group + sub;
+
+                        // Two weight rows (cp, cp+1) → even (lo) / odd (hi) nibbles.
+                        // SAFETY: cp<n and sb*8+8 ≤ kbytes ⇒ in-bounds 8-byte load;
+                        // (cp+1)*kbytes+sb*8+8 ≤ b_packed.len() when cp+1<n.
+                        let (lo0, hi0) = unpack8(b_packed.as_ptr().add(cp * kbytes + sb * 8));
+                        let (lo1, hi1) = if cp + 1 < n {
+                            unpack8(b_packed.as_ptr().add((cp + 1) * kbytes + sb * 8))
+                        } else {
+                            (zero8, zero8)
+                        };
+
+                        // Two activation rows (rp, rp+1), de-interleaved even/odd.
+                        // SAFETY: rp<m and sb*16+16 ≤ k ⇒ rp*k+sb*16+16 ≤ a.len();
+                        // (rp+1)*k+sb*16+16 ≤ a.len() when rp+1<m.
+                        let t0 = vld2_s8(a.as_ptr().add(rp * k + sb * 16));
+                        let (ev1, od1) = if rp + 1 < m {
+                            let t1 = vld2_s8(a.as_ptr().add((rp + 1) * k + sb * 16));
+                            (t1.0, t1.1)
+                        } else {
+                            (zero8, zero8)
+                        };
+
+                        // even-K SMMLA: A=[evenAct rp | rp+1], B=[lo cp | cp+1].
+                        // SAFETY: vmmlaq_s32 is register-only; i8mm enabled.
+                        acc = vmmlaq_s32(acc, vcombine_s8(t0.0, ev1), vcombine_s8(lo0, lo1));
+                        // odd-K SMMLA: A=[oddAct rp | rp+1], B=[hi cp | cp+1].
+                        acc = vmmlaq_s32(acc, vcombine_s8(t0.1, od1), vcombine_s8(hi0, hi1));
+                    }
+
+                    // Dequant by each B-row's per-group scale (cols 2q / 2q+1).
+                    let s_c0 = scales[cp * groups + g];
+                    let s_c1 = if cp + 1 < n {
+                        scales[(cp + 1) * groups + g]
+                    } else {
+                        0.0
+                    };
+                    lane[0] += s_c0 * vgetq_lane0(acc) as f32;
+                    lane[1] += s_c1 * vgetq_lane1(acc) as f32;
+                    lane[2] += s_c0 * vgetq_lane2(acc) as f32;
+                    lane[3] += s_c1 * vgetq_lane3(acc) as f32;
+                }
+
+                out[rp * n + cp] = lane[0];
+                if cp + 1 < n {
+                    out[rp * n + cp + 1] = lane[1];
+                }
+                if rp + 1 < m {
+                    out[(rp + 1) * n + cp] = lane[2];
+                }
+                if rp + 1 < m && cp + 1 < n {
+                    out[(rp + 1) * n + cp + 1] = lane[3];
+                }
+                cp += 2;
+            }
+            rp += 2;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -917,5 +1209,163 @@ mod tests {
         let mut got = vec![0i32; m * n];
         igemm_s8s8(&a, &b, m, k, n, &mut got);
         assert_eq!(got, want);
+    }
+
+    // ── native packed-int4 SDOT/SMMLA kernels (bd-1azu.22) ───────────────────
+    //
+    // In-process per-tier coverage: drive the PRIVATE packed kernels directly
+    // (feature-gated, bypassing dispatch) and assert bit-identical f32 to a
+    // packed-int4 scalar oracle written straight from the pinned packing spec —
+    // the same proof pattern `run_sdot_s8s8` / `run_smmla_s8s8` use for int8.
+    // (The public-dispatch + `FOCR_FORCE_ARCH` sweep + cross-impl parity vs the
+    // `unpack-then-int8` `igemm_s4s8` lives in `tests/int4_packed_parity.rs`.)
+
+    /// Packed-int4 GEMM scalar oracle, written from the spec (low nibble = even-K
+    /// weight, high = odd-K; per-group i32 dot, dequant-and-sum in f32 in
+    /// increasing group order). Independent of the module's own reference.
+    fn oracle_s4s8_packed(
+        a: &[i8],
+        b_packed: &[u8],
+        scales: &[f32],
+        group: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let groups = k / group;
+        let mut out = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc_f = 0.0f32;
+                for g in 0..groups {
+                    let mut gi: i32 = 0;
+                    for kk in g * group..(g + 1) * group {
+                        let byte = b_packed[ni * (k / 2) + kk / 2];
+                        // even kk → low nibble, odd kk → high nibble; sign-extend.
+                        let w = if kk % 2 == 0 {
+                            ((byte << 4) as i8) >> 4
+                        } else {
+                            (byte as i8) >> 4
+                        };
+                        gi += i32::from(a[mi * k + kk]) * i32::from(w);
+                    }
+                    acc_f += scales[ni * groups + g] * gi as f32;
+                }
+                out[mi * n + ni] = acc_f;
+            }
+        }
+        out
+    }
+
+    fn run_sdot_s4s8(
+        a: &[i8],
+        b_packed: &[u8],
+        scales: &[f32],
+        group: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<Vec<f32>> {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return None;
+        }
+        let mut out = vec![0.0f32; m * n];
+        // SAFETY: dotprod just runtime-detected; buffers match the packed shape.
+        unsafe {
+            aarch64_impl::igemm_s4s8_packed_sdot(a, b_packed, scales, group, m, k, n, &mut out);
+        }
+        Some(out)
+    }
+
+    fn run_smmla_s4s8(
+        a: &[i8],
+        b_packed: &[u8],
+        scales: &[f32],
+        group: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<Vec<f32>> {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return None;
+        }
+        let mut out = vec![0.0f32; m * n];
+        // SAFETY: i8mm just runtime-detected; buffers match the packed shape.
+        unsafe {
+            aarch64_impl::igemm_s4s8_packed_smmla(a, b_packed, scales, group, m, k, n, &mut out);
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn s4s8_packed_tiers_match_scalar_oracle_randomized() {
+        let mut rng = Rng(0x5104_9ac4_ed00_0a1b); // deterministic seed
+        // Shapes straddle the SDOT 4×4 and SMMLA 2×2 tile remainders in M and N,
+        // exercise both group sizes (16/32), single & multi sub-block groups, and
+        // the doctrine-#6 worst case K=6848 (dense layer-0 down_proj).
+        let cases = [
+            (1usize, 16usize, 1usize, 16usize),
+            (1, 32, 1, 32),
+            (2, 32, 3, 16),
+            (4, 64, 5, 32),
+            (3, 96, 2, 16),
+            (5, 128, 7, 32),
+            (8, 48, 9, 16),
+            (7, 160, 6, 32),
+            (9, 16, 4, 16),
+            (16, 64, 13, 16),
+            (6, 6848, 5, 16),
+            (4, 6848, 5, 32),
+        ];
+        for (m, k, n, group) in cases {
+            let groups = k / group;
+            let a = rand_i8(&mut rng, m * k);
+            let b_packed = rand_u8(&mut rng, n * (k / 2));
+            // Mixed-sign scales incl. non-power-of-two; the f32 summation order is
+            // identical on both sides, so any scale gives bit-identical results.
+            let scales: Vec<f32> = (0..n * groups)
+                .map(|i| ((i as f32 * 0.013) - 0.4) + if i % 3 == 0 { 0.125 } else { -0.0625 })
+                .collect();
+            let want = oracle_s4s8_packed(&a, &b_packed, &scales, group, m, k, n);
+            if let Some(got) = run_sdot_s4s8(&a, &b_packed, &scales, group, m, k, n) {
+                assert_eq!(
+                    got, want,
+                    "SDOT-packed != oracle (m={m},k={k},n={n},g={group})"
+                );
+            }
+            if let Some(got) = run_smmla_s4s8(&a, &b_packed, &scales, group, m, k, n) {
+                assert_eq!(
+                    got, want,
+                    "SMMLA-packed != oracle (m={m},k={k},n={n},g={group})"
+                );
+            }
+        }
+    }
+
+    /// Adversarial: all weights = int4-min (-8, byte 0x88), activations ±127 — the
+    /// operands that maximize the i32 per-group accumulator. Each group of ≤32
+    /// terms is ≤ 32·8·127 = 32_512 ≪ i32::MAX (doctrine #6); the SIMD i32 lane
+    /// reduce must equal the scalar oracle bit-for-bit (no overflow, exact dot).
+    #[test]
+    fn s4s8_packed_adversarial_max_operands() {
+        for &(m, k, n, group) in &[
+            (3usize, 6848usize, 5usize, 16usize),
+            (4, 6848, 6, 32),
+            (5, 64, 7, 16),
+        ] {
+            let groups = k / group;
+            let b_packed = vec![0x88u8; n * (k / 2)]; // both nibbles = -8
+            let a: Vec<i8> = (0..m * k)
+                .map(|i| if i % 2 == 0 { 127 } else { -127 })
+                .collect();
+            let scales = vec![1.0f32; n * groups];
+            let want = oracle_s4s8_packed(&a, &b_packed, &scales, group, m, k, n);
+            if let Some(got) = run_sdot_s4s8(&a, &b_packed, &scales, group, m, k, n) {
+                assert_eq!(got, want, "SDOT-packed adversarial (k={k},g={group})");
+            }
+            if let Some(got) = run_smmla_s4s8(&a, &b_packed, &scales, group, m, k, n) {
+                assert_eq!(got, want, "SMMLA-packed adversarial (k={k},g={group})");
+            }
+        }
     }
 }
