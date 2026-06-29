@@ -68,7 +68,8 @@ pub mod x86;
 // never name a tier.
 
 pub use dispatch::{
-    Caps, IsaTier, available_tiers, caps, detected_tier, igemm_s8s8, igemm_u8s8, tier_string,
+    Caps, IsaTier, SelftestCase, SelftestReport, available_tiers, caps, detected_tier, igemm_s8s8,
+    igemm_u8s8, selftest, tier_string,
 };
 
 #[cfg(test)]

@@ -326,6 +326,10 @@ pub enum RobotCmd {
     Health,
     /// Detected SIMD tiers (SMMLA/SDOT/VNNI/AMX/scalar) + core count.
     Backends,
+    /// Verify the dispatched int8 kernel is bit-identical to the scalar oracle
+    /// on THIS host's silicon (exit 1 on any divergence). `FOCR_FORCE_ARCH`
+    /// selects which available tier to verify.
+    Selftest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -412,6 +416,9 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             emit(&robot_backends_payload());
             Ok(())
         }
+        Command::Robot {
+            cmd: RobotCmd::Selftest,
+        } => run_robot_selftest(),
         Command::Ocr(args) if args.robot => {
             emit(&robot::run_start_event("ocr"));
             run_ocr(args, true)
@@ -881,6 +888,60 @@ fn robot_backends_payload() -> serde_json::Value {
         },
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
     })
+}
+
+/// `focr robot selftest` — re-run the dispatched int8 GEMM against the scalar
+/// oracle on this exact CPU and emit a machine-checkable verdict. Emits the
+/// report JSON (always, so robots see the per-shape detail) and THEN returns a
+/// generic error (exit 1) if any case diverged, so the command can gate a CI /
+/// post-install check. `FOCR_FORCE_ARCH` selects which available tier runs.
+fn run_robot_selftest() -> FocrResult<()> {
+    let report = simd::selftest();
+    let cases: Vec<_> = report
+        .cases
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "kind": c.kind,
+                "label": c.label,
+                "m": c.m,
+                "k": c.k,
+                "n": c.n,
+                "ok": c.ok,
+                "mismatches": c.mismatches,
+                "first_bad": c.first_bad.map(|(i, got, want)| serde_json::json!({
+                    "index": i, "dispatched": got, "oracle": want,
+                })),
+            })
+        })
+        .collect();
+    let available: Vec<_> = report.available.iter().map(|t| t.tag()).collect();
+    let passed = report.cases.iter().filter(|c| c.ok).count();
+    emit(&serde_json::json!({
+        "schema_version": robot::ROBOT_SCHEMA_VERSION,
+        "command": "robot.selftest",
+        "selected": report.selected.tag(),
+        "selected_feature": report.selected.feature_string(),
+        "available": available,
+        "override_env": "FOCR_FORCE_ARCH",
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "cases_total": report.cases.len(),
+        "cases_passed": passed,
+        "all_ok": report.all_ok,
+        "verdict": if report.all_ok { "pass" } else { "fail" },
+        "cases": cases,
+    }));
+    if report.all_ok {
+        Ok(())
+    } else {
+        let failed = report.cases.len() - passed;
+        Err(FocrError::Other(anyhow::anyhow!(
+            "robot selftest: {failed}/{} int8-kernel parity case(s) diverged from the scalar \
+             oracle on tier {} — this binary's accelerated int8 path is NOT bit-exact on this CPU",
+            report.cases.len(),
+            report.selected.feature_string(),
+        )))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

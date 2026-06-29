@@ -288,6 +288,179 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     }
 }
 
+// ── Runtime kernel self-test (`focr robot selftest`) ────────────────────────
+//
+// The dispatch tests below run at `cargo test` time on the BUILD host. They do
+// NOT prove anything about the int8 kernels on an end user's silicon — a
+// distributed binary runs on a CPU the build never saw. [`selftest`] closes
+// that gap: it re-runs the dispatched int8 GEMM against the bit-identical
+// [`scalar`](crate::simd::scalar) oracle, in-process, on whatever tier this
+// exact CPU selected, across a battery of shapes that includes the model's real
+// K dimensions and a worst-case-magnitude K=6848 case (the doctrine #6 overflow
+// stress). A user on an AVX2-only Threadripper or an SDOT Apple core can run
+// `focr robot selftest` and get a machine-checkable verdict that the
+// accelerated kernel their binary will actually dispatch to is exact on their
+// hardware. Pure safe code here — it only calls the public entrypoints.
+
+/// One int8-GEMM parity case: the dispatched kernel vs the scalar oracle on a
+/// single `(m, k, n)` shape, for one operand domain (`s8s8` or `u8s8`).
+#[derive(Debug, Clone)]
+pub struct SelftestCase {
+    /// Operand domain: `"s8s8"` (signed·signed) or `"u8s8"` (unsigned·signed).
+    pub kind: &'static str,
+    /// A short human label for the case (e.g. `"model:attn_proj_gemv"`).
+    pub label: &'static str,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    /// True iff the dispatched kernel matched the scalar oracle on every lane.
+    pub ok: bool,
+    /// Number of diverging output lanes (0 when `ok`).
+    pub mismatches: usize,
+    /// First diverging lane as `(index, dispatched, oracle)`, if any.
+    pub first_bad: Option<(usize, i32, i32)>,
+}
+
+/// The full runtime self-test verdict: the dispatched tier, every available
+/// tier, and the per-shape parity results.
+#[derive(Debug, Clone)]
+pub struct SelftestReport {
+    /// The tier the int8 GEMM entrypoints dispatch to on this host.
+    pub selected: IsaTier,
+    /// Every tier detected as available on this host, best-first.
+    pub available: Vec<IsaTier>,
+    /// Per-shape parity cases (both operand domains).
+    pub cases: Vec<SelftestCase>,
+    /// True iff EVERY case matched the oracle (the headline pass/fail).
+    pub all_ok: bool,
+}
+
+/// Deterministic xorshift32 — reproducible per-case fills with no `Math::random`
+/// (which is unavailable) and no run-to-run variation.
+fn xs32(state: &mut u32) -> u32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    *state = s;
+    s
+}
+
+/// The shape battery: edge/tail-coverage cases, the model's real GEMV
+/// dimensions, and a worst-case-K stress. `seed == 0` marks the constant-extreme
+/// overflow case (filled with operand-domain max magnitudes, not the PRNG).
+const SELFTEST_SHAPES: &[(&str, usize, usize, usize, u32)] = &[
+    // ── correctness floor + K-tail coverage (kernels block K; the tail is scalar) ──
+    ("edge:1x1x1", 1, 1, 1, 0x1111_1111),
+    ("edge:1x7x3", 1, 7, 3, 0x2222_2222),
+    ("edge:2x3x2", 2, 3, 2, 0x3333_3333),
+    ("ktail:1x15x8", 1, 15, 8, 0x4444_4444),
+    ("ktail:1x16x8", 1, 16, 8, 0x5555_5555),
+    ("ktail:1x17x8", 1, 17, 8, 0x6666_6666),
+    ("ktail:4x33x5", 4, 33, 5, 0x7777_7777),
+    // ── the model's real decode GEMV shapes (m=1, hidden=1280) ──
+    ("model:attn_proj_gemv", 1, 1280, 128, 0x0bad_c0de),
+    ("model:o_proj_gemv", 1, 1280, 1280, 0x1234_5678),
+    ("model:expert_down_gemv", 1, 6848, 256, 0x9abc_def0),
+    ("model:prefill_tile", 4, 1280, 64, 0x0f0f_0f0f),
+    // ── worst-case-K overflow stress (constant extremes; seed 0 sentinel) ──
+    ("overflow:max_mag_k6848", 1, 6848, 4, 0),
+];
+
+/// Run the int8-GEMM runtime self-test (the engine behind `focr robot
+/// selftest`). Re-runs the dispatched kernel against the scalar oracle on this
+/// host's selected tier across [`SELFTEST_SHAPES`]; never panics or allocates
+/// unboundedly (shapes are fixed and small). The result is a structured verdict
+/// the CLI renders to robot JSON.
+#[must_use]
+pub fn selftest() -> SelftestReport {
+    use super::scalar;
+    let mut cases = Vec::with_capacity(SELFTEST_SHAPES.len() * 2);
+
+    for &(label, m, k, n, seed) in SELFTEST_SHAPES {
+        // S8S8 domain.
+        let (a_s, b_s): (Vec<i8>, Vec<i8>) = if seed == 0 {
+            // Worst-case magnitude: a = i8::MAX, b = i8::MIN (largest |product|).
+            (vec![i8::MAX; m * k], vec![i8::MIN; n * k])
+        } else {
+            let mut st = seed | 1;
+            (
+                (0..m * k)
+                    .map(|_| (xs32(&mut st) & 0xff) as u8 as i8)
+                    .collect(),
+                (0..n * k)
+                    .map(|_| (xs32(&mut st) & 0xff) as u8 as i8)
+                    .collect(),
+            )
+        };
+        let mut got = vec![0i32; m * n];
+        let mut want = vec![0i32; m * n];
+        igemm_s8s8(&a_s, &b_s, m, k, n, &mut got);
+        scalar::igemm_s8s8(&a_s, &b_s, m, k, n, &mut want);
+        cases.push(compare_case("s8s8", label, m, k, n, &got, &want));
+
+        // U8S8 domain (the DynamicQuantizeLinear activation path / VNNI domain).
+        let (a_u, b_u): (Vec<u8>, Vec<i8>) = if seed == 0 {
+            (vec![u8::MAX; m * k], vec![i8::MIN; n * k])
+        } else {
+            let mut st = seed.rotate_left(7) | 1;
+            (
+                (0..m * k).map(|_| (xs32(&mut st) & 0xff) as u8).collect(),
+                (0..n * k)
+                    .map(|_| (xs32(&mut st) & 0xff) as u8 as i8)
+                    .collect(),
+            )
+        };
+        let mut gotu = vec![0i32; m * n];
+        let mut wantu = vec![0i32; m * n];
+        igemm_u8s8(&a_u, &b_u, m, k, n, &mut gotu);
+        scalar::igemm_u8s8(&a_u, &b_u, m, k, n, &mut wantu);
+        cases.push(compare_case("u8s8", label, m, k, n, &gotu, &wantu));
+    }
+
+    let all_ok = cases.iter().all(|c| c.ok);
+    let snapshot = caps();
+    SelftestReport {
+        selected: snapshot.selected,
+        available: snapshot.available.clone(),
+        cases,
+        all_ok,
+    }
+}
+
+/// Element-wise compare a dispatched result against the oracle into a
+/// [`SelftestCase`].
+fn compare_case(
+    kind: &'static str,
+    label: &'static str,
+    m: usize,
+    k: usize,
+    n: usize,
+    got: &[i32],
+    want: &[i32],
+) -> SelftestCase {
+    let mut mismatches = 0usize;
+    let mut first_bad = None;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        if g != w {
+            mismatches += 1;
+            if first_bad.is_none() {
+                first_bad = Some((i, g, w));
+            }
+        }
+    }
+    SelftestCase {
+        kind,
+        label,
+        m,
+        k,
+        n,
+        ok: mismatches == 0,
+        mismatches,
+        first_bad,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +565,55 @@ mod tests {
         igemm_u8s8(&a, &b, m, k, n, &mut got);
         scalar::igemm_u8s8(&a, &b, m, k, n, &mut want);
         assert_eq!(got, want);
+    }
+
+    /// The runtime self-test passes on THIS build host (whatever tier it
+    /// selected): every dispatched int8 GEMM matches the scalar oracle. This is
+    /// the same routine `focr robot selftest` runs on an end user's silicon.
+    #[test]
+    fn selftest_passes_on_build_host() {
+        let report = selftest();
+        assert!(
+            !report.cases.is_empty(),
+            "selftest must exercise at least one shape"
+        );
+        // Both operand domains run for every shape.
+        assert_eq!(report.cases.len(), SELFTEST_SHAPES.len() * 2);
+        assert!(report.available.contains(&report.selected));
+        for case in &report.cases {
+            assert!(
+                case.ok,
+                "tier {:?} diverged from scalar oracle on {} {} ({}x{}x{}): {} lane(s), first {:?}",
+                report.selected,
+                case.kind,
+                case.label,
+                case.m,
+                case.k,
+                case.n,
+                case.mismatches,
+                case.first_bad,
+            );
+        }
+        assert!(report.all_ok, "headline verdict must reflect all-ok cases");
+    }
+
+    /// The worst-case-magnitude K=6848 case actually exercises the documented
+    /// extremes (so the overflow stress is real, not a degenerate zero case),
+    /// and its hand-derived sum is what both kernels produce.
+    #[test]
+    fn selftest_overflow_case_is_worst_case_and_exact() {
+        // u8s8 worst case: a = u8::MAX (255), b = i8::MIN (-128), K = 6848.
+        // Σ = 255 * (-128) * 6848 = -223_518_720, comfortably inside i32 and
+        // ~9.6x above the i32 floor (-2_147_483_648) — the doctrine #6 headroom,
+        // proven live on this silicon.
+        let (k, n) = (6848usize, 4usize);
+        let a = vec![u8::MAX; k];
+        let b = vec![i8::MIN; n * k];
+        let mut got = vec![0i32; n];
+        let mut want = vec![0i32; n];
+        igemm_u8s8(&a, &b, 1, k, n, &mut got);
+        scalar::igemm_u8s8(&a, &b, 1, k, n, &mut want);
+        assert_eq!(got, want);
+        assert!(got.iter().all(|&v| v == -223_518_720));
     }
 }
