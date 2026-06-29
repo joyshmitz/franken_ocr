@@ -155,12 +155,35 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
     if width == 0 || height == 0 {
         return Err("zero image dimension".to_string());
     }
+    // Bound the DECLARED dimensions before any per-pixel allocation. A crafted PDF
+    // can claim a gigapixel image and make a downstream `width*height` product
+    // overflow `usize` (the CMYK guard) or reserve hundreds of TB (a raster
+    // `Vec`). Real document scans are far below this (a 600-DPI A0 page is ~0.5
+    // Gpx). `u32 * u32` is computed in `u64` so the check itself cannot overflow.
+    const MAX_PIXELS: u64 = 1 << 30; // 1 Gpx
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(format!(
+            "image dimensions {width}x{height} exceed the {MAX_PIXELS}-pixel maximum"
+        ));
+    }
     let bpc = img.bits_per_component.unwrap_or(8);
     let color_space = img.color_space.as_deref().unwrap_or("DeviceRGB");
     let filters = img.filters.clone().unwrap_or_default();
     let terminal = filters.last().map(String::as_str).unwrap_or("");
 
+    // The image codecs (DCT/CCITT) consume `img.content` verbatim — the RAW stream,
+    // with NO filters applied (lopdf's `get_page_images` does not decode). So a
+    // multi-filter chain whose codec is preceded by an ASCII/Flate filter would
+    // feed still-encoded bytes to the codec. Reject such chains with an accurate
+    // message rather than a misleading "decode failed". (The raw-sample branch is
+    // chain-safe: `decompressed_content` walks the whole filter chain.)
+    let chained = filters.len() > 1;
+
     match terminal {
+        "DCTDecode" if chained => Err(format!(
+            "image filter chain {filters:?} ending in DCTDecode is unsupported (only a \
+             sole DCTDecode filter); rasterize this PDF out of band and retry"
+        )),
         // `content` is already the raw JPEG byte stream.
         "DCTDecode" => image::load_from_memory_with_format(img.content, image::ImageFormat::Jpeg)
             .map_err(|e| format!("JPEG (DCTDecode) decode failed: {e}")),
@@ -175,11 +198,17 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
                               rasterize this PDF out of band and retry"
             .to_string()),
 
+        "CCITTFaxDecode" if chained => Err(format!(
+            "image filter chain {filters:?} ending in CCITTFaxDecode is unsupported (only a \
+             sole CCITTFaxDecode filter); rasterize this PDF out of band and retry"
+        )),
         "CCITTFaxDecode" => decode_ccitt_g4(doc, img, width, height),
 
         // Raw samples behind a stream-compression filter (or none): inflate and
         // pack into an image buffer per the color space / bit depth.
-        "FlateDecode" | "LZWDecode" | "ASCII85Decode" | "ASCIIHexDecode" | "" => {
+        // `decompressed_content` handles Flate/LZW/ASCII85; ASCIIHexDecode is NOT
+        // among them, so it falls through to the honest "unsupported" arm.
+        "FlateDecode" | "LZWDecode" | "ASCII85Decode" | "" => {
             let samples = decompressed_stream(doc, img.id)?;
             raw_samples_to_image(samples, width, height, bpc, color_space)
         }
@@ -346,7 +375,11 @@ fn decode_ccitt_g4(
     };
     let rows_hint = u16::try_from(height).ok().filter(|&h| h != 0);
 
-    let mut out: Vec<u8> = Vec::with_capacity(usize::from(cols) * height.max(1) as usize);
+    // Grow as the decode emits lines; do NOT pre-reserve from the declared
+    // `/Height`, which is an attacker-controlled `u32` (`cols * height` could
+    // reserve hundreds of TB and abort). The real output is bounded by the actual
+    // G4 stream — `decode_g4` stops at end-of-data or `rows_hint` rows.
+    let mut out: Vec<u8> = Vec::new();
     decode_g4(img.content.iter().copied(), cols, rows_hint, |line| {
         out.extend(pels(line, cols).map(|c| match c {
             Color::Black => black,
@@ -465,10 +498,14 @@ mod tests {
         });
         doc.trailer.set("Root", catalog_id);
 
+        // Unique temp path per call (tests run on parallel threads): pid + a
+        // process-wide atomic sequence, not a stack-address pointer.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
-            "focr_pdf_test_{}_{:p}.pdf",
+            "focr_pdf_test_{}_{}.pdf",
             std::process::id(),
-            &doc as *const _
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         doc.save(&path).expect("save synthesized pdf");
         path
@@ -530,6 +567,67 @@ mod tests {
             msg.contains("no image XObject"),
             "expected an actionable no-image message, got: {msg}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A crafted image claiming gigapixel dimensions must be rejected by the
+    /// dimension guard BEFORE any per-pixel allocation (no 280 TB reserve / no
+    /// `width*height` overflow), regardless of the (never-reached) codec content.
+    #[test]
+    fn oversized_pdf_image_is_rejected_before_allocation() {
+        use lopdf::{Stream, dictionary};
+
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 100_000_i64,
+                "Height" => 100_000_i64, // 1e10 px, far over the 1 Gpx cap
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            vec![0u8; 16], // dummy content; the guard fires before it is touched
+        )
+        .with_compression(false);
+        let path = build_single_page_pdf(Some(image));
+        let err = PdfPages::open(&path)
+            .expect("open")
+            .render(0)
+            .expect_err("oversized image must error");
+        assert!(err.to_string().contains("exceed"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A multi-filter chain ending in an image codec (`[ASCII85Decode, DCTDecode]`)
+    /// must be rejected with an accurate "chain ... unsupported" message rather than
+    /// feeding still-ASCII-encoded bytes to the JPEG decoder.
+    #[test]
+    fn chained_filter_image_is_rejected() {
+        use lopdf::{Object, Stream, dictionary};
+
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 4_i64,
+                "Height" => 4_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => Object::Array(vec![
+                    Object::Name(b"ASCII85Decode".to_vec()),
+                    Object::Name(b"DCTDecode".to_vec()),
+                ]),
+            },
+            vec![0u8; 16],
+        )
+        .with_compression(false);
+        let path = build_single_page_pdf(Some(image));
+        let err = PdfPages::open(&path)
+            .expect("open")
+            .render(0)
+            .expect_err("chained filter must error");
+        assert!(err.to_string().contains("chain"), "got: {err}");
         let _ = std::fs::remove_file(&path);
     }
 }

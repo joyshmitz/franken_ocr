@@ -81,6 +81,11 @@ pub struct OcrModel {
     /// ([`OcrEngine`] already amortizes the 6.2 GB weight load via its `Arc`
     /// cache, so a batch loop pays load + quant ONCE, not per page).
     decoder_cache_i8: std::sync::OnceLock<decoder::DecoderWeightCacheI8>,
+    /// Lazily-loaded, then reused BPE tokenizer. The `tokenizer.json` is ~9.9 MB;
+    /// parsing it once and caching it on the model amortizes that across every
+    /// page of a multi-page document (e.g. a PDF) instead of re-reading and
+    /// re-parsing the file on every prompt-build and detokenize call.
+    tokenizer: std::sync::OnceLock<crate::tokenizer::Tokenizer>,
 }
 
 /// Process-global cache of the last-loaded model, keyed by resolved path.
@@ -543,6 +548,7 @@ impl OcrModel {
             weights,
             decode_params: decode_params_from_env(),
             decoder_cache_i8: std::sync::OnceLock::new(),
+            tokenizer: std::sync::OnceLock::new(),
         });
 
         let mut guard = model_cache_guard()?;
@@ -860,12 +866,17 @@ impl OcrModel {
     /// # Errors
     /// [`FocrError::FormatMismatch`] (or an IO error) if `tokenizer.json` is
     /// missing or malformed beside the model artifact.
-    fn tokenizer(&self) -> FocrResult<crate::tokenizer::Tokenizer> {
+    fn tokenizer(&self) -> FocrResult<&crate::tokenizer::Tokenizer> {
+        if let Some(t) = self.tokenizer.get() {
+            return Ok(t);
+        }
         // The tokenizer.json ships beside the weights; the resolver hands us the
         // model path, the tokenizer sits in the same directory (or is the same
         // bundle dir). We look next to the resolved model path.
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))
+        let loaded = crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))?;
+        let _ = self.tokenizer.set(loaded);
+        Ok(self.tokenizer.get().expect("tokenizer just set"))
     }
 
     /// Run the two-tower vision encoder over every preprocessed view and project

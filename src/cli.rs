@@ -164,7 +164,8 @@ pub struct RobotRunArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct OcrRequestArgs {
-    /// Input document image path (v1 image-only; rasterization is out-of-band).
+    /// Input document path — an image (PNG/JPG/…) or a PDF (each page is
+    /// rasterized natively and OCR'd as one document).
     pub image: PathBuf,
     /// Explicit model artifact path for diagnostics and model-gated runs.
     #[arg(long)]
@@ -519,30 +520,64 @@ where
 }
 
 /// Recognize every page of a PDF and concatenate the per-page markdown into one
-/// document (pages joined by a blank line).
+/// document (successful pages joined by a blank line).
 ///
 /// Each page is rasterized in-memory by [`pdf`] and fed through the identical OCR
 /// pipeline a PNG takes — no out-of-band `pdftoppm`. Pages render lazily, one at a
-/// time, so a long book never holds every raster at once. A page whose image uses
-/// an unsupported codec (`JPXDecode`/`JBIG2Decode`) or that has no image XObject
-/// (vector/text page) surfaces the precise [`FocrError::InputDecode`] from
-/// [`pdf::PdfPages::render`], naming what was unsupported. Model resolution and the
-/// first-run download offer go through [`recognize_with_autodownload`].
+/// time, so a long book never holds every raster at once.
+///
+/// **Per-page resilience (mirrors the `ocr-batch` path):** a page that cannot be
+/// rendered or recognized — an unsupported codec (`JPXDecode`/`JBIG2Decode`), a
+/// vector/text page, a decode or timeout error — is logged to stderr and SKIPPED,
+/// so one bad page never discards (nor wastes the compute already spent on) the
+/// OCR of every other page. Only [`FocrError::ModelNotFound`] is propagated (it is
+/// a whole-document condition: it lets [`recognize_with_autodownload`] offer the
+/// first-run download and retry the whole document). If NOT ONE page decodes, the
+/// first failure is surfaced as a clean error instead of an empty document.
 fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> FocrResult<String> {
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
     recognize_with_autodownload(request, robot_mode, |model| {
         let mut document = String::new();
+        let mut ok_pages = 0usize;
+        let mut first_error: Option<FocrError> = None;
         for idx in 0..page_count {
-            let image = pages.render(idx)?;
-            let page_md = match model {
+            let page = pages.render(idx).and_then(|image| match model {
                 Some(m) => engine.recognize_dynamic_with_model(m, image),
                 None => engine.recognize_dynamic(image),
-            }?;
-            if idx > 0 {
-                document.push_str("\n\n");
+            });
+            match page {
+                Ok(page_md) => {
+                    if ok_pages > 0 {
+                        document.push_str("\n\n");
+                    }
+                    document.push_str(page_md.trim_end());
+                    ok_pages += 1;
+                }
+                // A missing model is a whole-document condition, never per-page:
+                // propagate it so the caller can offer the download and retry.
+                Err(e @ FocrError::ModelNotFound(_)) => return Err(e),
+                // Isolate every other per-page failure: warn and skip, keeping the
+                // rest of the document. (stderr only, never in robot mode.)
+                Err(e) => {
+                    if !robot_mode {
+                        eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
-            document.push_str(page_md.trim_end());
+        }
+        if ok_pages == 0 {
+            // PdfPages::open guarantees >=1 page, and ModelNotFound returns early,
+            // so first_error is always Some here; fall back defensively.
+            return Err(first_error.unwrap_or_else(|| {
+                FocrError::InputDecode(format!(
+                    "PDF {} produced no decodable pages",
+                    request.image.display()
+                ))
+            }));
         }
         Ok(document)
     })
