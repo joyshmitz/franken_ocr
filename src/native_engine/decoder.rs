@@ -2730,6 +2730,260 @@ pub fn batched_lm_head_i8(wc: &DecoderWeightCacheI8, hiddens: &[Mat]) -> FocrRes
     Ok(logits)
 }
 
+// ── Batched K-token speculative VERIFY forward (Lever D/K, bd-1azu.30) ────────
+//
+// Speculative decode proposes `K` draft tokens after the current sequence; the
+// verify half must compute the `K` next-token logits rows — one per draft
+// position — in ONE forward, BIT-EXACT to running `K` sequential single-token
+// decode steps. The win is QUERY-dim batching: the LINEAR projections that share
+// a weight panel across the `K` draft queries (the fused q/k/v stack and
+// `o_proj`) become ONE `M=K` int8 GEMM (read each weight row once, reuse across
+// all `K` queries — bd-1azu.2's M-independent i32 contraction), while the
+// attention stays a faithful per-position fold.
+//
+// LOSSLESS by construction, and NOT the rejected key-batch (docs/NEGATIVE_EVIDENCE.md):
+//  * the only cross-token coupling in a decode forward is the KV cache, so
+//    processing the `K` positions LAYER-major (all `K` through layer L, then
+//    layer L+1) over a SHARED evolving ring reproduces the token-major sequential
+//    KV evolution exactly — draft `i` at layer L writes its K/V then attends over
+//    reference ++ ring ++ draft[0..=i] at L, precisely as the sequential step
+//    would (draft[0..i] already written, draft[i+1..] not yet);
+//  * that per-position causal attention is delegated to
+//    [`rswa::verify_attention`], which replays the draft writes into a PRIVATE
+//    clone of the layer's ring (the caller's caches are never mutated) — so each
+//    context row is byte-for-byte the matching sequential [`rswa::attention`];
+//  * every per-position op outside attention (RMSNorm, RoPE at the TRUE absolute
+//    position `base_position + i`, the dense/MoE MLP, the residual adds, the final
+//    RMSNorm + `lm_head`) is the SAME single-token kernel the sequential decode
+//    runs, invoked once per draft position — row-independent, hence identical.
+// The per-projection `M=K`-vs-`m=1` byte-identity is the bd-1azu.2 gate
+// (`tests/batched_igemm_parity.rs` / `tests/batched_forward_parity.rs`); the
+// per-position verify attention + no-mutation is the bd-1azu.30 gate
+// (`tests/spec_verify_forward_parity.rs`).
+
+/// `FOCR_SPEC_VERIFY`: presence kill-switch that ARMS the bd-1azu.30 batched
+/// speculative verify forward ([`verify_forward`] / [`verify_forward_i8`]) at the
+/// (future) decode driver. DEFAULT OFF — when unset the verify forwards are simply
+/// unused and the live decode path is byte-for-byte today's. Consulted ONCE by the
+/// speculative-decode driver (bd-1azu.35), NEVER inside the verify math, exactly
+/// like [`BATCH_SPINE_ENV`] / [`QKV_FUSED_ENV`].
+const SPEC_VERIFY_ENV: &str = "FOCR_SPEC_VERIFY";
+
+/// Whether the batched speculative verify forward is armed (the [`SPEC_VERIFY_ENV`]
+/// kill-switch, read ONCE into a process-wide bool — never touched per-token). The
+/// verify kernels are pure and testable regardless of this flag; only the (later)
+/// driver's decision to route through them is gated here.
+#[must_use]
+pub fn spec_verify_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(SPEC_VERIFY_ENV).is_some())
+}
+
+/// Validate the `K` draft `token_embeds` against `[1, hidden]` and the per-layer
+/// `caches` count — the shared prologue of [`verify_forward`] / [`verify_forward_i8`].
+#[allow(dead_code)] // bd-1azu.30 verify seam: used only by the (gated) verify forwards.
+fn check_verify_inputs(
+    context: &str,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+) -> FocrResult<()> {
+    let hidden = config::HIDDEN_SIZE;
+    if caches.len() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::{context}: {} caches != {} layers",
+            caches.len(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+    for (i, te) in token_embeds.iter().enumerate() {
+        if te.rows != 1 || te.cols != hidden {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "decoder::{context}: token_embeds[{i}] shape [{}, {}] != [1, {hidden}]",
+                te.rows,
+                te.cols
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Batched `K`-token speculative VERIFY forward (f32) — bd-1azu.30. Given the `K`
+/// draft tokens' embeddings `token_embeds` (each `[1, hidden]`) proposed after the
+/// sequence whose KV is in `caches`, with draft position `i` at TRUE absolute
+/// position `base_position + i`, return the `K` next-token logits rows. Row `i` is
+/// BYTE-FOR-BYTE the logits running `i+1` sequential [`decode_step_with_cache`]
+/// calls (then [`lm_head_cached`]) would emit for draft position `i` — the
+/// lossless verify contract (see the section note above).
+///
+/// `caches` is READ-ONLY: [`rswa::verify_attention`] folds each draft token into a
+/// private clone of the per-layer ring, so the caller's caches are left untouched
+/// (no checkpoint/rollback needed).
+///
+/// # Errors
+/// [`FocrError::Other`] if `caches` is not `NUM_HIDDEN_LAYERS` long or any
+/// `token_embeds[i]` is not `[1, hidden]`; propagates the per-layer kernel errors.
+#[allow(dead_code)] // bd-1azu.30 verify seam: consumed by the speculative decode loop (later bead).
+pub(crate) fn verify_forward(
+    wc: &DecoderWeightCache,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+    base_position: usize,
+) -> FocrResult<Vec<Mat>> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::verify_forward",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    check_verify_inputs("verify_forward", caches, token_embeds)?;
+    let k = token_embeds.len();
+
+    // Per-draft-position running hidden `x[i]` (`[1, hidden]`), seeded from embeds.
+    let mut x: Vec<Mat> = token_embeds.to_vec();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let cl = &wc.layers[layer];
+        // 1. Per-position pre-attn RMSNorm + q/k/v projection (the bespoke f32
+        //    `gemv`, identical to the sequential `decode_step_with_cache`) + RoPE
+        //    at the draft position's TRUE absolute position.
+        let mut q_mats: Vec<Mat> = Vec::with_capacity(k);
+        let mut k_mats: Vec<Mat> = Vec::with_capacity(k);
+        let mut v_rows: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for i in 0..k {
+            let normed = nn::rms_norm(&x[i], Some(&cl.input_ln), eps)?;
+            let nrow = normed.row(0);
+            let mut q = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.q_proj, qkv_dim, hidden));
+            let mut kk = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.k_proj, qkv_dim, hidden));
+            let v = gemv(nrow, &cl.v_proj, qkv_dim, hidden);
+            let rope = RopeTable::build(&[base_position + i], config::HEAD_DIM, config::ROPE_THETA);
+            apply_rope(&mut q, &rope)?;
+            apply_rope(&mut kk, &rope)?;
+            q_mats.push(q);
+            k_mats.push(kk);
+            v_rows.push(v);
+        }
+        // 2. Query-batched verify attention: per draft position, fold its K/V into a
+        //    private clone of THIS layer's ring then attend (causal among draft) —
+        //    `caches[layer]` is not mutated.
+        let q_refs: Vec<&[f32]> = q_mats.iter().map(|m| m.data.as_slice()).collect();
+        let k_refs: Vec<&[f32]> = k_mats.iter().map(|m| m.data.as_slice()).collect();
+        let v_refs: Vec<&[f32]> = v_rows.iter().map(|r| r.as_slice()).collect();
+        let contexts = rswa::verify_attention(&caches[layer], &q_refs, &k_refs, &v_refs)?;
+        // 3. Per-position `o_proj`, residual, post-attn RMSNorm, MLP, residual.
+        for i in 0..k {
+            let o = gemv(&contexts[i].data, &cl.o_proj, hidden, qkv_dim);
+            let attn_out = Mat::from_vec(1, hidden, o);
+            let h = add_residual(&x[i], &attn_out)?;
+            let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+            let mlp_out = Mat::from_vec(1, hidden, decode_mlp(&cl.mlp, &normed2)?);
+            x[i] = add_residual(&h, &mlp_out)?;
+        }
+    }
+    // Final RMSNorm + lm_head per draft position (each row-independent).
+    x.iter().map(|h| lm_head_cached(wc, h)).collect()
+}
+
+/// Batched `K`-token speculative VERIFY forward (int8) — the int8 twin of
+/// [`verify_forward`] (bd-1azu.30). The q/k/v stack and `o_proj` run as ONE `M=K`
+/// [`gemv_i8_batched`] each (the shared weight panel read once, reused across all
+/// `K` draft queries — byte-identical per row to the `m=1` [`gemv_i8`] the
+/// sequential [`decode_step_with_cache_i8`] runs, bd-1azu.2); RoPE, the verify
+/// attention, the MoE dispatch, and the `lm_head` stay a faithful per-position
+/// loop over the existing single-token kernels. Row `i` is BYTE-FOR-BYTE the
+/// logits `i+1` sequential [`decode_step_with_cache_i8`] + [`lm_head_cached_i8`]
+/// calls would emit.
+///
+/// `caches` is READ-ONLY (see [`verify_forward`]).
+///
+/// # Errors
+/// As [`verify_forward`].
+#[allow(dead_code)] // bd-1azu.30 verify seam: consumed by the speculative decode loop (later bead).
+pub(crate) fn verify_forward_i8(
+    wc: &DecoderWeightCacheI8,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+    base_position: usize,
+) -> FocrResult<Vec<Mat>> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::verify_forward_i8",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    check_verify_inputs("verify_forward_i8", caches, token_embeds)?;
+    let k = token_embeds.len();
+
+    let mut x: Vec<Mat> = token_embeds.to_vec();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let cl = &wc.layers[layer];
+        // 1. Per-position pre-attn RMSNorm.
+        let mut normed: Vec<Mat> = Vec::with_capacity(k);
+        for i in 0..k {
+            normed.push(nn::rms_norm(&x[i], Some(&cl.input_ln), eps)?);
+        }
+        let nrows: Vec<&[f32]> = normed.iter().map(|m| m.row(0)).collect();
+        // 2. ONE `M=K` int8 GEMM per q/k/v projection (the fused stack when armed,
+        //    else three) — byte-identical per draft position to the matching branch
+        //    of `decode_step_with_cache_i8`.
+        let (mut q_mats, mut k_mats, v_rows): (Vec<Mat>, Vec<Mat>, Vec<Vec<f32>>) =
+            if let Some(qkv) = &cl.qkv {
+                let outs = gemv_i8_batched(&nrows, qkv);
+                let mut qm = Vec::with_capacity(k);
+                let mut km = Vec::with_capacity(k);
+                let mut vr = Vec::with_capacity(k);
+                for row in outs {
+                    qm.push(Mat::from_vec(1, qkv_dim, row[0..qkv_dim].to_vec()));
+                    km.push(Mat::from_vec(
+                        1,
+                        qkv_dim,
+                        row[qkv_dim..2 * qkv_dim].to_vec(),
+                    ));
+                    vr.push(row[2 * qkv_dim..3 * qkv_dim].to_vec());
+                }
+                (qm, km, vr)
+            } else {
+                let q_out = gemv_i8_batched(&nrows, &cl.q_proj);
+                let k_out = gemv_i8_batched(&nrows, &cl.k_proj);
+                let v_out = gemv_i8_batched(&nrows, &cl.v_proj);
+                let qm: Vec<Mat> = q_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                let km: Vec<Mat> = k_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                (qm, km, v_out)
+            };
+        // 3. RoPE each q/k at the draft position's TRUE absolute position.
+        for i in 0..k {
+            let rope = RopeTable::build(&[base_position + i], config::HEAD_DIM, config::ROPE_THETA);
+            apply_rope(&mut q_mats[i], &rope)?;
+            apply_rope(&mut k_mats[i], &rope)?;
+        }
+        // 4. Query-batched verify attention over a private clone of the ring.
+        let q_refs: Vec<&[f32]> = q_mats.iter().map(|m| m.data.as_slice()).collect();
+        let k_refs: Vec<&[f32]> = k_mats.iter().map(|m| m.data.as_slice()).collect();
+        let v_refs: Vec<&[f32]> = v_rows.iter().map(|r| r.as_slice()).collect();
+        let contexts = rswa::verify_attention(&caches[layer], &q_refs, &k_refs, &v_refs)?;
+        // 5. ONE `M=K` `o_proj` over the stacked per-position contexts.
+        let ctx_refs: Vec<&[f32]> = contexts.iter().map(|m| m.row(0)).collect();
+        let attn_rows = gemv_i8_batched(&ctx_refs, &cl.o_proj);
+        // 6. Per-position residual, post-attn RMSNorm, MoE dispatch, residual.
+        for (i, attn) in attn_rows.into_iter().enumerate() {
+            let attn_out = Mat::from_vec(1, hidden, attn);
+            let h = add_residual(&x[i], &attn_out)?;
+            let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+            let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+            x[i] = add_residual(&h, &mlp_out)?;
+        }
+    }
+    x.iter().map(|h| lm_head_cached_i8(wc, h)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

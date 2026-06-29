@@ -1213,6 +1213,81 @@ pub fn attention(
     decode_attention(cache, &q.data)
 }
 
+/// bd-1azu.30 verify seam — batched `K`-token R-SWA **verify** attention: the
+/// query-batched verify half of speculative decode. Given `K` draft tokens'
+/// already-RoPE'd per-head `q`/`k`/`v` rows (each `[NUM_HEADS * HEAD_DIM]`
+/// head-major flat, in draft order), return the `K` decode contexts that running
+/// `K` sequential single-token decode steps WOULD produce — WITHOUT mutating
+/// `cache`.
+///
+/// Draft position `i` attends to the reference block (full) + the live ring (the
+/// last `<= W` generated tokens) + `draft[0..=i]` (causal AMONG the draft). The
+/// draft K/V are replayed into a PRIVATE clone of `cache`, folding token `i`'s
+/// K/V in *before* its own query reads (OQ-3 — the query sees itself) and
+/// `draft[i+1..]` strictly *after*, so the trailing draft keys are simply not in
+/// the ring when query `i` reads it and enter its softmax as exact `0.0`. Row
+/// `i`'s causal reach therefore equals its sequential reach exactly — the
+/// front-pad / causal-limit trick of [`super::decoder::chunk_prefill_attention`],
+/// realized incrementally on the ring (which also reproduces ring EVICTION at
+/// steady state for free, because the clone IS the literal sequential ring
+/// evolution).
+///
+/// **QUERY-dim batching ONLY.** Each query attends over its OWN causal
+/// `reference ++ ring` union through the unchanged [`decode_attention`]; the keys
+/// are NEVER speculatively gathered into one shared block that all `K` queries
+/// attend (the rejected key-batch lever — `docs/NEGATIVE_EVIDENCE.md`). Hence
+/// `result[i]` is byte-for-byte [`decode_attention`] over the ring after
+/// `draft[0..=i]` were appended in order — the identical kernel, fold order,
+/// physical ring slots, and `FOCR_INT8_KV` / `FOCR_ATTN_GEMM` dispatch as the
+/// sequential decode — so the batched verify is bit-exact to `K` sequential
+/// [`attention`] calls.
+///
+/// The caller's `cache` is left byte-for-byte untouched (a fresh clone absorbs
+/// every speculative write — by-construction read-only); a later perf bead may
+/// swap the clone for [`RingCache::checkpoint`] / [`RingCache::rollback_to`].
+///
+/// # Errors
+/// [`FocrError::Other`] if the three draft slices disagree in length or any row
+/// is not `NUM_HEADS * HEAD_DIM`; propagates [`RingCache::write_decode_step`] /
+/// [`decode_attention`] errors (e.g. `cache` never had its prefill recorded).
+pub fn verify_attention(
+    cache: &RingCache,
+    draft_q: &[&[f32]],
+    draft_k: &[&[f32]],
+    draft_v: &[&[f32]],
+) -> FocrResult<Vec<Mat>> {
+    let k = draft_q.len();
+    if draft_k.len() != k || draft_v.len() != k {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rswa: verify_attention draft q/k/v counts disagree ({k}, {}, {})",
+            draft_k.len(),
+            draft_v.len()
+        )));
+    }
+    let expect = NUM_HEADS * HEAD_DIM;
+    for (i, q) in draft_q.iter().enumerate() {
+        if q.len() != expect {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rswa: verify_attention draft_q[{i}] len {} != NUM_HEADS*HEAD_DIM {expect}",
+                q.len()
+            )));
+        }
+    }
+    // Private working ring: the caller's `cache` is never mutated (by-construction
+    // read-only). Every speculative draft write lands in THIS clone only.
+    let mut work = cache.clone();
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        // Fold draft[i]'s K/V into the ring BEFORE its own query reads (OQ-3);
+        // draft[i+1..] are written only on later iterations, so query `i` cannot
+        // see them — its causal reach is exactly reference ++ ring ++ draft[0..=i],
+        // bit-for-bit what the i-th sequential `attention` call would compute.
+        work.write_decode_step(draft_k[i], draft_v[i])?;
+        out.push(decode_attention(&work, draft_q[i])?);
+    }
+    Ok(out)
+}
+
 /// Batched R-SWA **decode** attention stage (bd-1azu.5 — the Phase-6
 /// continuous-batch attention stage, bd-1azu): run all `B` in-flight
 /// page-streams' decode queries for ONE `layer` and return the `B` per-stream
