@@ -1098,9 +1098,33 @@ impl OcrModel {
         let mut generated: Vec<u32> = prompt_ids.to_vec();
         let mut emitted: Vec<u32> = Vec::new();
 
+        // FOCR_FUSE_NGRAM_LMHEAD (bd-1azu.54, Lever 3): fold the sliding-window
+        // no-repeat-ngram ban into the int8 lm_head dequant epilogue instead of the
+        // sampler's separate copy-then-mask pass. DEFAULT OFF — read ONCE here.
+        let fuse_ngram_lmhead = decoder::fuse_ngram_lmhead_enabled();
+
         while emitted.len() < params.max_length {
-            let logits = decoder::lm_head_cached_i8(wc, &last_hidden)?;
-            let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
+            // When armed AND the blocker can ban (enough history), mask in the
+            // lm_head epilogue and argmax the already-masked logits; otherwise the
+            // exact default `lm_head_cached_i8` -> `sampler::decode_step`. The chosen
+            // token is byte-for-byte identical either way (same masked row argmax'd).
+            let step: DecodeOutput = if fuse_ngram_lmhead
+                && params.no_repeat_ngram_size > 0
+                && generated.len() >= params.no_repeat_ngram_size
+            {
+                let banned = sampler::collect_sliding_window_ngram_bans(
+                    &generated,
+                    params.no_repeat_ngram_size,
+                    params.ngram_window,
+                    &[],
+                    sampler::VOCAB_SIZE,
+                );
+                let logits = decoder::lm_head_cached_i8_ngram_masked(wc, &last_hidden, &banned)?;
+                sampler::decode_step_premasked(&logits, params)?
+            } else {
+                let logits = decoder::lm_head_cached_i8(wc, &last_hidden)?;
+                sampler::decode_step(&logits, &generated, params)?
+            };
             generated.push(step.token_id);
             emitted.push(step.token_id);
             if step.is_eos {

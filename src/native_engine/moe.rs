@@ -281,21 +281,55 @@ pub fn route_default(hidden: &Mat, gate: &[f32]) -> FocrResult<Routing> {
 
 // ── P1-moe-experts / P1-dense-mlp0: the SwiGLU MLP ─────────────────────────
 
+/// `FOCR_FUSE_SWIGLU` (bd-1azu.54, Lever 2): fuse the SwiGLU activation
+/// `silu(gate)·up` into the expert FFN GEMM epilogue — apply it in a SINGLE pass
+/// over the gate GEMM output, in place, before the down-proj, instead of a
+/// separate `nn::silu` pass followed by an elementwise multiply over the same
+/// materialized buffer. DEFAULT OFF — unset reproduces the two-pass path
+/// byte-for-byte. Read ONCE into a process-wide bool.
+const FUSE_SWIGLU_ENV: &str = "FOCR_FUSE_SWIGLU";
+
+fn fuse_swiglu_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(FUSE_SWIGLU_ENV).is_some())
+}
+
+/// FUSED SwiGLU epilogue (FOCR_FUSE_SWIGLU): `gate[i] = silu(gate[i]) * up[i]` in
+/// ONE pass over the gate GEMM output. Byte-for-byte identical to the separate
+/// `nn::silu(gate)` then `gate[i] *= up[i]`: each lane computes `s/(1+e^-s)` — the
+/// exact `nn::silu` scalar — then multiplies by `up[i]`, so nothing is
+/// reassociated (the divide and the multiply stay distinct rounding steps, as in
+/// the two-pass order).
+#[inline]
+fn swiglu_elemwise_fused(gate: &mut [f32], up: &[f32]) {
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        let s = *g;
+        *g = (s / (1.0 + (-s).exp())) * u;
+    }
+}
+
 /// SwiGLU MLP forward: `down_proj(silu(gate_proj(x)) * up_proj(x))`
 /// ([SPEC-075]). Shared by the dense layer-0 MLP, the fused shared expert, and
 /// every routed expert (only `intermediate` differs).
 ///
 /// `x` is `[n_tok, hidden]`; returns `[n_tok, hidden]`.
 ///
+/// The `silu(gate)·up` activation runs as two passes (`nn::silu` then an
+/// elementwise multiply, the default) or, under [`FUSE_SWIGLU_ENV`], as a single
+/// fused epilogue pass ([`swiglu_elemwise_fused`]) — byte-for-byte identical.
+///
 /// # Errors
 /// [`FocrError::Other`] on any dimension mismatch in `w`.
 pub fn expert_mlp(x: &Mat, w: &MlpWeights<'_>) -> FocrResult<Mat> {
-    // gate = silu(x @ gate_proj.T)  -> [n_tok, intermediate]
+    // gate = x @ gate_proj.T  -> [n_tok, intermediate]
     let mut gate = linear_no_bias(x, w.gate_proj, w.intermediate, w.hidden)?;
-    nn::silu(&mut gate);
+    let fused = fuse_swiglu_enabled();
+    if !fused {
+        // Default: silu in place FIRST (today's exact two-pass ordering).
+        nn::silu(&mut gate);
+    }
     // up = x @ up_proj.T            -> [n_tok, intermediate]
     let up = linear_no_bias(x, w.up_proj, w.intermediate, w.hidden)?;
-    // elementwise silu(gate) * up
     if gate.data.len() != up.data.len() {
         return Err(FocrError::Other(anyhow::anyhow!(
             "moe::expert_mlp: gate/up shape mismatch ({} vs {})",
@@ -303,8 +337,14 @@ pub fn expert_mlp(x: &Mat, w: &MlpWeights<'_>) -> FocrResult<Mat> {
             up.data.len()
         )));
     }
-    for (g, &u) in gate.data.iter_mut().zip(up.data.iter()) {
-        *g *= u;
+    if fused {
+        // FOCR_FUSE_SWIGLU: silu(gate)·up folded into one epilogue pass.
+        swiglu_elemwise_fused(&mut gate.data, &up.data);
+    } else {
+        // elementwise silu(gate) * up (the second of the two default passes).
+        for (g, &u) in gate.data.iter_mut().zip(up.data.iter()) {
+            *g *= u;
+        }
     }
     // down = (silu(gate)*up) @ down_proj.T -> [n_tok, hidden]
     linear_no_bias(&gate, w.down_proj, w.hidden, w.intermediate)
@@ -687,6 +727,36 @@ mod tests {
         let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
         let (w, out, in_) = linrow(vec![vec![1.0, 0.0]]); // in=2 != x.cols=3
         assert!(linear_no_bias(&x, &w, out, in_).is_err());
+    }
+
+    /// FOCR_FUSE_SWIGLU (Lever 2, bd-1azu.54): the fused one-pass `silu(gate)·up`
+    /// epilogue must reproduce, BYTE-FOR-BYTE, the default two-pass path —
+    /// production `nn::silu` over the gate buffer THEN an elementwise multiply by
+    /// `up`. `inter` is deliberately not a tidy width so the activation tail is
+    /// exercised; the row spans negatives/positives (the silu sigmoid both ways).
+    #[test]
+    fn fused_swiglu_epilogue_is_byte_identical_to_two_pass() {
+        let inter = 257usize;
+        let gate0: Vec<f32> = (0..inter)
+            .map(|i| (i as f32 * 0.17).sin() * 4.0 - 1.3)
+            .collect();
+        let up: Vec<f32> = (0..inter)
+            .map(|i| (i as f32 * 0.23).cos() * 2.0 + 0.5)
+            .collect();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+
+        // Default two-pass: the production `nn::silu`, then elementwise multiply.
+        let mut sep = Mat::from_vec(1, inter, gate0.clone());
+        nn::silu(&mut sep);
+        for (g, &u) in sep.data.iter_mut().zip(up.iter()) {
+            *g *= u;
+        }
+
+        // Fused one-pass epilogue (the production helper).
+        let mut fused = gate0.clone();
+        swiglu_elemwise_fused(&mut fused, &up);
+
+        assert_eq!(bits(&sep.data), bits(&fused), "swiglu fused != two-pass");
     }
 
     #[test]

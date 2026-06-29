@@ -1581,12 +1581,25 @@ fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
 /// pool in `I8_GEMV_BLOCK` chunks, each a single `simd::igemm_s8s8` SDOT/VNNI
 /// call; i32 accumulation is exact (proven `K ≤ 6848 < i32::MAX`, `src/simd`).
 fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
+    debug_assert_eq!(x.len(), qw.k);
+    let (xq, a_scale) = quantize_row_i8(x);
+    gemv_i8_prequant(&xq, a_scale, qw)
+}
+
+/// Block-parallel int8 GEMV from a PRE-QUANTIZED activation row `(xq, a_scale)` —
+/// the body of [`gemv_i8`] hoisted out of the per-call activation quantize so a
+/// caller that already produced `(xq, a_scale)` (the fused norm->quant epilogue,
+/// [`FUSE_NORM_QUANT_ENV`]) can feed the SAME int8 row to several weights without
+/// re-quantizing. BYTE-FOR-BYTE identical to [`gemv_i8`]: each of the `n` output
+/// channels is an independent i32 SDOT dequantized by `a_scale · scale[o]`, so the
+/// rayon row-chunking never changes a per-channel value (the same N-independence
+/// the 64-row blocking and `fuse_qkv` already rely on).
+fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let k = qw.k;
     let n = qw.n;
-    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(xq.len(), k);
     debug_assert_eq!(qw.w.len(), n * k);
     debug_assert_eq!(qw.scales.len(), n);
-    let (xq, a_scale) = quantize_row_i8(x);
     let mut y = vec![0.0f32; n];
     y.par_chunks_mut(I8_GEMV_BLOCK)
         .enumerate()
@@ -1594,12 +1607,40 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len();
             let mut acc = vec![0i32; cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+            simd::igemm_s8s8(xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
             for (j, slot) in ys.iter_mut().enumerate() {
                 *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
             }
         });
     y
+}
+
+/// `FOCR_FUSE_NORM_QUANT` (bd-1azu.54, Lever 1): fold the decode-row int8
+/// activation quantize into the `input_layernorm` RMSNorm epilogue so the
+/// normalized row is quantized ONCE as it is produced and the same int8 row feeds
+/// q/k/v, instead of `nn::rms_norm` -> f32 `Mat` -> a re-quantize inside each
+/// [`gemv_i8`]. DEFAULT OFF — unset reproduces the norm-then-gemv path
+/// byte-for-byte. Read ONCE into a process-wide bool.
+const FUSE_NORM_QUANT_ENV: &str = "FOCR_FUSE_NORM_QUANT";
+
+fn fuse_norm_quant_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(FUSE_NORM_QUANT_ENV).is_some())
+}
+
+/// Fused RMSNorm + per-row int8 quantize (FOCR_FUSE_NORM_QUANT): returns the SAME
+/// `(xq, a_scale)` that `quantize_row_i8(nn::rms_norm(x, weight, eps).row(0))`
+/// produces. The normalized values come from the SAME `nn::rms_norm` kernel call,
+/// then the quantize (amax/scale/round/clamp of [`quantize_row_i8`]) is applied in
+/// the epilogue — so the int8 bytes + scale are byte-for-byte the separate
+/// norm-then-quantize, while the int8 GEMV ([`gemv_i8_prequant`]) no longer
+/// re-reads an f32 row to re-quantize it. `x` is a single decode row (`rows == 1`).
+///
+/// # Errors
+/// Propagates [`nn::rms_norm`]'s shape error.
+fn rms_norm_quant_i8(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<(Vec<i8>, f32)> {
+    let normed = nn::rms_norm(x, weight, eps)?;
+    Ok(quantize_row_i8(normed.row(0)))
 }
 
 /// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x) *
@@ -2185,6 +2226,110 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
 }
 
+// ── ngram-ban into the int8 lm_head epilogue (FOCR_FUSE_NGRAM_LMHEAD, bd-1azu.54) ──
+//
+// The greedy decode loop produces `[1, vocab]` lm_head logits, then the sampler's
+// `masked_sliding_window_logits_if_needed` COPIES the whole 129280-wide row and
+// sets every sliding-window no-repeat-ngram-banned token to -inf before argmax.
+// Because the ban SET is a pure function of the generated sequence (independent of
+// the logit values), it can be folded into the lm_head dequant epilogue: as each
+// output channel `o` is dequantized, a banned `o` is written -inf instead of its
+// dot product. This produces a logits row BYTE-FOR-BYTE identical to `gemv_i8`
+// followed by `masked_sliding_window_logits_if_needed` — non-banned channels keep
+// the same `acc·a_scale·scale[o]`, banned channels are -inf in both — so the argmax
+// (and the chosen token) is unchanged, with no separate full-row copy/mask pass.
+
+/// `FOCR_FUSE_NGRAM_LMHEAD` (bd-1azu.54, Lever 3): fold the sliding-window
+/// no-repeat-ngram ban into the int8 lm_head dequant epilogue (mask as logits are
+/// produced) instead of the sampler's separate copy-then-mask pass. DEFAULT OFF —
+/// unset reproduces the `lm_head_cached_i8` -> `sampler::decode_step` path
+/// byte-for-byte. Read ONCE into a process-wide bool.
+const FUSE_NGRAM_LMHEAD_ENV: &str = "FOCR_FUSE_NGRAM_LMHEAD";
+
+/// Read [`FUSE_NGRAM_LMHEAD_ENV`] ONCE into a process-wide bool (consulted by the
+/// decode driver, never inside a per-channel loop).
+pub fn fuse_ngram_lmhead_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(FUSE_NGRAM_LMHEAD_ENV).is_some())
+}
+
+/// Int8 lm_head GEMV with the no-repeat-ngram ban folded into the dequant epilogue
+/// (FOCR_FUSE_NGRAM_LMHEAD). `banned` is the set of vocab ids to mask to -inf
+/// (from [`sampler::collect_sliding_window_ngram_bans`]); out-of-range ids are
+/// ignored, and a repeated id is idempotent. With `banned` empty this is exactly
+/// [`gemv_i8`]. BYTE-FOR-BYTE identical to `gemv_i8(x, qw)` then setting `y[b] =
+/// -inf` for each in-range `b`: non-banned channels are the SAME
+/// `acc·a_scale·scale[o]`, banned channels are `f32::NEG_INFINITY`.
+fn gemv_i8_ngram_masked(x: &[f32], qw: &QInt8, banned: &[u32]) -> Vec<f32> {
+    let n = qw.n;
+    if banned.is_empty() {
+        // No ban this step ⇒ byte-for-byte the unmasked head (matches the sampler's
+        // `masked_sliding_window_logits_if_needed` returning `None`).
+        return gemv_i8(x, qw);
+    }
+    let mut ban_mask = vec![false; n];
+    for &b in banned {
+        let bi = b as usize;
+        if bi < n {
+            ban_mask[bi] = true;
+        }
+    }
+    let k = qw.k;
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.scales.len(), n);
+    let (xq, a_scale) = quantize_row_i8(x);
+    let mut y = vec![0.0f32; n];
+    y.par_chunks_mut(I8_GEMV_BLOCK)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len();
+            let mut acc = vec![0i32; cnt];
+            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+            for (j, slot) in ys.iter_mut().enumerate() {
+                *slot = if ban_mask[base + j] {
+                    f32::NEG_INFINITY
+                } else {
+                    acc[j] as f32 * a_scale * qw.scales[base + j]
+                };
+            }
+        });
+    y
+}
+
+/// Final RMSNorm + int8 lm_head with the no-repeat-ngram ban folded into the
+/// dequant epilogue — the FOCR_FUSE_NGRAM_LMHEAD twin of [`lm_head_cached_i8`].
+/// Returns `[1, vocab]` logits already masked, so the caller argmaxes directly
+/// (no separate sampler masking pass; see [`sampler::decode_step_premasked`]). The
+/// masked row is byte-for-byte the [`lm_head_cached_i8`] logits with
+/// `masked_sliding_window_logits_if_needed` applied — the monolithic head is itself
+/// byte-identical to the `FOCR_LMHEAD_SHARD` tiling, so this matches regardless of
+/// that flag.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch (mirrors [`lm_head_cached_i8`]).
+pub fn lm_head_cached_i8_ngram_masked(
+    wc: &DecoderWeightCacheI8,
+    hidden: &Mat,
+    banned: &[u32],
+) -> FocrResult<Mat> {
+    if hidden.rows != 1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::lm_head_cached_i8_ngram_masked: expected a single decode row, got {} rows",
+            hidden.rows
+        )));
+    }
+    let t = prof::enabled().then(std::time::Instant::now);
+    let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
+    let row = normed.row(0);
+    let logits = gemv_i8_ngram_masked(row, &wc.lm_head, banned);
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
+    Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
 /// Int8 prefill: the [`prefill_with_cache`] structure with the GEMMs routed through
 /// [`nn::linear_int8_dynamic`] (threaded SDOT/VNNI). Captures each layer's RoPE'd
 /// K/V into the R-SWA ring just like the f32 path. Returns the final
@@ -2359,22 +2504,42 @@ pub fn decode_step_with_cache_i8(
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
         let t_attn = profiling.then(std::time::Instant::now);
-        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
-        let nrow = normed.row(0);
-        let (mut q, mut k, v) = if let Some(qkv) = &cl.qkv {
-            // FOCR_QKV_FUSED: ONE quantize of `nrow`, ONE block-parallel GEMV over
-            // all 3*qkv_dim output rows, then slice into q/k/v. Byte-identical to
-            // the three-call `else` branch (each output row is an independent dot).
-            let out = gemv_i8(nrow, qkv);
-            let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
-            let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
-            let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
-            (q, k, v)
+        let (mut q, mut k, v) = if fuse_norm_quant_enabled() {
+            // FOCR_FUSE_NORM_QUANT (Lever 1): quantize the `input_layernorm` output
+            // ONCE in the norm epilogue and reuse that int8 row across q/k/v —
+            // byte-identical to re-quantizing `normed.row(0)` inside each `gemv_i8`
+            // (the quantize is deterministic, so once-then-reuse == thrice).
+            let (xq, a_scale) = rms_norm_quant_i8(&x, Some(&cl.input_ln), eps)?;
+            if let Some(qkv) = &cl.qkv {
+                let out = gemv_i8_prequant(&xq, a_scale, qkv);
+                let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
+                let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
+                let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
+                (q, k, v)
+            } else {
+                let q = Mat::from_vec(1, qkv_dim, gemv_i8_prequant(&xq, a_scale, &cl.q_proj));
+                let k = Mat::from_vec(1, qkv_dim, gemv_i8_prequant(&xq, a_scale, &cl.k_proj));
+                let v = gemv_i8_prequant(&xq, a_scale, &cl.v_proj);
+                (q, k, v)
+            }
         } else {
-            let q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
-            let k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
-            let v = gemv_i8(nrow, &cl.v_proj);
-            (q, k, v)
+            let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+            let nrow = normed.row(0);
+            if let Some(qkv) = &cl.qkv {
+                // FOCR_QKV_FUSED: ONE quantize of `nrow`, ONE block-parallel GEMV over
+                // all 3*qkv_dim output rows, then slice into q/k/v. Byte-identical to
+                // the three-call `else` branch (each output row is an independent dot).
+                let out = gemv_i8(nrow, qkv);
+                let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
+                let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
+                let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
+                (q, k, v)
+            } else {
+                let q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
+                let k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
+                let v = gemv_i8(nrow, &cl.v_proj);
+                (q, k, v)
+            }
         };
         apply_rope(&mut q, &rope)?;
         apply_rope(&mut k, &rope)?;
@@ -3042,6 +3207,128 @@ mod tests {
             bits(&y[2 * qkv_dim..3 * qkv_dim]),
             "v mismatch"
         );
+    }
+
+    // ── Fused norm->quant epilogue bit-identity (FOCR_FUSE_NORM_QUANT, bd-1azu.54) ──
+
+    /// Lever 1: folding the per-row int8 quantize into the RMSNorm epilogue and
+    /// reusing that ONE int8 row across q/k/v must reproduce, BYTE-FOR-BYTE, the
+    /// default `nn::rms_norm` -> f32 row -> per-`gemv_i8` re-quantize path — both
+    /// the dequantized projection outputs AND the intermediate `(xq, a_scale)`.
+    /// `qkv_dim` crosses a 64-row [`I8_GEMV_BLOCK`] boundary so the block fan-out is
+    /// exercised; the input row spans negatives/positives (dynamic amax/clamp/round).
+    #[test]
+    fn fused_norm_quant_is_byte_identical_to_norm_then_gemv() {
+        let hidden = 96usize;
+        let qkv_dim = 70usize; // crosses a 64-row I8_GEMV_BLOCK boundary
+        let mk = |salt: i32| -> QInt8 {
+            let mut w = vec![0i8; qkv_dim * hidden];
+            for o in 0..qkv_dim {
+                for i in 0..hidden {
+                    let raw = ((o as i32 * 29 + i as i32 * 11 + salt * 97) % 255) - 127;
+                    w[o * hidden + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..qkv_dim)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, qkv_dim, hidden)
+        };
+        let q_proj = mk(0);
+        let k_proj = mk(1);
+        let v_proj = mk(2);
+        let ln_w: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32) * 0.03).collect();
+        let x = Mat::from_vec(
+            1,
+            hidden,
+            (0..hidden)
+                .map(|i| (i as f32 * 0.41).cos() * 3.0 - 0.7)
+                .collect(),
+        );
+        let eps = config::RMS_NORM_EPS;
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+
+        // Default path: norm -> f32 row -> three re-quantizing `gemv_i8`.
+        let normed = nn::rms_norm(&x, Some(&ln_w), eps).unwrap();
+        let nrow = normed.row(0);
+        let q_def = gemv_i8(nrow, &q_proj);
+        let k_def = gemv_i8(nrow, &k_proj);
+        let v_def = gemv_i8(nrow, &v_proj);
+
+        // Fused path: quantize ONCE in the norm epilogue, reuse for q/k/v.
+        let (xq, a_scale) = rms_norm_quant_i8(&x, Some(&ln_w), eps).unwrap();
+        let q_fused = gemv_i8_prequant(&xq, a_scale, &q_proj);
+        let k_fused = gemv_i8_prequant(&xq, a_scale, &k_proj);
+        let v_fused = gemv_i8_prequant(&xq, a_scale, &v_proj);
+
+        assert_eq!(bits(&q_def), bits(&q_fused), "q mismatch");
+        assert_eq!(bits(&k_def), bits(&k_fused), "k mismatch");
+        assert_eq!(bits(&v_def), bits(&v_fused), "v mismatch");
+
+        // The fused `(xq, a_scale)` themselves equal the separate norm-then-quantize.
+        let (xq_ref, a_ref) = quantize_row_i8(nrow);
+        assert_eq!(xq, xq_ref, "int8 activation bytes mismatch");
+        assert_eq!(a_scale.to_bits(), a_ref.to_bits(), "a_scale bits mismatch");
+    }
+
+    // ── Fused ngram->lm_head epilogue bit-identity (FOCR_FUSE_NGRAM_LMHEAD, .54) ──
+
+    /// Lever 3: folding the sliding-window no-repeat-ngram ban into the int8 lm_head
+    /// dequant epilogue must reproduce, BYTE-FOR-BYTE, the default `gemv_i8` then
+    /// the sampler's `masked_sliding_window_logits_if_needed` copy-mask. `vocab`
+    /// crosses several [`I8_GEMV_BLOCK`] (64) boundaries. The sequence `[3,7,3]`
+    /// bans the bigram completion `7` (current_prefix `[3]`, bigram `(3,7)` in
+    /// window) — so the masked path is genuinely exercised — and the empty-ban case
+    /// must be byte-identical to the plain head.
+    #[test]
+    fn fused_ngram_lmhead_is_byte_identical_to_separate_mask() {
+        use super::super::sampler;
+        let vocab = 130usize;
+        let hidden = 48usize;
+        let mut w = vec![0i8; vocab * hidden];
+        for o in 0..vocab {
+            for i in 0..hidden {
+                let raw = ((o as i32 * 13 + i as i32 * 7 + 5) % 255) - 127;
+                w[o * hidden + i] = raw as i8;
+            }
+        }
+        let scales: Vec<f32> = (0..vocab).map(|o| 1.0e-3 + o as f32 * 1.0e-4).collect();
+        let qw = QInt8::new(w, scales, vocab, hidden);
+        let x: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32 * 0.31).sin() * 2.0 - 0.3)
+            .collect();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+
+        let ngram_size = 2usize;
+        let window = 16usize;
+        let seq: Vec<u32> = vec![3, 7, 3];
+
+        // Default path: full head, then the sampler's copy-then-mask.
+        let logits = gemv_i8(&x, &qw);
+        let expected =
+            sampler::masked_sliding_window_logits_if_needed(&logits, &seq, ngram_size, window, &[])
+                .unwrap_or_else(|| logits.clone());
+
+        // Fused path: ban set folded into the lm_head dequant epilogue.
+        let banned =
+            sampler::collect_sliding_window_ngram_bans(&seq, ngram_size, window, &[], vocab);
+        let fused = gemv_i8_ngram_masked(&x, &qw, &banned);
+
+        assert!(
+            !banned.is_empty(),
+            "test sequence should ban at least one token"
+        );
+        // token 7 is the bigram completion the sequence bans → its logit is -inf.
+        assert_eq!(
+            fused[7].to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            "banned token 7 should be masked to -inf"
+        );
+        assert_eq!(bits(&fused), bits(&expected), "masked logits row mismatch");
+
+        // No-ban case: empty bans ⇒ byte-for-byte the plain head.
+        let none = gemv_i8_ngram_masked(&x, &qw, &[]);
+        assert_eq!(bits(&none), bits(&logits), "no-ban head must equal gemv_i8");
     }
 
     // ── Batched M=B projection GEMV bit-identity (bd-1azu.3) ─────────────────────

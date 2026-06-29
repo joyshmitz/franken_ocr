@@ -238,6 +238,29 @@ pub(crate) fn masked_sliding_window_logits_if_needed(
     masked
 }
 
+/// Collect every in-vocab token id the sliding-window no-repeat-ngram processor
+/// would ban for `sequence`, as a flat list — the ban SET the
+/// `FOCR_FUSE_NGRAM_LMHEAD` lm_head epilogue masks to -inf as the logits are
+/// produced ([`super::decoder::lm_head_cached_i8_ngram_masked`]). Reuses the EXACT
+/// [`for_each_sliding_window_ngram_ban`] scan that
+/// [`masked_sliding_window_logits_if_needed`] uses, so the ban set is identical;
+/// ids may repeat when the same completion is reachable from several window
+/// positions (the epilogue mask is idempotent). `window == 0` is the HF global
+/// no-repeat-ngram fallback.
+pub(crate) fn collect_sliding_window_ngram_bans(
+    sequence: &[u32],
+    ngram_size: usize,
+    window: usize,
+    whitelist: &[u32],
+    vocab: usize,
+) -> Vec<u32> {
+    let mut banned = Vec::new();
+    for_each_sliding_window_ngram_ban(sequence, ngram_size, window, whitelist, vocab, |bi| {
+        banned.push(bi as u32);
+    });
+    banned
+}
+
 /// Apply the custom sliding-window no-repeat-n-gram blocker in place over a
 /// single batch row's `logits`, given the already-generated `sequence`
 /// ([SPEC-103], `modeling_unlimitedocr.py:354-383`).
@@ -364,6 +387,54 @@ pub fn decode_step(
     params: &DecodeParams,
 ) -> FocrResult<DecodeOutput> {
     let token_id = sample(logits, generated, params)?;
+    Ok(DecodeOutput::new(token_id, params))
+}
+
+/// Argmax + EOS over a `[1, vocab]` logits row whose sliding-window
+/// no-repeat-ngram ban has ALREADY been folded into the lm_head epilogue
+/// (`FOCR_FUSE_NGRAM_LMHEAD`, [`super::decoder::lm_head_cached_i8_ngram_masked`]):
+/// the banned tokens are already `-inf`, so this argmaxes directly with NO masking
+/// pass. For a row produced from those bans (via
+/// [`collect_sliding_window_ngram_bans`]), the chosen token is byte-for-byte the
+/// one [`decode_step`] returns for the UNMASKED logits + the same sequence — the
+/// row the argmax sees is identical either way (banned channels `-inf`, the rest
+/// the same lm_head dot products), and [`argmax_row`] is the same tie/NaN scan.
+///
+/// # Errors
+/// * [`FocrError::Other`] if `logits` is not a single row, or the backing length
+///   disagrees with `rows * cols`.
+/// * [`FocrError::NotImplemented`] for `temperature > 0` (sampling path).
+pub fn decode_step_premasked(logits: &Mat, params: &DecodeParams) -> FocrResult<DecodeOutput> {
+    if logits.rows != 1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked expects a single [1, vocab] logits row, got [{}, {}]",
+            logits.rows,
+            logits.cols
+        )));
+    }
+    if !params.is_greedy() {
+        return Err(FocrError::NotImplemented(
+            "native_engine::sampler::decode_step_premasked — temperature>0 sampling is outside the greedy fp32 spine"
+                .into(),
+        ));
+    }
+    let expected_len = logits.rows.checked_mul(logits.cols).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked: logits shape product overflow for [{}, {}]",
+            logits.rows,
+            logits.cols
+        ))
+    })?;
+    if logits.data.len() != expected_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked: logits data len {} != rows*cols {} for shape [{}, {}]",
+            logits.data.len(),
+            expected_len,
+            logits.rows,
+            logits.cols
+        )));
+    }
+    let token_id = argmax_row(logits.row(0))?;
     Ok(DecodeOutput::new(token_id, params))
 }
 
