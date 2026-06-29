@@ -52,6 +52,16 @@ fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 image = "0.25"
+# Native PDF page rasterization (src/pdf.rs): `focr ocr file.pdf` extracts each
+# page's image XObject and decodes it through the same pipeline a PNG takes — no
+# out-of-band poppler/pdftoppm. `lopdf` is the container/xref/object/stream parser
+# (pure Rust, no FFI); we write the image-codec dispatch ourselves. default-features
+# are off to drop the date/serde/tokio surface (chrono/jiff/time/rayon) the
+# scanned-image path never touches; the mandatory parser+crypto core stays.
+lopdf = { version = "0.43", default-features = false }
+# Pure-Rust CCITT Group 4 (T.6) fax decoder for bilevel scanned PDFs (the common
+# black-and-white scan filter). Already in the lock graph; no FFI.
+fax = "0.2"
 # Data-parallel fan-out for the bespoke single-token (m=1) decode GEMV kernels
 # (src/native_engine/decoder.rs `gemv`): the prefill GEMM is already threaded in
 # ft-kernel-cpu, but the decode GEMV falls below its threading threshold and was

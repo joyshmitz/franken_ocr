@@ -602,23 +602,49 @@ impl OcrModel {
     /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
         let t = std::time::Instant::now();
-        // ── 1. preprocess ────────────────────────────────────────────────────
+        // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         let pre = preprocess::preprocess_image(
             image_path,
             preprocess::PreprocessMode::Base { base_size: 1024 },
         )?;
-        let (image_w, image_h) = Self::image_dims(&pre);
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
+        self.forward_pre(pre)
+    }
 
-        // ── 2. vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ─────────
+    /// Forward an already-decoded in-memory image (e.g. a PDF page rasterized by
+    /// [`crate::pdf`]) through the identical pipeline as [`Self::forward`],
+    /// skipping only the file-decode step. Returns the raw decoded text plus the
+    /// source pixel dims for postprocess geometry.
+    ///
+    /// # Errors
+    /// As [`Self::forward`] (sans the file-open path).
+    pub fn forward_dynamic(&self, img: image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        let t = std::time::Instant::now();
+        let pre = preprocess::preprocess_dynamic(
+            img,
+            preprocess::PreprocessMode::Base { base_size: 1024 },
+        )?;
+        timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
+        self.forward_pre(pre)
+    }
+
+    /// Shared post-preprocess forward: vision tower → connector → decoder →
+    /// detokenize, over an already-built [`Preprocessed`] bundle. Both
+    /// [`Self::forward`] (from a path) and [`Self::forward_dynamic`] (from an
+    /// in-memory image) funnel through here, so the two entry points run the
+    /// byte-identical model pipeline once preprocessing has produced `pre`.
+    fn forward_pre(&self, pre: Preprocessed) -> FocrResult<(String, u32, u32)> {
+        let (image_w, image_h) = Self::image_dims(&pre);
+
+        // ── vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ───────────
         let tv = std::time::Instant::now();
         let vision_features = self.vision_tower(&pre)?;
         timing_log(&format!("vision_tower {:.2}s", tv.elapsed().as_secs_f64()));
 
-        // ── 3. connector: prompt embeds + masked_scatter of the 273-slot block ─
+        // ── connector: prompt embeds + masked_scatter of the 273-slot block ──
         let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
 
-        // ── 4. decoder prefill + sequential greedy AR decode to EOS ──────────
+        // ── decoder prefill + sequential greedy AR decode to EOS ─────────────
         let generated = self.generate(inputs_embeds, &prompt_ids)?;
 
         // Detokenize the generated ids into the raw model text (the postprocess
@@ -641,6 +667,18 @@ impl OcrModel {
     /// postprocess validation error.
     pub fn recognize(&self, image_path: &Path) -> FocrResult<String> {
         let (decoded, image_w, image_h) = self.forward(image_path)?;
+        postprocess::finalize(&decoded, image_w, image_h)
+    }
+
+    /// Recognize an already-decoded in-memory image end-to-end (forward +
+    /// postprocess), returning structured markdown — the in-memory form of
+    /// [`Self::recognize`] that the native PDF path ([`crate::pdf`]) uses to feed
+    /// one rasterized page without a temp file.
+    ///
+    /// # Errors
+    /// As [`Self::recognize`] (sans the file-open path).
+    pub fn recognize_dynamic(&self, img: image::DynamicImage) -> FocrResult<String> {
+        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
         postprocess::finalize(&decoded, image_w, image_h)
     }
 

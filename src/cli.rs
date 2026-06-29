@@ -4,8 +4,9 @@
 //! schema/health/backends`) work today; `ocr` routes through the native model
 //! resolver/engine skeleton and then fails cleanly at the first unimplemented
 //! stage, while `convert` and `doctor` return clear `NotImplemented` errors
-//! pointing at the plan phase that lands them. PDF input is intentionally absent
-//! — v1 is image-only (plan §7.7).
+//! pointing at the plan phase that lands them. PDF input is handled natively:
+//! `focr ocr file.pdf` rasterizes each page (the pure-Rust [`crate::pdf`] scanned-
+//! image fast path) and feeds it through the same pipeline an image takes.
 //!
 //! This module lives in the **library** so the single CLI entrypoint
 //! ([`cli_main`]) is shared by both binaries (`focr` and `franken_ocr`) without
@@ -15,11 +16,11 @@
 
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
-    native_engine, quant, robot, simd,
+    native_engine, pdf, quant, robot, simd,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 // Debug/test-only producer seam for process-level exit-code conformance while
@@ -456,28 +457,17 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     }
 
     let engine = OcrEngine::new()?;
-    let first = match request.model.as_deref() {
-        Some(model) => engine.recognize_with_model(model, &request.image),
-        None => engine.recognize(&request.image),
-    };
-    let markdown = match first {
-        Ok(md) => md,
-        // First-run auto-download: only when the user did NOT pin an explicit
-        // --model, we are on an interactive TTY, and not in robot mode (robots
-        // never prompt/fetch — they get the model-not-found error + pull hint).
-        Err(FocrError::ModelNotFound(msg)) => {
-            if request.model.is_none() && !robot_mode && is_interactive() {
-                match offer_first_run_download()? {
-                    Some(outcome) => {
-                        engine.recognize_with_model(&outcome.focrq_path, &request.image)?
-                    }
-                    None => return Err(FocrError::ModelNotFound(with_pull_hint(&msg))),
-                }
-            } else {
-                return Err(FocrError::ModelNotFound(with_pull_hint(&msg)));
-            }
-        }
-        Err(e) => return Err(e),
+    // A `.pdf` (or `%PDF-`-magic) input rasterizes each page and OCRs them as one
+    // document; everything else is a single decoded image. Both funnel through
+    // `recognize_with_autodownload` so model resolution + the first-run download
+    // offer behave identically.
+    let markdown = if pdf::looks_like_pdf(&request.image) {
+        recognize_pdf(&engine, &request, robot_mode)?
+    } else {
+        recognize_with_autodownload(&request, robot_mode, |model| match model {
+            Some(m) => engine.recognize_with_model(m, &request.image),
+            None => engine.recognize(&request.image),
+        })?
     };
     if robot_mode {
         emit(&serde_json::json!({
@@ -493,6 +483,69 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         println!("{markdown}");
     }
     Ok(())
+}
+
+/// Run one recognition, transparently offering the first-run model download once
+/// and retrying against the freshly-fetched model.
+///
+/// `recog(model)` performs a full recognition: `Some(path)` pins that artifact,
+/// `None` uses the engine default. The download offer fires only when the user
+/// did NOT pin an explicit `--model`, we are on an interactive TTY, and not in
+/// robot mode (robots never prompt/fetch — they get the clean model-not-found
+/// error + pull hint). Both the single-image and PDF paths funnel through here so
+/// model resolution and the auto-download behave identically.
+fn recognize_with_autodownload<F>(
+    request: &OcrRequest,
+    robot_mode: bool,
+    recog: F,
+) -> FocrResult<String>
+where
+    F: Fn(Option<&Path>) -> FocrResult<String>,
+{
+    match recog(request.model.as_deref()) {
+        Ok(md) => Ok(md),
+        Err(FocrError::ModelNotFound(msg)) => {
+            if request.model.is_none() && !robot_mode && is_interactive() {
+                match offer_first_run_download()? {
+                    Some(outcome) => recog(Some(&outcome.focrq_path)),
+                    None => Err(FocrError::ModelNotFound(with_pull_hint(&msg))),
+                }
+            } else {
+                Err(FocrError::ModelNotFound(with_pull_hint(&msg)))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Recognize every page of a PDF and concatenate the per-page markdown into one
+/// document (pages joined by a blank line).
+///
+/// Each page is rasterized in-memory by [`pdf`] and fed through the identical OCR
+/// pipeline a PNG takes — no out-of-band `pdftoppm`. Pages render lazily, one at a
+/// time, so a long book never holds every raster at once. A page whose image uses
+/// an unsupported codec (`JPXDecode`/`JBIG2Decode`) or that has no image XObject
+/// (vector/text page) surfaces the precise [`FocrError::InputDecode`] from
+/// [`pdf::PdfPages::render`], naming what was unsupported. Model resolution and the
+/// first-run download offer go through [`recognize_with_autodownload`].
+fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> FocrResult<String> {
+    let pages = pdf::PdfPages::open(&request.image)?;
+    let page_count = pages.len();
+    recognize_with_autodownload(request, robot_mode, |model| {
+        let mut document = String::new();
+        for idx in 0..page_count {
+            let image = pages.render(idx)?;
+            let page_md = match model {
+                Some(m) => engine.recognize_dynamic_with_model(m, image),
+                None => engine.recognize_dynamic(image),
+            }?;
+            if idx > 0 {
+                document.push_str("\n\n");
+            }
+            document.push_str(page_md.trim_end());
+        }
+        Ok(document)
+    })
 }
 
 /// Emit ONE batch image's outcome in the shared `ocr-batch` shape — a JSON object

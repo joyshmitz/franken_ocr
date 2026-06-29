@@ -25,6 +25,7 @@ pub mod conformance;
 pub mod dist;
 pub mod error;
 pub mod native_engine;
+pub mod pdf;
 pub mod preprocess;
 pub mod quant;
 pub mod robot;
@@ -201,6 +202,40 @@ impl OcrEngine {
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
             move || model.recognize(&image_path),
+        )
+    }
+
+    /// Recognize an already-decoded in-memory [`image::DynamicImage`], returning
+    /// structured markdown — the path-free form of [`OcrEngine::recognize`].
+    ///
+    /// This is the entry point the native PDF path uses: [`crate::pdf`] rasterizes
+    /// one PDF page to a `DynamicImage` and hands it here, so a scanned PDF flows
+    /// through the identical preprocess → vision → decoder → postprocess pipeline a
+    /// PNG would, with no intermediate temp files. The model is resolved from
+    /// [`OcrEngine::model_path`] and loaded/cached on first use.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize`].
+    pub fn recognize_dynamic(&self, image: image::DynamicImage) -> FocrResult<String> {
+        self.recognize_dynamic_with_model(&Self::model_path(), image)
+    }
+
+    /// Recognize an in-memory [`image::DynamicImage`] against the model artifact at
+    /// an explicit `model_path` (the path-explicit form of
+    /// [`OcrEngine::recognize_dynamic`]).
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_model`].
+    pub fn recognize_dynamic_with_model(
+        &self,
+        model_path: &Path,
+        image: image::DynamicImage,
+    ) -> FocrResult<String> {
+        let model = self.model_at(model_path)?;
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize_dynamic(image),
         )
     }
 

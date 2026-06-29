@@ -1,0 +1,535 @@
+//! Native PDF page rasterization in pure, memory-safe Rust (no FFI).
+//!
+//! `focr ocr file.pdf` renders each PDF page to an [`image::DynamicImage`] and
+//! feeds it through the same preprocess + OCR pipeline a PNG/JPG would take, so
+//! a PDF no longer has to be rasterized out of band (poppler / `pdftoppm`).
+//!
+//! ## Scope: the scanned-image fast path
+//!
+//! The overwhelming majority of OCR-input PDFs are *scans* — one full-page image
+//! XObject per page. This module extracts that image and decodes it to RGB/gray
+//! with the codecs the project already trusts ([`image`]'s JPEG via `zune-jpeg`,
+//! `flate2`/`miniz_oxide` for `FlateDecode`, the pure-Rust [`fax`] crate for
+//! CCITT Group 4). Everything here is pure Rust with no C/C++ FFI, matching the
+//! project's no-FFI doctrine. `lopdf` (with `default-features` off) is the new
+//! container parser; `fax` is already in the lock graph. We own the image-codec
+//! decode dispatch below, so the parser is the only borrowed piece.
+//!
+//! ## Honest limits
+//!
+//! Two image codecs have **no** production-quality pure-Rust decoder and are
+//! reported as a clear error rather than guessed at:
+//! * `JPXDecode` (JPEG 2000) — every working decoder wraps OpenJPEG (C / FFI).
+//! * `JBIG2Decode` — only C (`jbig2dec`) bindings exist.
+//!
+//! Born-digital PDFs whose pages are *vector / text* content (no full-page image
+//! XObject) also fall outside this fast path: rasterizing arbitrary PDF vector
+//! graphics needs a full content-stream interpreter + glyph rasterizer, tracked
+//! separately. Such pages, and the two unsupported codecs, surface as
+//! [`FocrError::InputDecode`] naming exactly what was unsupported, so the caller
+//! can rasterize that PDF out of band and retry.
+
+use std::path::Path;
+
+use image::{DynamicImage, GrayImage, ImageBuffer, RgbImage};
+use lopdf::xobject::PdfImage;
+use lopdf::{Document, Object, ObjectId};
+
+use crate::error::{FocrError, FocrResult};
+
+/// The 5-byte header every PDF begins with (`%PDF-`).
+const PDF_MAGIC: &[u8] = b"%PDF-";
+
+/// Whether `path` names a PDF: a `.pdf` extension, or a `%PDF-` magic prefix.
+///
+/// The magic check makes the routing robust to extension-less inputs; it reads
+/// only the first few bytes and never fails the caller (an unreadable file just
+/// returns `false` and is handled as a normal image path downstream).
+#[must_use]
+pub fn looks_like_pdf(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+    {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 5];
+    use std::io::Read;
+    matches!(file.read_exact(&mut head), Ok(())) && head == PDF_MAGIC
+}
+
+/// A lazily-rendered PDF: the parsed document plus its page object ids in order.
+///
+/// Pages are rendered one at a time via [`PdfPages::render`] so a 600-page book
+/// never materializes 600 rasters at once — the OCR driver pulls one page,
+/// recognizes it, and drops it before the next.
+pub struct PdfPages {
+    doc: Document,
+    /// Page object ids in 1-based page order (the value of `get_pages`).
+    pages: Vec<ObjectId>,
+}
+
+impl PdfPages {
+    /// Parse the PDF at `path`. Does not render any page yet.
+    ///
+    /// # Errors
+    /// [`FocrError::InputDecode`] if the file cannot be parsed as a PDF.
+    pub fn open(path: &Path) -> FocrResult<Self> {
+        let doc = Document::load(path)
+            .map_err(|e| FocrError::InputDecode(format!("parse PDF {}: {e}", path.display())))?;
+        let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
+        if pages.is_empty() {
+            return Err(FocrError::InputDecode(format!(
+                "PDF {} has no pages",
+                path.display()
+            )));
+        }
+        Ok(Self { doc, pages })
+    }
+
+    /// Number of pages.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether the document has no pages (never true after [`Self::open`], which
+    /// rejects empty documents — present for lint-clean `len()` ergonomics).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Render page `idx` (0-based) to a [`DynamicImage`], applying the page's
+    /// `/Rotate`.
+    ///
+    /// Picks the largest image XObject on the page (the main scan, ignoring small
+    /// preview/thumbnail images) and decodes it. See the module docs for the
+    /// supported codecs.
+    ///
+    /// # Errors
+    /// [`FocrError::InputDecode`] if the page has no decodable full-page image
+    /// (vector/text page), or its image uses an unsupported codec
+    /// (`JPXDecode` / `JBIG2Decode`) or color space.
+    pub fn render(&self, idx: usize) -> FocrResult<DynamicImage> {
+        let page_id = *self.pages.get(idx).ok_or_else(|| {
+            FocrError::InputDecode(format!(
+                "PDF page index {idx} out of range ({})",
+                self.len()
+            ))
+        })?;
+
+        let images = self.doc.get_page_images(page_id).map_err(|e| {
+            FocrError::InputDecode(format!("read images on PDF page {}: {e}", idx + 1))
+        })?;
+
+        // Fast path: the page's scan is the largest image XObject. Skip the
+        // small preview thumbnails some producers embed alongside the main scan.
+        let main = images
+            .iter()
+            .max_by_key(|im| (im.width as i128) * (im.height as i128))
+            .ok_or_else(|| {
+                FocrError::InputDecode(format!(
+                    "PDF page {} has no image XObject (vector/text PDFs are not supported by the \
+                     native fast path; rasterize the PDF out of band, e.g. with pdftoppm, and pass \
+                     the page images)",
+                    idx + 1
+                ))
+            })?;
+
+        let decoded = decode_image_xobject(&self.doc, main)
+            .map_err(|e| FocrError::InputDecode(format!("PDF page {}: {e}", idx + 1)))?;
+
+        Ok(apply_rotation(decoded, page_rotation(&self.doc, page_id)))
+    }
+}
+
+/// Decode one image XObject to RGB/gray, dispatching on its terminal `/Filter`.
+fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, String> {
+    let width = u32::try_from(img.width).map_err(|_| "negative image width".to_string())?;
+    let height = u32::try_from(img.height).map_err(|_| "negative image height".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("zero image dimension".to_string());
+    }
+    let bpc = img.bits_per_component.unwrap_or(8);
+    let color_space = img.color_space.as_deref().unwrap_or("DeviceRGB");
+    let filters = img.filters.clone().unwrap_or_default();
+    let terminal = filters.last().map(String::as_str).unwrap_or("");
+
+    match terminal {
+        // `content` is already the raw JPEG byte stream.
+        "DCTDecode" => image::load_from_memory_with_format(img.content, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("JPEG (DCTDecode) decode failed: {e}")),
+
+        // No pure-Rust decoder exists for either; be honest rather than wrong.
+        "JPXDecode" => Err(
+            "image uses JPXDecode (JPEG 2000), which has no pure-Rust decoder; \
+                            rasterize this PDF out of band and retry"
+                .to_string(),
+        ),
+        "JBIG2Decode" => Err("image uses JBIG2Decode, which has no pure-Rust decoder; \
+                              rasterize this PDF out of band and retry"
+            .to_string()),
+
+        "CCITTFaxDecode" => decode_ccitt_g4(doc, img, width, height),
+
+        // Raw samples behind a stream-compression filter (or none): inflate and
+        // pack into an image buffer per the color space / bit depth.
+        "FlateDecode" | "LZWDecode" | "ASCII85Decode" | "ASCIIHexDecode" | "" => {
+            let samples = decompressed_stream(doc, img.id)?;
+            raw_samples_to_image(samples, width, height, bpc, color_space)
+        }
+        other => Err(format!("unsupported image filter {other}")),
+    }
+}
+
+/// Re-fetch the image XObject as a stream and return its decompressed bytes.
+///
+/// `PdfImage::content` is the *raw* stream slice (still deflate/LZW/ASCII
+/// encoded for those filters), so the samples must come from
+/// `Stream::decompressed_content`, which also un-applies PNG predictors.
+fn decompressed_stream(doc: &Document, id: ObjectId) -> Result<Vec<u8>, String> {
+    let stream = doc
+        .get_object(id)
+        .and_then(Object::as_stream)
+        .map_err(|e| format!("read image stream: {e}"))?;
+    stream
+        .decompressed_content()
+        .map_err(|e| format!("inflate image stream: {e}"))
+}
+
+/// Build a [`DynamicImage`] from raw component samples.
+fn raw_samples_to_image(
+    samples: Vec<u8>,
+    width: u32,
+    height: u32,
+    bpc: i64,
+    color_space: &str,
+) -> Result<DynamicImage, String> {
+    let comps = match color_space {
+        "DeviceRGB" | "CalRGB" => 3usize,
+        "DeviceGray" | "CalGray" => 1,
+        "DeviceCMYK" => 4,
+        // ICCBased streams carry an /N component count; without resolving the
+        // profile we cannot know it here, and Indexed/Separation need a palette.
+        // Punt with a clear message rather than render garbage.
+        other => return Err(format!("unsupported color space {other}")),
+    };
+
+    match bpc {
+        8 => match comps {
+            3 => from_raw_rgb(width, height, samples),
+            1 => from_raw_gray(width, height, samples),
+            4 => Ok(DynamicImage::ImageRgb8(cmyk8_to_rgb(
+                &samples, width, height,
+            )?)),
+            _ => Err(format!("unsupported component count {comps}")),
+        },
+        1 => bilevel_to_gray(&samples, width, height),
+        16 => {
+            // Samples are big-endian; downscale to 8-bpc by keeping the high byte.
+            let high: Vec<u8> = samples.chunks_exact(2).map(|c| c[0]).collect();
+            raw_samples_to_image(high, width, height, 8, color_space)
+        }
+        other => Err(format!("unsupported bits-per-component {other}")),
+    }
+}
+
+fn from_raw_rgb(width: u32, height: u32, samples: Vec<u8>) -> Result<DynamicImage, String> {
+    let buf: RgbImage = ImageBuffer::from_raw(width, height, samples)
+        .ok_or_else(|| "RGB sample count does not match image dimensions".to_string())?;
+    Ok(DynamicImage::ImageRgb8(buf))
+}
+
+fn from_raw_gray(width: u32, height: u32, samples: Vec<u8>) -> Result<DynamicImage, String> {
+    let buf: GrayImage = ImageBuffer::from_raw(width, height, samples)
+        .ok_or_else(|| "gray sample count does not match image dimensions".to_string())?;
+    Ok(DynamicImage::ImageLuma8(buf))
+}
+
+/// Expand 8-bpc CMYK to RGB (the naive `r = 255 - min(255, c + k)` conversion;
+/// adequate for OCR, which only needs legible contrast, not color fidelity).
+fn cmyk8_to_rgb(samples: &[u8], width: u32, height: u32) -> Result<RgbImage, String> {
+    let pixels = (width as usize) * (height as usize);
+    if samples.len() < pixels * 4 {
+        return Err("CMYK sample count does not match image dimensions".to_string());
+    }
+    let mut out = Vec::with_capacity(pixels * 3);
+    for px in samples.chunks_exact(4).take(pixels) {
+        let (c, m, y, k) = (
+            u16::from(px[0]),
+            u16::from(px[1]),
+            u16::from(px[2]),
+            u16::from(px[3]),
+        );
+        out.push((255 - (c + k).min(255)) as u8);
+        out.push((255 - (m + k).min(255)) as u8);
+        out.push((255 - (y + k).min(255)) as u8);
+    }
+    ImageBuffer::from_raw(width, height, out).ok_or_else(|| "CMYK->RGB pack failed".to_string())
+}
+
+/// Unpack MSB-first, byte-padded 1-bpc bilevel samples to an 8-bpc gray image.
+fn bilevel_to_gray(samples: &[u8], width: u32, height: u32) -> Result<DynamicImage, String> {
+    let row_bytes = (width as usize).div_ceil(8);
+    if samples.len() < row_bytes * height as usize {
+        return Err("bilevel sample count does not match image dimensions".to_string());
+    }
+    let mut out = Vec::with_capacity((width as usize) * (height as usize));
+    for y in 0..height as usize {
+        let row = &samples[y * row_bytes..];
+        for x in 0..width as usize {
+            let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
+            out.push(if bit == 1 { 255 } else { 0 });
+        }
+    }
+    from_raw_gray(width, height, out)
+}
+
+/// Decode a CCITT Group 4 (T.6) fax image XObject to an 8-bpc gray image.
+///
+/// Group 4 is `/K < 0`; G3 (`/K >= 0`) is reported unsupported. `/BlackIs1`
+/// flips the 0=black / 255=white convention.
+fn decode_ccitt_g4(
+    doc: &Document,
+    img: &PdfImage,
+    width: u32,
+    height: u32,
+) -> Result<DynamicImage, String> {
+    use fax::Color;
+    use fax::decoder::{decode_g4, pels};
+
+    let stream = doc
+        .get_object(img.id)
+        .and_then(Object::as_stream)
+        .map_err(|e| format!("read CCITT stream: {e}"))?;
+
+    // /DecodeParms (or the /DP abbreviation) may be a dict or an array of dicts;
+    // the single-dict form is what scanners emit for a lone CCITT filter.
+    let parms = stream
+        .dict
+        .get(b"DecodeParms")
+        .or_else(|_| stream.dict.get(b"DP"))
+        .and_then(Object::as_dict)
+        .ok();
+    let param_i64 = |key: &[u8], default: i64| -> i64 {
+        parms
+            .and_then(|p| p.get(key).ok())
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(default)
+    };
+    let k = param_i64(b"K", 0);
+    let columns = u16::try_from(param_i64(b"Columns", 1728)).unwrap_or(1728);
+    let black_is_1 = parms
+        .and_then(|p| p.get(b"BlackIs1").ok())
+        .and_then(|o| o.as_bool().ok())
+        .unwrap_or(false);
+
+    if k >= 0 {
+        return Err(
+            "CCITTFaxDecode K>=0 (Group 3) is not supported; only Group 4 (K<0)".to_string(),
+        );
+    }
+    let cols = if columns == 0 {
+        u16::try_from(width).unwrap_or(1728)
+    } else {
+        columns
+    };
+    let (black, white) = if black_is_1 {
+        (255u8, 0u8)
+    } else {
+        (0u8, 255u8)
+    };
+    let rows_hint = u16::try_from(height).ok().filter(|&h| h != 0);
+
+    let mut out: Vec<u8> = Vec::with_capacity(usize::from(cols) * height.max(1) as usize);
+    decode_g4(img.content.iter().copied(), cols, rows_hint, |line| {
+        out.extend(pels(line, cols).map(|c| match c {
+            Color::Black => black,
+            Color::White => white,
+        }));
+    })
+    .ok_or_else(|| "CCITT Group 4 decode failed".to_string())?;
+
+    let decoded_rows = u32::try_from(out.len() / usize::from(cols).max(1)).unwrap_or(0);
+    from_raw_gray(u32::from(cols), decoded_rows, out)
+}
+
+/// The page's `/Rotate` (an inheritable multiple of 90, clockwise), normalized
+/// to `0 | 90 | 180 | 270`.
+fn page_rotation(doc: &Document, page_id: ObjectId) -> i64 {
+    inherited(doc, page_id, b"Rotate")
+        .and_then(|o| o.as_i64().ok())
+        .unwrap_or(0)
+        .rem_euclid(360)
+}
+
+/// Apply a clockwise rotation (0/90/180/270) to the rendered page.
+fn apply_rotation(img: DynamicImage, degrees: i64) -> DynamicImage {
+    match degrees {
+        90 => DynamicImage::ImageRgba8(image::imageops::rotate90(&img)),
+        180 => DynamicImage::ImageRgba8(image::imageops::rotate180(&img)),
+        270 => DynamicImage::ImageRgba8(image::imageops::rotate270(&img)),
+        _ => img,
+    }
+}
+
+/// Resolve an inheritable page attribute, walking `/Parent` (bounded against a
+/// cyclic page tree).
+fn inherited<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a Object> {
+    for _ in 0..64 {
+        let dict = doc.get_dictionary(id).ok()?;
+        if let Ok(value) = dict.get(key) {
+            return Some(value);
+        }
+        id = dict.get(b"Parent").and_then(Object::as_reference).ok()?;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_pdf_by_extension() {
+        assert!(looks_like_pdf(Path::new("/x/y/scan.pdf")));
+        assert!(looks_like_pdf(Path::new("/x/y/scan.PDF")));
+        assert!(!looks_like_pdf(Path::new("/x/y/page.png")));
+        // Missing file, no .pdf extension -> not a PDF (no panic).
+        assert!(!looks_like_pdf(Path::new("/no/such/file.bin")));
+    }
+
+    #[test]
+    fn bilevel_unpacks_msb_first() {
+        // 8x1: 0b1010_0000 -> px0=255, px1=0, px2=255, rest 0.
+        let img = bilevel_to_gray(&[0b1010_0000], 8, 1).expect("bilevel");
+        let gray = img.to_luma8();
+        assert_eq!(gray.get_pixel(0, 0).0[0], 255);
+        assert_eq!(gray.get_pixel(1, 0).0[0], 0);
+        assert_eq!(gray.get_pixel(2, 0).0[0], 255);
+        assert_eq!(gray.get_pixel(3, 0).0[0], 0);
+    }
+
+    #[test]
+    fn cmyk_pure_black_and_white() {
+        // pixel0 = pure K (black), pixel1 = all-zero (white).
+        let rgb = cmyk8_to_rgb(&[0, 0, 0, 255, 0, 0, 0, 0], 2, 1).expect("cmyk");
+        assert_eq!(rgb.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn rgb_dimension_mismatch_errors() {
+        // 3 bytes is not enough for a 2x2 RGB image (needs 12).
+        assert!(from_raw_rgb(2, 2, vec![1, 2, 3]).is_err());
+    }
+
+    /// A minimal one-page PDF whose only object is a single image XObject — the
+    /// shared scaffold for the round-trip tests. `image_xobject` is `None` for a
+    /// page with no image (the vector/text case).
+    fn build_single_page_pdf(image_xobject: Option<lopdf::Stream>) -> std::path::PathBuf {
+        use lopdf::{Object, dictionary};
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let resources = match image_xobject {
+            Some(stream) => {
+                let image_id = doc.add_object(stream);
+                dictionary! { "XObject" => dictionary! { "Im0" => image_id } }
+            }
+            None => dictionary! {},
+        };
+        let resources_id = doc.add_object(resources);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0_i64.into(), 0_i64.into(), 100_i64.into(), 100_i64.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let path = std::env::temp_dir().join(format!(
+            "focr_pdf_test_{}_{:p}.pdf",
+            std::process::id(),
+            &doc as *const _
+        ));
+        doc.save(&path).expect("save synthesized pdf");
+        path
+    }
+
+    /// End-to-end through the real `lopdf` parser: synthesize a one-page PDF whose
+    /// only XObject is a `DCTDecode` (JPEG) image, reopen it via [`PdfPages`], and
+    /// confirm the page renders to an image of the JPEG's dimensions. Exercises
+    /// `get_page_images` + the `DCTDecode` dispatch + the JPEG decoder — the
+    /// dominant real scanned-PDF path.
+    #[test]
+    fn render_dctdecode_pdf_page_decodes_jpeg_xobject() {
+        use image::{ImageBuffer, Rgb};
+        use lopdf::{Stream, dictionary};
+        use std::io::Cursor;
+
+        let (w, h) = (16u32, 12u32);
+        let src = DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, _| {
+            Rgb([(x * 16) as u8, 64, 128])
+        }));
+        let mut jpeg = Vec::new();
+        src.write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .expect("encode jpeg");
+
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(w),
+                "Height" => i64::from(h),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        )
+        .with_compression(false);
+        let path = build_single_page_pdf(Some(image));
+
+        let pages = PdfPages::open(&path).expect("open synthesized pdf");
+        assert_eq!(pages.len(), 1);
+        let page = pages.render(0).expect("render dct page");
+        // The JPEG decoder reports the encoded dimensions back unchanged.
+        assert_eq!((page.width(), page.height()), (w, h));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A page with no image XObject (a vector/text page) must surface the precise,
+    /// actionable [`FocrError::InputDecode`] rather than rendering garbage.
+    #[test]
+    fn render_image_free_page_errors_clearly() {
+        let path = build_single_page_pdf(None);
+        let pages = PdfPages::open(&path).expect("open synthesized pdf");
+        assert_eq!(pages.len(), 1);
+        let err = pages.render(0).expect_err("vector page must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no image XObject"),
+            "expected an actionable no-image message, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

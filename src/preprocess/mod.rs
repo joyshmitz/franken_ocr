@@ -300,8 +300,10 @@ pub fn preprocess_bytes(bytes: &[u8], mode: PreprocessMode) -> FocrResult<Prepro
 /// Core pipeline over an already-decoded (EXIF-applied, any color) image.
 ///
 /// Split out from the I/O so the tiling/normalization math is unit-testable
-/// without touching the filesystem ([SPEC-022..031]).
-fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
+/// without touching the filesystem ([SPEC-022..031]), and so an in-memory image
+/// (e.g. a PDF page rasterized by [`crate::pdf`]) can enter the pipeline without
+/// a temp file, identically to a decoded file.
+pub fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
     let original_size = img.dimensions();
     let validated = validate_mode(mode)?;
 
