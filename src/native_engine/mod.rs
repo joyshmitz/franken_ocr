@@ -270,8 +270,8 @@ fn model_search_dirs() -> Vec<PathBuf> {
     {
         dirs.extend(std::env::split_paths(&raw));
     }
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        dirs.push(PathBuf::from(home).join(".cache/franken_ocr/models"));
+    if let Some(root) = crate::dist::cache_root() {
+        dirs.push(root.join("models"));
     }
     dirs
 }

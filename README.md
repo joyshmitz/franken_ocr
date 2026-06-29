@@ -127,7 +127,15 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
-The script detects your OS and CPU architecture, downloads the matching binary from the `v0.1.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it prints a note that native Windows binaries are not published yet, recommends WSL2, and exits cleanly (see [Limitations](#limitations)).
+The script detects your OS and CPU architecture, downloads the matching binary from the `v0.1.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
+
+On native Windows, install from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
+```
+
+This downloads the `focr-x86_64-pc-windows-msvc.exe` binary, verifies it by SHA256, and puts `focr` on your PATH.
 
 ### Manual binary download
 
@@ -139,6 +147,7 @@ Release binaries are raw executables, not tar.gz archives. Each one is a single 
 | macOS Intel | `focr-x86_64-apple-darwin` |
 | Linux x86-64 (glibc) | `focr-x86_64-unknown-linux-gnu` |
 | Linux ARM64 (glibc) | `focr-aarch64-unknown-linux-gnu` |
+| Windows x86-64 | `focr-x86_64-pc-windows-msvc.exe` |
 
 Each asset has a `<asset>.sha256` sidecar in the standard `"<hex>  <asset>"` format. Download the binary and its sidecar from the release base URL, verify, then install. Example for Apple Silicon:
 
@@ -395,7 +404,7 @@ What this is and is not:
 
 - **int8 can repeat on hard tables.** int8 decode is roughly 2.5x faster and byte-identical to f32 on typical pages, but some dense tables (for example `page_0590`) can trigger repetition runs. The no-repeat n-gram guard and the f32 fallback are the documented kill-switches. The vision tower stays high precision because quantizing it breaks OCR.
 - **Image input only in v1.** PNG, JPG, and similar; PDFs are rasterized out of band.
-- **No native Windows binary in v0.1.0.** The engine's async I/O is Unix-first. Under WSL2, install and run as Linux. Native Windows is a tracked future effort (epic `bd-3u97`); the installer detects native Git-Bash/MSYS/Cygwin and points you at WSL2 rather than installing a binary that does not exist.
+- **Native Windows (x86_64) is supported and proven end-to-end; ARM64 is not yet.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10: the same 3.9 GB int8 weights, vision tower, and DeepSeek-V2 decoder produce the same markdown a Mac or Linux host does. `focr.exe robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle, including the K=6848 overflow case). The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`. Two gaps remain, both tracked under epic `bd-3u97`: `focr pull` does not work on Windows yet (an async-runtime IOCP send-path bug surfaces as `WSAENOTCONN` / os error 10057, tracked as `bd-15ow`), so fetch the weights on macOS/Linux/WSL and copy `unlimited-ocr.focrq` + `tokenizer.json` into the cache directory (or pass `--model <path>`); and ARM64 Windows is not published.
 - **One model only.** This is a deliberate non-goal to be general. `franken_ocr` will not become a model zoo or a generic inference runtime.
 - **Not benchmark SOTA.** Unlimited-OCR is strong but not the OmniDocBench leader. The aim is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
 - **CPU only.** No GPU. CUDA is a deferred stretch goal; CPU stays the product.

@@ -115,13 +115,38 @@ fn sha256_hex_matches(data: &[u8], expected: &str) -> bool {
     hex32(&got) == expected.trim().to_ascii_lowercase()
 }
 
-/// The cache directory new artifacts install into: `~/.cache/franken_ocr/models`
-/// (the first user-cache entry of the model search path).
+/// The per-user cache root for franken_ocr artifacts, resolved per platform:
+/// `%LOCALAPPDATA%\franken_ocr` on Windows (falling back to
+/// `%USERPROFILE%\.cache\franken_ocr`), and `$HOME/.cache/franken_ocr`
+/// everywhere else. Returns `None` only when the platform's home/appdata
+/// environment is entirely unset.
+#[must_use]
+pub fn cache_root() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(local).join("franken_ocr"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile).join(".cache").join("franken_ocr"));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("franken_ocr"))
+    }
+}
+
+/// The cache directory new artifacts install into: `%LOCALAPPDATA%\franken_ocr\models`
+/// on Windows, `~/.cache/franken_ocr/models` elsewhere (the first user-cache entry
+/// of the model search path).
 pub fn cache_models_dir() -> FocrResult<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        FocrError::Other(anyhow::anyhow!("HOME is not set; cannot resolve cache"))
-    })?;
-    Ok(PathBuf::from(home).join(".cache/franken_ocr/models"))
+    cache_root().map(|root| root.join("models")).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "cannot resolve a user cache directory (set HOME, or LOCALAPPDATA/USERPROFILE on Windows)"
+        ))
+    })
 }
 
 /// Is `source` an `http(s)` URL (vs. a local filesystem path)?

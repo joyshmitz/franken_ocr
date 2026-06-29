@@ -21,9 +21,19 @@ Direction after `0.1.0`. Nothing here has shipped; these are the next workstream
   int4 s4s8 micro-kernel and exploratory `FOCR_EXPERTS_INT4` / `FOCR_LMHEAD_INT4`
   experiments already exist behind kill switches, but int4 is not validated and
   `focr convert` accepts only int8 in this release.
-- **Native Windows support** (epic `bd-3u97`). The async I/O substrate is Unix-first,
-  so `0.1.0` ships no native Windows binary. WSL2 is the supported path on Windows
-  today; a native target is tracked, not promised.
+- **Native Windows (x86_64)** (epic `bd-3u97`). The `x86_64-pc-windows-msvc` target now
+  compiles with zero errors and `focr.exe` runs full OCR end-to-end on Windows 10:
+  `--version` reports `focr 0.1.0`, `robot backends` selects AVX2 via runtime ISA
+  detection, `robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle,
+  including the K=6848 i32-overflow case), and `focr ocr page.png` on a real scanned page
+  produces the same markdown as a Mac or Linux host. The model cache resolves to
+  `%LOCALAPPDATA%\franken_ocr\models` (falling back to
+  `%USERPROFILE%\.cache\franken_ocr\models`), and an `install.ps1` one-liner downloads
+  and SHA256-verifies the Windows binary. Two gaps remain under `bd-3u97`: `focr pull`
+  does not work on Windows yet (an IOCP send-path bug surfaces as `WSAENOTCONN` /
+  os error 10057, tracked as `bd-15ow`; fetch the weights elsewhere and copy
+  `unlimited-ocr.focrq` + `tokenizer.json` into the cache, or pass `--model`), and
+  ARM64 Windows is not published.
 - **The full conformance ladder.** Extend the seeded parity ladder into the complete
   three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
   gates across the whole forward path.

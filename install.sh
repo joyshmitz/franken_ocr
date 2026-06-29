@@ -32,10 +32,12 @@
 #   HTTP_PROXY         HTTP proxy for downloads
 #
 # WINDOWS
-#   There is no native Windows binary in v0.1.0. The engine I/O is Unix-first;
-#   native Windows support is tracked as epic bd-3u97. Under WSL this installer
-#   proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it prints a note
-#   recommending WSL2 and exits without installing.
+#   v0.1.0 ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
+#   proven end-to-end on Windows 10. This POSIX installer cannot install it from a
+#   Git-Bash/MSYS/Cygwin shell, so there it points you at the PowerShell installer:
+#     irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
+#   Under WSL this installer proceeds as Linux. ARM64 Windows is not published yet
+#   (tracked as epic bd-3u97).
 #
 # BUILD REALITY
 #   franken_ocr path-depends on sibling repos that are not published to
@@ -243,8 +245,8 @@ Environment:
 
 Platforms with prebuilt binaries:
   macOS Apple Silicon, macOS Intel, Linux x86-64 (glibc), Linux ARM64 (glibc)
-  Windows: run inside WSL2. There is no native Windows binary in ${FALLBACK_VERSION}
-  (the engine I/O is Unix-first; native Windows is tracked as epic bd-3u97).
+  Windows x86-64: native focr.exe via the PowerShell installer (install.ps1), or
+  run this script inside WSL2. ARM64 Windows is not published yet (epic bd-3u97).
 
 After install, download the model once with:  focr pull
 Then parse a page with:                       focr ocr page.png
@@ -313,24 +315,28 @@ print_windows_note() {
       --border-foreground 214 \
       --padding "1 2" \
       --margin "1 0" \
-      "$(gum style --foreground 214 --bold 'Native Windows is not supported yet')" \
+      "$(gum style --foreground 214 --bold 'Native Windows is supported')" \
       "" \
-      "$(gum style --foreground 252 "focr ${FALLBACK_VERSION} does not publish a native Windows binary.")" \
-      "$(gum style --foreground 252 'The engine I/O is Unix-first; native Windows is tracked as epic bd-3u97.')" \
+      "$(gum style --foreground 252 "focr ${FALLBACK_VERSION} publishes a native x86_64 Windows binary.")" \
+      "$(gum style --foreground 252 'This shell (Git-Bash/MSYS/Cygwin) cannot install it; use PowerShell.')" \
       "" \
-      "$(gum style --foreground 42 'Recommended: install and run focr inside WSL2 (for example Ubuntu).')" \
-      "$(gum style --foreground 245 'Open a WSL shell, then re-run this installer there.')"
+      "$(gum style --foreground 42 'In a PowerShell window, run:')" \
+      "$(gum style --foreground 42 'irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex')" \
+      "" \
+      "$(gum style --foreground 245 'Alternative: install and run focr inside WSL2, then re-run this installer there.')"
     echo ""
   else
     echo ""
     draw_box "1;33" \
-      "Native Windows is not supported yet" \
+      "Native Windows is supported" \
       "" \
-      "focr ${FALLBACK_VERSION} does not publish a native Windows binary." \
-      "The engine I/O is Unix-first; native Windows is tracked as epic bd-3u97." \
+      "focr ${FALLBACK_VERSION} publishes a native x86_64 Windows binary." \
+      "This shell (Git-Bash/MSYS/Cygwin) cannot install it; use PowerShell." \
       "" \
-      "Recommended: install and run focr inside WSL2 (for example Ubuntu)." \
-      "Open a WSL shell, then re-run this installer there."
+      "In a PowerShell window, run:" \
+      "irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex" \
+      "" \
+      "Alternative: install and run focr inside WSL2, then re-run this installer there."
     echo ""
   fi
 }
