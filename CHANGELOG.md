@@ -29,11 +29,11 @@ Direction after `0.1.0`. Nothing here has shipped; these are the next workstream
   produces the same markdown as a Mac or Linux host. The model cache resolves to
   `%LOCALAPPDATA%\franken_ocr\models` (falling back to
   `%USERPROFILE%\.cache\franken_ocr\models`), and an `install.ps1` one-liner downloads
-  and SHA256-verifies the Windows binary. Two gaps remain under `bd-3u97`: `focr pull`
-  does not work on Windows yet (an IOCP send-path bug surfaces as `WSAENOTCONN` /
-  os error 10057, tracked as `bd-15ow`; fetch the weights elsewhere and copy
-  `unlimited-ocr.focrq` + `tokenizer.json` into the cache, or pass `--model`), and
-  ARM64 Windows is not published.
+  and SHA256-verifies the Windows binary and then offers to run `focr pull`. `focr pull`
+  works on Windows too: the full 3.9 GB multi-part download, reassembly, and SHA-256
+  verify complete over the native async HTTP/TLS stack (the earlier send-path bug that
+  surfaced as `WSAENOTCONN` / os error 10057, `bd-15ow`, is fixed). One gap remains under
+  `bd-3u97`: ARM64 Windows is not published.
 - **The full conformance ladder.** Extend the seeded parity ladder into the complete
   three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
   gates across the whole forward path.

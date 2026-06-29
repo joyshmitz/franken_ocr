@@ -24,7 +24,7 @@
     -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.1.0)
     -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
     -Verify            Run "focr robot selftest" after install and report the verdict
-    -NoPull            Do not print model-placement instructions after install
+    -NoPull            Do not offer to download the model after install (focr pull)
     -Quiet             Suppress non-error output
     -Force             Reinstall even when the same version is present
     -Help              Show usage and exit
@@ -198,7 +198,7 @@ Options:
   -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to $($script:FallbackVersion))
   -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
   -Verify            Run "focr robot selftest" after install and report the verdict
-  -NoPull            Do not print model-placement instructions after install
+  -NoPull            Do not offer to download the model after install (focr pull)
   -Quiet             Suppress non-error output
   -Force             Reinstall even when the same version is present
   -Help              Show this help and exit
@@ -212,9 +212,8 @@ Platform:
   Windows on ARM64 is not published yet; this installer reports that and stops.
   On macOS or Linux, use the shell installer (install.sh) instead.
 
-After install, place the model once (focr pull is not wired on Windows yet, bd-15ow):
-  pull on macOS/Linux/WSL, copy the .focrq + tokenizer.json into the model cache.
-Then parse a page with:                       focr ocr page.png
+After install, download the model once (about 3.9 GB):  focr pull
+Then parse a page with:                                 focr ocr page.png
 "@
     Write-Host $u
 }
@@ -440,31 +439,55 @@ function Invoke-SelfTest {
     }
 }
 
-# Model acquisition on Windows. `focr pull` does not work on native Windows yet:
-# the async HTTP stack hits an IOCP send-path bug (WSAENOTCONN, os error 10057),
-# tracked as bd-15ow. So this installer never runs `focr pull` here; it prints the
-# verified manual-placement steps instead. The .focrq format is self-describing
-# (int8-ness comes from the file header, not the name), so the weights can be
-# fetched on any other machine and copied over unchanged.
-function Show-ModelInstructions {
-    if ($NoPull -or $script:Quiet) { return }
+# Model acquisition. `focr pull` downloads the ~3.9 GB int8 weights + tokenizer
+# into the model cache. This is verified working on native Windows: the async
+# HTTP/TLS send-path that previously surfaced WSAENOTCONN (os error 10057) was
+# fixed (bd-15ow). Mirrors the shell installer's maybe_offer_pull: never
+# auto-downloads in quiet or non-interactive runs (CI, piped scripts); offers an
+# interactive y/N prompt otherwise so the large download is always a choice.
+function Invoke-ModelPull {
+    param([string]$Exe)
+    if ($NoPull) { return }
+
+    # The model is about 3.9 GB. Never auto-download in quiet or non-interactive
+    # runs (CI, cron, piped scripts); just leave a clear hint.
+    $interactive = $false
+    try {
+        $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+    } catch {
+        $interactive = $false
+    }
+    if ($script:Quiet -or -not $interactive) {
+        Info 'Model weights are not bundled. Download them later with: focr pull'
+        return
+    }
 
     Write-Host ''
-    Info 'focr needs the OCR model (about 3.9 GB) before it can parse a page.'
-    Warn 'On native Windows, "focr pull" is not wired up yet (network issue bd-15ow).'
-    $lines = @(
-        'Fetch the weights once on macOS, Linux, or WSL:',
-        '  focr pull',
-        'That writes ~/.cache/franken_ocr/models/{unlimited-ocr.int8.focrq, tokenizer.json}.',
-        '',
-        'Copy both files into the Windows model cache, renaming the weights:',
-        "  $($script:ModelCache)\unlimited-ocr.focrq      (the .int8.focrq file)",
-        "  $($script:ModelCache)\tokenizer.json",
-        '',
-        'Then "focr ocr page.png" finds the model automatically. Or skip the cache',
-        'and point at the file directly:  focr ocr --model C:\path\model.focrq page.png'
-    )
-    Write-Box -Lines $lines -AnsiCode '0;36' -Color Cyan
+    Info 'focr needs the OCR model before it can parse a page.'
+    Info "The download is about 3.9 GB into $($script:ModelCache)."
+    $ans = Read-Host 'Download the model now with focr pull? (y/N)'
+    if ($ans -match '^(y|yes)$') {
+        Info 'Running: focr pull'
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $code = 1
+        try {
+            & $Exe pull | Out-Host
+            $code = $LASTEXITCODE
+        } catch {
+            Warn "focr pull could not run: $($_.Exception.Message)"
+            return
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+        if ($code -eq 0) {
+            Ok "Model downloaded into $($script:ModelCache)"
+        } else {
+            Warn 'focr pull did not finish. Retry later with: focr pull'
+        }
+    } else {
+        Info 'Skipped. Download the model later with: focr pull'
+    }
 }
 
 # ============================================================================
@@ -492,7 +515,7 @@ function Write-Summary {
         $lines.Add('')
     }
     $lines.Add('First steps:')
-    $lines.Add('  (place the model first, see the cyan box above; pull is bd-15ow on Windows)')
+    $lines.Add('  focr pull                 download the model (about 3.9 GB)')
     $lines.Add('  focr ocr page.png         parse an image into markdown')
     $lines.Add('  focr ocr page.png --json  emit structured JSON')
     $lines.Add('  focr robot selftest       verify the int8 kernel on this host')
@@ -560,7 +583,7 @@ function Main {
             Ok "focr $version is already installed at $target"
             Info 'Use -Force to reinstall.'
             Update-Path
-            Info "Model weights are not bundled; place them in $($script:ModelCache) (pull is bd-15ow on Windows)."
+            Info 'Model weights are not bundled; download them with: focr pull'
             return 0
         }
 
@@ -619,7 +642,7 @@ function Main {
 
         if ($Verify) { Invoke-SelfTest -Exe $target }
 
-        Show-ModelInstructions
+        Invoke-ModelPull -Exe $target
         Write-Summary -Exe $target -Version $version
         return 0
     } catch {
