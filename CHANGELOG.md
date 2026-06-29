@@ -14,29 +14,97 @@ sections as they land.
 
 ## [Unreleased]
 
-Direction after `0.1.0`. Nothing here has shipped; these are the next workstreams.
+Direction after `0.2.0`. Nothing here has shipped; these are the next workstreams.
 
 - **int4 expert quantization.** Group-quantized int4 expert weights at a
   Q4_K_M-class footprint, gated on a measured character-error-rate budget. A packed
   int4 s4s8 micro-kernel and exploratory `FOCR_EXPERTS_INT4` / `FOCR_LMHEAD_INT4`
   experiments already exist behind kill switches, but int4 is not validated and
-  `focr convert` accepts only int8 in this release.
-- **Native Windows (x86_64)** (epic `bd-3u97`). The `x86_64-pc-windows-msvc` target now
-  compiles with zero errors and `focr.exe` runs full OCR end-to-end on Windows 10:
-  `--version` reports `focr 0.1.0`, `robot backends` selects AVX2 via runtime ISA
-  detection, `robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle,
-  including the K=6848 i32-overflow case), and `focr ocr page.png` on a real scanned page
-  produces the same markdown as a Mac or Linux host. The model cache resolves to
-  `%LOCALAPPDATA%\franken_ocr\models` (falling back to
-  `%USERPROFILE%\.cache\franken_ocr\models`), and an `install.ps1` one-liner downloads
-  and SHA256-verifies the Windows binary and then offers to run `focr pull`. `focr pull`
-  works on Windows too: the full 3.9 GB multi-part download, reassembly, and SHA-256
-  verify complete over the native async HTTP/TLS stack (the earlier send-path bug that
-  surfaced as `WSAENOTCONN` / os error 10057, `bd-15ow`, is fixed). One gap remains under
-  `bd-3u97`: ARM64 Windows is not published.
+  `focr convert` accepts only int8 as of `0.2.0`.
 - **The full conformance ladder.** Extend the seeded parity ladder into the complete
   three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
   gates across the whole forward path.
+- **ARM64 Windows** (`bd-3u97`). `x86_64` Windows ships in `0.2.0`; the aarch64-windows
+  target is not yet published.
+
+## [0.2.0] - 2026-06-29
+
+The document-input release. `focr` now reads **PDFs** natively, the agent-facing robot
+stream finally carries the recognized text, and **native Windows (x86_64)** is proven
+end to end — all in pure, memory-safe Rust, still with no Python, no CUDA, and no FFI at
+inference. A two-pass fresh-eyes security and correctness review hardened the new PDF
+codec path before it shipped.
+
+### Added
+
+**Native PDF page OCR — `focr ocr file.pdf`** (epic `bd-0a7`). Scanned / image-XObject
+PDF pages are rasterized **in-process, in pure memory-safe Rust with no FFI**, then fed
+through the identical preprocess → vision → decoder → postprocess pipeline a PNG takes —
+no out-of-band `pdftoppm`. `lopdf` (with `default-features` off; 8 net-new pure-Rust
+crates) is the container parser, and the project owns the image-codec dispatch:
+`DCTDecode` (JPEG via `zune-jpeg`), `CCITTFaxDecode` Group 4 (the pure-Rust `fax` crate),
+and `FlateDecode` / `LZWDecode` / `ASCII85Decode` raw samples in RGB / gray / CMYK /
+1-bpc bilevel, with `/Rotate` applied and inheritable page attributes resolved. Pages
+render lazily one at a time, so a 600-page book never materializes 600 rasters at once.
+`JPXDecode` (JPEG 2000), `JBIG2Decode`, and born-digital vector / text pages — none of
+which has a pure-Rust decoder — surface a precise, actionable error instead of a wrong
+guess. The document loop is per-page resilient: an undecodable page is logged and skipped
+so one bad page never discards the rest of the document, while whole-run conditions
+(model-not-found, cooperative cancel, model format mismatch) abort immediately
+([397f281](https://github.com/Dicklesworthstone/franken_ocr/commit/397f281)). In-memory
+`OcrEngine::recognize_dynamic` / `recognize_dynamic_with_model` entry points back this
+path and are reusable by library embedders.
+
+**Native Windows (x86_64)** (epic `bd-3u97`). The `x86_64-pc-windows-msvc` target
+compiles with zero errors and `focr.exe` runs full OCR end to end on Windows 10:
+`robot backends` selects AVX2 via runtime ISA detection, `robot selftest` passes 24/24
+(int8 GEMM bit-identical to the scalar oracle, including the K=6848 i32-accumulation
+overflow case), and `focr ocr page.png` on a real scanned page produces the same markdown
+as a Mac or Linux host. The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`
+(falling back to `%USERPROFILE%\.cache\franken_ocr\models`), and an `install.ps1`
+one-liner downloads and SHA256-verifies the Windows binary, then offers to run
+`focr pull`. `focr pull` works on Windows too: the full 3.9 GB multi-part download,
+reassembly, and SHA-256 verify complete over the native async HTTP/TLS stack — the
+earlier send-path bug that surfaced as `WSAENOTCONN` / os error 10057 (`bd-15ow`) is
+fixed in the asupersync runtime. ARM64 Windows is not yet published
+([d8e40bd](https://github.com/Dicklesworthstone/franken_ocr/commit/d8e40bd),
+[44d4949](https://github.com/Dicklesworthstone/franken_ocr/commit/44d4949)).
+
+### Changed
+
+- **Robot `run_complete` carries the recognized markdown** (`bd-3o5p`). `focr ocr --robot`
+  and `focr robot run` previously emitted a payload-less `run_complete`, so a machine
+  consumer received no OCR text at all; the terminal success event now carries the
+  recognized `markdown`. `run_complete` was already an advertised event kind, so this
+  finalizes its payload without a schema-version bump (`ROBOT_SCHEMA_VERSION` stays `1`)
+  ([1351013](https://github.com/Dicklesworthstone/franken_ocr/commit/1351013)).
+- Input is now **document images and PDFs**, not image-only; `AGENTS.md` and
+  `focr ocr --help` document PDF as a supported input
+  ([49b19c2](https://github.com/Dicklesworthstone/franken_ocr/commit/49b19c2)).
+
+### Fixed and hardened (PDF codec review)
+
+A two-pass fresh-eyes review of the new PDF path, before release:
+
+- **Gigapixel-allocation DoS / overflow.** A crafted PDF declaring gigapixel image
+  dimensions could overflow the CMYK `width*height` product or drive a raster `Vec`
+  reserve into hundreds of TB. A 1-Gpx declared-dimension guard (computed in `u64`, so
+  the check itself cannot overflow) now fires before any per-pixel allocation
+  ([770a5e5](https://github.com/Dicklesworthstone/franken_ocr/commit/770a5e5)).
+- **CCITT no longer pre-reserves from the attacker-controlled `/Height`** — the output
+  grows as the Group 4 decoder emits lines.
+- **Multi-filter codec chains** ending in `DCTDecode` / `CCITTFaxDecode` are rejected
+  with an accurate message instead of feeding still-encoded bytes to the image codec.
+- **Per-page PDF resilience with whole-run aborts** — cooperative cancel and model
+  format-mismatch propagate instead of being swallowed per page, and a Ctrl+C mid-document
+  aborts rather than logging a skip per remaining page
+  ([49b19c2](https://github.com/Dicklesworthstone/franken_ocr/commit/49b19c2)).
+
+### Performance
+
+- The ~9.9 MB BPE tokenizer is cached on the model (`OnceLock`), so a multi-page PDF
+  parses `tokenizer.json` once instead of twice per page; a load failure is not cached
+  ([770a5e5](https://github.com/Dicklesworthstone/franken_ocr/commit/770a5e5)).
 
 ## [0.1.0] - 2026-06-29
 
@@ -249,5 +317,6 @@ results above. The `.focrq` byte-parity, the SHA256 manifest verification in
 `focr pull`, and the 24/24 `robot selftest` (including the K=6848 overflow case) were
 all verified on real hardware on Apple Silicon and on a real x86 AVX2 host.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.1.0
