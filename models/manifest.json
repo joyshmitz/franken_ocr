@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "model": "unlimited-ocr",
+  "license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
+  "quants": {
+    "int8": {
+      "focrq": {
+        "filename": "unlimited-ocr.int8.focrq",
+        "size": 3914093440,
+        "sha256": "d8c5fcf223c8e062af63f6b86964d099e2c5a5b272ae096a09433aaf5510a440",
+        "parts": [
+          {
+            "size": 1957046720,
+            "sha256": "e58503fb1700a56cff71d2c136c223efa5c10c38604901987904467267c815e3",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-v1/unlimited-ocr.int8.focrq.part00",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr.int8.focrq.part00"
+            ]
+          },
+          {
+            "size": 1957046720,
+            "sha256": "6a647a04fece7bced666c0e56581969c1a799e8447c64e9abf37ee10c322ec7d",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-v1/unlimited-ocr.int8.focrq.part01",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr.int8.focrq.part01"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "tokenizer": {
+    "filename": "tokenizer.json",
+    "size": 9979544,
+    "sha256": "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+    "parts": [
+      {
+        "size": 9979544,
+        "sha256": "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+        "urls": [
+          "https://huggingface.co/baidu/Unlimited-OCR/resolve/main/tokenizer.json",
+          "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-v1/tokenizer.json"
+        ]
+      }
+    ]
+  }
+}
