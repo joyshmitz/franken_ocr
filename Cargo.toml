@@ -55,6 +55,12 @@ image = "0.25"
 # ft-kernel-cpu, but the decode GEMV falls below its threading threshold and was
 # running single-threaded. Already in the lock graph via ft-kernel-cpu.
 rayon = "1"
+# Provenance hashing for `focr convert`: the deterministic sha256 of the source
+# safetensors shard, stamped into the `.focrq` header (`source_sha256`) so a
+# converted artifact is traceable to its bf16 origin. Pure-Rust RustCrypto, no
+# framework. Used by lib code (src/quant/convert.rs) — must be a normal dependency,
+# not dev-only, or the lib fails to build outside the test profile.
+sha2 = "0.10"
 
 # Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
 # "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg
@@ -62,9 +68,6 @@ rayon = "1"
 # actually wired behind `--features mimalloc`.
 [features]
 mimalloc = []
-
-[dev-dependencies]
-sha2 = "0.10"
 
 # The `>=0.3.5,<0.4` asupersync the engine needs is not yet on crates.io (the
 # index tops out at 0.3.4); it lives as the local sibling crate `/dp/asupersync`

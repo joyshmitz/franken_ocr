@@ -44,7 +44,7 @@ use crate::error::{FocrError, FocrResult};
 use crate::preprocess::{self, Preprocessed};
 use sampler::{DecodeOutput, DecodeParams};
 use tensor::Mat;
-use weights::Weights;
+use weights::{DType, Weights};
 
 /// The loaded Unlimited-OCR model: weights + the fixed-shape forward.
 ///
@@ -407,6 +407,19 @@ pub fn native_model_available(path: &Path) -> bool {
     sniff_weight_container_from_reader(file)
 }
 
+/// Whether `weights` is a pre-quantized int8 `.focrq` produced by `focr convert`
+/// (its decoder GEMM tensors are stored `QInt8PerChan`). Sentinel: `lm_head.weight`,
+/// which the converter always quantizes. A raw safetensors shard or a
+/// high-precision-only `.focrq` returns `false`, so this never perturbs an
+/// existing artifact's decode path.
+fn weights_are_prequantized_int8(weights: &Weights) -> bool {
+    weights.is_focrq()
+        && matches!(
+            weights.record("lm_head.weight").map(|rec| rec.dtype),
+            Some(DType::QInt8PerChan)
+        )
+}
+
 fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResult<Weights> {
     let recognized_container = looks_like_weight_container(&bytes);
     Weights::from_bytes(bytes).map_err(|e| {
@@ -517,6 +530,14 @@ impl OcrModel {
             ))
         })?;
         let weights = load_weights_from_resolved_model(&resolved, bytes)?;
+        // A pre-quantized int8 `.focrq` (the decoder GEMM tensors stored
+        // `QInt8PerChan` by `focr convert`) is self-describingly an int8 artifact:
+        // route decode through the int8 cache automatically so `focr ocr --model
+        // <int8.focrq>` reproduces the `FOCR_DECODE_INT8` path byte-for-byte
+        // without the env. OR-only with the flag/env — never disables a path.
+        if weights_are_prequantized_int8(&weights) {
+            force_int8_decode(true);
+        }
         let model = Arc::new(Self {
             path: resolved.clone(),
             weights,

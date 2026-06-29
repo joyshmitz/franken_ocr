@@ -41,7 +41,7 @@ use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
 use super::tensor::{Mat, QInt8};
-use super::weights::Weights;
+use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 use crate::simd;
 use rayon::prelude::*;
@@ -1698,6 +1698,31 @@ fn quant_oc(w: &[f32], out: usize) -> QInt8 {
     nn::quantize_int8(w, out, w.len() / out)
 }
 
+/// Resolve `name` to a per-output-channel int8 weight, from EITHER source:
+///
+/// * a raw bf16/f32 safetensors record → widen the `[out, in]` mat and
+///   [`quant_oc`] it at load time (the original path), OR
+/// * a pre-quantized `.focrq` record (`QInt8PerChan`, produced by `focr convert`)
+///   → read it back verbatim via [`Weights::qint8`], skipping the re-quantize.
+///
+/// The two are byte-identical: `focr convert` quantizes with the SAME
+/// [`nn::quantize_int8`] this `quant_oc` calls, on the SAME widened weight, so a
+/// converted artifact decodes bit-for-bit like the load-time `FOCR_DECODE_INT8`
+/// path. This is the consume side of the convert↔decode contract.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if `name` is absent or mis-shaped.
+fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QInt8> {
+    if matches!(
+        weights.record(name).map(|rec| rec.dtype),
+        Some(DType::QInt8PerChan)
+    ) {
+        weights.qint8(name)
+    } else {
+        Ok(quant_oc(&weights.mat(name)?.data, out))
+    }
+}
+
 // ── CCD-sharded / L3-tiled lm_head (FOCR_LMHEAD_SHARD, bd-1azu.25) ────────────
 //
 // The `lm_head` projects the final hidden `[1, 1280]` against the `[129280, 1280]`
@@ -1936,30 +1961,26 @@ impl DecoderWeightCacheI8 {
             let prefix = format!("model.layers.{layer}");
             let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
             let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let q_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.q_proj.weight"))?
-                    .data,
+            let q_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.q_proj.weight"),
                 qkv_dim,
-            );
-            let k_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.k_proj.weight"))?
-                    .data,
+            )?;
+            let k_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.k_proj.weight"),
                 qkv_dim,
-            );
-            let v_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.v_proj.weight"))?
-                    .data,
+            )?;
+            let v_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.v_proj.weight"),
                 qkv_dim,
-            );
-            let o_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
-                    .data,
+            )?;
+            let o_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.o_proj.weight"),
                 hidden,
-            );
+            )?;
             // Fused q/k/v stack (FOCR_QKV_FUSED): built ONCE here so decode runs a
             // single block-parallel GEMV. Byte-identical to the 3 separate calls.
             let qkv = qkv_fused_enabled().then(|| fuse_qkv(&q_proj, &k_proj, &v_proj));
@@ -1967,9 +1988,9 @@ impl DecoderWeightCacheI8 {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
                 CachedMlpI8::Dense {
-                    gate: quant_oc(&weights.mat(&format!("{p}.gate_proj.weight"))?.data, inter),
-                    up: quant_oc(&weights.mat(&format!("{p}.up_proj.weight"))?.data, inter),
-                    down: quant_oc(&weights.mat(&format!("{p}.down_proj.weight"))?.data, hidden),
+                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_oc_loaded(weights, &format!("{p}.down_proj.weight"), hidden)?,
                 }
             } else {
                 let p = format!("{prefix}.mlp");
@@ -1978,46 +1999,32 @@ impl DecoderWeightCacheI8 {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
-                                .data,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.gate_proj.weight"),
                             inter,
-                        ),
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
-                                .data,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.up_proj.weight"),
                             inter,
-                        ),
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
-                                .data,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.down_proj.weight"),
                             hidden,
-                        ),
+                        )?,
                     ]);
                 }
                 let si = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
-                            .data,
-                        si,
-                    ),
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.up_proj.weight"))?
-                            .data,
-                        si,
-                    ),
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.down_proj.weight"))?
-                            .data,
+                    quant_oc_loaded(weights, &format!("{p}.shared_experts.gate_proj.weight"), si)?,
+                    quant_oc_loaded(weights, &format!("{p}.shared_experts.up_proj.weight"), si)?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.down_proj.weight"),
                         hidden,
-                    ),
+                    )?,
                 ];
                 CachedMlpI8::Moe {
                     gate,
@@ -2037,7 +2044,7 @@ impl DecoderWeightCacheI8 {
             });
         }
         let final_norm = weights.vec("model.norm.weight")?;
-        let lm_head = quant_oc(&weights.mat("lm_head.weight")?.data, config::VOCAB_SIZE);
+        let lm_head = quant_oc_loaded(weights, "lm_head.weight", config::VOCAB_SIZE)?;
         Ok(Self {
             layers,
             final_norm,

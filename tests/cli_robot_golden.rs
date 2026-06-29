@@ -1505,13 +1505,23 @@ fn ocr_env_model_path_without_cli_model_reaches_resolver() {
     );
 }
 
-/// [C4] `focr convert -o out.focrq in.safetensors` -> NotImplemented golden.
+/// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is
+/// now implemented (it writes a real `.focrq`); int4 remains the unvalidated
+/// lossy path that refuses BEFORE any file I/O (doctrine #1), so this stays a
+/// deterministic NotImplemented surface regardless of the input's existence.
 #[test]
-fn convert_not_implemented_golden() {
+fn convert_int4_not_implemented_golden() {
     assert_not_implemented_golden(
-        "convert_not_implemented_golden",
+        "convert_int4_not_implemented_golden",
         "convert_not_implemented",
-        &["convert", "in.safetensors", "-o", "out.focrq"],
+        &[
+            "convert",
+            "in.safetensors",
+            "-o",
+            "out.focrq",
+            "--quant",
+            "int4",
+        ],
     );
 }
 
@@ -1813,10 +1823,18 @@ fn exit_code_conformance() {
             clause: "E3",
             xfail: None,
         },
-        // [E1] not-implemented -> 1
+        // [E1] not-implemented -> 1. int8 convert is implemented; the int4 lossy
+        // path is the remaining NotImplemented surface (refuses before I/O).
         ExitRow {
-            label: "convert -> 1 (NotImplemented)",
-            argv: &["convert", "in.safetensors", "-o", "out.focrq"],
+            label: "convert --quant int4 -> 1 (NotImplemented)",
+            argv: &[
+                "convert",
+                "in.safetensors",
+                "-o",
+                "out.focrq",
+                "--quant",
+                "int4",
+            ],
             expect: 1,
             clause: "E1",
             xfail: None,
@@ -1844,9 +1862,12 @@ fn exit_code_conformance() {
         },
         // The forward-dependent documented codes are process-covered in Phase 0
         // through the debug/test producer seam that feeds the real CLI
-        // dispatcher and robot error path. Convert-side format mismatch is still
-        // blocked on `convert`, while the `.focrq` reader path itself is
-        // live-covered by ocr_robot_future_focrq_stream_matches_exit_code.
+        // dispatcher and robot error path. int8 `convert` is now implemented, but
+        // this static-argv row points at a NON-EXISTENT input, so it resolves to
+        // ModelNotFound (3) before the parser; reaching convert-side
+        // FormatMismatch(7) needs a malformed but EXISTING container, while the
+        // `.focrq` reader path itself is live-covered by
+        // ocr_robot_future_focrq_stream_matches_exit_code.
         ExitRow {
             label: "forced input-decode -> 4",
             argv: &["ocr", "/some/document.png"],
@@ -1874,7 +1895,7 @@ fn exit_code_conformance() {
             expect: 7,
             clause: "E7",
             xfail: Some(
-                "Convert-side FormatMismatch(exit 7) is unreachable until `convert` lands; the path-explicit .focrq reader coverage lives in ocr_robot_future_focrq_stream_matches_exit_code.",
+                "Convert-side FormatMismatch(exit 7) needs a malformed but EXISTING container; this static-argv row's non-existent input resolves to ModelNotFound(3) first. The path-explicit .focrq reader coverage lives in ocr_robot_future_focrq_stream_matches_exit_code.",
             ),
         },
     ];

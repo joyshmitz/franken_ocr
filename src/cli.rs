@@ -15,7 +15,7 @@
 
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine,
-    native_engine, robot, simd,
+    native_engine, quant, robot, simd,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
@@ -366,6 +366,17 @@ impl ArchTarget {
             Self::X86Amx => "x86-amx",
         }
     }
+
+    /// The `.focrq` header packing byte (`0` Generic … `3` X86Amx — the order the
+    /// `FocrqBuilder`/reader fix for `arch_target`).
+    fn packing_byte(self) -> u8 {
+        match self {
+            Self::Generic => 0,
+            Self::Aarch64Smmla => 1,
+            Self::X86Vnni => 2,
+            Self::X86Amx => 3,
+        }
+    }
 }
 
 impl std::fmt::Display for ArchTarget {
@@ -556,24 +567,107 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     Ok(())
 }
 
+/// Offline weight transform: raw bf16 safetensors → a self-contained int8
+/// `.focrq` (plan §5). The int8 decoder tensors are quantized with the SAME
+/// [`native_engine::nn::quantize_int8`] the load-time `FOCR_DECODE_INT8` cache
+/// uses, so the artifact decodes byte-for-byte like that path on the source
+/// shard; everything else (vision, projector, embed_tokens, router gate, norms)
+/// is copied verbatim. `--quant int4` is not yet validated (doctrine #1) and
+/// returns `NotImplemented`.
 fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
+    // int4: surface the machine scaffold (so robot callers still see the planned
+    // shape) then refuse — BEFORE any file I/O, so the outcome is deterministic
+    // regardless of whether the input exists.
+    if args.quant == QuantTarget::Int4 {
+        if args.json {
+            emit(&serde_json::json!({
+                "schema_version": robot::ROBOT_SCHEMA_VERSION,
+                "command": "convert",
+                "status": "scaffold",
+                "implemented": false,
+                "input": args.input,
+                "output": args.output,
+                "quant": args.quant.as_str(),
+                "arch": args.arch.as_str(),
+            }));
+        }
+        return Err(FocrError::NotImplemented(
+            "focr convert --quant int4 is not yet supported; the int4 group-quantized \
+             path is unvalidated (use --quant int8)"
+                .into(),
+        ));
+    }
+
+    // int8 — the validated path. Resolve the input the way `ocr` resolves a model
+    // (a `.safetensors` file as-is, or the canonical shard inside a directory).
+    let resolved = native_engine::OcrModel::resolve_model(&args.input)?;
+    let bytes = std::fs::read(&resolved).map_err(|e| {
+        FocrError::ModelNotFound(format!(
+            "cannot read safetensors at {}: {e}",
+            resolved.display()
+        ))
+    })?;
+    let input_bytes = bytes.len();
+    let source_sha256 = quant::convert::sha256_of_bytes(&bytes);
+    // `from_bytes` keeps ownership of the single read; the hash above borrowed it.
+    let weights = native_engine::weights::Weights::from_bytes(bytes)?;
+    let tensor_count = weights.len();
+    let quantized = weights
+        .names()
+        .filter(|name| quant::convert::is_decoder_int8_tensor(name))
+        .count();
+
+    let blob = quant::convert::safetensors_to_focrq(
+        &weights,
+        quant::convert::ConvertQuant::Int8,
+        args.arch.packing_byte(),
+        source_sha256,
+    )?;
+    let output_bytes = blob.len();
+    std::fs::write(&args.output, &blob).map_err(|e| {
+        FocrError::Other(anyhow::anyhow!(
+            "writing .focrq to {}: {e}",
+            args.output.display()
+        ))
+    })?;
+
+    let sha_hex = hex_encode32(&source_sha256);
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "command": "convert",
-            "status": "scaffold",
-            "implemented": false,
-            "landing_phase": "Phase 2",
-            "plan_section": "§5",
-            "input": args.input,
+            "status": "ok",
+            "implemented": true,
+            "input": resolved,
             "output": args.output,
             "quant": args.quant.as_str(),
             "arch": args.arch.as_str(),
+            "source_sha256": sha_hex,
+            "tensors": tensor_count,
+            "tensors_quantized": quantized,
+            "input_bytes": input_bytes,
+            "output_bytes": output_bytes,
         }));
+    } else {
+        eprintln!(
+            "[focr] convert: wrote {} ({} quant {}: {tensor_count} tensors, {quantized} int8, \
+             {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex}",
+            args.output.display(),
+            args.arch.as_str(),
+            args.quant.as_str(),
+        );
     }
-    Err(FocrError::NotImplemented(
-        "focr convert — the weight transformer lands in Phase 2 (see plan §5)".into(),
-    ))
+    Ok(())
+}
+
+/// Lowercase-hex-encode the 32-byte source digest for human/robot display.
+fn hex_encode32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for &b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn run_runs(args: &RunsArgs) -> FocrResult<()> {
