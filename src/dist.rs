@@ -458,12 +458,18 @@ fn install_file(
         file.size as f64 / 1.0e9,
         file.parts.len()
     ));
-    runtime.block_on(async move {
+    let download = runtime.block_on(async move {
         let cx = Cx::current().ok_or_else(|| {
             FocrError::Other(anyhow::anyhow!("runtime did not install an ambient Cx"))
         })?;
         download_remote_file(&cx, &file_owned, &tmp_for_async, quiet).await
-    })?;
+    });
+    if let Err(e) = download {
+        // Don't leave a half-written `.partial` littering the cache; the next
+        // attempt would truncate it anyway, but a failed pull should be tidy.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, final_path).map_err(|e| {
         FocrError::Other(anyhow::anyhow!(
             "install {} -> {}: {e}",
