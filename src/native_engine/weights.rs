@@ -46,6 +46,7 @@ use std::path::Path;
 use half::bf16;
 use serde::Deserialize;
 
+use super::model_arch;
 use super::tensor::{Mat, QInt4, QInt8};
 use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
@@ -59,15 +60,63 @@ fn checked_shape_len(name: &str, lhs: usize, rhs: usize, expr: &str) -> FocrResu
     })
 }
 
-fn validate_license_notice(notice: &str) -> FocrResult<()> {
-    if notice == FOCR_MODEL_LICENSE_NOTICE
-        || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
-    {
-        Ok(())
-    } else {
-        Err(FocrError::FormatMismatch(
-            ".focrq license_notice must include Copyright (c) 2026 Baidu and MIT License".into(),
-        ))
+/// Resolve the architecture id a `.focrq` declares against the model registry.
+///
+/// An **absent** `model_id` (`""`, the v1 form, since `model_id` is a v2 header
+/// addition) resolves to the default architecture — Unlimited-OCR — so every
+/// pre-existing v1 artifact keeps loading unchanged. A **non-empty** id that is
+/// not in the registry is a forward-incompatible artifact and is **refused**
+/// loudly (mirroring the `format_version > max` rejection), rather than silently
+/// loaded as the default model.
+fn resolve_model_id(declared: &str) -> FocrResult<&'static str> {
+    if declared.is_empty() {
+        return Ok(model_arch::default_arch().id());
+    }
+    model_arch::arch_by_id(declared)
+        .map(|arch| arch.id())
+        .ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
+                ".focrq declares unknown model_id {declared:?} \
+                 (not in the model registry; this binary cannot load it)"
+            ))
+        })
+}
+
+/// Validate the `.focrq` license notice against the notice the *declared
+/// architecture* requires.
+///
+/// * **Unlimited-OCR** (and every v1 artifact, which resolves to it): the Baidu
+///   MIT contract, accepting any semantically-equivalent notice that carries the
+///   required copyright + MIT-license tokens (back-compat with the historical
+///   check — the `model_config`/notice text was hand-authored in early artifacts).
+/// * **Any other registered arch** (e.g. GOT-OCR2 → Apache-2.0/StepFun): the
+///   notice must equal that arch's declared [`model_arch::ModelArch::license_notice`] exactly.
+///
+/// `model_id` is the already-resolved (registry-known) id from
+/// [`resolve_model_id`], so the lookup here cannot miss.
+fn validate_license_notice(notice: &str, model_id: &str) -> FocrResult<()> {
+    if model_id == model_arch::default_arch().id() {
+        return if notice == FOCR_MODEL_LICENSE_NOTICE
+            || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
+        {
+            Ok(())
+        } else {
+            Err(FocrError::FormatMismatch(
+                ".focrq license_notice must include Copyright (c) 2026 Baidu and MIT License"
+                    .into(),
+            ))
+        };
+    }
+    match model_arch::arch_by_id(model_id) {
+        Some(arch) if notice == arch.license_notice() => Ok(()),
+        Some(arch) => Err(FocrError::FormatMismatch(format!(
+            ".focrq license_notice does not match the registered {model_id} notice \
+             (expected {:?})",
+            arch.license_notice()
+        ))),
+        None => Err(FocrError::FormatMismatch(format!(
+            ".focrq license_notice: unknown model_id {model_id:?}"
+        ))),
     }
 }
 
@@ -248,6 +297,13 @@ struct FocrqHeader {
     /// notices that include the required copyright and MIT-license tokens.
     #[serde(default)]
     license_notice: String,
+    /// The model-architecture id (`ModelArch::id`, e.g. `"got-ocr2"`) this
+    /// artifact declares, so the loader selects the right arch from the registry.
+    /// **Absent in v1 artifacts** (the field is a v2 addition) ⇒ deserializes to
+    /// `""` ⇒ [`resolve_model_id`] defaults it to `unlimited-ocr` (the only model
+    /// v1 ever produced), so every existing `.focrq` keeps loading unchanged.
+    #[serde(default)]
+    model_id: String,
 }
 
 /// A zero-copy view of one stored tensor: its dtype, shape, and the raw payload
@@ -313,6 +369,10 @@ pub struct Weights {
     source_sha256: String,
     /// The `.focrq` license notice (MIT/Baidu; `""` for safetensors).
     license_notice: String,
+    /// The resolved model-architecture id (`ModelArch::id`). A v2 `.focrq`
+    /// declares it; a v1 `.focrq` or raw safetensors resolves to the default
+    /// `unlimited-ocr`. Always a registry-known id (validated at load).
+    model_id: &'static str,
     /// Whether this came from a `.focrq` container (vs. a raw safetensors shard).
     is_focrq: bool,
 }
@@ -332,6 +392,7 @@ impl Default for Weights {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            model_id: model_arch::default_arch().id(),
             is_focrq: false,
         }
     }
@@ -439,7 +500,11 @@ impl Weights {
         }
         let header: FocrqHeader = serde_json::from_slice(&bytes[cur..header_end])
             .map_err(|e| FocrError::FormatMismatch(format!(".focrq header JSON invalid: {e}")))?;
-        validate_license_notice(&header.license_notice)?;
+        // Resolve the declared architecture FIRST (absent ⇒ v1 default unlimited-ocr;
+        // unknown non-empty id ⇒ loud refusal) so the license check below can demand
+        // the right notice for that arch (Baidu/MIT vs e.g. GOT-OCR2 Apache-2.0).
+        let model_id = resolve_model_id(&header.model_id)?;
+        validate_license_notice(&header.license_notice, model_id)?;
         if !header.source_sha256.is_empty() {
             validate_source_sha256_hex(&header.source_sha256)?;
         }
@@ -469,6 +534,7 @@ impl Weights {
             arch_target,
             source_sha256,
             license_notice: header.license_notice,
+            model_id,
             is_focrq: true,
         })
     }
@@ -550,6 +616,8 @@ impl Weights {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            // A raw safetensors shard is the upstream Unlimited-OCR checkpoint.
+            model_id: model_arch::default_arch().id(),
             is_focrq: false,
         })
     }
@@ -637,6 +705,16 @@ impl Weights {
     #[must_use]
     pub fn license_notice(&self) -> &str {
         &self.license_notice
+    }
+
+    /// The resolved model-architecture id ([`model_arch::ModelArch::id`]) this
+    /// artifact declares — e.g. `"unlimited-ocr"` or `"got-ocr2"`. A v1 `.focrq` (no
+    /// `model_id` header) and a raw safetensors shard both report the default
+    /// `"unlimited-ocr"`. Always a registry-known id (validated at load), so the
+    /// engine can look the arch up with [`model_arch::arch_by_id`] infallibly.
+    #[must_use]
+    pub fn model_id(&self) -> &'static str {
+        self.model_id
     }
 
     /// Iterate the tensor names (sorted, since the directory is a `BTreeMap`).
@@ -1072,6 +1150,33 @@ mod tests {
         blob
     }
 
+    /// Hand-assemble a v2 `.focrq` blob that declares a `model_id` (the A2 arch
+    /// tag), with an arbitrary license notice so the arch-aware license check can
+    /// be exercised independently of the tensor payload.
+    fn build_focrq_with_model_id(
+        directory_json: &str,
+        payload: &[u8],
+        license_notice: &str,
+        model_id: &str,
+    ) -> Vec<u8> {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let header = format!(
+            "{{\"tensors\":{directory_json},\"arch_target\":0,\"source_sha256\":\"\",\
+             \"license_notice\":\"{}\",\"model_id\":\"{}\"}}",
+            esc(license_notice),
+            esc(model_id),
+        );
+        let mut blob = Vec::new();
+        blob.extend_from_slice(FOCRQ_MAGIC);
+        blob.extend_from_slice(&FOCRQ_FORMAT_VERSION.to_le_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        blob.extend_from_slice(header.as_bytes());
+        blob.extend_from_slice(payload);
+        blob
+    }
+
     /// Hand-assemble a minimal safetensors blob from `(name, dtype, shape,
     /// bytes)` tensors laid out contiguously in directory order.
     fn build_safetensors(tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
@@ -1113,6 +1218,7 @@ mod tests {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            model_id: model_arch::default_arch().id(),
             is_focrq: true,
         }
     }
@@ -1155,6 +1261,72 @@ mod tests {
         assert!(matches!(err, FocrError::FormatMismatch(_)));
         assert!(format!("{err}").contains("license_notice"));
         assert!(format!("{err}").contains("MIT License"));
+    }
+
+    // ── model_id arch tag (A2) ──────────────────────────────────────────────
+
+    /// The GOT-OCR2 notice the registry declares (used so the test never drifts
+    /// from `model_arch`'s source of truth).
+    fn got_ocr2_notice() -> &'static str {
+        crate::native_engine::model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 is a registered arch")
+            .license_notice()
+    }
+
+    #[test]
+    fn focrq_absent_model_id_resolves_to_unlimited_ocr() {
+        // A v1 blob (no model_id key at all) loads and reports the default arch.
+        let blob = build_focrq(1, 0, [0u8; 32], "{}", &[]);
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    #[test]
+    fn focrq_empty_model_id_string_resolves_to_unlimited_ocr() {
+        // The key physically present but empty (serde-default equivalent) also
+        // resolves to the default, and still demands the Baidu/MIT notice.
+        let blob = build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "");
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    #[test]
+    fn focrq_declares_got_ocr2_with_apache_notice_loads() {
+        // A planned (not-yet-implemented) arch's weights still LOAD — only the
+        // forward is gated — and the arch-specific Apache-2.0 notice is accepted.
+        let blob = build_focrq_with_model_id("{}", &[], got_ocr2_notice(), "got-ocr2");
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "got-ocr2");
+    }
+
+    #[test]
+    fn focrq_unknown_model_id_is_refused() {
+        // A forward-incompatible artifact (id this binary's registry lacks) is a
+        // loud rejection, not a silent fallback to the default model.
+        let blob =
+            build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "totally-bogus-model");
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("unknown model_id"));
+    }
+
+    #[test]
+    fn focrq_got_ocr2_with_wrong_notice_is_refused() {
+        // got-ocr2 declared but carrying the Baidu/MIT notice (not its Apache-2.0
+        // one) ⇒ the arch-aware license check refuses it.
+        let blob = build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "got-ocr2");
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("does not match the registered got-ocr2 notice"));
+    }
+
+    #[test]
+    fn safetensors_reports_default_model_id() {
+        // A raw upstream shard is the Unlimited-OCR checkpoint.
+        let blob = build_safetensors(&[("w", "BF16", vec![1], bf16_le_bytes(&[1.0]))]);
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+        assert!(!w.is_focrq());
     }
 
     #[test]

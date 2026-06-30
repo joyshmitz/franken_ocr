@@ -98,6 +98,19 @@ The header object has this top-level shape:
 }
 ```
 
+A non-default architecture additionally declares a `model_id` (placed between
+`model_config` and `packing_manifest`), e.g. for a GOT-OCR2 artifact:
+
+```json
+{
+  "arch_target": 0,
+  "format_version": 1,
+  "license_notice": "GOT-OCR2.0 (StepFun) - Apache-2.0",
+  "model_id": "got-ocr2",
+  "tensors": {}
+}
+```
+
 The fixed prefix is authoritative for `format_version`. The writer also emits a
 forward-compatible JSON `format_version` mirror, but current readers ignore
 unknown header fields. `arch_target` and `source_sha256` are emitted in both
@@ -110,7 +123,7 @@ Required top-level fields:
 |-------|------|---------------|
 | `arch_target` | integer | One of the `arch_target` numeric values below. |
 | `source_sha256` | hex string | 64 lowercase hex chars when known; empty means use the prefix bytes. |
-| `license_notice` | string | Non-empty and contains `Copyright (c) 2026 Baidu` and `MIT License`; the project writer fills this from `FOCR_MODEL_LICENSE_NOTICE`. |
+| `license_notice` | string | The notice the **declared architecture** requires (see `model_id`). For `unlimited-ocr` / v1 artifacts: non-empty and contains `Copyright (c) 2026 Baidu` and `MIT License` (the project writer fills this from `FOCR_MODEL_LICENSE_NOTICE`). For any other arch: equal to that arch's `ModelArch::license_notice` (e.g. GOT-OCR2 → `GOT-OCR2.0 (StepFun) - Apache-2.0`). |
 | `tensors` | object | Map from canonical tensor name to one tensor record. |
 
 Forward-compatible optional fields:
@@ -118,6 +131,7 @@ Forward-compatible optional fields:
 | Field | Type | Rule |
 |-------|------|------|
 | `format_version` | integer | Writer emits the prefix version for traceability. |
+| `model_id` | string | The architecture id (`ModelArch::id`) the loader selects from the model registry. **Absent ⇒ the default `unlimited-ocr`** (so every v1 artifact loads unchanged); a non-empty id not in this binary's registry is **refused** (forward-incompatible artifact). The writer omits it for the default arch so re-converting Unlimited-OCR stays byte-identical to v1. |
 | `provenance` | object | Contains pinned commits and source hashes when attached. |
 | `model_config` | object | Frozen relevant config fields from truth-pack `config.json` when attached. |
 | `packing_manifest` | object | Converter/packing metadata and optional bit-allocation table when attached. |
@@ -401,14 +415,17 @@ not baseline assumptions.
 7. Parse header JSON.
 8. Resolve `arch_target` and `source_sha256` from the header when present, or
    from the fixed prefix otherwise.
-9. Check non-empty `license_notice` includes Baidu MIT attribution.
-10. Validate `model_config` against the compiled truth-pack census.
-11. Validate every tensor record and byte range in the `tensors` map.
-12. Build an immutable map `name -> TensorRange`.
-13. Warn on compatible arch mismatch; error on incompatible packing.
+9. Resolve `model_id` against the model registry: absent ⇒ the default
+   `unlimited-ocr`; a non-empty id the registry lacks ⇒ refuse (forward-incompatible).
+10. Check `license_notice` against the resolved arch: the Baidu MIT attribution for
+    `unlimited-ocr`, else exact equality with that arch's `ModelArch::license_notice`.
+11. Validate `model_config` against the compiled truth-pack census.
+12. Validate every tensor record and byte range in the `tensors` map.
+13. Build an immutable map `name -> TensorRange`.
+14. Warn on compatible arch mismatch; error on incompatible packing.
 
 No tensor dequantization is required during header sniffing. `native_model_available`
-may stop after step 12.
+may stop after step 13.
 
 ## Writer Determinism
 
