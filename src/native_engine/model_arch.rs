@@ -227,8 +227,21 @@ pub struct PlannedArch {
     vision_encoder: VisionEncoder,
     decoder: Decoder,
     tokenizer: TokenizerKind,
+    /// The greedy-decode contract, where known from the model's config/census
+    /// (e.g. GOT-OCR2 from `docs/zoo/got-ocr2-spec.md`); `PLACEHOLDER_CONTRACT`
+    /// until censused. Informational for a planned model (never used for inference).
+    decode_contract: DecodeContract,
     tasks: &'static [Task],
 }
+
+/// A not-yet-determined greedy contract for a planned model whose config has not
+/// been censused (temperature 0 = greedy; the rest zeroed).
+const PLACEHOLDER_CONTRACT: DecodeContract = DecodeContract {
+    temperature: 0.0,
+    eos_token_id: 0,
+    no_repeat_ngram_size: 0,
+    ngram_window: 0,
+};
 
 impl ModelArch for PlannedArch {
     fn id(&self) -> &'static str {
@@ -253,14 +266,7 @@ impl ModelArch for PlannedArch {
         self.tokenizer
     }
     fn decode_contract(&self) -> DecodeContract {
-        // Informational for a planned model; the real values are read from the
-        // model's config when its decoder lands (A7 + the model's sub-epic).
-        DecodeContract {
-            temperature: 0.0,
-            eos_token_id: 0,
-            no_repeat_ngram_size: 0,
-            ngram_window: 0,
-        }
+        self.decode_contract
     }
     fn tasks(&self) -> &'static [Task] {
         self.tasks
@@ -271,6 +277,9 @@ impl ModelArch for PlannedArch {
 }
 
 // ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
+// GOT-OCR2.0 — censused (docs/zoo/got-ocr2-spec.md, bd-3jo6.2.1): SAM-ViT-B encoder
+// + Linear(1024→1024) connector + Qwen1.5/Qwen2-arch 0.5B DENSE decoder; the
+// tokenizer is the original Qwen tiktoken BPE (qwen.tiktoken), not a HF tokenizer.json.
 static GOT_OCR2: PlannedArch = PlannedArch {
     id: "got-ocr2",
     display_name: "GOT-OCR2.0",
@@ -279,6 +288,14 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::SamVit,
     decoder: Decoder::Qwen2Dense,
     tokenizer: TokenizerKind::Qwen2Bpe,
+    // Real config (census): greedy, eos=151643 (<|endoftext|>), no_repeat_ngram=20
+    // (HF builtin/global, window 0), max_new 4096, stop "<|im_end|>".
+    decode_contract: DecodeContract {
+        temperature: 0.0,
+        eos_token_id: 151_643,
+        no_repeat_ngram_size: 20,
+        ngram_window: 0,
+    },
     tasks: &[
         Task::Ocr,
         Task::Formula,
@@ -297,6 +314,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::Siglip,
     decoder: Decoder::LlamaDense,
     tokenizer: TokenizerKind::SmolLm2Bpe,
+    decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Describe, Task::Vqa],
 };
 static ONECHART: PlannedArch = PlannedArch {
@@ -307,6 +325,7 @@ static ONECHART: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::SamVit,
     decoder: Decoder::Qwen2Dense,
     tokenizer: TokenizerKind::Qwen2Bpe,
+    decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Chart],
 };
 static TROMR: PlannedArch = PlannedArch {
@@ -317,6 +336,7 @@ static TROMR: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::ResNetVit,
     decoder: Decoder::Seq2SeqDense,
     tokenizer: TokenizerKind::MusicVocab,
+    decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Music],
 };
 static TROCR: PlannedArch = PlannedArch {
@@ -327,6 +347,7 @@ static TROCR: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::BeitVit,
     decoder: Decoder::Seq2SeqDense,
     tokenizer: TokenizerKind::SentencePiece,
+    decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Handwriting],
 };
 static PIX2TEX: PlannedArch = PlannedArch {
@@ -337,6 +358,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::ResNetVit,
     decoder: Decoder::Seq2SeqDense,
     tokenizer: TokenizerKind::SentencePiece,
+    decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Formula],
 };
 
@@ -424,6 +446,24 @@ mod tests {
         assert_eq!(got.tokenizer(), TokenizerKind::Qwen2Bpe);
         // An unknown id resolves to nothing.
         assert!(arch_by_id("does-not-exist").is_none());
+    }
+
+    /// The GOT-OCR2 planned descriptor matches the census (docs/zoo/got-ocr2-spec.md).
+    #[test]
+    fn got_ocr2_descriptor_matches_the_census() {
+        let got = arch_by_id("got-ocr2").expect("got-ocr2 registered");
+        assert!(!got.implemented());
+        assert_eq!(got.vision_encoder(), VisionEncoder::SamVit);
+        assert_eq!(got.decoder(), Decoder::Qwen2Dense);
+        assert_eq!(got.tokenizer(), TokenizerKind::Qwen2Bpe);
+        // Real config from the census: greedy, eos=<|endoftext|>(151643), ngram 20.
+        let c = got.decode_contract();
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.eos_token_id, 151_643);
+        assert_eq!(c.no_repeat_ngram_size, 20);
+        // Same doctrine-#2 quant policy (vision high-precision; decoder GEMMs int8).
+        assert!(got.quant_policy().vision_high_precision);
+        assert!(got.quant_policy().decoder_gemms_int8);
     }
 
     /// The descriptor must match the LIVE engine constants, so it can never drift.
