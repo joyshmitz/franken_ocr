@@ -178,6 +178,52 @@ convs, the connector, `embed_tokens`/`lm_head` (tied), and ALL norms. Tied embed
 ONE matrix (pending OQ-1). The convert path applies this per-arch quant policy (A3) keyed by
 the `got-ocr2` model id.
 
+## 12. OQ resolutions + exact tensor names (from the downloaded weights, 2026-06-30)
+
+Resolved by reading `config.json`, `generation_config.json`, `qwen.tiktoken`, and the
+**safetensors header** (472 tensors, parsed from a 1.5 MB range probe — no full download
+needed to inventory keys):
+
+- **OQ-1 RESOLVED.** `lm_head.weight` **IS stored separately** ([151860,1024] BF16)
+  alongside `model.embed_tokens.weight` ([151860,1024] BF16) — both present despite
+  `tie_word_embeddings=true`. This is the extra ~155 M params that make the file 1.43 GB
+  bf16 (~715 M) vs the 580 M headline. **Decision:** load `lm_head.weight` directly; when
+  the full file lands, verify it byte-equals `embed_tokens` (tied) and store one copy if so.
+- **OQ-2 RESOLVED.** Each decoder layer has `self_attn.{q,k,v}_proj.bias` ([1024]) and
+  `self_attn.o_proj.weight` with **no `o_proj.bias`**; MLP and norms are unbiased. (Qwen2 default.)
+- **OQ-3 RESOLVED.** `qwen.tiktoken` = 151643 base BPE entries (ranks 0..151642); specials
+  fill 151643..151859 (`<|endoftext|>`=151643, `<|im_start|>`=151644, `<|im_end|>`=151645,
+  `<|extra_0..205|>`, then `<img>`=151857/`</img>`=151858/`<imgpad>`=151859); the 151852..151856
+  gap is unused padding; embedding is padded to 151860.
+- **OQ-4 RESOLVED.** Decomposed rel-pos confirmed: WINDOWED blocks (0,1,3,4,6,7,9,10) carry
+  `attn.rel_pos_{h,w}` [27,64] (2·14−1=27, window 14); GLOBAL blocks (2,5,8,11) carry [127,64]
+  (2·64−1=127, full 64 grid). head_dim 64.
+- **OQ-6 RESOLVED.** head_dim 64 → full rotary over 64.
+- **OQ-8 RESOLVED.** `no_repeat_ngram_size=20` is hard-coded in `chat()` (HF builtin = global,
+  window 0); `generation_config.json` sets `max_new_tokens=2048` (the `chat()` call overrides to 4096).
+- **Still open (code-level, not weight-resolvable):** OQ-5 (vision LayerNorm / LayerNorm2d eps —
+  SAM default 1e-6, confirm in `got_vision_b.py`), OQ-7 (exact 0–1000 bbox normalization basis),
+  OQ-9 (tile order: row-major, thumbnail last — from `run_ocr_2.0_crop.py`).
+
+**Exact tensor names (for the B2 convert map):**
+- Decoder (×24 layers): `model.embed_tokens.weight` [151860,1024]; `model.layers.{i}.input_layernorm.weight`
+  [1024], `…post_attention_layernorm.weight` [1024]; `…self_attn.{q,k,v}_proj.weight` [1024,1024] +
+  `.bias` [1024]; `…self_attn.o_proj.weight` [1024,1024]; `…mlp.gate_proj.weight` [2816,1024],
+  `…mlp.up_proj.weight` [2816,1024], `…mlp.down_proj.weight` [1024,2816]; `model.norm.weight` [1024];
+  `lm_head.weight` [151860,1024].
+- Vision (`model.vision_tower_high.`, ×12 blocks): `patch_embed.proj.weight` [768,3,16,16]+`.bias` [768];
+  `pos_embed` [1,64,64,768]; per block `blocks.{i}.attn.qkv.weight` [2304,768]+`.bias` [2304],
+  `…attn.proj.weight` [768,768]+`.bias` [768], `…attn.rel_pos_{h,w}` ([27,64] or [127,64]), plus
+  the block's `norm1/norm2` + `mlp` (standard SAM block); neck `neck.0.weight` [256,768,1,1],
+  `neck.1.{weight,bias}` [256] (LN2d), `neck.2.weight` [256,256,3,3], `neck.3.{weight,bias}` [256] (LN2d);
+  compressor `net_2.weight` [512,256,3,3], `net_3.weight` [1024,512,3,3].
+- Connector: `model.mm_projector_vary.weight` [1024,1024] + `.bias` [1024].
+
+**Quant map (doctrine #2, for B2):** int8 → the 24 decoder layers' `{q,k,v,o}_proj.weight` +
+`mlp.{gate,up,down}_proj.weight` (the GEMMs); `lm_head.weight` int8 only behind the measured-CER
+kill-switch. high-precision (bf16/f32) → everything in `model.vision_tower_high.*`,
+`mm_projector_vary`, `embed_tokens`, all `*layernorm*`/`norm`, and the qkv biases.
+
 ### Sources
 - config.json / modeling_GOT.py / got_vision_b.py / tokenization_qwen.py / qwen.tiktoken /
   render_tools.py — https://huggingface.co/stepfun-ai/GOT-OCR2_0/tree/main
