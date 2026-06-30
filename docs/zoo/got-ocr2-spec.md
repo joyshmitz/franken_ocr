@@ -232,6 +232,77 @@ needed to inventory keys):
 kill-switch. high-precision (bf16/f32) → everything in `model.vision_tower_high.*`,
 `mm_projector_vary`, `embed_tokens`, all `*layernorm*`/`norm`, and the qkv biases.
 
+## 13. Implementation reuse map (foundation scout, 2026-06-30)
+
+From the parallel scout of the existing engine (`decoder.rs`/`moe.rs`/`vision_sam.rs`/int8
+kernels). **B6/A6 (tokenizer) is DONE** — `src/tokenizer/tiktoken.rs`, token-id-exact (§7, §12).
+The rest is parity-gated on the oracle (task: GOT torch oracle); the L0a tokenizer gate is the
+prerequisite and is green.
+
+### 13a. Decoder (B5/A7) — Qwen2-0.5B dense = config re-parameterization, not a rewrite
+Land it by parameterizing the existing driver with a `DecoderConfig`, NOT forking `decoder.rs`.
+- **Reuse verbatim:** `simd::igemm_s8s8`; prefill `nn::linear_int8_dynamic` (already
+  `bias: Option<&[f32]>`); decode `gemv_i8` / `expert_gemv_i8` (the latter IS the dense SwiGLU);
+  `nn::rms_norm` (eps 1e-6 identical); `RopeTable::build`/`apply_rope` (NEOX rotate_half,
+  parameterized by head_dim/theta); `nn::sdpa`/`prefill_attention` (full-causal MHA — pass
+  num_heads=16, head_dim=64, scale 1/8); the dequant-once weight-cache pattern; `embed_tokens`
+  gather; the int8 overflow proof harness.
+- **New / different:** (1) dense SwiGLU on all 24 layers (drop the MoE router/experts; intermediate
+  **2816** — use `decoder::dense_mlp`, NOT `moe::dense_mlp` which hard-asserts 6848). (2) q/k/v_proj
+  **WITH** bias, o_proj without → a new `gemv_i8_bias` (or post-dequant `y[o]+=bias[o]` in f32, after
+  the int8 contraction, before RoPE). (3) full-causal growing KV `Qwen2KvCache` replacing the R-SWA
+  `RingCache`/`rswa::decode_attention` (those hardcode 10 heads/128 dim/128-window — all wrong);
+  keep ALL K/V, append one row/step, attend via `nn::sdpa(seq_q=1, seq_k=n_kv)` at scale 1/8. (4) tied
+  embeddings — store ONE hp `[151860,1024]` for both `embed_tokens` and the (default-f32) lm_head; int8
+  lm_head only behind a measured-CER kill-switch. (5) sampler: **global (window-0) no_repeat_ngram=20**
+  (existing path is windowed-128; window-0 ⇒ unbounded ban history).
+- **Internal `.focrq` tensor layout B2 MUST target** (HF GOT names map 1:1; B2 = quant-policy split +
+  tie de-dup, not a rename). `[int8]`=`QInt8PerChan`, `[HP]`=BF16/F32. Per layer `model.layers.{i}`, i∈0..24:
+
+  | tensor | shape | store |
+  |---|---|---|
+  | `.input_layernorm.weight`, `.post_attention_layernorm.weight` | [1024] | HP |
+  | `.self_attn.{q,k,v}_proj.weight` | [1024,1024] | **int8** |
+  | `.self_attn.{q,k,v}_proj.bias` | [1024] | HP |
+  | `.self_attn.o_proj.weight` (no bias) | [1024,1024] | **int8** |
+  | `.mlp.{gate,up}_proj.weight` | [2816,1024] | **int8** |
+  | `.mlp.down_proj.weight` | [1024,2816] | **int8** |
+
+  Top level: `model.norm.weight` [1024] HP; `model.embed_tokens.weight` [151860,1024] HP (serves embed
+  AND lm_head); **`lm_head.weight` NOT stored** (tied alias — §12 proved byte-identical). 7 int8 GEMMs/layer.
+- **int8 overflow (doctrine #6):** worst K=2816 (`down_proj`) ⇒ 2816·127·127 = 45,419,264 ≈ 2.1% of
+  i32::MAX, safer than the proven Baidu K=6848. Add `KCase{k:2816}` to `tests/int32_overflow_proof.rs`.
+- **Parity-gated OQs before any decoder kernel ships:** RoPE numerics at θ=1e6 vs HF `Qwen2RotaryEmbedding`;
+  scale 1/8 with no query pre-scaling (confirm no `attention_scaling`/mup); absence of q/k-norm (Qwen2 not
+  Qwen3 — assert no `*_norm` keys, fail loud); bias add order/dtype (decode m=1 row must byte-match prefill
+  m>1 last row).
+
+### 13b. Vision (B3) — `vision_sam.rs` is ALREADY a parity-tested GOT vision encoder
+Baidu's DeepEncoder reuses the same SAM-ViT-B + Vary 2-conv compressor (this corrects §10's "net_2/net_3
+NEW"). **Tower change = ONE line:** `sam_weights_from` hardcodes `let p = "model.sam_model";`
+(`vision_sam.rs:282`); GOT keys are `model.vision_tower_high.*` — parameterize `p` by arch `model_id`,
+zero other renames (all leaf names + geometry constants already match GOT; windowed/global decomposed
+rel-pos already implemented + gated). `forward_with` returns `[1024,256]` = the GOT vision feature; the
+batched path serves GOT multi-crop (≤7 tiles).
+- **NOT reused:** `vision_clip.rs` (GOT has no CLIP tower), `vision_bridge.rs` concat, `connector.rs`
+  newline/seperator/fuse (`N_EMBED=1280` is Baidu-specific).
+- **New (all HP):** GOT connector `model.mm_projector_vary.{weight[1024,1024],bias[1024]}` = Linear(1024→1024),
+  no act/no norm (reuse `vision_sam::Linear::apply`); the **`<imgpad>` splice** (prompt = `<img>` +
+  `<imgpad>`×(256·tiles) + `</img>`; at forward the 256 `<imgpad>` rows are overwritten by projected
+  features via the existing `connector::masked_scatter`). Connector currency = **1024** (Qwen2 hidden), not 1280.
+- **Preprocess (arch-key 3 params):** CLIP mean/std `(0.48145466,0.4578275,0.40821073)/(0.26862954,0.26130258,0.27577711)`;
+  resize = bicubic **squash** to 1024×1024 (no aspect-preserve, no pad — `resize_exact(1024,1024,CatmullRom)`,
+  CatmullRom≈PIL-bicubic is the one known sub-L0 divergence); multi-crop `min1/max6, use_thumbnail, thumbnail LAST`.
+  OQ-5 (LayerNorm eps) + the global-block rel-pos byte-equality confirmed via the oracle before shipping.
+
+### 13c. Oracle / parity ladder (B8) — L0a green; L0b→L5 gated
+**L0a tokenizer `tok_id_mismatch_count==0` (24/24) — DONE this session.** Build the rest: establish the
+oracle **nondeterminism floor FIRST** (4 runs/doc × 2 thread counts; GOT is ~580M so a CPU-f32 oracle is
+feasible) → `tolerances.toml` seeds L3/L4. L0b preprocess (`preproc_max_abs_diff≤1e-4` + tile-layout-exact),
+L0c prompt id-exact (the `<img>`+`<imgpad>`×256+`</img>` splice stream), L1 per-op cos≥1−1e-6, L2 per-seam
+(SAM-out/connector-out/24 hiddens/final-norm), L3 logits (f32+int8 tracked separately, tol from floor), L4
+id-exact to first divergence, L5 CER/structural per mode. Build refs: `transformers==4.37.2` + `AutoModel.from_pretrained('.', trust_remote_code=True)`; new GOT branch in `scripts/gen_reference_fixtures.py`.
+
 ### Sources
 - config.json / modeling_GOT.py / got_vision_b.py / tokenization_qwen.py / qwen.tiktoken /
   render_tools.py — https://huggingface.co/stepfun-ai/GOT-OCR2_0/tree/main
