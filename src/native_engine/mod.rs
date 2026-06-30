@@ -716,13 +716,16 @@ impl OcrModel {
     }
 
     /// The model architecture this loaded model is — the [`model_arch::ModelArch`]
-    /// descriptor that drives its identity, config, and (A1) the forward dispatch.
-    /// Today the only loadable artifact is the Baidu Unlimited-OCR model, so this
-    /// is always [`model_arch::default_arch`]; once `.focrq` v2 carries an arch tag
-    /// (foundation task A2) this will read the tag from `self.weights`.
+    /// descriptor that drives its identity, config, and the forward dispatch.
+    ///
+    /// Read from the `.focrq` v2 `model_id` tag the loader resolved (A2): a v1
+    /// `.focrq` or raw safetensors reports `unlimited-ocr`, a tagged artifact
+    /// reports its own arch (e.g. `got-ocr2`). `model_id()` is always a
+    /// registry-known id (validated at load), so the lookup cannot miss; the
+    /// `unwrap_or_else` is a defensive fallback (e.g. an empty [`Weights::default`]).
     #[must_use]
     pub fn arch(&self) -> &'static dyn model_arch::ModelArch {
-        model_arch::default_arch()
+        model_arch::arch_by_id(self.weights.model_id()).unwrap_or_else(model_arch::default_arch)
     }
 
     /// Guard the per-arch forward dispatch (A1): an IMPLEMENTED arch proceeds; a
@@ -748,10 +751,11 @@ impl OcrModel {
     /// in-memory image) funnel through here, so the two entry points run the
     /// byte-identical model pipeline once preprocessing has produced `pre`.
     fn forward_pre(&self, pre: Preprocessed) -> FocrResult<(String, u32, u32)> {
-        // Per-arch forward dispatch seam (model zoo, A1): only an IMPLEMENTED arch
-        // runs its forward. Today the only loadable arch is Unlimited-OCR (always
-        // implemented), so this never trips; it is the point where GOT-OCR2 /
-        // SmolVLM2 / … route to their own forward once those sub-epics land.
+        // Per-arch forward dispatch seam (model zoo, A1+A2): only an IMPLEMENTED arch
+        // runs its forward. `arch()` now reads the loaded artifact's `model_id` tag,
+        // so a (future) GOT-OCR2 / SmolVLM2 / … `.focrq` cleanly returns
+        // NotImplemented here until its sub-epic lands its own forward, rather than
+        // mis-running the Unlimited-OCR pipeline on foreign weights.
         Self::ensure_arch_implemented(self.arch())?;
         let (image_w, image_h) = Self::image_dims(&pre);
 
@@ -2395,5 +2399,45 @@ mod tests {
             err.to_string().contains("got-ocr2"),
             "names the arch: {err}"
         );
+    }
+
+    #[test]
+    fn arch_is_read_from_the_loaded_focrq_model_id_tag() {
+        use crate::native_engine::model_arch;
+        // A minimal got-ocr2-tagged .focrq (no tensors needed — arch() reads only
+        // the model_id the loader resolved). Proves A2's tag drives dispatch:
+        // loading must NOT silently mis-identify it as the default Unlimited-OCR.
+        let got_notice = model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 registered")
+            .license_notice();
+        let blob = crate::quant::focrq::FocrqBuilder::new()
+            .with_model_id("got-ocr2")
+            .with_license_notice(got_notice)
+            .build();
+        let path = std::env::temp_dir().join(format!(
+            "focr_arch_tag_{}_{}.focrq",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, &blob).unwrap();
+
+        let model = OcrModel::load(&path).expect("a tagged .focrq loads");
+        assert_eq!(
+            model.arch().id(),
+            "got-ocr2",
+            "arch() reads the model_id tag"
+        );
+
+        // …and the forward dispatch guard cleanly refuses the not-yet-implemented
+        // arch instead of running the Unlimited-OCR pipeline on foreign weights.
+        let err = OcrModel::ensure_arch_implemented(model.arch())
+            .expect_err("a planned arch's forward must be refused");
+        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
+        assert!(err.to_string().contains("got-ocr2"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
