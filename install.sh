@@ -26,10 +26,13 @@
 #   --help             Show this help and exit
 #
 # Environment:
-#   PREFIX             Install into $PREFIX/bin instead of ~/.local/bin
-#   VERSION            Same as --version
-#   HTTPS_PROXY        HTTPS proxy for downloads (preferred)
-#   HTTP_PROXY         HTTP proxy for downloads
+#   PREFIX                 Install into $PREFIX/bin instead of ~/.local/bin
+#   VERSION                Same as --version
+#   HTTPS_PROXY            HTTPS proxy for downloads (preferred)
+#   HTTP_PROXY             HTTP proxy for downloads
+#   FOCR_INSTALL_BASE_URL  Override the release base (corporate mirror / airgap
+#                          cache / the e2e installer test). The asset and its
+#                          .sha256 sidecar are fetched from directly under it.
 #
 # WINDOWS
 #   v0.1.0 ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
@@ -103,7 +106,7 @@ fi
 info() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 39 "-> $*"
+    gum style --foreground 39 -- "-> $*"
   else
     echo -e "\033[0;34m->\033[0m $*"
   fi
@@ -112,7 +115,7 @@ info() {
 ok() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 42 "ok $*"
+    gum style --foreground 42 -- "ok $*"
   else
     echo -e "\033[0;32mok\033[0m $*"
   fi
@@ -121,7 +124,7 @@ ok() {
 warn() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 214 "warn $*"
+    gum style --foreground 214 -- "warn $*"
   else
     echo -e "\033[1;33mwarn\033[0m $*"
   fi
@@ -130,7 +133,7 @@ warn() {
 # err is never silenced by --quiet; failures must always be visible.
 err() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "error $*"
+    gum style --foreground 196 -- "error $*"
   else
     echo -e "\033[0;31merror\033[0m $*"
   fi
@@ -238,10 +241,11 @@ Options:
   --help             Show this help and exit
 
 Environment:
-  PREFIX             Install into \$PREFIX/bin instead of ~/.local/bin
-  VERSION            Same as --version
-  HTTPS_PROXY        HTTPS proxy for downloads (preferred)
-  HTTP_PROXY         HTTP proxy for downloads
+  PREFIX                 Install into \$PREFIX/bin instead of ~/.local/bin
+  VERSION                Same as --version
+  HTTPS_PROXY            HTTPS proxy for downloads (preferred)
+  HTTP_PROXY             HTTP proxy for downloads
+  FOCR_INSTALL_BASE_URL  Override the release base URL (mirror / airgap / tests)
 
 Platforms with prebuilt binaries:
   macOS Apple Silicon, macOS Intel, Linux x86-64 (glibc), Linux ARM64 (glibc)
@@ -403,6 +407,13 @@ detect_platform() {
 # ============================================================================
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
+  # With a custom base URL (mirror/airgap/e2e test) there is no GitHub API to
+  # query; pin the fallback version rather than reaching out to the network.
+  if [ -n "${FOCR_INSTALL_BASE_URL:-}" ]; then
+    VERSION="$FALLBACK_VERSION"
+    info "Using $VERSION (custom FOCR_INSTALL_BASE_URL)"
+    return 0
+  fi
 
   info "Resolving the latest release..."
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
@@ -441,7 +452,11 @@ normalize_version() {
 }
 
 set_urls() {
-  BASE_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
+  # FOCR_INSTALL_BASE_URL overrides the release base (corporate mirror, airgap
+  # cache, or the e2e installer test serving a fake release over file://). When
+  # unset, the canonical GitHub releases URL is used. The asset + .sha256 sidecar
+  # are expected directly under the base.
+  BASE_URL="${FOCR_INSTALL_BASE_URL:-https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}}"
   ASSET_URL="${BASE_URL}/${ASSET}"
   SHA_URL="${ASSET_URL}.sha256"
 }
@@ -787,7 +802,7 @@ print_summary() {
       echo ""
       local line
       for line in "${lines[@]}"; do
-        gum style --foreground 245 "$line"
+        gum style --foreground 245 -- "$line"
       done
     } | gum style --border normal --border-foreground 42 --padding "1 2"
   else
