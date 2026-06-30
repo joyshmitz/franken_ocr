@@ -72,6 +72,27 @@ pub fn run_error_event(err: &FocrError) -> Value {
     })
 }
 
+/// Build a robot-mode `page` event recording that one document page was SKIPPED
+/// mid-run (e.g. an undecodable PDF page the resilient document loop dropped to
+/// keep the rest of the document).
+///
+/// This is the machine-stream counterpart of the human stderr warning: without
+/// it a robot consumer would receive a short document with no signal that pages
+/// were dropped. `page` is 1-based; `error_kind` mirrors [`FocrError::kind`] so
+/// the skip reason is machine-classifiable, and `message` carries the human
+/// detail. `page` is an advertised [`EVENT_KINDS`] kind, so this finalizes a slice
+/// of its payload without changing the advertised event set (schema stays v1).
+pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "page",
+        "status": "skipped",
+        "page": page,
+        "error_kind": err.kind(),
+        "message": err.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +161,18 @@ mod tests {
         assert_eq!(event["markdown"], "# Title\n\nbody text");
         // The terminal success event is an advertised kind (no schema bump).
         assert!(EVENT_KINDS.contains(&"run_complete"));
+    }
+
+    #[test]
+    fn page_skipped_event_classifies_the_skip() {
+        let event = page_skipped_event(7, &FocrError::InputDecode("bad xobject".into()));
+        assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
+        assert_eq!(event["event"], "page");
+        assert_eq!(event["status"], "skipped");
+        assert_eq!(event["page"], 7);
+        assert_eq!(event["error_kind"], "input_decode");
+        assert_eq!(event["message"], "input decode error: bad xobject");
+        // `page` is an advertised kind, so no schema bump is implied.
+        assert!(EVENT_KINDS.contains(&"page"));
     }
 }

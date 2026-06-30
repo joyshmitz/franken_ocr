@@ -152,10 +152,10 @@ pub struct ClipBlockWeights {
 
 /// All CLIP tower weights needed for [`forward_with`].
 ///
-/// This is the in-memory view the `.focrq` loader (bd-1es.3) will hydrate; the
-/// public [`forward`] entrypoint will pull these out of [`Weights`] once that
-/// reader exists. Keeping it explicit lets the tower be exercised end-to-end in
-/// unit tests with no model present.
+/// This is the in-memory view the `.focrq` loader (bd-1es.3) hydrates; the
+/// public [`forward`] entrypoint pulls these out of [`Weights`] through that
+/// reader's named-tensor accessors. Keeping it explicit lets the tower be
+/// exercised end-to-end in unit tests with no model present.
 #[derive(Debug, Clone)]
 pub struct ClipWeights {
     /// Learned class token, length `hidden_size` (`class_embedding`).
@@ -174,15 +174,15 @@ pub struct ClipWeights {
 /// Run the CLIP tower over the image with the SAM features as `patch_embeds`,
 /// returning the per-patch CLIP hidden states (class token included at row 0).
 ///
-/// This is the [`Weights`]-backed entrypoint the engine wires; until the
-/// `.focrq` reader (bd-1es.3) exposes typed tensor accessors there is nothing to
-/// hydrate a [`ClipWeights`] from, so it currently reports
-/// [`FocrError::NotImplemented`]. The real math lives in [`forward_with`], which
-/// is fully exercised by the unit tests below.
+/// This is the [`Weights`]-backed entrypoint the engine wires: the `.focrq`
+/// reader (bd-1es.3) exposes typed tensor accessors, so it hydrates a
+/// [`ClipWeights`] from [`Weights`] and runs the real math in [`forward_with`],
+/// which is fully exercised by the unit tests below.
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until the weight loader lands; thereafter
-/// whatever [`forward_with`] returns.
+/// Propagates accessor errors from building the [`ClipWeights`] (e.g. a missing
+/// or mis-shaped `model.vision_model.*` tensor) and whatever [`forward_with`]
+/// returns.
 pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResult<Mat> {
     let cfg = ClipConfig::default();
     ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;

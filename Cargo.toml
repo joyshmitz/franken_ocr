@@ -62,6 +62,14 @@ lopdf = { version = "0.43", default-features = false }
 # Pure-Rust CCITT Group 4 (T.6) fax decoder for bilevel scanned PDFs (the common
 # black-and-white scan filter). Already in the lock graph; no FFI.
 fax = "0.2"
+# Bounded zlib inflate for the sole-FlateDecode image path (src/pdf.rs): lopdf's
+# `Stream::decompressed_content` materializes the FULL inflated output before any
+# length check, so a tiny "zip bomb" stream (KBs inflating to GBs) is an OOM/DoS
+# vector. For a sole FlateDecode with no predictor we inflate it ourselves under an
+# explicit cap and reject overruns. Already in the lock graph (via lopdf/png/tiff);
+# declaring it a direct dep unifies on the same 1.x — no new crate, no FFI
+# (pure-Rust miniz_oxide backend).
+flate2 = "1"
 # Data-parallel fan-out for the bespoke single-token (m=1) decode GEMV kernels
 # (src/native_engine/decoder.rs `gemv`): the prefill GEMM is already threaded in
 # ft-kernel-cpu, but the decode GEMV falls below its threading threshold and was

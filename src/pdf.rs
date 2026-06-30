@@ -209,26 +209,125 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
         // `decompressed_content` handles Flate/LZW/ASCII85; ASCIIHexDecode is NOT
         // among them, so it falls through to the honest "unsupported" arm.
         "FlateDecode" | "LZWDecode" | "ASCII85Decode" | "" => {
-            let samples = decompressed_stream(doc, img.id)?;
+            // Bound the inflate at 4x the samples the (already MAX_PIXELS-bounded)
+            // declared dimensions could legitimately decode to, so a highly
+            // compressed "zip bomb" stream cannot inflate to GBs before any length
+            // check. Only a sole FlateDecode is inflated under this cap directly
+            // (see `decompressed_stream`); LZW/ASCII85/chains keep lopdf's decoder.
+            let cap = expected_sample_cap(width, height, bpc, color_space);
+            let sole_flate = !chained && terminal == "FlateDecode";
+            let samples = decompressed_stream(doc, img.id, img.content, sole_flate, cap)?;
             raw_samples_to_image(samples, width, height, bpc, color_space)
         }
         other => Err(format!("unsupported image filter {other}")),
     }
 }
 
-/// Re-fetch the image XObject as a stream and return its decompressed bytes.
+/// Re-fetch the image XObject as a stream and return its decompressed bytes,
+/// bounding the inflate so a decompression bomb cannot OOM the process.
 ///
-/// `PdfImage::content` is the *raw* stream slice (still deflate/LZW/ASCII
-/// encoded for those filters), so the samples must come from
-/// `Stream::decompressed_content`, which also un-applies PNG predictors.
-fn decompressed_stream(doc: &Document, id: ObjectId) -> Result<Vec<u8>, String> {
+/// `raw` is `PdfImage::content`, the *raw* stream slice (still deflate/LZW/ASCII
+/// encoded for those filters). lopdf's `Stream::decompressed_content` un-applies
+/// the whole filter chain (including PNG/TIFF predictors) but materializes the
+/// FULL inflated output before any length check — so a tiny, highly-compressed
+/// FlateDecode stream (a "zip bomb", ~1000:1) inflates to GBs regardless of the
+/// declared dimensions. For the common case — a SOLE FlateDecode with no predictor
+/// — we inflate `raw` ourselves under `cap` and reject an overrun, allocating at
+/// most `cap + 1` bytes. Everything else (LZW, ASCII85, filter chains, or a
+/// `/Predictor > 1` that needs un-applying) falls back to `decompressed_content`;
+/// those paths keep lopdf's residual unbounded-inflate risk.
+fn decompressed_stream(
+    doc: &Document,
+    id: ObjectId,
+    raw: &[u8],
+    sole_flate: bool,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
     let stream = doc
         .get_object(id)
         .and_then(Object::as_stream)
         .map_err(|e| format!("read image stream: {e}"))?;
+    // Bounded fast path only when nothing downstream of the inflate is needed: a
+    // single FlateDecode with no PNG/TIFF predictor. A predictor (>1) or any chain
+    // would need lopdf's post-processing, so those keep the unbounded decoder. The
+    // `?` still propagates a cap overrun (the bomb signal) before the `let Some`.
+    if sole_flate
+        && stream_predictor(stream) <= 1
+        && let Some(out) = bounded_inflate(raw, cap)?
+    {
+        return Ok(out);
+    }
+    // The bounded path did not apply, or `raw` was not decodable as standalone zlib
+    // (e.g. a headerless raw-deflate stream some producers emit); fall back to
+    // lopdf's framing-tolerant decoder.
     stream
         .decompressed_content()
         .map_err(|e| format!("inflate image stream: {e}"))
+}
+
+/// The `/Predictor` in a stream's `/DecodeParms` (or its `/DP` abbreviation), or
+/// `1` (no predictor) when absent. A sole-filter stream carries `DecodeParms` as a
+/// single dict; the array form (filter chains) is never routed to the bounded path.
+fn stream_predictor(stream: &lopdf::Stream) -> i64 {
+    stream
+        .dict
+        .get(b"DecodeParms")
+        .or_else(|_| stream.dict.get(b"DP"))
+        .and_then(Object::as_dict)
+        .ok()
+        .and_then(|p| p.get(b"Predictor").ok())
+        .and_then(|o| o.as_i64().ok())
+        .unwrap_or(1)
+}
+
+/// Inflate a sole-FlateDecode (zlib) stream, refusing to allocate past `cap`.
+///
+/// PDF `/FlateDecode` is the zlib data format (RFC 1950), so `ZlibDecoder` is the
+/// right reader. Reading just one byte past `cap` distinguishes "fits" from
+/// "overruns" without buffering the whole bomb. Returns `Ok(None)` — *not* an error
+/// — when `raw` is not valid standalone zlib, so the caller can fall back to lopdf's
+/// framing-tolerant decoder; a clean inflate that overruns `cap` is the bomb signal
+/// and is the only `Err`.
+fn bounded_inflate(raw: &[u8], cap: u64) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    if flate2::read::ZlibDecoder::new(raw)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if out.len() as u64 > cap {
+        return Err(format!(
+            "decompressed image stream exceeds the {cap}-byte cap \
+             (4x the expected sample size; possible decompression bomb)"
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// A generous cap on the inflated sample buffer: `4 × width × height × components ×
+/// ceil(bpc/8)`.
+///
+/// The declared dimensions are already `MAX_PIXELS`-bounded, so this bounds a
+/// decompression bomb to a small multiple of the bytes those dimensions could
+/// legitimately decode to, instead of the GBs an adversarial stream would inflate
+/// to. Unknown color spaces get the 4-component (CMYK) upper bound;
+/// `raw_samples_to_image` rejects them afterward. `saturating_mul` keeps the
+/// arithmetic from overflowing on hostile inputs.
+fn expected_sample_cap(width: u32, height: u32, bpc: i64, color_space: &str) -> u64 {
+    let comps: u64 = match color_space {
+        "DeviceGray" | "CalGray" => 1,
+        "DeviceRGB" | "CalRGB" => 3,
+        _ => 4, // DeviceCMYK and any unknown: the largest plausible component count
+    };
+    let bytes_per_comp = (bpc.max(1) as u64).div_ceil(8);
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(comps)
+        .saturating_mul(bytes_per_comp)
+        .saturating_mul(4)
 }
 
 /// Build a [`DynamicImage`] from raw component samples.

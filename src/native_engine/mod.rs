@@ -67,9 +67,9 @@ use weights::{DType, Weights};
 pub struct OcrModel {
     /// Filesystem path the model was resolved + loaded from (provenance).
     path: PathBuf,
-    /// The loaded weight set. Still a Phase-2 stub with no tensor accessors;
-    /// every `Weights`-backed stage entrypoint therefore surfaces a clean
-    /// [`FocrError::NotImplemented`] until the `.focrq` reader (bd-1es.3) lands.
+    /// The loaded weight set. The `.focrq` reader (bd-1es.3) is wired, so every
+    /// `Weights`-backed stage entrypoint hydrates its named tensors and runs the
+    /// real math.
     weights: Weights,
     /// Frozen greedy decode contract (temperature 0, EOS 1, no_repeat_ngram 35,
     /// single-image window 128). Built once at load so the AR loop reads a
@@ -887,13 +887,12 @@ impl OcrModel {
     /// `patch_embeds`) [`vision_clip::forward`] -> [`vision_bridge::forward`]
     /// (concat CLIP[:,1:] ++ SAM, then the linear projector). The SAM/CLIP/bridge
     /// kernels are implemented and tested over explicit weight bundles; the
-    /// `Weights`-backed entrypoints used here surface
-    /// [`FocrError::NotImplemented`] until the `.focrq` reader exposes their named
-    /// tensors (bd-1es.3).
+    /// `Weights`-backed entrypoints used here hydrate their named tensors via the
+    /// `.focrq` reader (bd-1es.3) and run the real math.
     ///
     /// # Errors
-    /// The first vision-stage error (today [`FocrError::NotImplemented`] from the
-    /// `Weights`-backed SAM/CLIP/bridge entrypoints).
+    /// The first vision-stage error (e.g. a missing or mis-shaped tensor surfaced
+    /// by the `Weights`-backed SAM/CLIP/bridge entrypoints, or a kernel failure).
     fn vision_tower(&self, pre: &Preprocessed) -> FocrResult<Vec<Mat>> {
         let mut features = Vec::new();
         for view in Self::views(pre) {

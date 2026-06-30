@@ -528,9 +528,11 @@ where
 ///
 /// **Per-page resilience (mirrors the `ocr-batch` path):** a page that cannot be
 /// rendered or recognized — an unsupported codec (`JPXDecode`/`JBIG2Decode`), a
-/// vector/text page, a per-page decode or timeout error — is logged to stderr and
-/// SKIPPED, so one bad page never discards (nor wastes the compute already spent
-/// on) the OCR of every other page. The **whole-run** conditions are propagated
+/// vector/text page, a per-page decode or timeout error — is SKIPPED, so one bad
+/// page never discards (nor wastes the compute already spent on) the OCR of every
+/// other page. The skip is surfaced so it is never silent: a structured `page`
+/// NDJSON event ([`robot::page_skipped_event`]) in robot mode, else a human stderr
+/// warning. The **whole-run** conditions are propagated
 /// immediately instead of being swallowed per-page:
 /// * [`FocrError::ModelNotFound`] — lets [`recognize_with_autodownload`] offer the
 ///   first-run download and retry the whole document;
@@ -571,10 +573,15 @@ fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> 
                     | FocrError::Cancelled
                     | FocrError::FormatMismatch(_)),
                 ) => return Err(e),
-                // Isolate every other per-page failure: warn and skip, keeping the
-                // rest of the document. (stderr only, never in robot mode.)
+                // Isolate every other per-page failure: skip it, keeping the rest
+                // of the document, but SURFACE the skip on whichever stream the
+                // caller is reading — a structured `page` NDJSON event in robot
+                // mode (so a machine consumer can tell the document is missing
+                // pages), else a human stderr warning.
                 Err(e) => {
-                    if !robot_mode {
+                    if robot_mode {
+                        emit(&robot::page_skipped_event(idx + 1, &e));
+                    } else {
                         eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
                     }
                     if first_error.is_none() {

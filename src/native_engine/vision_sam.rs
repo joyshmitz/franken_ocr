@@ -13,9 +13,8 @@
 //! Weights are owned by the parallel weights wave; this module operates over a
 //! [`SamWeights`] parameter bundle so the full math is unit-testable on tiny
 //! synthetic inputs with no model present. The public [`forward`] entrypoint
-//! adapts a loaded [`Weights`] into a [`SamWeights`] once the `.focrq` reader
-//! exposes named tensors (Phase 2, bd-1es.3); until then it surfaces a clear
-//! `NotImplemented` rather than fabricating output.
+//! adapts a loaded [`Weights`] into a [`SamWeights`] through the `.focrq`
+//! reader's named-tensor accessors (bd-1es.3) and runs the real SAM forward.
 
 use super::nn;
 use super::tensor::Mat;
@@ -253,9 +252,10 @@ pub struct SamWeights {
 /// (`flatten(2)` layout, OQ-6).
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until the `.focrq` reader (Phase 2) exposes
-/// named SAM tensors to build a [`SamWeights`]. The real math lives in
-/// [`forward_with`], which is exercised by the unit tests below.
+/// Propagates accessor errors from building the [`SamWeights`] (e.g. a missing
+/// or mis-shaped `model.sam_model.*` tensor), the input-shape checks above, and
+/// whatever [`forward_with`] returns. The real math lives in [`forward_with`],
+/// which is exercised by the unit tests below.
 pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
     if image.rows != 3 {
         return Err(FocrError::Other(anyhow::anyhow!(
