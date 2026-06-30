@@ -23,6 +23,7 @@
 pub mod batch_scheduler;
 pub mod connector;
 pub mod decoder;
+pub mod model_arch;
 pub mod moe;
 pub mod nn;
 pub mod postprocess;

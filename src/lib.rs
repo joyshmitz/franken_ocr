@@ -34,6 +34,9 @@ pub mod tokenizer;
 
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
+/// Multi-model architecture descriptors + registry (the "model zoo" foundation,
+/// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
+pub use native_engine::model_arch;
 pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
 
 use std::path::Path;
