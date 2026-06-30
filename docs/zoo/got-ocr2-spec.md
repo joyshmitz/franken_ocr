@@ -184,11 +184,12 @@ Resolved by reading `config.json`, `generation_config.json`, `qwen.tiktoken`, an
 **safetensors header** (472 tensors, parsed from a 1.5 MB range probe — no full download
 needed to inventory keys):
 
-- **OQ-1 RESOLVED.** `lm_head.weight` **IS stored separately** ([151860,1024] BF16)
-  alongside `model.embed_tokens.weight` ([151860,1024] BF16) — both present despite
-  `tie_word_embeddings=true`. This is the extra ~155 M params that make the file 1.43 GB
-  bf16 (~715 M) vs the 580 M headline. **Decision:** load `lm_head.weight` directly; when
-  the full file lands, verify it byte-equals `embed_tokens` (tied) and store one copy if so.
+- **OQ-1 RESOLVED (final, verified against the full 1.43 GB download).** `lm_head.weight`
+  and `model.embed_tokens.weight` are both stored ([151860,1024] BF16) AND are
+  **byte-identical** (same SHA-256 over the tensor data) — genuinely tied. The duplicate
+  is the extra ~155 M params that make the file 1.43 GB bf16 (~715 M) vs the 580 M headline.
+  **Decision:** the `.focrq` stores ONE copy and uses it for both `embed_tokens` and `lm_head`.
+  (Full file verified complete: 472 tensors, max data offset + header == file size 1432121416 B.)
 - **OQ-2 RESOLVED.** Each decoder layer has `self_attn.{q,k,v}_proj.bias` ([1024]) and
   `self_attn.o_proj.weight` with **no `o_proj.bias`**; MLP and norms are unbiased. (Qwen2 default.)
 - **OQ-3 RESOLVED.** `qwen.tiktoken` = 151643 base BPE entries (ranks 0..151642); specials
