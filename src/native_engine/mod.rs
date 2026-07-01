@@ -89,6 +89,10 @@ pub struct OcrModel {
     /// page of a multi-page document (e.g. a PDF) instead of re-reading and
     /// re-parsing the file on every prompt-build and detokenize call.
     tokenizer: std::sync::OnceLock<crate::tokenizer::Tokenizer>,
+    /// Lazily-loaded GOT-OCR2 Qwen tiktoken tokenizer (from `qwen.tiktoken` beside
+    /// the model). Only populated for the `got-ocr2` arch; the Baidu path uses
+    /// [`Self::tokenizer`] above.
+    got_tokenizer: std::sync::OnceLock<crate::tokenizer::tiktoken::Tiktoken>,
 }
 
 /// Process-global cache of the last-loaded model, keyed by resolved path.
@@ -632,6 +636,7 @@ impl OcrModel {
             decode_params: decode_params_from_env(),
             decoder_cache_i8: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
+            got_tokenizer: std::sync::OnceLock::new(),
         });
 
         let mut guard = model_cache_guard()?;
@@ -690,6 +695,9 @@ impl OcrModel {
     /// if a required tensor is absent from the loaded weights, or an image-decode
     /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
+        if self.arch().id() == "got-ocr2" {
+            return self.forward_got(&preprocess::decode_path(image_path)?);
+        }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         let pre = preprocess::preprocess_image(
@@ -708,6 +716,9 @@ impl OcrModel {
     /// # Errors
     /// As [`Self::forward`] (sans the file-open path).
     pub fn forward_dynamic(&self, img: image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        if self.arch().id() == "got-ocr2" {
+            return self.forward_got(&img);
+        }
         let t = std::time::Instant::now();
         let pre = preprocess::preprocess_dynamic(
             img,
@@ -715,6 +726,47 @@ impl OcrModel {
         )?;
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
+    }
+
+    /// The GOT-OCR2 forward path (bead B3/B5/B7): squash-bicubic-1024/CLIP preprocess
+    /// → SAM-ViT-B vision + `mm_projector_vary` connector + `<imgpad>` splice →
+    /// Qwen2 dense decoder greedy generation → tiktoken decode. Returns the decoded
+    /// text plus source pixel dims (for the postprocess geometry the wrappers share).
+    fn forward_got(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        use image::GenericImageView;
+        let t = std::time::Instant::now();
+        let (w, h) = img.dimensions();
+        let tk = self.got_tokenizer()?;
+        // The greedy AR loop re-runs prefill per token (correct, O(n²)); the model
+        // stops at <|im_end|>. Cap length defensively (config max_new_tokens 4096).
+        let text = got::recognize(
+            &self.weights,
+            tk,
+            img,
+            self.arch().vision_tower_prefix(),
+            4096,
+        )?;
+        timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
+        Ok((text, w, h))
+    }
+
+    /// The GOT Qwen tiktoken tokenizer, loaded from `qwen.tiktoken` beside the
+    /// model and cached. (The Baidu path uses [`Self::tokenizer`].)
+    fn got_tokenizer(&self) -> FocrResult<&crate::tokenizer::tiktoken::Tiktoken> {
+        if let Some(t) = self.got_tokenizer.get() {
+            return Ok(t);
+        }
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let path = dir.join("qwen.tiktoken");
+        let bytes = std::fs::read(&path).map_err(|e| {
+            FocrError::ModelNotFound(format!(
+                "GOT-OCR2 tokenizer qwen.tiktoken not found beside the model at {}: {e}",
+                path.display()
+            ))
+        })?;
+        let loaded = crate::tokenizer::tiktoken::Tiktoken::from_qwen_tiktoken(&bytes)?;
+        let _ = self.got_tokenizer.set(loaded);
+        Ok(self.got_tokenizer.get().expect("got tokenizer just set"))
     }
 
     /// The model architecture this loaded model is — the [`model_arch::ModelArch`]

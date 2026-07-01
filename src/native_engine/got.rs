@@ -21,10 +21,18 @@
 //! the known CatmullRom-vs-bicubic resample tolerance, which the preprocess gate
 //! covers separately). See the `#[cfg(test)]` seam gate.
 
+use image::DynamicImage;
+
+use super::decoder_qwen2::{self, DecoderConfig};
 use super::tensor::Mat;
 use super::weights::Weights;
 use super::{connector, decoder, vision_sam};
 use crate::error::FocrResult;
+use crate::preprocess;
+use crate::tokenizer::tiktoken::Tiktoken;
+
+/// GOT generation stop id (`<|im_end|>`).
+pub const EOS_ID: u32 = 151_645;
 
 /// The GOT `<imgpad>` per-patch image token (spec §5): the prompt slot a projected
 /// vision-feature row overwrites.
@@ -73,6 +81,48 @@ pub fn build_inputs_embeds(
     let mask: Vec<bool> = prompt_ids.iter().map(|&id| id == IMG_PAD_ID).collect();
     connector::masked_scatter(&mut inputs_embeds, &tokens, &mask)?;
     Ok(inputs_embeds)
+}
+
+/// Build the GOT plain-OCR prompt id-stream (the `ocr_type != "format"` path of
+/// `GOTQwenForCausalLM.chat`): the MPT system turn, the `<img><imgpad>×256</img>`
+/// image splice, the `OCR: ` instruction, and the assistant role marker. Encoded
+/// with all specials enabled — token-id-EXACT to the torch oracle's 287-id
+/// `l0c_prompt_ids` (proven by `tiktoken::tests::prompt_id_oracle_cross_check`).
+///
+/// # Errors
+/// A tokenizer encode error (impossible for this fixed ASCII prompt).
+pub fn plain_ocr_prompt_ids(tk: &Tiktoken) -> FocrResult<Vec<u32>> {
+    let system = "<|im_start|>system\n        You should follow the instructions carefully and explain your answers in detail.";
+    let imgpad = "<imgpad>".repeat(IMAGE_TOKEN_LEN);
+    let prompt = format!(
+        "{system}<|im_end|><|im_start|>user\n<img>{imgpad}</img>\nOCR: <|im_end|><|im_start|>assistant\n"
+    );
+    tk.encode(&prompt)
+}
+
+/// End-to-end GOT-OCR2 recognition: squash-bicubic-1024/CLIP preprocess → SAM
+/// vision + connector + `<imgpad>` splice → Qwen2 dense decoder greedy generation →
+/// tiktoken decode (specials stripped). `prefix` is the arch's vision-tower tensor
+/// prefix (`model.vision_tower_high`); `max_new` caps the generated length.
+///
+/// The generation is the correct, unoptimized O(n²) prefill-per-step path (the
+/// KV-cache decode-step is the perf follow-on); it stops early at `<|im_end|>`.
+///
+/// # Errors
+/// A preprocess, vision, decode, or tokenizer error.
+pub fn recognize(
+    weights: &Weights,
+    tk: &Tiktoken,
+    img: &DynamicImage,
+    prefix: &str,
+    max_new: usize,
+) -> FocrResult<String> {
+    let image = preprocess::got_view_tensor(img);
+    let prompt_ids = plain_ocr_prompt_ids(tk)?;
+    let inputs_embeds = build_inputs_embeds(weights, &image, &prompt_ids, prefix)?;
+    let cfg = DecoderConfig::got_ocr2();
+    let ids = decoder_qwen2::generate_greedy(weights, &cfg, &inputs_embeds, max_new, EOS_ID)?;
+    Ok(tk.decode_skip_special(&ids)?.trim().to_string())
 }
 
 /// `[r, c]` row-major → `[c, r]` row-major (channel-major SAM output → token-major).
