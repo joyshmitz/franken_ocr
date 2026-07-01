@@ -119,14 +119,25 @@ pub fn recognize(
     max_new: usize,
     format: bool,
 ) -> FocrResult<String> {
+    let tv = std::time::Instant::now();
     let image = preprocess::got_view_tensor(img);
     let prompt_ids = ocr_prompt_ids(tk, format)?;
     let inputs_embeds = build_inputs_embeds(weights, &image, &prompt_ids, prefix)?;
+    super::timing_log(&format!(
+        "  got.vision+splice {:.2}s",
+        tv.elapsed().as_secs_f64()
+    ));
+    let tg = std::time::Instant::now();
     let cfg = DecoderConfig::got_ocr2();
-    // The O(n)-per-token KV-cache decode (B9) — bit-identical to the certified
-    // re-prefill `generate_greedy`, but usable on real (long) documents.
+    // The O(n)-per-token KV-cache decode (B9): one seeding prefill then a full-causal
+    // decode step per token, all int8 GEMMs through the n-parallel `gemv`.
     let ids =
         decoder_qwen2::generate_greedy_kvcache(weights, &cfg, &inputs_embeds, max_new, EOS_ID)?;
+    super::timing_log(&format!(
+        "  got.generate {} tokens {:.2}s",
+        ids.len(),
+        tg.elapsed().as_secs_f64()
+    ));
     Ok(tk.decode_skip_special(&ids)?.trim().to_string())
 }
 

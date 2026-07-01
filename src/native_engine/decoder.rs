@@ -366,6 +366,30 @@ pub fn norm_and_lm_head(
     lm_head_proj(&normed, head_w, vocab)
 }
 
+/// [`norm_and_lm_head`] with the head weight **already transposed** to a matmul-ready
+/// `[hidden, vocab]` [`Mat`] — **bit-identical** logits (same `rms_norm`, same
+/// `nn::matmul`), but WITHOUT re-transposing the (large, tied) embedding on every call.
+///
+/// The naive [`lm_head_proj`]/[`linear_no_bias`] path transposes the whole
+/// `[vocab, hidden]` head matrix per call (~0.6 GB for GOT's 151860×1024). The
+/// O(n)-per-token KV-cache decode invokes the head once per generated token, so that
+/// redundant transpose measured as **~95% of decode wall-clock** (463 s of a 487 s
+/// page). Loop callers build the transpose ONCE and pass it here; the one-shot seeding
+/// prefill keeps the naive path. Numerically identical, so parity/oracle gates hold.
+///
+/// # Errors
+/// [`FocrError::Other`] on any `rms_norm`/`matmul` shape mismatch (e.g.
+/// `head_wt.rows != hidden.cols`).
+pub(crate) fn norm_and_lm_head_pretransposed(
+    hidden: &Mat,
+    norm_w: &[f32],
+    head_wt: &Mat,
+    eps: f32,
+) -> FocrResult<Mat> {
+    let normed = nn::rms_norm(hidden, Some(norm_w), eps)?;
+    nn::matmul(&normed, head_wt)
+}
+
 /// Project (already-normed) hidden states to vocab logits — the bare
 /// `lm_head` GEMM `[seq, hidden] x [vocab, hidden]^T -> [seq, vocab]`
 /// ([SPEC-081]).
@@ -1612,6 +1636,44 @@ fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
                 *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
             }
         });
+    y
+}
+
+/// Ties-to-even twin of [`quantize_row_i8`] — matches the prefill's
+/// `nn::linear_int8_dynamic` (which quantizes activations ties-to-even), so a decode
+/// m=1 GEMV built on it is numerically consistent with the certified prefill. Same
+/// `scale = max|x|/127`. (GOT decode throughput, bead B9.)
+#[inline]
+pub(crate) fn quantize_row_i8_te(x: &[f32]) -> (Vec<i8>, f32) {
+    let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let a_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let inv = 1.0 / a_scale;
+    let xq: Vec<i8> = x
+        .iter()
+        .map(|&v| (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (xq, a_scale)
+}
+
+/// n-parallel m=1 int8 GEMV from a PRE-QUANTIZED activation `(xq, a_scale)`, adding
+/// an optional per-output f32 `bias` after dequant. Reuses [`gemv_i8_prequant`] (the
+/// output channels fan across the rayon pool — the decode kernel that keeps m=1 fast,
+/// vs `nn::linear_int8_dynamic` which parallelizes over the m=1 row = single-thread).
+/// The fused-qkv decode quantizes the normed row ONCE and feeds q/k/v (one `[3·d, h]`
+/// panel + concatenated biases) through a single call.
+pub(crate) fn gemv_i8_bias_prequant(
+    xq: &[i8],
+    a_scale: f32,
+    qw: &QInt8,
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
+    let mut y = gemv_i8_prequant(xq, a_scale, qw);
+    if let Some(b) = bias {
+        debug_assert_eq!(b.len(), y.len());
+        for (v, &bb) in y.iter_mut().zip(b) {
+            *v += bb;
+        }
+    }
     y
 }
 

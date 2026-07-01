@@ -26,15 +26,26 @@
 //!
 //! Generation: [`generate_greedy`] is the correct O(n²) re-prefill path (the parity
 //! oracle); [`generate_greedy_kvcache`] (bead B9) is the O(n)-per-token full-causal
-//! **KV-cache** decode used in production — held bit-identical to `generate_greedy`
-//! (hence the torch oracle L4) by routing every decode GEMM through the SAME
-//! `nn::linear_int8_dynamic` (ties-to-even) the prefill uses.
+//! **KV-cache** decode used in production. The seeding prefill stays on the row-parallel
+//! `nn::linear_int8_dynamic` (m = N); each single-token decode step (m = 1) instead
+//! runs the **n-parallel** `gemv_i8_bias_prequant` — same int8 weights, activations
+//! quantized ties-to-even (`quantize_row_i8_te`) to match the prefill — so the decode
+//! stays **argmax-exact** to `generate_greedy` (hence the torch oracle L4) while giving
+//! every core work at m = 1 (the row-parallel kernel is single-threaded there).
 
 use super::decoder;
 use super::nn;
 use super::tensor::{Mat, QInt8};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Decode-step wall-clock accumulators (ns), summed across the whole generate loop.
+/// Read + printed only when `FOCR_TIMING` is set (perf bring-up); the `fetch_add`s
+/// are `Relaxed` and off the hot numeric path, so they cost nothing measurable.
+static DECODE_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+static DECODE_GEMV_NS: AtomicU64 = AtomicU64::new(0);
+static DECODE_LMHEAD_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Config of a dense (Qwen2/Llama-style) decoder — the parameters the shared leaf
 /// kernels need, so one driver serves GOT-OCR2 (and later SmolVLM2/OneChart).
@@ -432,23 +443,42 @@ fn qwen2_decode_attention(
 struct GotLayerW {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
-    q: QInt8,
-    k: QInt8,
-    v: QInt8,
+    /// Fused q|k|v projection `[3·qkv_dim, hidden]` (one int8 panel) so the decode
+    /// quantizes the normed row ONCE and runs ONE n-parallel GEMV for all three.
+    qkv: QInt8,
+    qkv_bias: Vec<f32>,
     o: QInt8,
     gate: QInt8,
     up: QInt8,
     down: QInt8,
-    q_b: Vec<f32>,
-    k_b: Vec<f32>,
-    v_b: Vec<f32>,
+}
+
+/// Concatenate the row-major q/k/v `[d, h]` int8 panels + scales into one
+/// `[3·d, h]` [`QInt8`] — bit-identical per-output-channel to the three separate
+/// GEMMs (each output channel keeps its own scale), but one dispatch.
+fn concat_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
+    let mut w = Vec::with_capacity(q.w.len() * 3);
+    w.extend_from_slice(&q.w);
+    w.extend_from_slice(&k.w);
+    w.extend_from_slice(&v.w);
+    let mut scales = Vec::with_capacity(q.n * 3);
+    scales.extend_from_slice(&q.scales);
+    scales.extend_from_slice(&k.scales);
+    scales.extend_from_slice(&v.scales);
+    QInt8::new(w, scales, q.n * 3, q.k)
 }
 
 /// The whole GOT decoder's decode-time weights (pre-loaded once for a generation).
 struct GotDecodeWeights {
     layers: Vec<GotLayerW>,
     final_norm: Vec<f32>,
+    /// Tied `embed_tokens` `[vocab, hidden]`, row-major — the per-token embed lookup.
     embed: Vec<f32>,
+    /// The SAME weights transposed to `[hidden, vocab]` ONCE at build, matmul-ready for
+    /// the decode-step `lm_head` so it never re-transposes the ~0.6 GB matrix per token
+    /// (that transpose was 95% of decode wall-clock). See
+    /// [`decoder::norm_and_lm_head_pretransposed`].
+    lm_head_t: Mat,
     cfg: DecoderConfig,
 }
 
@@ -458,24 +488,29 @@ impl GotDecodeWeights {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
+            let q = decoder::quant_oc_loaded(
+                weights,
+                &format!("{p}.self_attn.q_proj.weight"),
+                qkv_dim,
+            )?;
+            let k = decoder::quant_oc_loaded(
+                weights,
+                &format!("{p}.self_attn.k_proj.weight"),
+                qkv_dim,
+            )?;
+            let v = decoder::quant_oc_loaded(
+                weights,
+                &format!("{p}.self_attn.v_proj.weight"),
+                qkv_dim,
+            )?;
+            let mut qkv_bias = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
+            qkv_bias.extend(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?);
+            qkv_bias.extend(weights.vec(&format!("{p}.self_attn.v_proj.bias"))?);
             layers.push(GotLayerW {
                 input_ln: weights.vec(&format!("{p}.input_layernorm.weight"))?,
                 post_attn_ln: weights.vec(&format!("{p}.post_attention_layernorm.weight"))?,
-                q: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    qkv_dim,
-                )?,
-                k: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    qkv_dim,
-                )?,
-                v: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    qkv_dim,
-                )?,
+                qkv: concat_qkv(&q, &k, &v),
+                qkv_bias,
                 o: decoder::quant_oc_loaded(
                     weights,
                     &format!("{p}.self_attn.o_proj.weight"),
@@ -492,15 +527,27 @@ impl GotDecodeWeights {
                     &format!("{p}.mlp.down_proj.weight"),
                     hidden,
                 )?,
-                q_b: weights.vec(&format!("{p}.self_attn.q_proj.bias"))?,
-                k_b: weights.vec(&format!("{p}.self_attn.k_proj.bias"))?,
-                v_b: weights.vec(&format!("{p}.self_attn.v_proj.bias"))?,
             });
         }
+        let embed = weights.mat("model.embed_tokens.weight")?.data;
+        // Transpose the tied head `[vocab, hidden]` -> `[hidden, vocab]` ONCE here (the
+        // SAME transpose `linear_no_bias` does per call), so the decode-step lm_head is a
+        // plain matmul against a matmul-ready `Mat` — bit-identical logits, no per-token
+        // ~0.6 GB re-transpose (which was 95% of decode wall-clock).
+        let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
+        let mut wt = vec![0.0f32; embed.len()];
+        for o in 0..vocab {
+            let src = &embed[o * hidden..(o + 1) * hidden];
+            for (i, &val) in src.iter().enumerate() {
+                wt[i * vocab + o] = val;
+            }
+        }
+        let lm_head_t = Mat::from_vec(hidden, vocab, wt);
         Ok(Self {
             layers,
             final_norm: weights.vec("model.norm.weight")?,
-            embed: weights.mat("model.embed_tokens.weight")?.data,
+            embed,
+            lm_head_t,
             cfg: *cfg,
         })
     }
@@ -519,11 +566,12 @@ fn forward_prefill_seed(
     let mut x = inputs_embeds.clone();
     let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
+    let qkv_dim = cfg.qkv_dim();
     for (l, cl) in w.layers.iter().enumerate() {
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
-        let mut q = nn::linear_int8_dynamic(&normed, &cl.q, Some(&cl.q_b))?;
-        let mut k = nn::linear_int8_dynamic(&normed, &cl.k, Some(&cl.k_b))?;
-        let v = nn::linear_int8_dynamic(&normed, &cl.v, Some(&cl.v_b))?;
+        // one fused q|k|v GEMM (m=N, row-parallel), then split the columns.
+        let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, Some(&cl.qkv_bias))?;
+        let (mut q, mut k, v) = split_qkv_rows(&qkv, qkv_dim);
         decoder::apply_rope(&mut q, &rope)?;
         decoder::apply_rope(&mut k, &rope)?;
         caches[l].seed(&k.data, &v.data); // the very K/V prefill_attention consumes
@@ -538,6 +586,27 @@ fn forward_prefill_seed(
     Ok(logits.data[(logits.rows - 1) * cfg.vocab_size..].to_vec())
 }
 
+/// Split a fused `[N, 3·d]` q|k|v activation into three `[N, d]` mats (column blocks).
+fn split_qkv_rows(fused: &Mat, d: usize) -> (Mat, Mat, Mat) {
+    let n = fused.rows;
+    let (mut q, mut k, mut v) = (
+        vec![0.0f32; n * d],
+        vec![0.0f32; n * d],
+        vec![0.0f32; n * d],
+    );
+    for r in 0..n {
+        let row = &fused.data[r * 3 * d..(r + 1) * 3 * d];
+        q[r * d..(r + 1) * d].copy_from_slice(&row[0..d]);
+        k[r * d..(r + 1) * d].copy_from_slice(&row[d..2 * d]);
+        v[r * d..(r + 1) * d].copy_from_slice(&row[2 * d..3 * d]);
+    }
+    (
+        Mat::from_vec(n, d, q),
+        Mat::from_vec(n, d, k),
+        Mat::from_vec(n, d, v),
+    )
+}
+
 /// One decode step over a single token embedding `x: [1, hidden]` at absolute
 /// `position`, appending to `caches`. Returns the `[vocab]` next-token logits.
 fn qwen2_decode_step(
@@ -547,27 +616,49 @@ fn qwen2_decode_step(
     position: usize,
 ) -> FocrResult<Vec<f32>> {
     let cfg = &w.cfg;
-    let (qkv_dim, eps) = (cfg.qkv_dim(), cfg.rms_norm_eps);
-    let rope = decoder::RopeTable::build(&[position], cfg.head_dim, cfg.rope_theta);
+    let (hidden, qkv_dim, eps) = (cfg.hidden_size, cfg.qkv_dim(), cfg.rms_norm_eps);
+    let (num_heads, head_dim) = (cfg.num_attention_heads, cfg.head_dim);
+    let rope = decoder::RopeTable::build(&[position], head_dim, cfg.rope_theta);
     let mut x = x.clone();
+    let tlayers = std::time::Instant::now();
     for (l, cl) in w.layers.iter().enumerate() {
+        // ── attention: quantize the normed row ONCE, fused q|k|v GEMV (n-parallel) ──
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
-        let mut q = nn::linear_int8_dynamic(&normed, &cl.q, Some(&cl.q_b))?;
-        let mut k = nn::linear_int8_dynamic(&normed, &cl.k, Some(&cl.k_b))?;
-        let v = nn::linear_int8_dynamic(&normed, &cl.v, Some(&cl.v_b))?;
+        let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
+        let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, Some(&cl.qkv_bias));
+        let mut q = Mat::from_vec(1, qkv_dim, qkv[0..qkv_dim].to_vec());
+        let mut k = Mat::from_vec(1, qkv_dim, qkv[qkv_dim..2 * qkv_dim].to_vec());
+        let v = &qkv[2 * qkv_dim..3 * qkv_dim];
         decoder::apply_rope(&mut q, &rope)?;
         decoder::apply_rope(&mut k, &rope)?;
-        caches[l].append(&k.data, &v.data);
-        let ctx =
-            qwen2_decode_attention(&caches[l], &q.data, cfg.num_attention_heads, cfg.head_dim);
-        let ctx = Mat::from_vec(1, qkv_dim, ctx);
-        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, None)?;
-        let h = decoder::add_residual(&x, &attn)?;
+        caches[l].append(&k.data, v);
+        let ta = std::time::Instant::now();
+        let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim);
+        DECODE_ATTN_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let (xqc, ac) = decoder::quantize_row_i8_te(&ctx);
+        let attn = decoder::gemv_i8_bias_prequant(&xqc, ac, &cl.o, None);
+        let h = decoder::add_residual(&x, &Mat::from_vec(1, hidden, attn))?;
+        // ── dense SwiGLU: quantize normed2 ONCE, share it for gate + up ──────────
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-        let mlp = decoder::expert_mlp_i8(&normed2, &cl.gate, &cl.up, &cl.down)?;
-        x = decoder::add_residual(&h, &mlp)?;
+        let (xq2, a2) = decoder::quantize_row_i8_te(&normed2.data);
+        let mut gate = Mat::from_vec(
+            1,
+            cfg.intermediate_size,
+            decoder::gemv_i8_bias_prequant(&xq2, a2, &cl.gate, None),
+        );
+        let up = decoder::gemv_i8_bias_prequant(&xq2, a2, &cl.up, None);
+        nn::silu(&mut gate);
+        for (g, &u) in gate.data.iter_mut().zip(up.iter()) {
+            *g *= u;
+        }
+        let (xq3, a3) = decoder::quantize_row_i8_te(&gate.data);
+        let down = decoder::gemv_i8_bias_prequant(&xq3, a3, &cl.down, None);
+        x = decoder::add_residual(&h, &Mat::from_vec(1, hidden, down))?;
     }
-    let logits = decoder::norm_and_lm_head(&x, &w.final_norm, &w.embed, cfg.vocab_size, eps)?;
+    DECODE_GEMV_NS.fetch_add(tlayers.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let thead = std::time::Instant::now();
+    let logits = decoder::norm_and_lm_head_pretransposed(&x, &w.final_norm, &w.lm_head_t, eps)?;
+    DECODE_LMHEAD_NS.fetch_add(thead.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(logits.data)
 }
 
@@ -590,7 +681,16 @@ pub fn generate_greedy_kvcache(
     let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
         .map(|_| Qwen2KvCache::new(cfg.qkv_dim(), n + max_new))
         .collect();
+    let timing = std::env::var_os("FOCR_TIMING").is_some();
+    if timing {
+        DECODE_ATTN_NS.store(0, Ordering::Relaxed);
+        DECODE_GEMV_NS.store(0, Ordering::Relaxed);
+        DECODE_LMHEAD_NS.store(0, Ordering::Relaxed);
+    }
+    let tseed = std::time::Instant::now();
     let last_logits = forward_prefill_seed(&w, inputs_embeds, &mut caches)?;
+    let seed_s = tseed.elapsed().as_secs_f64();
+    let tdec = std::time::Instant::now();
     let mut ids = Vec::new();
     let mut next = argmax(&last_logits) as u32;
     for _ in 0..max_new {
@@ -603,6 +703,27 @@ pub fn generate_greedy_kvcache(
         let position = caches[0].n_kv;
         let logits = qwen2_decode_step(&w, &mut caches, &te, position)?;
         next = argmax(&logits) as u32;
+    }
+    if timing {
+        let dec_s = tdec.elapsed().as_secs_f64();
+        let ns = 1e-9;
+        let (attn, layers, head) = (
+            DECODE_ATTN_NS.load(Ordering::Relaxed) as f64 * ns,
+            DECODE_GEMV_NS.load(Ordering::Relaxed) as f64 * ns,
+            DECODE_LMHEAD_NS.load(Ordering::Relaxed) as f64 * ns,
+        );
+        eprintln!(
+            "[focr-timing]   decode {} tok in {:.2}s ({:.1} tok/s) | seed(prefill) {:.2}s | \
+             layers {:.2}s (attn {:.2}s, gemv+misc {:.2}s) | lm_head {:.2}s",
+            ids.len(),
+            dec_s,
+            ids.len() as f64 / dec_s.max(1e-9),
+            seed_s,
+            layers,
+            attn,
+            layers - attn,
+            head,
+        );
     }
     Ok(ids)
 }
