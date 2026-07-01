@@ -38,7 +38,63 @@ use super::nn;
 use super::tensor::{Mat, QInt8};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
+use rayon::prelude::*;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── GOT decode perf levers (bd-3bom follow-on) — each gated so ONE build measures
+//    every config, and the gate on a numerics-changing lever IS its doctrine-#2
+//    kill-switch. Tri-state env: "1"/"int8"/"on" force ON, "0"/"f32"/"off" force OFF,
+//    unset ⇒ the compiled default. Read ONCE into a process-wide bool. ─────────────
+
+/// `FOCR_GOT_INT8_LMHEAD` — run the GOT `lm_head` as an int8 per-output-channel GEMV
+/// (SDOT on Apple Silicon / AVX-512-VNNI·AVX-VNNI·AVX2 on Intel-AMD) instead of the f32
+/// matmul over the 151860×1024 tied head, then recover the exact greedy pick with a small
+/// f32 top-K refine ([`refine_topk_f32`]). The lm_head is the dominant memory-bound decode
+/// stage (reads the ~0.6 GB f32 head per token); int8 cuts that to ~0.15 GB + moves it onto
+/// the int8 matmul units (measured **8.2× on the head**, **1.85× on the whole GOT forward**).
+///
+/// int8-on-`lm_head` is BEYOND doctrine #2's validated set, so it stays a MEASURED
+/// kill-switch — but **default ON**, because the top-K refine makes it **byte-identical** to
+/// the f32 head (688/688 tokens on page_0107; == the torch oracle L4). `FOCR_GOT_INT8_LMHEAD=0`
+/// forces the provably-bit-identical f32 head back. See artifacts/perf/bd-3bom/.
+const GOT_INT8_LMHEAD_DEFAULT: bool = true;
+
+/// `FOCR_GOT_SEQ_ATTN` — force the SERIAL per-head decode attention. The parallel path
+/// (default) fans the independent heads across the rayon pool; it is bit-identical (each
+/// head is a self-contained softmax over disjoint output lanes), so this gate exists only
+/// as a measurement/safety switch, not a correctness one.
+const GOT_PARALLEL_ATTN_DEFAULT: bool = true;
+
+fn env_tristate(var: &str, default: bool) -> bool {
+    match std::env::var(var).ok().as_deref() {
+        Some("1" | "int8" | "on" | "true" | "yes") => true,
+        Some("0" | "f32" | "off" | "false" | "no") => false,
+        _ => default,
+    }
+}
+
+fn got_int8_lmhead_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| env_tristate("FOCR_GOT_INT8_LMHEAD", GOT_INT8_LMHEAD_DEFAULT))
+}
+
+fn got_parallel_attn_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    // FOCR_GOT_SEQ_ATTN=1 forces serial ⇒ parallel is the inverse.
+    *FLAG.get_or_init(|| !env_tristate("FOCR_GOT_SEQ_ATTN", !GOT_PARALLEL_ATTN_DEFAULT))
+}
+
+/// The GOT `lm_head` weight, resolved ONCE per generation to either the f32 pre-transposed
+/// `[hidden, vocab]` matrix (bit-identical to the certified path) or the int8 per-output-
+/// channel quantization of the SAME tied head (the [`got_int8_lmhead_enabled`] lever).
+enum LmHead {
+    /// `[hidden, vocab]` row-major, matmul-ready (see [`decoder::norm_and_lm_head_pretransposed`]).
+    F32(Mat),
+    /// `[vocab, hidden]` per-output-channel int8 (the native checkpoint layout, fed to the
+    /// n-parallel `gemv_i8` — argmax-exact to f32 on the oracle L4 / page_0107 CER).
+    Int8(QInt8),
+}
 
 /// Decode-step wall-clock accumulators (ns), summed across the whole generate loop.
 /// Read + printed only when `FOCR_TIMING` is set (perf bring-up); the `fetch_add`s
@@ -401,41 +457,67 @@ fn qwen2_decode_attention(
     num_heads: usize,
     head_dim: usize,
 ) -> Vec<f32> {
-    let n_kv = cache.n_kv;
     let dim = num_heads * head_dim;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut out = vec![0.0f32; dim];
-    let mut scores = vec![0.0f32; n_kv];
-    for h in 0..num_heads {
-        let qh = &q_row[h * head_dim..h * head_dim + head_dim];
-        // scores[r] = scale · (q_h · k[r, head h]); track the max for a stable softmax.
-        let mut smax = f32::NEG_INFINITY;
-        for (r, s) in scores.iter_mut().enumerate() {
-            let base = r * dim + h * head_dim;
-            let kh = &cache.k[base..base + head_dim];
-            let dot: f32 = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum();
-            *s = dot * scale;
-            smax = smax.max(*s);
-        }
-        // softmax over the cached positions.
-        let mut denom = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - smax).exp();
-            denom += *s;
-        }
-        let inv = 1.0 / denom;
-        // out_h = Σ_r softmax[r] · v[r, head h].
-        let oh = &mut out[h * head_dim..h * head_dim + head_dim];
-        for (r, &s) in scores.iter().enumerate() {
-            let w = s * inv;
-            let base = r * dim + h * head_dim;
-            let vh = &cache.v[base..base + head_dim];
-            for (o, &vv) in oh.iter_mut().zip(vh) {
-                *o += w * vv;
-            }
+    if got_parallel_attn_enabled() {
+        // Each head is a self-contained softmax writing a DISJOINT `[head_dim]` output
+        // lane, so fanning the heads across the rayon pool is bit-identical (no cross-head
+        // dependence, per-head accumulation order unchanged). `par_chunks_mut(head_dim)`
+        // hands head `h` its own output slice + its own scratch.
+        out.par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(h, oh)| decode_attn_head(cache, q_row, h, head_dim, dim, scale, oh));
+    } else {
+        for h in 0..num_heads {
+            let oh = &mut out[h * head_dim..(h + 1) * head_dim];
+            decode_attn_head(cache, q_row, h, head_dim, dim, scale, oh);
         }
     }
     out
+}
+
+/// One attention head's decode: `softmax(scale · q_h·Kᵀ) · V`, writing `[head_dim]` into
+/// `oh`. Reads the token-major cache directly; the only per-head temp is `[n_kv]` scores.
+/// Identical math whether called serially or from the rayon fan-out above.
+#[inline]
+fn decode_attn_head(
+    cache: &Qwen2KvCache,
+    q_row: &[f32],
+    h: usize,
+    head_dim: usize,
+    dim: usize,
+    scale: f32,
+    oh: &mut [f32],
+) {
+    let n_kv = cache.n_kv;
+    let qh = &q_row[h * head_dim..h * head_dim + head_dim];
+    let mut scores = vec![0.0f32; n_kv];
+    // scores[r] = scale · (q_h · k[r, head h]); track the max for a stable softmax.
+    let mut smax = f32::NEG_INFINITY;
+    for (r, s) in scores.iter_mut().enumerate() {
+        let base = r * dim + h * head_dim;
+        let kh = &cache.k[base..base + head_dim];
+        let dot: f32 = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum();
+        *s = dot * scale;
+        smax = smax.max(*s);
+    }
+    // softmax over the cached positions.
+    let mut denom = 0.0f32;
+    for s in &mut scores {
+        *s = (*s - smax).exp();
+        denom += *s;
+    }
+    let inv = 1.0 / denom;
+    // out_h = Σ_r softmax[r] · v[r, head h].
+    for (r, &s) in scores.iter().enumerate() {
+        let w = s * inv;
+        let base = r * dim + h * head_dim;
+        let vh = &cache.v[base..base + head_dim];
+        for (o, &vv) in oh.iter_mut().zip(vh) {
+            *o += w * vv;
+        }
+    }
 }
 
 /// One layer's decode weights, loaded ONCE (int8 GEMMs read verbatim from the
@@ -475,10 +557,11 @@ struct GotDecodeWeights {
     /// Tied `embed_tokens` `[vocab, hidden]`, row-major — the per-token embed lookup.
     embed: Vec<f32>,
     /// The SAME weights transposed to `[hidden, vocab]` ONCE at build, matmul-ready for
-    /// the decode-step `lm_head` so it never re-transposes the ~0.6 GB matrix per token
-    /// (that transpose was 95% of decode wall-clock). See
-    /// [`decoder::norm_and_lm_head_pretransposed`].
-    lm_head_t: Mat,
+    /// the decode-step `lm_head`. Either the f32 pre-transposed `[hidden, vocab]` head
+    /// (bit-identical to the certified path — never re-transposes the ~0.6 GB matrix per
+    /// token, which was 95% of decode wall-clock) or its int8 quantization
+    /// ([`got_int8_lmhead_enabled`]). Built ONCE. See [`got_lm_head`].
+    lm_head: LmHead,
     cfg: DecoderConfig,
 }
 
@@ -530,32 +613,94 @@ impl GotDecodeWeights {
             });
         }
         let embed = weights.mat("model.embed_tokens.weight")?.data;
-        // Transpose the tied head `[vocab, hidden]` -> `[hidden, vocab]` ONCE here (the
-        // SAME transpose `linear_no_bias` does per call), so the decode-step lm_head is a
-        // plain matmul against a matmul-ready `Mat` — bit-identical logits, no per-token
-        // ~0.6 GB re-transpose (which was 95% of decode wall-clock).
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
-        let mut wt = vec![0.0f32; embed.len()];
-        for o in 0..vocab {
-            let src = &embed[o * hidden..(o + 1) * hidden];
-            for (i, &val) in src.iter().enumerate() {
-                wt[i * vocab + o] = val;
+        // Resolve the lm_head ONCE. int8 lever: quantize the tied `[vocab, hidden]` head to
+        // per-output-channel int8 in its NATIVE layout (fed to the n-parallel `gemv_i8` —
+        // SDOT on aarch64, VNNI on x86). f32 path: transpose `[vocab, hidden]` -> the
+        // matmul-ready `[hidden, vocab]` ONCE (the SAME transpose `linear_no_bias` did per
+        // call), so the decode-step head is a plain matmul with no per-token ~0.6 GB
+        // re-transpose (which was 95% of decode wall-clock). Only ONE is built, so int8 also
+        // halves the head's resident memory (no f32 `[hidden, vocab]` copy).
+        let lm_head = if got_int8_lmhead_enabled() {
+            LmHead::Int8(nn::quantize_int8(&embed, vocab, hidden))
+        } else {
+            let mut wt = vec![0.0f32; embed.len()];
+            for o in 0..vocab {
+                let src = &embed[o * hidden..(o + 1) * hidden];
+                for (i, &val) in src.iter().enumerate() {
+                    wt[i * vocab + o] = val;
+                }
             }
-        }
-        let lm_head_t = Mat::from_vec(hidden, vocab, wt);
+            LmHead::F32(Mat::from_vec(hidden, vocab, wt))
+        };
         Ok(Self {
             layers,
             final_norm: weights.vec("model.norm.weight")?,
             embed,
-            lm_head_t,
+            lm_head,
             cfg: *cfg,
         })
     }
 }
 
+/// How many of the int8-approx head logits get recomputed in exact f32 before the greedy
+/// argmax (the [`refine_topk_f32`] near-lossless pass). 256 ≫ any realistic gap between the
+/// true best token's int8 rank and rank 1, so the refined argmax matches the f32 head.
+const GOT_LMHEAD_REFINE_K: usize = 256;
+
+/// The GOT `lm_head` over a SINGLE hidden row `x_row` (`[1, hidden]`): the final
+/// `rms_norm` then the head projection, dispatched to the f32 pre-transposed matmul
+/// (bit-identical to the certified path) or the int8 per-channel `gemv_i8`
+/// ([`got_int8_lmhead_enabled`]). Returns the `[vocab]` logits. Both the seeding prefill
+/// (last position only — the rest are never argmaxed) and every decode step funnel through
+/// here, so a whole generation uses ONE lm_head numeric path.
+///
+/// The int8 path is made **near-lossless** by [`refine_topk_f32`]: the fast int8 GEMV picks
+/// the top candidates, then those are recomputed in exact f32 so the greedy pick matches the
+/// f32 head (the argmax lives in the int8 top-K with overwhelming probability).
+fn got_lm_head(w: &GotDecodeWeights, x_row: &Mat, eps: f32) -> FocrResult<Vec<f32>> {
+    match &w.lm_head {
+        LmHead::F32(wt) => {
+            Ok(decoder::norm_and_lm_head_pretransposed(x_row, &w.final_norm, wt, eps)?.data)
+        }
+        LmHead::Int8(q) => {
+            let normed = nn::rms_norm(x_row, Some(&w.final_norm), eps)?;
+            let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
+            let mut logits = decoder::gemv_i8_bias_prequant(&xq, a, q, None);
+            refine_topk_f32(&mut logits, &normed.data, &w.embed, w.cfg.hidden_size);
+            Ok(logits)
+        }
+    }
+}
+
+/// Recompute the `GOT_LMHEAD_REFINE_K` largest int8-approx `logits` in exact f32
+/// (`normed · embed_row` — the SAME value the f32 head produces for that token), so the
+/// greedy argmax over the refined vector matches the f32 lm_head. Makes the int8 lm_head
+/// near-lossless: the true best token is in the int8 top-K with overwhelming probability, so
+/// its refined logit is exact and wins. `embed` is the tied head `[vocab, hidden]` row-major.
+fn refine_topk_f32(logits: &mut [f32], normed: &[f32], embed: &[f32], hidden: usize) {
+    let vocab = logits.len();
+    let k = GOT_LMHEAD_REFINE_K.min(vocab);
+    if k == 0 {
+        return;
+    }
+    // Partition so idx[..k] index the k largest int8-approx logits (O(vocab), no full sort).
+    let mut idx: Vec<u32> = (0..vocab as u32).collect();
+    idx.select_nth_unstable_by(k - 1, |&a, &b| {
+        logits[b as usize].total_cmp(&logits[a as usize])
+    });
+    for &t in &idx[..k] {
+        let t = t as usize;
+        let row = &embed[t * hidden..(t + 1) * hidden];
+        logits[t] = normed.iter().zip(row).map(|(&x, &wv)| x * wv).sum();
+    }
+}
+
 /// Seeding prefill: run all `N` positions through the layers (BIT-IDENTICAL to
 /// [`forward_prefill`] — same `linear_int8_dynamic` kernel), capturing each layer's
-/// post-RoPE K + post-proj V into `caches`, and return the **last-position** logits.
+/// post-RoPE K + post-proj V into `caches`, and return the **last-position** logits
+/// (projected via [`got_lm_head`] on the single last row — the other N-1 rows are never
+/// argmaxed, so we skip the full `[N, vocab]` head GEMM the naive path computed).
 fn forward_prefill_seed(
     w: &GotDecodeWeights,
     inputs_embeds: &Mat,
@@ -582,8 +727,13 @@ fn forward_prefill_seed(
         let mlp = decoder::expert_mlp_i8(&normed2, &cl.gate, &cl.up, &cl.down)?;
         x = decoder::add_residual(&h, &mlp)?;
     }
-    let logits = decoder::norm_and_lm_head(&x, &w.final_norm, &w.embed, cfg.vocab_size, eps)?;
-    Ok(logits.data[(logits.rows - 1) * cfg.vocab_size..].to_vec())
+    let last = x.rows - 1;
+    let x_last = Mat::from_vec(
+        1,
+        cfg.hidden_size,
+        x.data[last * cfg.hidden_size..].to_vec(),
+    );
+    got_lm_head(w, &x_last, eps)
 }
 
 /// Split a fused `[N, 3·d]` q|k|v activation into three `[N, d]` mats (column blocks).
@@ -657,9 +807,9 @@ fn qwen2_decode_step(
     }
     DECODE_GEMV_NS.fetch_add(tlayers.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let thead = std::time::Instant::now();
-    let logits = decoder::norm_and_lm_head_pretransposed(&x, &w.final_norm, &w.lm_head_t, eps)?;
+    let logits = got_lm_head(w, &x, eps)?;
     DECODE_LMHEAD_NS.fetch_add(thead.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(logits.data)
+    Ok(logits)
 }
 
 /// **O(n)-per-token** greedy decode: identical id-stream to [`generate_greedy`] but
