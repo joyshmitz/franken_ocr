@@ -113,8 +113,12 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`.
-    fn apply(&self, x: &Mat) -> FocrResult<Mat> {
+    /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`. Also the
+    /// GOT `mm_projector_vary` connector (a plain Linear(1024→1024)+bias).
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] if `x.cols != self.in_`.
+    pub fn apply(&self, x: &Mat) -> FocrResult<Mat> {
         if x.cols != self.in_ {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "vision_sam linear: input cols {} != expected in_features {}",
@@ -257,6 +261,17 @@ pub struct SamWeights {
 /// whatever [`forward_with`] returns. The real math lives in [`forward_with`],
 /// which is exercised by the unit tests below.
 pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
+    forward_prefix(weights, image, "model.sam_model")
+}
+
+/// [`forward`] with an explicit `.focrq` tensor-name prefix for the SAM-family
+/// vision tower — Baidu Unlimited-OCR uses `model.sam_model` (the default), GOT-OCR2
+/// uses `model.vision_tower_high`; the leaf tensor names + all geometry are identical.
+///
+/// # Errors
+/// As [`forward`] — the first vision-stage error (missing/mis-shaped tensor or a
+/// kernel failure).
+pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResult<Mat> {
     if image.rows != 3 {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_sam::forward: expected 3 input channels, got {}",
@@ -271,15 +286,15 @@ pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
             image.cols
         )));
     }
-    let w = sam_weights_from(weights)?;
+    let w = sam_weights_from(weights, prefix)?;
     forward_with(&w, image, side, side)
 }
 
-/// Build a [`SamWeights`] from the named `model.sam_model.*` tensors in
-/// `weights` (BF16→f32 widened at the accessor). Dims are read from each
-/// tensor's shape; rel-pos table sizes are derived from the stored rows.
-fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
-    let p = "model.sam_model";
+/// Build a [`SamWeights`] from the named `{prefix}.*` tensors in `weights`
+/// (BF16→f32 widened at the accessor). Dims are read from each tensor's shape;
+/// rel-pos table sizes are derived from the stored rows.
+fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
+    let p = prefix;
     let flat = |n: &str| weights.vec(n);
     let conv = |n: &str, bias: bool| -> FocrResult<Conv> {
         let d = tensor_min_rank_shape(weights, n, 2)?;
@@ -1580,7 +1595,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]
@@ -1596,7 +1611,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]
@@ -1619,7 +1634,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]

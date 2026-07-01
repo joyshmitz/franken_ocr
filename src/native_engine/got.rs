@@ -1,0 +1,182 @@
+//! GOT-OCR2.0 model assembly (bead B3): the vision front-half that turns a
+//! preprocessed image + prompt id-stream into the decoder `inputs_embeds`, which
+//! [`super::decoder_qwen2::forward_prefill`] then consumes. The Qwen2 dense
+//! decoder itself lives in [`super::decoder_qwen2`]; this module is the
+//! GOT-specific glue (SAM tower prefix, the `mm_projector_vary` connector, and the
+//! `<imgpad>` splice) — none of which the Baidu path shares (GOT has no CLIP tower,
+//! no `image_newline`/`view_seperator`, and its connector currency is 1024, not 1280).
+//!
+//! Every piece reuses an existing, parity-tested primitive:
+//! * SAM-ViT-B tower → [`super::vision_sam::forward_prefix`] with the arch's
+//!   `model.vision_tower_high` prefix (identical leaf names + geometry to Baidu's
+//!   `model.sam_model`); returns `[1024, 256]` channel-major.
+//! * connector → [`super::vision_sam::Linear::apply`] (`mm_projector_vary`, a plain
+//!   `Linear(1024→1024)+bias`, no act/no norm).
+//! * embed + splice → [`super::decoder::embed_tokens`] (tied HP table) +
+//!   [`super::connector::masked_scatter`] over the `<imgpad>` (151859) rows.
+//!
+//! Certified against the bit-deterministic torch oracle: feeding the oracle's own
+//! preprocessed image, the assembled `inputs_embeds` matches the oracle's
+//! post-splice `hidden_0` (isolating the vision kernels + connector + splice from
+//! the known CatmullRom-vs-bicubic resample tolerance, which the preprocess gate
+//! covers separately). See the `#[cfg(test)]` seam gate.
+
+use super::tensor::Mat;
+use super::weights::Weights;
+use super::{connector, decoder, vision_sam};
+use crate::error::FocrResult;
+
+/// The GOT `<imgpad>` per-patch image token (spec §5): the prompt slot a projected
+/// vision-feature row overwrites.
+pub const IMG_PAD_ID: u32 = 151_859;
+/// Projected vision feature rows per image view (`image_token_len`).
+pub const IMAGE_TOKEN_LEN: usize = 256;
+
+/// GOT vision features from a preprocessed `[3, side*side]` image: the SAM-ViT-B
+/// tower (`prefix`, e.g. `model.vision_tower_high`) → `[1024, 256]` channel-major →
+/// transpose → `[256, 1024]` → the `mm_projector_vary` `Linear(1024→1024)+bias` →
+/// `[256, 1024]` token-major features. All high-precision (BF16→f32).
+///
+/// # Errors
+/// The first vision-stage error (missing/mis-shaped tensor or kernel failure).
+pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResult<Mat> {
+    let sam = vision_sam::forward_prefix(weights, image, prefix)?; // [1024, 256] channel-major
+    let sam_t = transpose(&sam); // [256, 1024] token-major
+    let w = weights.vec("model.mm_projector_vary.weight")?; // [1024*1024] row-major [out,in]
+    let b = weights.vec("model.mm_projector_vary.bias")?; // [1024]
+    let proj = vision_sam::Linear {
+        w,
+        b,
+        out: 1024,
+        in_: 1024,
+    };
+    proj.apply(&sam_t) // [256, 1024]
+}
+
+/// Build the GOT decoder `inputs_embeds`: embed the prompt id-stream against the
+/// tied `model.embed_tokens.weight`, then `masked_scatter` the vision features
+/// into the 256 `<imgpad>` rows (in prompt order). Returns `[seq, hidden]`.
+///
+/// # Errors
+/// A vision/embed error, or a [`connector::masked_scatter`] mismatch (the number
+/// of `<imgpad>` rows must equal `vision_features.rows`).
+pub fn build_inputs_embeds(
+    weights: &Weights,
+    image: &Mat,
+    prompt_ids: &[u32],
+    prefix: &str,
+) -> FocrResult<Mat> {
+    let tokens = vision_features(weights, image, prefix)?; // [256, 1024]
+    let embed = weights.mat("model.embed_tokens.weight")?; // [vocab, hidden]
+    let (vocab, hidden) = (embed.rows, embed.cols);
+    let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, prompt_ids)?;
+    let mask: Vec<bool> = prompt_ids.iter().map(|&id| id == IMG_PAD_ID).collect();
+    connector::masked_scatter(&mut inputs_embeds, &tokens, &mask)?;
+    Ok(inputs_embeds)
+}
+
+/// `[r, c]` row-major → `[c, r]` row-major (channel-major SAM output → token-major).
+fn transpose(m: &Mat) -> Mat {
+    let (r, c) = (m.rows, m.cols);
+    let mut out = vec![0.0f32; r * c];
+    for i in 0..r {
+        for j in 0..c {
+            out[j * r + i] = m.data[i * c + j];
+        }
+    }
+    Mat::from_vec(c, r, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **B3 — the GOT vision/connector/splice parity gate.** Env-gated: `FOCR_GOT_MODEL`
+    /// = the got-ocr2 weights (`.focrq` or safetensors — vision is HP either way),
+    /// `FOCR_ORACLE_IMAGE` = the oracle's own preprocessed image `[3,1024,1024]`
+    /// (raw f32), `FOCR_ORACLE_HIDDEN0` = the oracle post-splice decoder input
+    /// `[287,1024]`. Feeding the oracle's image isolates the vision kernels +
+    /// connector + splice from the resample tolerance; the assembled inputs_embeds
+    /// must match `hidden_0` tightly.
+    #[test]
+    fn vision_splice_matches_oracle_hidden0() {
+        let (Ok(model), Ok(img), Ok(h0)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_ORACLE_IMAGE"),
+            std::env::var("FOCR_ORACLE_HIDDEN0"),
+        ) else {
+            return;
+        };
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+
+        // the committed 287-id GOT plain-OCR prompt (256 <imgpad>).
+        const L0C: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/l0c_prompt.json"
+        ));
+        let v: serde_json::Value = serde_json::from_str(L0C).unwrap();
+        let prompt_ids: Vec<u32> = v["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(
+            prompt_ids.iter().filter(|&&i| i == IMG_PAD_ID).count(),
+            IMAGE_TOKEN_LEN
+        );
+
+        let img_flat = read_f32_le(&img);
+        let side = 1024usize;
+        assert_eq!(img_flat.len(), 3 * side * side, "image not [3,1024,1024]");
+        let image = Mat::from_vec(3, side * side, img_flat);
+
+        let embeds = build_inputs_embeds(&weights, &image, &prompt_ids, "model.vision_tower_high")
+            .expect("build inputs_embeds");
+        assert_eq!(embeds.rows, prompt_ids.len());
+        assert_eq!(embeds.cols, 1024);
+
+        let oracle = read_f32_le(&h0);
+        assert_eq!(oracle.len(), embeds.data.len(), "hidden0 shape mismatch");
+        let (cos, max_abs) = cosine_maxabs(&embeds.data, &oracle);
+        eprintln!(
+            "[B3 vision] inputs_embeds vs oracle hidden_0: cos={cos:.6} max_abs={max_abs:.4}"
+        );
+        assert!(
+            cos >= 0.999,
+            "inputs_embeds cosine {cos:.6} < 0.999 — vision/splice diverged"
+        );
+    }
+
+    fn read_f32_le(path: &str) -> Vec<f32> {
+        std::fs::read(path)
+            .expect("blob")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn cosine_maxabs(a: &[f32], b: &[f32]) -> (f64, f32) {
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+            .sum();
+        let na: f64 = a
+            .iter()
+            .map(|&x| f64::from(x) * f64::from(x))
+            .sum::<f64>()
+            .sqrt();
+        let nb: f64 = b
+            .iter()
+            .map(|&y| f64::from(y) * f64::from(y))
+            .sum::<f64>()
+            .sqrt();
+        let max_abs = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0, f32::max);
+        (dot / (na * nb), max_abs)
+    }
+}

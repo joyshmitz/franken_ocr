@@ -169,6 +169,12 @@ pub trait ModelArch: Send + Sync {
     fn tie_word_embeddings(&self) -> bool {
         false
     }
+    /// The `.focrq` tensor-name prefix for this arch's SAM-family vision tower.
+    /// Baidu Unlimited-OCR (default) uses `model.sam_model`; GOT-OCR2 uses
+    /// `model.vision_tower_high` (identical leaf names + geometry, different prefix).
+    fn vision_tower_prefix(&self) -> &'static str {
+        "model.sam_model"
+    }
 }
 
 /// The Baidu Unlimited-OCR architecture — the FIRST [`ModelArch`] implementation
@@ -243,6 +249,9 @@ pub struct PlannedArch {
     /// Whether the model ties `lm_head` to `embed_tokens` (so the converter omits
     /// `lm_head.weight`); see [`ModelArch::tie_word_embeddings`].
     tie_word_embeddings: bool,
+    /// The SAM-family vision tower `.focrq` tensor-name prefix; see
+    /// [`ModelArch::vision_tower_prefix`].
+    vision_tower_prefix: &'static str,
 }
 
 /// A not-yet-determined greedy contract for a planned model whose config has not
@@ -288,6 +297,9 @@ impl ModelArch for PlannedArch {
     fn tie_word_embeddings(&self) -> bool {
         self.tie_word_embeddings
     }
+    fn vision_tower_prefix(&self) -> &'static str {
+        self.vision_tower_prefix
+    }
 }
 
 // ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
@@ -321,6 +333,7 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     ],
     // Verified byte-identical lm_head == embed_tokens (spec §12) → omit lm_head.
     tie_word_embeddings: true,
+    vision_tower_prefix: "model.vision_tower_high",
 };
 static SMOLVLM2: PlannedArch = PlannedArch {
     id: "smolvlm2",
@@ -333,6 +346,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Describe, Task::Vqa],
     tie_word_embeddings: false, // placeholder until censused (sub-epic C)
+    vision_tower_prefix: "model.vision_tower", // SigLIP; placeholder until censused
 };
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
@@ -345,6 +359,7 @@ static ONECHART: PlannedArch = PlannedArch {
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Chart],
     tie_word_embeddings: false, // placeholder until censused (sub-epic D)
+    vision_tower_prefix: "model.vision_tower_high", // GOT/Vary lineage
 };
 static TROMR: PlannedArch = PlannedArch {
     id: "tromr",
@@ -357,6 +372,7 @@ static TROMR: PlannedArch = PlannedArch {
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Music],
     tie_word_embeddings: false, // placeholder until censused (sub-epic E)
+    vision_tower_prefix: "model.sam_model", // ResNet stem; placeholder
 };
 static TROCR: PlannedArch = PlannedArch {
     id: "trocr",
@@ -369,6 +385,7 @@ static TROCR: PlannedArch = PlannedArch {
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Handwriting],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
+    vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
 };
 static PIX2TEX: PlannedArch = PlannedArch {
     id: "pix2tex",
@@ -381,6 +398,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Formula],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
+    vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
 };
 
 /// The model registry, in priority order (the default + implemented first, then the
