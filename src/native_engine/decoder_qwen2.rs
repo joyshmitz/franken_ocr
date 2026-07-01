@@ -35,6 +35,7 @@
 
 use super::decoder;
 use super::nn;
+use super::sampler;
 use super::tensor::{Mat, QInt8};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
@@ -125,6 +126,10 @@ pub struct DecoderConfig {
     pub rms_norm_eps: f32,
     /// Whether q/k/v_proj carry a bias (GOT true; o_proj never does).
     pub attn_qkv_bias: bool,
+    /// HF-builtin **global** no-repeat-n-gram size for greedy generation (GOT 20,
+    /// hard-coded upstream in `chat()` — spec §12 OQ-8); `0` disables the guard
+    /// (bd-ff4i: unguarded greedy repetition-runs on some real pages).
+    pub no_repeat_ngram_size: usize,
 }
 
 impl DecoderConfig {
@@ -141,6 +146,7 @@ impl DecoderConfig {
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
             attn_qkv_bias: true,
+            no_repeat_ngram_size: 20,
         }
     }
 
@@ -356,7 +362,8 @@ pub fn forward_prefill(
 
 /// Greedy (argmax, temperature-0) autoregressive decode from `inputs_embeds`,
 /// generating up to `max_new` tokens and stopping at `eos`. Returns the generated
-/// id-stream (excluding the prompt).
+/// id-stream (excluding the prompt). Each pick runs through [`argmax_no_repeat`]
+/// (`cfg.no_repeat_ngram_size`, the upstream global ban — bd-ff4i).
 ///
 /// This is the **correct, unoptimized** generation path: each step re-runs the
 /// full prefill over the grown sequence (O(n²) — a KV-cache decode-step is the
@@ -381,13 +388,7 @@ pub fn generate_greedy(
         let cur = Mat::from_vec(rows, hidden, std::mem::take(&mut data));
         let logits = forward_prefill(weights, cfg, &cur)?;
         let last = &logits.data[(logits.rows - 1) * vocab..];
-        let next = last
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                if x > bv { (i, x) } else { (bi, bv) }
-            })
-            .0 as u32;
+        let next = argmax_no_repeat(last, &ids, cfg.no_repeat_ngram_size) as u32;
         ids.push(next);
         // reclaim the prefix embeds and append the chosen token's embedding.
         data = cur.data;
@@ -815,7 +816,9 @@ fn qwen2_decode_step(
 /// **O(n)-per-token** greedy decode: identical id-stream to [`generate_greedy`] but
 /// with a full-causal KV cache instead of re-running prefill each step. The bit-for-bit
 /// equality is enforced by reusing [`nn::linear_int8_dynamic`] for every GEMM (the
-/// prefill kernel), so the decode never diverges from the certified path.
+/// prefill kernel), so the decode never diverges from the certified path. Both paths
+/// apply the same [`argmax_no_repeat`] global no-repeat-n-gram guard (bd-ff4i), so
+/// their id-streams stay identical on repetition-prone pages too.
 ///
 /// # Errors
 /// Any prefill/decode-step error, or a missing `model.embed_tokens.weight`.
@@ -842,7 +845,7 @@ pub fn generate_greedy_kvcache(
     let seed_s = tseed.elapsed().as_secs_f64();
     let tdec = std::time::Instant::now();
     let mut ids = Vec::new();
-    let mut next = argmax(&last_logits) as u32;
+    let mut next = argmax_no_repeat(&last_logits, &ids, cfg.no_repeat_ngram_size) as u32;
     for _ in 0..max_new {
         ids.push(next);
         if next == eos {
@@ -852,7 +855,7 @@ pub fn generate_greedy_kvcache(
         // the new token occupies the position after every currently-cached row.
         let position = caches[0].n_kv;
         let logits = qwen2_decode_step(&w, &mut caches, &te, position)?;
-        next = argmax(&logits) as u32;
+        next = argmax_no_repeat(&logits, &ids, cfg.no_repeat_ngram_size) as u32;
     }
     if timing {
         let dec_s = tdec.elapsed().as_secs_f64();
@@ -876,6 +879,23 @@ pub fn generate_greedy_kvcache(
         );
     }
     Ok(ids)
+}
+
+/// Greedy pick with the HF-builtin **global** no-repeat-n-gram ban (bd-ff4i,
+/// spec §12 OQ-8): mask to −∞ every token that would complete an `n`-gram already
+/// present in the generated `ids` (reusing the sampler's `window == 0` global
+/// scan), then argmax. `n == 0` disables (plain argmax). The guard cannot fire
+/// before `ids` holds `n` tokens, so a repeat-free stream — e.g. the oracle-L4
+/// cert sequence — stays BYTE-IDENTICAL to unguarded greedy. Scans the generated
+/// stream only: upstream's HF processor also spans the prompt ids, which a text
+/// completion can re-match only by re-emitting prompt text (no observed case).
+/// Composes with the int8+top-K-refine head: a ban removes at most a handful of
+/// ids per step, so the masked argmax still lands inside the refined top-K.
+fn argmax_no_repeat(logits: &[f32], ids: &[u32], n: usize) -> usize {
+    match sampler::masked_sliding_window_logits_if_needed(logits, ids, n, 0, &[]) {
+        Some(masked) => argmax(&masked),
+        None => argmax(logits),
+    }
 }
 
 /// Argmax over a logit row (first max on ties) — the shared greedy pick.
@@ -904,6 +924,35 @@ mod tests {
         assert_eq!(c.vocab_size, 151_860);
         // full-causal scale must be exactly 1/8 (= 1/sqrt(64), what prefill_attention derives).
         assert!(((1.0 / (c.head_dim as f32).sqrt()) - 0.125).abs() < 1e-7);
+        // upstream `chat()` hard-codes the HF global no_repeat_ngram_size=20 (OQ-8).
+        assert_eq!(c.no_repeat_ngram_size, 20);
+    }
+
+    #[test]
+    fn no_repeat_guard_bans_the_cycle_completion() {
+        // ids end with the prefix [7, 8]; the 3-gram [7, 8, 9] already occurred, so
+        // token 9 must be banned even though its logit is the max — the pick falls
+        // to the runner-up (token 2).
+        let ids = [7u32, 8, 9, 1, 7, 8];
+        let mut logits = vec![0.0f32; 10];
+        logits[9] = 5.0;
+        logits[2] = 4.0;
+        assert_eq!(argmax_no_repeat(&logits, &ids, 3), 2);
+        // the plain argmax (guard disabled) still picks the banned token.
+        assert_eq!(argmax_no_repeat(&logits, &ids, 0), 9);
+    }
+
+    #[test]
+    fn no_repeat_guard_is_identity_on_a_clean_stream() {
+        // no 3-gram repeats anywhere: the guard must not perturb the argmax.
+        let ids = [1u32, 2, 3, 4, 5, 6];
+        let mut logits = vec![0.0f32; 10];
+        logits[7] = 3.0;
+        assert_eq!(argmax_no_repeat(&logits, &ids, 3), argmax(&logits));
+        // too short to hold a single n-gram: also identity.
+        assert_eq!(argmax_no_repeat(&logits, &ids[..2], 3), argmax(&logits));
+        // empty stream (the seed pick): identity.
+        assert_eq!(argmax_no_repeat(&logits, &[], 3), argmax(&logits));
     }
 
     /// Read a raw little-endian f32 blob.

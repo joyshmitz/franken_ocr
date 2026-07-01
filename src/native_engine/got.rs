@@ -34,6 +34,21 @@ use crate::tokenizer::tiktoken::Tiktoken;
 /// GOT generation stop id (`<|im_end|>`).
 pub const EOS_ID: u32 = 151_645;
 
+/// `FOCR_GOT_NO_REPEAT_NGRAM` — override the GOT global no-repeat-n-gram size
+/// (bd-ff4i kill-switch; upstream `chat()` hard-codes 20, spec §12 OQ-8). `0`
+/// disables the guard, restoring the pre-guard unguarded greedy; unset or
+/// unparsable keeps the config default. Read once per process (mirrors the
+/// other `FOCR_GOT_*` decode levers).
+fn no_repeat_ngram_override(default: usize) -> usize {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    N.get_or_init(|| {
+        std::env::var("FOCR_GOT_NO_REPEAT_NGRAM")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+    .unwrap_or(default)
+}
+
 /// The GOT `<imgpad>` per-patch image token (spec §5): the prompt slot a projected
 /// vision-feature row overwrites.
 pub const IMG_PAD_ID: u32 = 151_859;
@@ -128,7 +143,8 @@ pub fn recognize(
         tv.elapsed().as_secs_f64()
     ));
     let tg = std::time::Instant::now();
-    let cfg = DecoderConfig::got_ocr2();
+    let mut cfg = DecoderConfig::got_ocr2();
+    cfg.no_repeat_ngram_size = no_repeat_ngram_override(cfg.no_repeat_ngram_size);
     // The O(n)-per-token KV-cache decode (B9): one seeding prefill then a full-causal
     // decode step per token, all int8 GEMMs through the n-parallel `gemv`.
     let ids =
