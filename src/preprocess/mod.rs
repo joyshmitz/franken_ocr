@@ -599,6 +599,47 @@ pub fn find_closest_aspect_ratio(
 /// `ToTensor` scales `u8` `[0,255]` -> `f32` `[0,1]`; `Normalize(mean=0.5,
 /// std=0.5)` maps to `[-1,1]` as `(v - 0.5) / 0.5 = 2v - 1`. Layout is
 /// channel-major (`rows=3`, `cols=H*W`), element `(c, y*W + x)`.
+/// GOT-OCR2's OpenAI/CLIP normalization mean (`GOTImageEvalProcessor`, spec §13b).
+pub const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+/// GOT-OCR2's OpenAI/CLIP normalization std.
+pub const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
+/// GOT-OCR2 fixed input side (`image_size=1024`).
+pub const GOT_SIZE: u32 = 1024;
+
+/// GOT-OCR2 preprocess (`GOTImageEvalProcessor(image_size=1024)`): **squash**
+/// bicubic resize to 1024×1024 (NO aspect-preserve, NO pad) + CLIP-norm →
+/// `[3, 1024*1024]` channel-major, the exact tensor `vision_sam::forward` reads.
+///
+/// `CatmullRom ≈ PIL bicubic` is the one known sub-L0 divergence (spec §13b): the
+/// stats match the torch oracle to ~1e-4 but the resample is not bit-identical.
+///
+/// # Errors
+/// [`FocrError`] if the image cannot be decoded.
+pub fn preprocess_got(path: &Path) -> FocrResult<crate::native_engine::tensor::Mat> {
+    Ok(got_view_tensor(&decode_path(path)?))
+}
+
+/// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
+pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
+    let rgb = img
+        .resize_exact(GOT_SIZE, GOT_SIZE, FilterType::CatmullRom)
+        .to_rgb8();
+    let side = GOT_SIZE as usize;
+    let n = side * side;
+    let mut data = vec![0.0f32; 3 * n];
+    for y in 0..side {
+        for x in 0..side {
+            let px = rgb.get_pixel(x as u32, y as u32).0;
+            let s = y * side + x;
+            for c in 0..3 {
+                let v = f32::from(px[c]) / 255.0;
+                data[c * n + s] = (v - CLIP_MEAN[c]) / CLIP_STD[c];
+            }
+        }
+    }
+    crate::native_engine::tensor::Mat::from_vec(3, n, data)
+}
+
 fn view_tensor(img: &DynamicImage) -> ViewTensor {
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -626,6 +667,38 @@ fn view_tensor(img: &DynamicImage) -> ViewTensor {
 mod tests {
     use super::*;
     use image::{Rgb, RgbImage};
+
+    /// **L0b — GOT preprocess vs the torch oracle.** `preprocess_got` on the shared
+    /// `sample_text.png` must match `GOTImageEvalProcessor`'s output stats (from
+    /// `oracle_fixtures.json` `l0b_preprocess`). The CatmullRom-vs-PIL-bicubic
+    /// resample is the one known sub-L0 divergence, so aggregate stats match to a
+    /// small tolerance (not bit-exact).
+    #[test]
+    fn got_preprocess_matches_oracle_l0b() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/sample_text.png"
+        );
+        let m = preprocess_got(std::path::Path::new(path)).expect("got preprocess");
+        assert_eq!(m.rows, 3);
+        assert_eq!(m.cols, (GOT_SIZE * GOT_SIZE) as usize);
+
+        let d: Vec<f64> = m.data.iter().map(|&v| f64::from(v)).collect();
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        let var = d.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / d.len() as f64;
+        let std = var.sqrt();
+        let min = d.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = d.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!("[L0b] mean={mean:.4} std={std:.4} min={min:.4} max={max:.4}");
+
+        // oracle l0b_preprocess (transformers 4.45.2, f32 CPU).
+        let (o_mean, o_std, o_min, o_max) = (2.046_326_7, 0.138_841_3, -1.777_664_1, 2.145_897);
+        assert!((mean - o_mean).abs() < 5e-3, "mean {mean} vs {o_mean}");
+        assert!((std - o_std).abs() < 5e-3, "std {std} vs {o_std}");
+        // CLIP-normalized extremes: white→(1-mean)/std, black→-mean/std; robust to resample.
+        assert!((min - o_min).abs() < 1e-2, "min {min} vs {o_min}");
+        assert!((max - o_max).abs() < 1e-2, "max {max} vs {o_max}");
+    }
 
     /// Build a tiny synthetic RGB image (no weights/tokenizer needed).
     fn solid(w: u32, h: u32, color: [u8; 3]) -> DynamicImage {

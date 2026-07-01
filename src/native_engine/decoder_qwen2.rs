@@ -285,6 +285,53 @@ pub fn forward_prefill(
     )
 }
 
+/// Greedy (argmax, temperature-0) autoregressive decode from `inputs_embeds`,
+/// generating up to `max_new` tokens and stopping at `eos`. Returns the generated
+/// id-stream (excluding the prompt).
+///
+/// This is the **correct, unoptimized** generation path: each step re-runs the
+/// full prefill over the grown sequence (O(n²) — a KV-cache decode-step is the
+/// perf follow-on, bead B9), appending the argmax token's embedding. It reproduces
+/// the torch oracle's greedy L4 output; correctness first, then speed (doctrine #1).
+///
+/// # Errors
+/// Any [`forward_prefill`] error, or a missing `model.embed_tokens.weight`.
+pub fn generate_greedy(
+    weights: &Weights,
+    cfg: &DecoderConfig,
+    inputs_embeds: &Mat,
+    max_new: usize,
+    eos: u32,
+) -> FocrResult<Vec<u32>> {
+    let embed = weights.mat("model.embed_tokens.weight")?;
+    let (vocab, hidden) = (embed.rows, embed.cols);
+    let mut data = inputs_embeds.data.clone();
+    let mut rows = inputs_embeds.rows;
+    let mut ids = Vec::new();
+    for _ in 0..max_new {
+        let cur = Mat::from_vec(rows, hidden, std::mem::take(&mut data));
+        let logits = forward_prefill(weights, cfg, &cur)?;
+        let last = &logits.data[(logits.rows - 1) * vocab..];
+        let next = last
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+            .0 as u32;
+        ids.push(next);
+        // reclaim the prefix embeds and append the chosen token's embedding.
+        data = cur.data;
+        if next == eos {
+            break;
+        }
+        let te = decoder::embed_tokens(&embed.data, vocab, hidden, &[next])?;
+        data.extend_from_slice(&te.data);
+        rows += 1;
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +437,36 @@ mod tests {
         assert!(
             cos >= 0.99,
             "logit cosine {cos:.6} < 0.99 — decoder diverged"
+        );
+    }
+
+    /// **B5/B7 — greedy generation matches the torch oracle's L4 output.** Feeds the
+    /// oracle's post-splice `hidden_0` and greedily decodes; the ids must equal the
+    /// oracle's greedy prefix `[9707, 38, 1793, 12, …]` (oracle_fixtures.json
+    /// `l4_greedy_decode_ids`). Limited to 4 tokens (each step re-runs prefill —
+    /// the unoptimized correct path). Env-gated like the parity gate.
+    #[test]
+    fn greedy_generation_matches_oracle_l4() {
+        let (Ok(model), Ok(h0)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_ORACLE_HIDDEN0"),
+        ) else {
+            return;
+        };
+        let cfg = DecoderConfig::got_ocr2();
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+        let h0_flat = read_f32_le(&h0);
+        let n = h0_flat.len() / cfg.hidden_size;
+        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+
+        // eos = <|im_end|> (151645); 4 new tokens is enough to prove the append loop.
+        let ids = generate_greedy(&weights, &cfg, &inputs, 4, 151_645).expect("generate");
+        eprintln!("[B5 gen] first ids = {ids:?}");
+        // int8 build: argmax is exact on this confident prefix (matches the f32 oracle).
+        assert_eq!(
+            ids,
+            vec![9707, 38, 1793, 12],
+            "greedy ids diverged from the torch oracle L4"
         );
     }
 }
