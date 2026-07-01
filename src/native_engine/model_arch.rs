@@ -252,6 +252,9 @@ pub struct PlannedArch {
     /// The SAM-family vision tower `.focrq` tensor-name prefix; see
     /// [`ModelArch::vision_tower_prefix`].
     vision_tower_prefix: &'static str,
+    /// Whether this arch's forward RUNS today (`focr models` "ready"). GOT-OCR2 does
+    /// (its full pipeline + KV-cache decode ship); the rest are still descriptors.
+    implemented: bool,
 }
 
 /// A not-yet-determined greedy contract for a planned model whose config has not
@@ -292,7 +295,7 @@ impl ModelArch for PlannedArch {
         self.tasks
     }
     fn implemented(&self) -> bool {
-        false
+        self.implemented
     }
     fn tie_word_embeddings(&self) -> bool {
         self.tie_word_embeddings
@@ -334,6 +337,7 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     // Verified byte-identical lm_head == embed_tokens (spec §12) → omit lm_head.
     tie_word_embeddings: true,
     vision_tower_prefix: "model.vision_tower_high",
+    implemented: true, // full pipeline + KV-cache decode ship (B1-B9,B11); focr ocr runs it
 };
 static SMOLVLM2: PlannedArch = PlannedArch {
     id: "smolvlm2",
@@ -347,6 +351,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     tasks: &[Task::Describe, Task::Vqa],
     tie_word_embeddings: false, // placeholder until censused (sub-epic C)
     vision_tower_prefix: "model.vision_tower", // SigLIP; placeholder until censused
+    implemented: false,
 };
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
@@ -360,6 +365,7 @@ static ONECHART: PlannedArch = PlannedArch {
     tasks: &[Task::Chart],
     tie_word_embeddings: false, // placeholder until censused (sub-epic D)
     vision_tower_prefix: "model.vision_tower_high", // GOT/Vary lineage
+    implemented: false,
 };
 static TROMR: PlannedArch = PlannedArch {
     id: "tromr",
@@ -373,6 +379,7 @@ static TROMR: PlannedArch = PlannedArch {
     tasks: &[Task::Music],
     tie_word_embeddings: false, // placeholder until censused (sub-epic E)
     vision_tower_prefix: "model.sam_model", // ResNet stem; placeholder
+    implemented: false,
 };
 static TROCR: PlannedArch = PlannedArch {
     id: "trocr",
@@ -386,6 +393,7 @@ static TROCR: PlannedArch = PlannedArch {
     tasks: &[Task::Handwriting],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
     vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
+    implemented: false,
 };
 static PIX2TEX: PlannedArch = PlannedArch {
     id: "pix2tex",
@@ -399,6 +407,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     tasks: &[Task::Formula],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
     vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
+    implemented: false,
 };
 
 /// The model registry, in priority order (the default + implemented first, then the
@@ -442,23 +451,20 @@ mod tests {
     #[test]
     fn registry_lists_the_default_first_then_the_planned_zoo() {
         let archs = registry();
-        // Exactly one IMPLEMENTED arch (the default, first), the rest planned.
+        // The default (Unlimited-OCR) is first + implemented.
         assert_eq!(archs[0].id(), "unlimited-ocr");
         assert!(archs[0].implemented());
-        let implemented: Vec<&str> = archs
+        // The IMPLEMENTED set: Unlimited-OCR (fast plain OCR) + GOT-OCR2 (specialized
+        // structured OCR — both run today via `focr ocr`).
+        let mut implemented: Vec<&str> = archs
             .iter()
             .filter(|a| a.implemented())
             .map(|a| a.id())
             .collect();
-        assert_eq!(
-            implemented,
-            ["unlimited-ocr"],
-            "only Unlimited-OCR runs today"
-        );
-        // The planned zoo models are all present and NOT yet implemented.
-        for id in [
-            "got-ocr2", "smolvlm2", "onechart", "tromr", "trocr", "pix2tex",
-        ] {
+        implemented.sort_unstable();
+        assert_eq!(implemented, ["got-ocr2", "unlimited-ocr"]);
+        // The remaining zoo models are present but NOT yet implemented (descriptors).
+        for id in ["smolvlm2", "onechart", "tromr", "trocr", "pix2tex"] {
             let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
@@ -477,21 +483,21 @@ mod tests {
             arch_by_id("unlimited-ocr").map(ModelArch::id),
             Some("unlimited-ocr")
         );
-        // A planned arch resolves (described) but is not implemented.
-        let got = arch_by_id("got-ocr2").expect("got-ocr2 is a registered planned arch");
+        // GOT-OCR2 resolves and is now implemented (full pipeline + KV-cache decode ship).
+        let got = arch_by_id("got-ocr2").expect("got-ocr2 is a registered arch");
         assert_eq!(got.id(), "got-ocr2");
-        assert!(!got.implemented());
+        assert!(got.implemented());
         assert_eq!(got.decoder(), Decoder::Qwen2Dense);
         assert_eq!(got.tokenizer(), TokenizerKind::Qwen2Bpe);
         // An unknown id resolves to nothing.
         assert!(arch_by_id("does-not-exist").is_none());
     }
 
-    /// The GOT-OCR2 planned descriptor matches the census (docs/zoo/got-ocr2-spec.md).
+    /// The GOT-OCR2 descriptor matches the census (docs/zoo/got-ocr2-spec.md).
     #[test]
     fn got_ocr2_descriptor_matches_the_census() {
         let got = arch_by_id("got-ocr2").expect("got-ocr2 registered");
-        assert!(!got.implemented());
+        assert!(got.implemented());
         assert_eq!(got.vision_encoder(), VisionEncoder::SamVit);
         assert_eq!(got.decoder(), Decoder::Qwen2Dense);
         assert_eq!(got.tokenizer(), TokenizerKind::Qwen2Bpe);

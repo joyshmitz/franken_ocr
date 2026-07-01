@@ -194,6 +194,19 @@ impl OcrEngine {
     /// model is the clean [`FocrError::ModelNotFound`] without ever entering the
     /// runtime.
     ///
+    /// # Choosing a model
+    /// The engine runs whichever `.focrq` you point it at; pick by task:
+    /// * **`unlimited-ocr`** (the default; what [`OcrEngine::recognize`] resolves) —
+    ///   the **fast plain-text document OCR** model for general documents & PDFs.
+    ///   This is the right default for ordinary text.
+    /// * **`got-ocr2`** — a heavier, **specialized structured-output** model for the
+    ///   formats the default cannot produce: math (LaTeX), tables, charts, molecular
+    ///   (SMILES), geometry, and sheet music. Reach for it **only when you need that
+    ///   format extraction**, not as a faster general OCR.
+    ///
+    /// See [`native_engine::model_arch`] for the registry (id → tasks → implemented)
+    /// and `docs/zoo/` for each model's spec.
+    ///
     /// # Errors
     /// As [`OcrEngine::recognize`].
     pub fn recognize_with_model(&self, model_path: &Path, image_path: &Path) -> FocrResult<String> {

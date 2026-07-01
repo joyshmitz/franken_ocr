@@ -158,7 +158,10 @@ pub struct OcrBatchArgs {
     /// and reused across all of them (load-once batch throughput).
     #[arg(required = true)]
     pub images: Vec<PathBuf>,
-    /// Explicit model artifact path (else the env-resolved default).
+    /// Model artifact path. Default (unset) = the FAST plain-text OCR model
+    /// (unlimited-ocr). Pass a `got-ocr2.int8.focrq` for SPECIALIZED structured
+    /// output — math (LaTeX), tables, charts, molecular, geometry, sheet music
+    /// (heavier per page). `focr pull got-ocr2` first; see `focr models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Emit machine-readable JSON (one object per image + a final summary).
@@ -1489,6 +1492,10 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "models": models,
+            "guidance": {
+                "unlimited-ocr": "default; FAST plain-text document OCR (general documents & PDFs)",
+                "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text"
+            },
         }));
     } else {
         // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
@@ -1510,6 +1517,22 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 tasks
             );
         }
+        println!();
+        println!("Choosing a model:");
+        println!(
+            "  unlimited-ocr (default)  FAST plain-text document OCR — general documents & PDFs."
+        );
+        println!(
+            "  got-ocr2                 SPECIALIZED structured output the default can't produce:"
+        );
+        println!("                           math (LaTeX), tables, charts, molecular (SMILES),");
+        println!(
+            "                           geometry, sheet music. Heavier per page — use it when you"
+        );
+        println!(
+            "                           need FORMAT, not for plain text. `focr pull got-ocr2`,"
+        );
+        println!("                           then `focr ocr --model got-ocr2.int8.focrq <image>`.");
     }
     Ok(())
 }

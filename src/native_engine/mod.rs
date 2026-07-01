@@ -2487,12 +2487,13 @@ mod tests {
             "arch() reads the model_id tag"
         );
 
-        // …and the forward dispatch guard cleanly refuses the not-yet-implemented
-        // arch instead of running the Unlimited-OCR pipeline on foreign weights.
-        let err = OcrModel::ensure_arch_implemented(model.arch())
-            .expect_err("a planned arch's forward must be refused");
-        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
-        assert!(err.to_string().contains("got-ocr2"));
+        // …and the forward dispatch guard now ADMITS got-ocr2 (its full pipeline ships,
+        // B1–B9/B11), so `ensure_arch_implemented` is Ok and the real got-ocr2 forward
+        // runs — rather than the Unlimited-OCR pipeline being applied to foreign weights.
+        // (The refusal path for a genuinely unimplemented arch is covered by the mock
+        // `PlannedArch` test above.)
+        OcrModel::ensure_arch_implemented(model.arch())
+            .expect("got-ocr2 is implemented, so its forward is admitted");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -269,7 +269,21 @@ focr models                                 # human table
 focr models --json                          # machine-readable list
 ```
 
-Today this lists the Baidu Unlimited-OCR model (`ready`). The roadmap (epic `bd-3jo6`) adds specialized models — GOT-OCR2 (math/tables/charts/molecular/geometry/music), SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
+**Which model do I use?**
+
+| Model | Use it for | Speed |
+|---|---|---|
+| **`unlimited-ocr`** *(default)* | **Plain-text document OCR** — general documents & PDFs. This is what `focr ocr` runs by default. | **Fast** (~seconds/page) |
+| **`got-ocr2`** | **Specialized *structured* output the default can't produce**: math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music. | Heavier per page |
+
+`unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` **only when you need format extraction** (formulas, tables, etc.) — it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
+
+```bash
+focr pull got-ocr2                                    # download the weights + tokenizer
+focr ocr --model got-ocr2.int8.focrq page.png         # specialized OCR
+```
+
+The roadmap (epic `bd-3jo6`) adds further specialized models — SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
 
 ### `focr convert <input>`
 
