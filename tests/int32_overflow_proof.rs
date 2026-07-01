@@ -69,8 +69,16 @@ const MODEL_KS: &[KCase] = &[
         note: "decoder hidden size (q/k/v/o, gate/up at hidden width)",
     },
     KCase {
+        k: 1024,
+        note: "GOT-OCR2 Qwen2 decoder width (q/k/v/o, gate/up at hidden 1024)",
+    },
+    KCase {
         k: 2048,
         note: "projector input width (2048 -> 1280)",
+    },
+    KCase {
+        k: 2816,
+        note: "GOT-OCR2 Qwen2 dense down_proj (intermediate 2816) — bead B5",
     },
     KCase {
         k: 4096,

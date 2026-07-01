@@ -315,7 +315,7 @@ pub fn dense_mlp(
 ///
 /// # Errors
 /// [`FocrError::Other`] if `x.cols != in_` or `w.len() != out * in_`.
-fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat> {
+pub(crate) fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat> {
     checked_mat_len("linear_no_bias x", x)?;
     if x.cols != in_ {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -1712,7 +1712,7 @@ fn quant_oc(w: &[f32], out: usize) -> QInt8 {
 ///
 /// # Errors
 /// [`FocrError::FormatMismatch`] if `name` is absent or mis-shaped.
-fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QInt8> {
+pub(crate) fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QInt8> {
     if matches!(
         weights.record(name).map(|rec| rec.dtype),
         Some(DType::QInt8PerChan)
@@ -2055,7 +2055,7 @@ impl DecoderWeightCacheI8 {
 
 /// One SwiGLU expert over a `[n_tok, hidden]` activation, int8 — `down(silu(gate·x)
 /// * (up·x))` via [`nn::linear_int8_dynamic`]. The int8 twin of [`moe::expert_mlp`].
-fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> FocrResult<Mat> {
+pub(crate) fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> FocrResult<Mat> {
     let mut g = nn::linear_int8_dynamic(x, gate, None)?;
     nn::silu(&mut g);
     let u = nn::linear_int8_dynamic(x, up, None)?;

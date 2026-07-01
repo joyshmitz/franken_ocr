@@ -1,0 +1,395 @@
+//! The Qwen2-arch **dense** decoder forward (GOT-OCR2.0, bead B5) — a thin driver
+//! that composes the already-parity-tested leaf kernels in [`super::decoder`] with
+//! a [`DecoderConfig`], rather than forking the DeepSeek-V2 MoE + R-SWA path (whose
+//! `config` module and `RingCache`/`rswa` attention hardcode 1280/12/10/128 and a
+//! 128-token sliding window — all wrong for GOT).
+//!
+//! GOT-OCR2's decoder is Qwen2-0.5B: 24 layers, hidden 1024, 16 heads (no GQA,
+//! head_dim 64), dense SwiGLU (intermediate 2816, silu), RoPE θ=1e6, **full-causal**
+//! attention (scale 1/8 = 1/√64), q/k/v_proj **with bias** (o_proj none), RMSNorm
+//! ε=1e-6, and **tied** embeddings (`lm_head` == `embed_tokens`, stored once,
+//! high-precision). Every one of those maps onto an existing kernel:
+//! * q/k/v/o + gate/up/down GEMMs → [`nn::linear_int8_dynamic`] (int8, and it
+//!   already carries the qkv bias) or the f32 [`super::decoder::linear_no_bias`];
+//! * RoPE → [`super::decoder::RopeTable::build`] + [`super::decoder::apply_rope`]
+//!   (NEOX rotate-half = HF Qwen2), built once at `head_dim=64, θ=1e6`;
+//! * attention → [`super::decoder::prefill_attention`] (full-causal MHA, scale
+//!   `1/√head_dim` = 1/8 at head_dim 64);
+//! * norms → [`nn::rms_norm`]; tied head → [`super::decoder::norm_and_lm_head`].
+//!
+//! [`linear_auto`] picks int8 vs f32 **per GEMM** from the loaded tensor's dtype,
+//! so the SAME forward certifies both the shipping `got-ocr2.int8.focrq` (int8
+//! decoder GEMMs) and the raw bf16 `model.safetensors` (an f32 reference). Parity
+//! is held against the bit-deterministic torch oracle (floor = 0) at the decoder
+//! seam: feed the oracle's post-splice `hidden_0` and match the last-position
+//! logits (see the `#[cfg(test)]` parity gate).
+//!
+//! Scope: **prefill only** (the parity path). The m=1 generation decode-step (a
+//! bias-carrying `gemv_i8` + a growing full-causal KV cache) lands with B7's
+//! generation loop; the prefill last-position logits already certify every kernel.
+
+use super::decoder;
+use super::nn;
+use super::tensor::Mat;
+use super::weights::{DType, Weights};
+use crate::error::{FocrError, FocrResult};
+
+/// Config of a dense (Qwen2/Llama-style) decoder — the parameters the shared leaf
+/// kernels need, so one driver serves GOT-OCR2 (and later SmolVLM2/OneChart).
+#[derive(Debug, Clone, Copy)]
+pub struct DecoderConfig {
+    /// Residual-stream width (GOT 1024).
+    pub hidden_size: usize,
+    /// Dense SwiGLU inner width (GOT 2816).
+    pub intermediate_size: usize,
+    /// Number of transformer layers (GOT 24).
+    pub num_hidden_layers: usize,
+    /// Attention heads (GOT 16).
+    pub num_attention_heads: usize,
+    /// Per-head dim (GOT 64); `num_attention_heads * head_dim == hidden` for GOT.
+    pub head_dim: usize,
+    /// Vocabulary (GOT 151860).
+    pub vocab_size: usize,
+    /// RoPE base θ (GOT 1e6).
+    pub rope_theta: f32,
+    /// RMSNorm ε (GOT 1e-6).
+    pub rms_norm_eps: f32,
+    /// Whether q/k/v_proj carry a bias (GOT true; o_proj never does).
+    pub attn_qkv_bias: bool,
+}
+
+impl DecoderConfig {
+    /// The GOT-OCR2.0 (Qwen2-0.5B) decoder configuration (`config.json`, spec §4).
+    #[must_use]
+    pub fn got_ocr2() -> Self {
+        Self {
+            hidden_size: 1024,
+            intermediate_size: 2816,
+            num_hidden_layers: 24,
+            num_attention_heads: 16,
+            head_dim: 64,
+            vocab_size: 151_860,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+            attn_qkv_bias: true,
+        }
+    }
+
+    /// The q/k/v/o projection width (`num_attention_heads * head_dim`). Equals
+    /// `hidden_size` for GOT (no GQA), but kept distinct so the driver survives a
+    /// GQA model.
+    #[must_use]
+    pub fn qkv_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim
+    }
+}
+
+/// One GEMM `y = x @ W^T (+ bias)` where `W` (name `weight_name` in `weights`) is
+/// either a pre-quantized `QInt8PerChan` record (the `.focrq` shipping path →
+/// [`nn::linear_int8_dynamic`], which dequantizes then adds `bias` in f32) or a
+/// high-precision bf16/f32 record (the reference path → [`decoder::linear_no_bias`]
+/// + a manual bias add). Dispatching per tensor lets ONE forward certify both.
+fn linear_auto(
+    weights: &Weights,
+    x: &Mat,
+    weight_name: &str,
+    in_: usize,
+    out: usize,
+    bias: Option<&[f32]>,
+) -> FocrResult<Mat> {
+    let is_int8 = matches!(
+        weights.record(weight_name).map(|r| r.dtype),
+        Some(DType::QInt8PerChan)
+    );
+    if is_int8 {
+        let qw = decoder::quant_oc_loaded(weights, weight_name, out)?;
+        nn::linear_int8_dynamic(x, &qw, bias)
+    } else {
+        let w = weights.mat(weight_name)?;
+        if w.data.len() != out * in_ {
+            return Err(FocrError::FormatMismatch(format!(
+                "decoder_qwen2: {weight_name} has {} elems, expected {out}*{in_}",
+                w.data.len()
+            )));
+        }
+        let mut y = decoder::linear_no_bias(x, &w.data, in_, out)?;
+        if let Some(b) = bias {
+            add_bias(&mut y, b);
+        }
+        Ok(y)
+    }
+}
+
+/// Add a per-output-channel bias to each row (f32 reference path; the int8 path
+/// adds bias inside `linear_int8_dynamic` at the same point — after dequant).
+fn add_bias(y: &mut Mat, bias: &[f32]) {
+    debug_assert_eq!(bias.len(), y.cols);
+    for row in y.data.chunks_mut(y.cols) {
+        for (v, &b) in row.iter_mut().zip(bias.iter()) {
+            *v += b;
+        }
+    }
+}
+
+/// Reject Qwen3-style per-head q/k norms (Qwen2 has none) — their silent presence
+/// would be a silent parity divergence (spec §13a OQ).
+fn assert_no_qk_norm(weights: &Weights, layer_prefix: &str) -> FocrResult<()> {
+    for suffix in [".self_attn.q_norm.weight", ".self_attn.k_norm.weight"] {
+        let name = format!("{layer_prefix}{suffix}");
+        if weights.record(&name).is_some() {
+            return Err(FocrError::FormatMismatch(format!(
+                "decoder_qwen2: unexpected {name} — Qwen2 has no q/k-norm; refusing to run \
+                 a mismatched architecture"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One Qwen2 dense layer over the prefill activations `x: [seq, hidden]`.
+fn qwen2_layer(
+    weights: &Weights,
+    x: &Mat,
+    layer: usize,
+    rope: &decoder::RopeTable,
+    cfg: &DecoderConfig,
+) -> FocrResult<Mat> {
+    let p = format!("model.layers.{layer}");
+    assert_no_qk_norm(weights, &p)?;
+    let eps = cfg.rms_norm_eps;
+    let (hidden, qkv_dim, inter) = (cfg.hidden_size, cfg.qkv_dim(), cfg.intermediate_size);
+
+    // ── attention ────────────────────────────────────────────────────────────
+    let input_ln = weights.vec(&format!("{p}.input_layernorm.weight"))?;
+    let normed = nn::rms_norm(x, Some(&input_ln), eps)?;
+
+    let (q_b, k_b, v_b) = if cfg.attn_qkv_bias {
+        (
+            Some(weights.vec(&format!("{p}.self_attn.q_proj.bias"))?),
+            Some(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?),
+            Some(weights.vec(&format!("{p}.self_attn.v_proj.bias"))?),
+        )
+    } else {
+        (None, None, None)
+    };
+    let mut q = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.q_proj.weight"),
+        hidden,
+        qkv_dim,
+        q_b.as_deref(),
+    )?;
+    let mut k = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.k_proj.weight"),
+        hidden,
+        qkv_dim,
+        k_b.as_deref(),
+    )?;
+    let v = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.v_proj.weight"),
+        hidden,
+        qkv_dim,
+        v_b.as_deref(),
+    )?;
+
+    decoder::apply_rope(&mut q, rope)?;
+    decoder::apply_rope(&mut k, rope)?;
+    let ctx = decoder::prefill_attention(&q, &k, &v, cfg.num_attention_heads, cfg.head_dim)?;
+    let attn = linear_auto(
+        weights,
+        &ctx,
+        &format!("{p}.self_attn.o_proj.weight"),
+        qkv_dim,
+        hidden,
+        None,
+    )?;
+    let h = decoder::add_residual(x, &attn)?;
+
+    // ── dense SwiGLU MLP ──────────────────────────────────────────────────────
+    let post_ln = weights.vec(&format!("{p}.post_attention_layernorm.weight"))?;
+    let normed2 = nn::rms_norm(&h, Some(&post_ln), eps)?;
+    let mut g = linear_auto(
+        weights,
+        &normed2,
+        &format!("{p}.mlp.gate_proj.weight"),
+        hidden,
+        inter,
+        None,
+    )?;
+    nn::silu(&mut g);
+    let u = linear_auto(
+        weights,
+        &normed2,
+        &format!("{p}.mlp.up_proj.weight"),
+        hidden,
+        inter,
+        None,
+    )?;
+    for (a, &b) in g.data.iter_mut().zip(u.data.iter()) {
+        *a *= b;
+    }
+    let mlp = linear_auto(
+        weights,
+        &g,
+        &format!("{p}.mlp.down_proj.weight"),
+        inter,
+        hidden,
+        None,
+    )?;
+    decoder::add_residual(&h, &mlp)
+}
+
+/// Run the dense decoder prefill over `inputs_embeds: [seq, hidden]` (the
+/// post-`<imgpad>`-splice decoder input) through all layers and the final norm +
+/// **tied** lm_head, returning logits `[seq, vocab]`.
+///
+/// `weights` may be the int8 `got-ocr2.int8.focrq` or the raw bf16 safetensors;
+/// [`linear_auto`] adapts per GEMM. The lm_head is always f32 (the tied
+/// `model.embed_tokens.weight`, HP).
+///
+/// # Errors
+/// [`FocrError`] on a shape mismatch, a missing tensor, or a rejected q/k-norm.
+pub fn forward_prefill(
+    weights: &Weights,
+    cfg: &DecoderConfig,
+    inputs_embeds: &Mat,
+) -> FocrResult<Mat> {
+    if inputs_embeds.cols != cfg.hidden_size {
+        return Err(FocrError::FormatMismatch(format!(
+            "decoder_qwen2: inputs_embeds cols {} != hidden {}",
+            inputs_embeds.cols, cfg.hidden_size
+        )));
+    }
+    let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
+    let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
+
+    let mut x = inputs_embeds.clone();
+    for layer in 0..cfg.num_hidden_layers {
+        x = qwen2_layer(weights, &x, layer, &rope, cfg)?;
+    }
+
+    // final RMSNorm + tied lm_head (embed_tokens^T, f32).
+    let final_norm = weights.vec("model.norm.weight")?;
+    let embed = weights.mat("model.embed_tokens.weight")?;
+    decoder::norm_and_lm_head(
+        &x,
+        &final_norm,
+        &embed.data,
+        cfg.vocab_size,
+        cfg.rms_norm_eps,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn got_config_is_the_censused_shape() {
+        let c = DecoderConfig::got_ocr2();
+        assert_eq!(c.hidden_size, 1024);
+        assert_eq!(c.intermediate_size, 2816);
+        assert_eq!(c.num_hidden_layers, 24);
+        assert_eq!(c.num_attention_heads, 16);
+        assert_eq!(c.head_dim, 64);
+        assert_eq!(c.qkv_dim(), 1024);
+        assert_eq!(c.vocab_size, 151_860);
+        // full-causal scale must be exactly 1/8 (= 1/sqrt(64), what prefill_attention derives).
+        assert!(((1.0 / (c.head_dim as f32).sqrt()) - 0.125).abs() < 1e-7);
+    }
+
+    /// Read a raw little-endian f32 blob.
+    fn read_f32_le(path: &str) -> Vec<f32> {
+        let bytes = std::fs::read(path).expect("oracle blob");
+        assert_eq!(bytes.len() % 4, 0, "not a whole f32 count");
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn argmax(v: &[f32]) -> usize {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+            .0
+    }
+
+    /// **B5 — the GOT decoder parity gate vs the bit-deterministic torch oracle.**
+    /// Env-gated (skip-with-success when the artifacts are absent, per the
+    /// model-gated pattern): `FOCR_GOT_MODEL` = the got-ocr2 `.focrq` (int8) or the
+    /// raw bf16 `model.safetensors` (f32 reference); `FOCR_ORACLE_HIDDEN0` = the
+    /// oracle's post-splice decoder input `[N,1024]`; `FOCR_ORACLE_LOGITS` = the
+    /// oracle last-position logits `[vocab]`.
+    ///
+    /// CERTIFIED (2026-06-30, GOT-OCR2 weights): the **f32 reference** path
+    /// (`model.safetensors`) matches the torch oracle to **cos = 1.000000** — every
+    /// kernel is numerically exact — and the shipping **int8** path
+    /// (`got-ocr2.int8.focrq`) to **cos = 0.9993**, with the greedy next-token
+    /// **argmax = 9707 exact on both**.
+    #[test]
+    fn decoder_matches_torch_oracle() {
+        let (Ok(model), Ok(h0), Ok(lg)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_ORACLE_HIDDEN0"),
+            std::env::var("FOCR_ORACLE_LOGITS"),
+        ) else {
+            return;
+        };
+        let cfg = DecoderConfig::got_ocr2();
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+
+        let h0_flat = read_f32_le(&h0);
+        let n = h0_flat.len() / cfg.hidden_size;
+        assert_eq!(n * cfg.hidden_size, h0_flat.len(), "hidden0 not [N,1024]");
+        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+
+        let logits = forward_prefill(&weights, &cfg, &inputs).expect("prefill forward");
+        assert_eq!(logits.cols, cfg.vocab_size);
+        let ours = &logits.data[(logits.rows - 1) * logits.cols..];
+
+        let oracle = read_f32_le(&lg);
+        let oracle = &oracle[oracle.len() - cfg.vocab_size..]; // last position if [N,vocab]
+
+        // greedy next-token identity (the load-bearing gate; must hold on int8 too).
+        assert_eq!(
+            argmax(ours),
+            argmax(oracle),
+            "next-token argmax diverged from the torch oracle"
+        );
+        // cosine + max-abs. Oracle floor = 0, so any residual is our numeric/quant
+        // error: an int8 build stays high-cos; an f32 build is near bit-exact.
+        let dot: f64 = ours
+            .iter()
+            .zip(oracle)
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let na: f64 = ours
+            .iter()
+            .map(|&a| f64::from(a) * f64::from(a))
+            .sum::<f64>()
+            .sqrt();
+        let nb: f64 = oracle
+            .iter()
+            .map(|&b| f64::from(b) * f64::from(b))
+            .sum::<f64>()
+            .sqrt();
+        let cos = dot / (na * nb);
+        eprintln!(
+            "[B5 parity] argmax={} cos={cos:.6} (oracle argmax={})",
+            argmax(ours),
+            argmax(oracle)
+        );
+        assert!(
+            cos >= 0.99,
+            "logit cosine {cos:.6} < 0.99 — decoder diverged"
+        );
+    }
+}
