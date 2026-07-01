@@ -306,9 +306,9 @@ pub fn generate_greedy(
     let embed = weights.mat("model.embed_tokens.weight")?;
     let (vocab, hidden) = (embed.rows, embed.cols);
     let mut data = inputs_embeds.data.clone();
-    let mut rows = inputs_embeds.rows;
     let mut ids = Vec::new();
     for _ in 0..max_new {
+        let rows = data.len() / hidden;
         let cur = Mat::from_vec(rows, hidden, std::mem::take(&mut data));
         let logits = forward_prefill(weights, cfg, &cur)?;
         let last = &logits.data[(logits.rows - 1) * vocab..];
@@ -327,7 +327,6 @@ pub fn generate_greedy(
         }
         let te = decoder::embed_tokens(&embed.data, vocab, hidden, &[next])?;
         data.extend_from_slice(&te.data);
-        rows += 1;
     }
     Ok(ids)
 }
