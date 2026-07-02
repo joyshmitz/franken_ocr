@@ -7,16 +7,16 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![version: v0.2.0](https://img.shields.io/badge/version-v0.2.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.2.0)
+[![version: v0.3.0](https://img.shields.io/badge/version-v0.3.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.3.0)
 [![status: working](https://img.shields.io/badge/status-working-success.svg)](#quick-example)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![toolchain: nightly](https://img.shields.io/badge/toolchain-nightly-purple.svg)](./rust-toolchain.toml)
 [![unsafe: forbidden*](https://img.shields.io/badge/unsafe-forbidden*-success.svg)](https://github.com/rust-secure-code/safety-dance/)
-[![model: Baidu Unlimited-OCR](https://img.shields.io/badge/model-Baidu_Unlimited--OCR-teal.svg)](https://huggingface.co/baidu/Unlimited-OCR)
+[![default model: Baidu Unlimited-OCR](https://img.shields.io/badge/default_model-Baidu_Unlimited--OCR-teal.svg)](https://huggingface.co/baidu/Unlimited-OCR)
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine that runs exactly one model, Baidu Unlimited-OCR, with no general ML framework, no Python, no CUDA, no FFI at inference, and no GPU.** It parses document images into Markdown, JSON, or a versioned NDJSON event stream, on a single static binary that fits in about 5 MB.
+**A pure-Rust, memory-safe, CPU-only OCR engine that runs a small, hand-frankenized family of models — Baidu Unlimited-OCR as the default, GOT-OCR2 for specialized structured output — on one set of model-specific kernels, with no general ML framework, no Python, no CUDA, no FFI at inference, and no GPU.** It parses document images into Markdown, JSON, or a versioned NDJSON event stream, on a single static binary that fits in about 5 MB.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/
 
 </div>
 
-The installer detects your platform, downloads the right prebuilt binary from the `v0.2.0` release, verifies it by SHA256, and puts `focr` on your PATH. Then `focr pull` fetches the weights once and you run offline forever after.
+The installer detects your platform, downloads the right prebuilt binary from the `v0.3.0` release, verifies it by SHA256, and puts `focr` on your PATH. Then `focr pull` fetches the weights once and you run offline forever after.
 
 ---
 
@@ -35,7 +35,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 
 **The problem.** Baidu Unlimited-OCR is a strong document-parsing model: Markdown, tables, LaTeX, reading order, many pages in one pass. The official stack is Python plus CUDA. Most machines that need OCR (laptops, CI runners, agent hosts, edge boxes) have no usable GPU, and a Python plus CUDA dependency is heavy to ship and awkward to embed.
 
-**The solution.** `franken_ocr` is a library plus a single-binary CLI (`focr`) that runs this one model on CPU with nothing but a Rust binary. It transforms the bf16 checkpoint into a custom int8 format and runs it through kernels written for this model's exact shapes. On a real page measured against the Baidu reference, the end-to-end character-error-rate is **0.0094**; the decode matched the reference to within a single token, and on one token it beat the reference. That is a measured result on the 6.67 GB model, not a target.
+**The solution.** `franken_ocr` is a library plus a single-binary CLI (`focr`) that runs this model on CPU with nothing but a Rust binary. It transforms the bf16 checkpoint into a custom int8 format and runs it through kernels written for this model's exact shapes. On a real page measured against the Baidu reference, the end-to-end character-error-rate is **0.0094**; the decode matched the reference to within a single token, and on one token it beat the reference. That is a measured result on the 6.67 GB model, not a target.
 
 ### Why `focr`?
 
@@ -87,7 +87,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 ## Design Philosophy
 
-**One model, every dimension fixed.** A general ML framework pays a generality tax on every operation: dynamic dtype dispatch, arbitrary shapes, autograd bookkeeping, broadcast machinery, a device abstraction. `franken_ocr` runs exactly one model whose every dimension is known at compile time (hidden 1280, 10 heads, head_dim 128, 64 experts, top-6 routing, MoE intermediate 896, R-SWA window 128, vocab 129280). That buys shape-specialized kernels with no runtime shape branching in the hot loop.
+**A few models, every dimension fixed.** A general ML framework pays a generality tax on every operation: dynamic dtype dispatch, arbitrary shapes, autograd bookkeeping, broadcast machinery, a device abstraction. `franken_ocr` runs a small set of hand-ported models whose every dimension is known at compile time (for the default Unlimited-OCR: hidden 1280, 10 heads, head_dim 128, 64 experts, top-6 routing, MoE intermediate 896, R-SWA window 128, vocab 129280). That buys shape-specialized kernels with no runtime shape branching in the hot loop. The scope is a few hand-tuned, certified models, not any model: there is no generic runtime underneath.
 
 **Offline at inference.** The only network step is `focr pull`, which runs ahead of time. There is no Python, no CUDA, no FFI, and no GPU in the inference path. The async runtime that orchestrates I/O and cancellation is an owned internal detail; the library API is synchronous and blocking, so there is no async plumbing to thread through your code.
 
@@ -101,13 +101,13 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 ## How `franken_ocr` Compares
 
-`franken_ocr` is the only one of these built for a single model on CPU.
+`franken_ocr` is the only one of these built for a fixed, hand-tuned set of models on CPU.
 
-| | `franken_ocr` v0.2.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
+| | `franken_ocr` v0.3.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
 |---|---|---|---|---|
 | Language / runtime | Pure Rust, one binary | Python + HF transformers | C++ | C++ |
 | Primary target | CPU | CUDA GPU | CPU/GPU | CPU/GPU |
-| Scope | This one model | This model | Many models | Many models |
+| Scope | A few hand-tuned models | This model | Many models | Many models |
 | int8 kernels | Model-specific tiled SDOT/SMMLA/VNNI | n/a | Generic K-quant | MLAS |
 | Vision encoder | First-class, kept high precision | First-class | Kept F16 (mmproj) | Depends on export |
 | Network at inference | None | None | None | None |
@@ -121,7 +121,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 - You want a single binary you can drop on a CI runner, an agent host, or an edge box.
 
 **When `franken_ocr` might not be ideal:**
-- You need a model zoo or a generic inference runtime. `franken_ocr` runs exactly one model, by design.
+- You need a generic inference runtime that loads arbitrary models. `franken_ocr` runs a few hand-ported, certified models, by design.
 - You need the OmniDocBench leader; Unlimited-OCR is strong but not the top of the board.
 
 ---
@@ -134,7 +134,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
-The script detects your OS and CPU architecture, downloads the matching binary from the `v0.2.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
+The script detects your OS and CPU architecture, downloads the matching binary from the `v0.3.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
 
 On native Windows, install from PowerShell:
 
@@ -159,7 +159,7 @@ Release binaries are raw executables, not tar.gz archives. Each one is a single 
 Each asset has a `<asset>.sha256` sidecar in the standard `"<hex>  <asset>"` format. Download the binary and its sidecar from the release base URL, verify, then install. Example for Apple Silicon:
 
 ```bash
-base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.2.0
+base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.3.0
 asset=focr-aarch64-apple-darwin-neon-sdot-i8mm
 
 curl -fsSLO "$base/$asset"
@@ -199,7 +199,7 @@ cargo build --release
 
 ## Command Reference
 
-Both `focr ocr` and `focr robot run` accept the same image plus inference-tuning flags. The default crop mode is `gundam` (dynamic-resolution tiling); the alternative is `base`.
+Both `focr ocr` and `focr robot run` accept the same image plus inference-tuning flags. The default crop mode is `base` (the certified single 1024-pixel global view); `--crop-mode gundam` selects the reference dynamic-resolution tiling, whose end-to-end certification is still pending.
 
 ### `focr ocr <image>`
 
@@ -212,9 +212,10 @@ focr ocr page.png -o page.md               # write Markdown to a file
 focr ocr page.png -o page.json             # write structured JSON (markdown + boxes) to a file
 focr ocr page.png -o page.md --extract-figures   # also save figures, referenced from the .md
 focr ocr page.png --robot                  # NDJSON pipeline events
-focr ocr page.png --crop-mode base         # disable dynamic-resolution tiling
+focr ocr page.png --crop-mode gundam       # reference dynamic-resolution tiling (uncertified)
 focr ocr page.png --max-length 4096 --temperature 0.0
 focr ocr page.png --model /path/to/unlimited-ocr.focrq
+focr ocr eq.png --task formula --model got-ocr2.int8.focrq   # specialized task routing (see below)
 ```
 
 **Output (`-o`/`--output FILE`).** Writes the result to a file instead of stdout; the
@@ -234,6 +235,15 @@ JSON gains a `figures` array of `{label, page, bbox, path}`. Each figure's forma
 chosen by content — JPG (quality 85) for photographic regions, lossless PNG for
 line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
 PDFs name figures per page (`page{N}_figure_{M}`).
+
+**Tasks (`--task`).** Convenience routing over the model zoo (`focr models`). `--task ocr`
+(the default) is plain document OCR, unchanged. The six specialized tasks — `formula`,
+`tables`, `chart`, `molecular`, `geometry`, `music` — are all served by GOT-OCR2's
+`OCR with format:` mode, so each implies `--format` (an explicit `--format` composes
+idempotently) and needs the got-ocr2 model: `focr pull got-ocr2`, then
+`--model got-ocr2.int8.focrq`. Pointing a specialized task at the default plain-text
+model fails with usage guidance before any weights load. `--task describe` (photo
+description / VQA) is planned for the smolvlm2 model and fails clean today.
 
 Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (sampling), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
 
@@ -282,6 +292,7 @@ focr models --json                          # machine-readable list
 focr pull got-ocr2                                    # download the weights + tokenizer
 focr ocr --model got-ocr2.int8.focrq page.png         # plain-text OCR
 focr ocr --model got-ocr2.int8.focrq --format eq.png  # structured .mmd: LaTeX / tables / charts / music
+focr ocr --model got-ocr2.int8.focrq --task tables page.png  # task shorthand (implies --format)
 ```
 
 The roadmap (epic `bd-3jo6`) adds further specialized models — SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
@@ -332,6 +343,9 @@ focr doctor --json                          # idempotent self-check / repair
 | `FOCR_MANIFEST_URL` | Override the manifest source (a local path or an `https` URL). Defaults to the built-in repo manifest. |
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
+| `FOCR_MAX_NEW_TOKENS` | Cap the number of generated tokens (the engine's `max_length`; default 32768). An explicit `--max-length` flag outranks it. Capping never changes the per-step math, so a capped run's tokens are a true prefix of the full run's. |
+| `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode all pages together, with `FOCR_BATCH_SIZE` streams in flight (default 8). Present ⇒ armed; unset (the default) runs the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
+| `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
 | `FOCR_FORCE_ARCH` | Force the SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`vnni`/`amx`) for CPU dispatch; used by `robot selftest` and SIMD detection. |
 | `FOCR_RESAMPLE` | Preprocess resampling kernel. Unset (default): the `image` crate's CatmullRom. `pil-bicubic`: a Pillow-bit-exact fixed-point BICUBIC at every resize site, for reference-exact comparison against the PIL/torch oracle (DISC-001 in `docs/DISCREPANCIES.md`). |
 | `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). |
@@ -425,7 +439,7 @@ To force a specific tier for verification, set `FOCR_FORCE_ARCH` (for example `F
 
 ### Checksum mismatch on a manual download
 
-`focr pull` verifies every byte automatically, so prefer it. If you downloaded an asset by hand and `shasum -a 256 -c` (or `sha256sum -c`) fails, the download is corrupt or truncated; re-download the binary and its `.sha256` sidecar from the `v0.2.0` release. A format or version mismatch on a model artifact surfaces as exit code 7.
+`focr pull` verifies every byte automatically, so prefer it. If you downloaded an asset by hand and `shasum -a 256 -c` (or `sha256sum -c`) fails, the download is corrupt or truncated; re-download the binary and its `.sha256` sidecar from the `v0.3.0` release. A format or version mismatch on a model artifact surfaces as exit code 7.
 
 ### Running fully offline
 
@@ -461,7 +475,7 @@ What this is and is not:
 - **int8 can repeat on hard tables.** int8 decode is roughly 2.5x faster and byte-identical to f32 on typical pages, but some dense tables (for example `page_0590`) can trigger repetition runs. The no-repeat n-gram guard and the f32 fallback are the documented kill-switches. The vision tower stays high precision because quantizing it breaks OCR.
 - **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes each page (pure-Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. The fast path covers the common scanned-PDF codecs — JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported (rasterize that PDF out of band and retry).
 - **Native Windows (x86_64) is supported and proven end-to-end; ARM64 is not yet.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10: the same 3.9 GB int8 weights, vision tower, and DeepSeek-V2 decoder produce the same markdown a Mac or Linux host does. `focr.exe robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle, including the K=6848 overflow case). `focr pull` works on Windows too — the full 3.9 GB multi-part download, reassembly, and SHA-256 verify complete over the native async HTTP/TLS stack (an earlier send-path bug that surfaced as `WSAENOTCONN` / os error 10057, `bd-15ow`, is fixed). The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`. The one remaining gap, tracked under epic `bd-3u97`, is that ARM64 Windows is not published.
-- **One model only.** This is a deliberate non-goal to be general. `franken_ocr` will not become a model zoo or a generic inference runtime.
+- **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models — Unlimited-OCR by default, GOT-OCR2 for structured formats, more per the roadmap in `focr models` — each transformed offline and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
 - **Not benchmark SOTA.** Unlimited-OCR is strong but not the OmniDocBench leader. The aim is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
 - **CPU only.** No GPU. CUDA is a deferred stretch goal; CPU stays the product.
 
@@ -471,7 +485,7 @@ What this is and is not:
 
 **Is this affiliated with Baidu?** No. It is an independent pure-Rust reimplementation that runs Baidu's openly-licensed (MIT) model weights. The weights and any quantized derivative this project distributes carry the model notice surfaced by the binary and `.focrq` metadata: `Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License`.
 
-**Why not just use llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused build: a single fixed model lets the kernels specialize to its exact shapes and skip the generality tax, and the whole thing ships as one Rust binary with no FFI. It is portable to targets where `ort` or CUDA cannot build.
+**Why not just use llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused build: a small fixed set of hand-ported models lets the kernels specialize to each model's exact shapes and skip the generality tax, and the whole thing ships as one Rust binary with no FFI. It is portable to targets where `ort` or CUDA cannot build.
 
 **Why Rust, and why forbid `unsafe`?** Memory safety for a multi-gigabyte weight loader and a tight decode loop, with `unsafe` confined to small, audited SIMD modules that each carry a bit-identical scalar fallback.
 

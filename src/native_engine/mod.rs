@@ -264,6 +264,65 @@ pub struct DecodeOverrides {
     pub ngram_window: Option<usize>,
 }
 
+/// CLI preprocess overrides (`--base-size`, `--image-size`, `--crop-mode`) —
+/// the preprocess twin of [`DecodeOverrides`] (bd-1e9n). `None` everywhere =
+/// the certified default (a single Base-1024 global view — every oracle cert
+/// and golden was produced there). `gundam: Some(true)` selects the reference
+/// dynamic-tiling mode ([SPEC-023..028]; connector + placeholder census are
+/// implemented and unit-tested, but Gundam e2e has no oracle cert yet — the
+/// CLI surfaces it as the reference behavior it is, and parity for it rides
+/// the conformance ladder like everything else).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PreprocessOverrides {
+    /// Global-view edge length (`--base-size`; default 1024).
+    pub base_size: Option<usize>,
+    /// Gundam local-tile edge length (`--image-size`; default 640).
+    pub image_size: Option<usize>,
+    /// `--crop-mode`: `Some(true)` = Gundam tiling, `Some(false)` = Base,
+    /// `None` = the engine default (Base).
+    pub gundam: Option<bool>,
+}
+
+/// The process-global [`PreprocessOverrides`] store (same discipline as
+/// [`DECODE_OVERRIDES`]: set by the CLI before the engine is built).
+static PREPROCESS_OVERRIDES: Mutex<PreprocessOverrides> = Mutex::new(PreprocessOverrides {
+    base_size: None,
+    image_size: None,
+    gundam: None,
+});
+
+/// Set (or clear, with `PreprocessOverrides::default()`) the process-wide
+/// preprocess overrides. Call BEFORE recognitions.
+pub fn set_preprocess_overrides(overrides: PreprocessOverrides) {
+    *PREPROCESS_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
+}
+
+/// Resolve the forward path's preprocess mode: the certified Base-1024 default
+/// unless the CLI overrode it. Pure over its input; the tiny wrapper below
+/// reads the global.
+fn resolve_preprocess_mode(o: PreprocessOverrides) -> preprocess::PreprocessMode {
+    let base_size = o.base_size.unwrap_or(1024);
+    if o.gundam == Some(true) {
+        preprocess::PreprocessMode::Gundam {
+            base_size,
+            tile_size: o.image_size.unwrap_or(640),
+        }
+    } else {
+        preprocess::PreprocessMode::Base { base_size }
+    }
+}
+
+/// The forward path's preprocess mode under the current process-wide overrides.
+fn preprocess_mode() -> preprocess::PreprocessMode {
+    resolve_preprocess_mode(
+        *PREPROCESS_OVERRIDES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// The process-global [`DecodeOverrides`] store. A `Mutex` (not `OnceLock`) so a
 /// long-lived embedder can re-set between recognitions; reads happen once per
 /// model load, never per token.
@@ -883,10 +942,9 @@ impl OcrModel {
         }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
-        let pre = preprocess::preprocess_image(
-            image_path,
-            preprocess::PreprocessMode::Base { base_size: 1024 },
-        )?;
+        // Mode = the certified Base-1024 default unless the CLI overrode it
+        // (--base-size/--image-size/--crop-mode, bd-1e9n).
+        let pre = preprocess::preprocess_image(image_path, preprocess_mode())?;
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
     }
@@ -903,10 +961,7 @@ impl OcrModel {
             return self.forward_got(&img);
         }
         let t = std::time::Instant::now();
-        let pre = preprocess::preprocess_dynamic(
-            img,
-            preprocess::PreprocessMode::Base { base_size: 1024 },
-        )?;
+        let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
     }
@@ -1247,12 +1302,13 @@ impl OcrModel {
         let mut out: Vec<Option<FocrResult<String>>> = (0..n).map(|_| None).collect();
 
         // Stage 1: preprocess every page (a per-page error records + skips it).
+        // Same mode resolution as the single-page forward (bd-1e9n) — the
+        // batched-vision stage groups views by side, so Gundam's mixed
+        // 640/1024 views batch correctly too.
+        let mode = preprocess_mode();
         let mut pres: Vec<Option<Preprocessed>> = (0..n).map(|_| None).collect();
         for (gi, &path) in image_paths.iter().enumerate() {
-            match preprocess::preprocess_image(
-                path,
-                preprocess::PreprocessMode::Base { base_size: 1024 },
-            ) {
+            match preprocess::preprocess_image(path, mode) {
                 Ok(p) => pres[gi] = Some(p),
                 Err(e) => out[gi] = Some(Err(e)),
             }
@@ -2617,6 +2673,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`resolve_preprocess_mode`] is the pure CLI-flag → [`PreprocessMode`]
+    /// mapping (bd-1e9n): default = the certified Base-1024; overrides land
+    /// exactly where set.
+    #[test]
+    fn preprocess_overrides_resolve_modes() {
+        use preprocess::PreprocessMode as M;
+        assert_eq!(
+            resolve_preprocess_mode(PreprocessOverrides::default()),
+            M::Base { base_size: 1024 }
+        );
+        assert_eq!(
+            resolve_preprocess_mode(PreprocessOverrides {
+                base_size: Some(512),
+                ..Default::default()
+            }),
+            M::Base { base_size: 512 }
+        );
+        assert_eq!(
+            resolve_preprocess_mode(PreprocessOverrides {
+                gundam: Some(true),
+                ..Default::default()
+            }),
+            M::Gundam {
+                base_size: 1024,
+                tile_size: 640
+            }
+        );
+        assert_eq!(
+            resolve_preprocess_mode(PreprocessOverrides {
+                gundam: Some(false),
+                base_size: Some(768),
+                image_size: Some(512),
+            }),
+            M::Base { base_size: 768 }
+        );
     }
 
     /// [`apply_decode_overrides`] is the pure CLI-flag → [`DecodeParams`] mapping

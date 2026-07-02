@@ -216,8 +216,15 @@ pub struct OcrRequestArgs {
     /// Reference local tile size from `infer(..., image_size=640)`.
     #[arg(long, default_value_t = DEFAULT_IMAGE_SIZE)]
     pub image_size: i64,
-    /// Vision preprocessing mode: reference Gundam tiling or base global view.
-    #[arg(long, value_enum, default_value_t = CropMode::Gundam)]
+    /// Vision preprocessing mode. `base` (the default) is the certified single
+    /// 1024-pixel global view — the mode every oracle cert and golden was
+    /// produced under, and what the engine has always actually run. `gundam`
+    /// selects the reference dynamic-resolution tiling (a 1024 global view plus
+    /// 640 local tiles); its connector path is unit-tested but has no e2e
+    /// oracle certification yet. (Until bd-1e9n this flag was parsed and
+    /// silently dropped with a `gundam` default label the engine never honored;
+    /// the default now states the real, certified behavior.)
+    #[arg(long, value_enum, default_value_t = CropMode::Base)]
     pub crop_mode: CropMode,
     /// Maximum generated sequence length.
     #[arg(long, default_value_t = DEFAULT_MAX_LENGTH)]
@@ -292,6 +299,21 @@ impl RobotRunArgs {
 /// `FOCR_MAX_NEW_TOKENS`) in force. The preprocess flags (`--base-size`,
 /// `--image-size`, `--crop-mode`) are a separate, still-unwired surface — see
 /// the tracking bead filed with this change.
+/// Map the request's preprocess tuning flags onto engine
+/// [`native_engine::PreprocessOverrides`] (bd-1e9n), with the same
+/// explicit-only rule as [`decode_overrides_from`] for the sizes. `--crop-mode`
+/// is a two-value enum whose `base` default IS the engine default, so only
+/// `gundam` produces an override.
+fn preprocess_overrides_from(request: &OcrRequest) -> native_engine::PreprocessOverrides {
+    native_engine::PreprocessOverrides {
+        base_size: (i64::from(request.base_size) != DEFAULT_BASE_SIZE)
+            .then_some(request.base_size as usize),
+        image_size: (i64::from(request.image_size) != DEFAULT_IMAGE_SIZE)
+            .then_some(request.image_size as usize),
+        gundam: matches!(request.crop_mode, CropMode::Gundam).then_some(true),
+    }
+}
+
 fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides {
     native_engine::DecodeOverrides {
         max_length: (i64::from(request.max_length) != DEFAULT_MAX_LENGTH)
@@ -1012,6 +1034,7 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // `OcrEngine::new()`: the decode params are resolved at model load.
     native_engine::force_got_format(request.format);
     native_engine::set_decode_overrides(decode_overrides_from(&request));
+    native_engine::set_preprocess_overrides(preprocess_overrides_from(&request));
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
@@ -1499,7 +1522,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     let omit_lm_head = arch.tie_word_embeddings();
     let quantized = weights
         .names()
-        .filter(|name| quant::convert::is_decoder_int8_tensor(name))
+        .filter(|name| quant::convert::is_decoder_int8_tensor_for(name, arch))
         .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
         .count();
 
@@ -2383,6 +2406,50 @@ mod tests {
             panic!("expected robot run");
         };
         assert!(args.request.to_request().expect("request builds").format);
+    }
+
+    #[test]
+    fn preprocess_flags_become_overrides_only_when_explicit() {
+        // Defaults ⇒ NO overrides: the engine keeps its certified Base-1024.
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let req = args.to_request().expect("request builds");
+        assert_eq!(
+            preprocess_overrides_from(&req),
+            native_engine::PreprocessOverrides::default()
+        );
+
+        // Explicit flags ⇒ each maps onto the engine overrides; gundam is the
+        // only crop-mode value that produces one (base IS the engine default).
+        let cli = Cli::try_parse_from([
+            "focr",
+            "ocr",
+            "scan.png",
+            "--base-size",
+            "512",
+            "--image-size",
+            "512",
+            "--crop-mode",
+            "gundam",
+        ])
+        .expect("ocr with preprocess flags parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let o = preprocess_overrides_from(&args.to_request().expect("request builds"));
+        assert_eq!(o.base_size, Some(512));
+        assert_eq!(o.image_size, Some(512));
+        assert_eq!(o.gundam, Some(true));
+
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--crop-mode", "base"])
+            .expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let o = preprocess_overrides_from(&args.to_request().expect("request builds"));
+        assert_eq!(o.gundam, None);
     }
 
     #[test]
