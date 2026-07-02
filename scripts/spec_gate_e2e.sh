@@ -175,8 +175,10 @@ step "3/4 CORPUS"
 LIST="$WORK/pages.list"
 : > "$LIST"
 if [ -d "$FOCR_SPEC_E2E_IMAGES" ]; then
-  # Sorted for a stable, reproducible page order.
-  find "$FOCR_SPEC_E2E_IMAGES" -maxdepth 1 -type f \
+  # Sorted for a stable, reproducible page order. `! -name '._*'` skips the
+  # macOS AppleDouble resource-fork sidecars external volumes grow — they are
+  # not decodable images and would count as spurious arm failures.
+  find "$FOCR_SPEC_E2E_IMAGES" -maxdepth 1 -type f ! -name '._*' \
     \( -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' \
        -o -name '*.PNG' -o -name '*.JPG' -o -name '*.JPEG' \) \
     2>/dev/null | sort > "$LIST"
