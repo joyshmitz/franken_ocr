@@ -53,6 +53,29 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("vision_sam", re.compile(r"^vision\.sam (?P<s>\d+(?:\.\d+)?)s$")),
     ("vision_clip", re.compile(r"^vision\.clip (?P<s>\d+(?:\.\d+)?)s$")),
     ("vision_bridge", re.compile(r"^vision\.bridge (?P<s>\d+(?:\.\d+)?)s$")),
+    # Batched-vision lines (bd-t6a / bd-1azu.10, spine multi-page path,
+    # src/native_engine/mod.rs::vision_tower_batched_pages). The sam/clip/bridge
+    # batch lines fold into the same stage names as their per-view twins (both
+    # are the run's total time in that tower); hydrate is its own info stage.
+    (
+        "vision_hydrate",
+        re.compile(r"^vision\.hydrate\(batch\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "vision_sam_batch",
+        re.compile(
+            r"^vision\.sam\(batch of (?P<views>\d+), side (?P<side>\d+)\)"
+            r" (?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
+        "vision_clip_batch",
+        re.compile(r"^vision\.clip\(batch of (?P<views>\d+)\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "vision_bridge_batch",
+        re.compile(r"^vision\.bridge\(batch of (?P<views>\d+)\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
     ("vision_encode", re.compile(r"^vision_tower (?P<s>\d+(?:\.\d+)?)s$")),
     (
         "weight_cache_build",
@@ -150,6 +173,16 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
         _add(stages, "decode_layers", float(groups["layers"]), None)
         _add(stages, "decode_attn", float(groups["attn"]), None)
         _add(stages, "decode_lm_head", float(groups["head"]), None)
+        return
+    if name.endswith("_batch"):
+        # Batched vision (bd-t6a): same tower work as the per-view lines, one
+        # line per side-group. Fold into the per-view stage name and keep the
+        # batching evidence (`batched`, summed `views`) alongside.
+        base = name[: -len("_batch")]
+        _add(stages, base, float(groups["s"]), None)
+        entry = stages[base]
+        entry["batched"] = True
+        entry["views"] = entry.get("views", 0) + int(groups["views"])
         return
     tokens = int(groups["tok"]) if groups.get("tok") is not None else None
     _add(stages, name, float(groups["s"]), tokens)
@@ -452,6 +485,17 @@ layers 10.00s (attn 3.00s, gemv+misc 7.00s) | lm_head 1.50s
 [focr-timing] got forward 14.10s
 """
 
+# The bd-t6a spine batched-vision line set (multi-page: two side groups for
+# sam, single lines for hydrate/clip/bridge; the second sam group proves the
+# same-stage fold sums seconds and view counts).
+_SYNTHETIC_BATCH = """\
+[focr-timing]   vision.hydrate(batch) 0.62s
+[focr-timing]   vision.sam(batch of 3, side 1024) 2.40s
+[focr-timing]   vision.sam(batch of 2, side 640) 0.80s
+[focr-timing]   vision.clip(batch of 5) 0.90s
+[focr-timing]   vision.bridge(batch of 5) 0.12s
+"""
+
 
 def _self_test() -> int:
     failures: list[str] = []
@@ -478,6 +522,24 @@ def _self_test() -> int:
     check("got-prefill-seed", math.isclose(got["prefill"]["s"], 0.55))
     check("got-vision", math.isclose(got["got_vision_splice"]["s"], 1.30))
     check("got-precision-unknown", infer_precision([got]) is None)
+
+    # bd-t6a batched-vision lines: hydrate is its own stage; sam/clip/bridge
+    # batch lines fold into the per-view stage names, summing seconds + views.
+    batch = parse_run(_SYNTHETIC_BATCH)
+    check("batch-hydrate", math.isclose(batch["vision_hydrate"]["s"], 0.62))
+    check("batch-sam-sum", math.isclose(batch["vision_sam"]["s"], 3.20))
+    check("batch-sam-views", batch["vision_sam"]["views"] == 5)
+    check("batch-sam-occurrences", batch["vision_sam"]["occurrences"] == 2)
+    check("batch-sam-marker", batch["vision_sam"].get("batched") is True)
+    check("batch-clip", math.isclose(batch["vision_clip"]["s"], 0.90))
+    check("batch-bridge", math.isclose(batch["vision_bridge"]["s"], 0.12))
+    check("batch-precision-unknown", infer_precision([batch]) is None)
+
+    # Per-view and batched lines for the same tower coexist in one run (a
+    # mixed spine run): the fold sums into a single stage entry.
+    mixed = parse_run(_SYNTHETIC_BATCH + "[focr-timing]   vision.sam 1.00s\n")
+    check("batch-mixed-sam-sum", math.isclose(mixed["vision_sam"]["s"], 4.20))
+    check("batch-mixed-occurrences", mixed["vision_sam"]["occurrences"] == 3)
 
     # No timing lines / unknown timing line both refuse (never fabricate).
     for name, text in (
