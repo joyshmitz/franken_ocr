@@ -135,6 +135,20 @@ pub struct DecoderConfig {
     /// `kv_group()` query heads (SmolVLM2-500M: 15 q heads over 5 kv heads).
     /// Must divide `num_attention_heads` evenly.
     pub num_key_value_heads: usize,
+    /// Decoder-layer tensor-name prefix INCLUDING the trailing dot (GOT
+    /// `model.layers.`, SmolVLM2 `model.text_model.layers.`) — pinned against
+    /// the `ModelArch` descriptor by a unit test so config and registry cannot
+    /// drift (C5, bd-3jo6.3.5).
+    pub layers_prefix: &'static str,
+    /// The token-embedding table's tensor name.
+    pub embed_tokens: &'static str,
+    /// The final (pre-lm_head) RMSNorm weight's tensor name.
+    pub final_norm: &'static str,
+    /// `Some(name)` = the UNTIED lm_head tensor (SmolVLM2 `lm_head.weight`);
+    /// `None` = tied to [`Self::embed_tokens`] (GOT). Drives BOTH lm_head
+    /// resolution paths (f32 pretranspose AND the int8+refine lever) and —
+    /// load-bearing — the top-K f32 refine's exact-recompute source.
+    pub lm_head: Option<&'static str>,
 }
 
 impl DecoderConfig {
@@ -153,6 +167,35 @@ impl DecoderConfig {
             attn_qkv_bias: true,
             no_repeat_ngram_size: 20,
             num_key_value_heads: 16,
+            layers_prefix: "model.layers.",
+            embed_tokens: "model.embed_tokens.weight",
+            final_norm: "model.norm.weight",
+            lm_head: None,
+        }
+    }
+
+    /// The SmolVLM2-500M (SmolLM2-360M) decoder configuration
+    /// (docs/zoo/smolvlm2-spec.md §4, census-pinned from the real config.json;
+    /// C5, bd-3jo6.3.5): GQA 15 q heads over 5 kv heads, NO qkv bias, UNTIED
+    /// lm_head, no upstream repetition guard.
+    #[must_use]
+    pub fn smolvlm2() -> Self {
+        Self {
+            hidden_size: 960,
+            intermediate_size: 2560,
+            num_hidden_layers: 32,
+            num_attention_heads: 15,
+            head_dim: 64,
+            vocab_size: 49_280,
+            rope_theta: 100_000.0,
+            rms_norm_eps: 1e-5,
+            attn_qkv_bias: false,
+            no_repeat_ngram_size: 0,
+            num_key_value_heads: 5,
+            layers_prefix: "model.text_model.layers.",
+            embed_tokens: "model.text_model.embed_tokens.weight",
+            final_norm: "model.text_model.norm.weight",
+            lm_head: Some("lm_head.weight"),
         }
     }
 
@@ -248,7 +291,7 @@ fn qwen2_layer(
     rope: &decoder::RopeTable,
     cfg: &DecoderConfig,
 ) -> FocrResult<Mat> {
-    let p = format!("model.layers.{layer}");
+    let p = format!("{}{layer}", cfg.layers_prefix);
     assert_no_qk_norm(weights, &p)?;
     let eps = cfg.rms_norm_eps;
     let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
@@ -368,9 +411,13 @@ pub fn forward_prefill(
         x = qwen2_layer(weights, &x, layer, &rope, cfg)?;
     }
 
-    // final RMSNorm + tied lm_head (embed_tokens^T, f32).
-    let final_norm = weights.vec("model.norm.weight")?;
-    let embed = weights.mat("model.embed_tokens.weight")?;
+    // final RMSNorm + lm_head (f32): the tied embed table (GOT) or the arch's
+    // untied head tensor (SmolVLM2), per cfg.lm_head.
+    let final_norm = weights.vec(cfg.final_norm)?;
+    let embed = match cfg.lm_head {
+        Some(name) => weights.mat(name)?,
+        None => weights.mat(cfg.embed_tokens)?,
+    };
     decoder::norm_and_lm_head(
         &x,
         &final_norm,
@@ -399,7 +446,7 @@ pub fn generate_greedy(
     max_new: usize,
     eos: u32,
 ) -> FocrResult<Vec<u32>> {
-    let embed = weights.mat("model.embed_tokens.weight")?;
+    let embed = weights.mat(cfg.embed_tokens)?;
     let (vocab, hidden) = (embed.rows, embed.cols);
     let mut data = inputs_embeds.data.clone();
     let mut ids = Vec::new();
@@ -560,7 +607,10 @@ struct GotLayerW {
     /// Fused q|k|v projection `[q_dim + 2·kv_dim, hidden]` (one int8 panel) so the decode
     /// quantizes the normed row ONCE and runs ONE n-parallel GEMV for all three.
     qkv: QInt8,
-    qkv_bias: Vec<f32>,
+    /// Fused q|k|v bias, `None` for a bias-free arch (SmolVLM2; C5/D4) —
+    /// [`decoder::gemv_i8_bias_prequant`] and [`nn::linear_int8_dynamic`] both
+    /// skip the add on `None`.
+    qkv_bias: Option<Vec<f32>>,
     o: QInt8,
     gate: QInt8,
     up: QInt8,
@@ -588,8 +638,14 @@ fn concat_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
 struct GotDecodeWeights {
     layers: Vec<GotLayerW>,
     final_norm: Vec<f32>,
-    /// Tied `embed_tokens` `[vocab, hidden]`, row-major — the per-token embed lookup.
+    /// `embed_tokens` `[vocab, hidden]`, row-major — the per-token embed lookup
+    /// (also the lm_head SOURCE when the arch ties them; see `untied_head`).
     embed: Vec<f32>,
+    /// The UNTIED lm_head `[vocab, hidden]` when `cfg.lm_head` names one
+    /// (SmolVLM2); `None` = tied (the head reads `embed`). LOAD-BEARING for the
+    /// int8 lever: the top-K f32 refine must recompute against THIS matrix —
+    /// refining against `embed` on an untied arch silently corrupts the argmax.
+    untied_head: Option<Vec<f32>>,
     /// The SAME weights transposed to `[hidden, vocab]` ONCE at build, matmul-ready for
     /// the decode-step `lm_head`. Either the f32 pre-transposed `[hidden, vocab]` head
     /// (bit-identical to the certified path — never re-transposes the ~0.6 GB matrix per
@@ -600,21 +656,33 @@ struct GotDecodeWeights {
 }
 
 impl GotDecodeWeights {
+    /// The lm_head SOURCE matrix `[vocab, hidden]`: the arch's untied head when
+    /// it stores one, else the tied embed table. The int8 lever's exact-f32
+    /// refine MUST read this (never `embed` directly).
+    fn head_matrix(&self) -> &[f32] {
+        self.untied_head.as_deref().unwrap_or(&self.embed)
+    }
+
     fn build(weights: &Weights, cfg: &DecoderConfig) -> FocrResult<Self> {
         let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
         let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
-            let p = format!("model.layers.{l}");
+            let p = format!("{}{l}", cfg.layers_prefix);
             let q =
                 decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.q_proj.weight"), q_dim)?;
             let k =
                 decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.k_proj.weight"), kv_dim)?;
             let v =
                 decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.v_proj.weight"), kv_dim)?;
-            let mut qkv_bias = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
-            qkv_bias.extend(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?);
-            qkv_bias.extend(weights.vec(&format!("{p}.self_attn.v_proj.bias"))?);
+            let qkv_bias = if cfg.attn_qkv_bias {
+                let mut b = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
+                b.extend(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?);
+                b.extend(weights.vec(&format!("{p}.self_attn.v_proj.bias"))?);
+                Some(b)
+            } else {
+                None
+            };
             layers.push(GotLayerW {
                 input_ln: weights.vec(&format!("{p}.input_layernorm.weight"))?,
                 post_attn_ln: weights.vec(&format!("{p}.post_attention_layernorm.weight"))?,
@@ -638,7 +706,13 @@ impl GotDecodeWeights {
                 )?,
             });
         }
-        let embed = weights.mat("model.embed_tokens.weight")?.data;
+        let embed = weights.mat(cfg.embed_tokens)?.data;
+        // UNTIED head (SmolVLM2): its own [vocab, hidden] tensor; tied (GOT):
+        // alias the embed table (never duplicate GOT's ~0.6 GB).
+        let untied_head = match cfg.lm_head {
+            Some(name) => Some(weights.mat(name)?.data),
+            None => None,
+        };
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
         // Resolve the lm_head ONCE. int8 lever: quantize the tied `[vocab, hidden]` head to
         // per-output-channel int8 in its NATIVE layout (fed to the n-parallel `gemv_i8` —
@@ -647,12 +721,23 @@ impl GotDecodeWeights {
         // call), so the decode-step head is a plain matmul with no per-token ~0.6 GB
         // re-transpose (which was 95% of decode wall-clock). Only ONE is built, so int8 also
         // halves the head's resident memory (no f32 `[hidden, vocab]` copy).
-        let lm_head = if got_int8_lmhead_enabled() {
-            LmHead::Int8(nn::quantize_int8(&embed, vocab, hidden))
+        let head_src: &[f32] = untied_head.as_deref().unwrap_or(&embed);
+        // Lever policy (doctrine #2 / OQ-6): the int8+refine head is measured
+        // byte-identical on GOT only; an UNTIED arch defaults to the f32
+        // pretransposed head until its own L4 cert lands (the same env can
+        // force the lever on for experiments — not OnceLock-cached here, build
+        // runs once per generation).
+        let int8_head = if cfg.lm_head.is_some() {
+            env_tristate("FOCR_GOT_INT8_LMHEAD", false)
         } else {
-            let mut wt = vec![0.0f32; embed.len()];
+            got_int8_lmhead_enabled()
+        };
+        let lm_head = if int8_head {
+            LmHead::Int8(nn::quantize_int8(head_src, vocab, hidden))
+        } else {
+            let mut wt = vec![0.0f32; head_src.len()];
             for o in 0..vocab {
-                let src = &embed[o * hidden..(o + 1) * hidden];
+                let src = &head_src[o * hidden..(o + 1) * hidden];
                 for (i, &val) in src.iter().enumerate() {
                     wt[i * vocab + o] = val;
                 }
@@ -661,8 +746,9 @@ impl GotDecodeWeights {
         };
         Ok(Self {
             layers,
-            final_norm: weights.vec("model.norm.weight")?,
+            final_norm: weights.vec(cfg.final_norm)?,
             embed,
+            untied_head,
             lm_head,
             cfg: *cfg,
         })
@@ -693,7 +779,12 @@ fn got_lm_head(w: &GotDecodeWeights, x_row: &Mat, eps: f32) -> FocrResult<Vec<f3
             let normed = nn::rms_norm(x_row, Some(&w.final_norm), eps)?;
             let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
             let mut logits = decoder::gemv_i8_bias_prequant(&xq, a, q, None);
-            refine_topk_f32(&mut logits, &normed.data, &w.embed, w.cfg.hidden_size);
+            refine_topk_f32(
+                &mut logits,
+                &normed.data,
+                w.head_matrix(),
+                w.cfg.hidden_size,
+            );
             Ok(logits)
         }
     }
@@ -703,7 +794,9 @@ fn got_lm_head(w: &GotDecodeWeights, x_row: &Mat, eps: f32) -> FocrResult<Vec<f3
 /// (`normed · embed_row` — the SAME value the f32 head produces for that token), so the
 /// greedy argmax over the refined vector matches the f32 lm_head. Makes the int8 lm_head
 /// near-lossless: the true best token is in the int8 top-K with overwhelming probability, so
-/// its refined logit is exact and wins. `embed` is the tied head `[vocab, hidden]` row-major.
+/// its refined logit is exact and wins. `embed` is the HEAD SOURCE `[vocab, hidden]`
+/// row-major — the tied embed table OR the arch's untied lm_head
+/// ([`GotDecodeWeights::head_matrix`]), never blindly the embed.
 fn refine_topk_f32(logits: &mut [f32], normed: &[f32], embed: &[f32], hidden: usize) {
     let vocab = logits.len();
     let k = GOT_LMHEAD_REFINE_K.min(vocab);
@@ -741,7 +834,7 @@ fn forward_prefill_seed(
     for (l, cl) in w.layers.iter().enumerate() {
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         // one fused q|k|v GEMM (m=N, row-parallel), then split the columns.
-        let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, Some(&cl.qkv_bias))?;
+        let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, cl.qkv_bias.as_deref())?;
         let (mut q, mut k, v) = split_qkv_rows(&qkv, q_dim, kv_dim);
         decoder::apply_rope(&mut q, &rope)?;
         decoder::apply_rope(&mut k, &rope)?;
@@ -847,7 +940,7 @@ fn qwen2_decode_step(
         // ── attention: quantize the normed row ONCE, fused q|k|v GEMV (n-parallel) ──
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
-        let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, Some(&cl.qkv_bias));
+        let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, cl.qkv_bias.as_deref());
         let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
         let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
         let v = &qkv[q_dim + kv_dim..q_dim + 2 * kv_dim];
@@ -1003,27 +1096,176 @@ mod tests {
         assert_eq!(c.no_repeat_ngram_size, 20);
     }
 
-    /// The SmolVLM2-500M shape (census docs/zoo/smolvlm2-spec.md): 15 q heads
-    /// over 5 kv heads, head_dim 64 — the exact GQA delta A7 exists for.
-    fn smolvlm2_like_cfg() -> DecoderConfig {
-        DecoderConfig {
-            hidden_size: 960,
-            intermediate_size: 2560,
-            num_hidden_layers: 32,
-            num_attention_heads: 15,
-            head_dim: 64,
-            vocab_size: 49_280,
-            rope_theta: 100_000.0,
-            rms_norm_eps: 1e-5,
-            attn_qkv_bias: false,
-            no_repeat_ngram_size: 0,
-            num_key_value_heads: 5,
-        }
+    /// The SmolVLM2-500M census shape (docs/zoo/smolvlm2-spec.md §4), now the
+    /// PUBLIC constructor (C5); this pin mirrors got_config_is_the_censused_shape.
+    #[test]
+    fn smolvlm2_config_is_the_censused_shape() {
+        let c = DecoderConfig::smolvlm2();
+        assert_eq!(c.hidden_size, 960);
+        assert_eq!(c.intermediate_size, 2560);
+        assert_eq!(c.num_hidden_layers, 32);
+        assert_eq!(c.num_attention_heads, 15);
+        assert_eq!(c.head_dim, 64);
+        assert_eq!(c.vocab_size, 49_280);
+        assert!(!c.attn_qkv_bias, "SmolLM2 carries no qkv bias");
+        assert_eq!(c.no_repeat_ngram_size, 0, "no upstream repetition guard");
+        assert_eq!(c.lm_head, Some("lm_head.weight"), "UNTIED head");
+        // scale must be exactly 1/8 (= 1/sqrt(64), what prefill_attention derives).
+        assert!(((1.0 / (c.head_dim as f32).sqrt()) - 0.125).abs() < 1e-7);
+    }
+
+    /// The DecoderConfig tensor names may never drift from the ModelArch
+    /// registry descriptor (the convert side classifies by the SAME names).
+    #[test]
+    fn smolvlm2_config_names_match_the_descriptor() {
+        let c = DecoderConfig::smolvlm2();
+        let arch = super::super::model_arch::arch_by_id("smolvlm2").expect("registered");
+        assert_eq!(c.layers_prefix, arch.decoder_layers_prefix());
+        assert_eq!(c.embed_tokens, arch.embed_tokens_name());
+        assert_eq!(
+            c.lm_head.is_none(),
+            arch.tie_word_embeddings(),
+            "tied-ness must agree between config and descriptor"
+        );
+        let g = DecoderConfig::got_ocr2();
+        let got = super::super::model_arch::arch_by_id("got-ocr2").expect("registered");
+        assert_eq!(g.layers_prefix, got.decoder_layers_prefix());
+        assert_eq!(g.embed_tokens, got.embed_tokens_name());
+        assert!(got.tie_word_embeddings() && g.lm_head.is_none());
+    }
+
+    /// The int8 lever's refine source: untied arch ⇒ the untied head matrix,
+    /// NEVER the embed table (a wrong source silently corrupts the argmax).
+    #[test]
+    fn head_matrix_prefers_the_untied_head() {
+        let mk = |untied: Option<Vec<f32>>| GotDecodeWeights {
+            layers: Vec::new(),
+            final_norm: Vec::new(),
+            embed: vec![1.0],
+            untied_head: untied,
+            lm_head: LmHead::F32(Mat::from_vec(1, 1, vec![0.0])),
+            cfg: DecoderConfig::smolvlm2(),
+        };
+        assert_eq!(mk(Some(vec![2.0])).head_matrix(), &[2.0][..]);
+        assert_eq!(mk(None).head_matrix(), &[1.0][..]);
+    }
+
+    /// **C5 — the SmolVLM2 decoder parity gate vs the torch oracle** (mirrors
+    /// the B5 GOT gate above). Env-gated skip-with-success:
+    /// `FOCR_SMOLVLM2_MODEL` = the smolvlm2 `.focrq` (int8) or the raw f32
+    /// `model.safetensors`; `FOCR_SMOLVLM2_ORACLE_HIDDEN0` = the oracle's
+    /// text-only-prompt `hidden_states[0]` `[N,960]` f32-LE;
+    /// `FOCR_SMOLVLM2_ORACLE_LOGITS` = the oracle last-position logits
+    /// `[49280]`. Fixtures come from `scripts/gen_reference_fixtures_smolvlm2.py`.
+    #[test]
+    fn smolvlm2_decoder_matches_torch_oracle() {
+        let (Ok(model), Ok(h0), Ok(lg)) = (
+            std::env::var("FOCR_SMOLVLM2_MODEL"),
+            std::env::var("FOCR_SMOLVLM2_ORACLE_HIDDEN0"),
+            std::env::var("FOCR_SMOLVLM2_ORACLE_LOGITS"),
+        ) else {
+            return;
+        };
+        let cfg = DecoderConfig::smolvlm2();
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load smolvlm2 weights");
+
+        let h0_flat = read_f32_le(&h0);
+        let n = h0_flat.len() / cfg.hidden_size;
+        assert_eq!(n * cfg.hidden_size, h0_flat.len(), "hidden0 not [N,960]");
+        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+
+        let logits = forward_prefill(&weights, &cfg, &inputs).expect("prefill forward");
+        assert_eq!(logits.cols, cfg.vocab_size);
+        let ours = &logits.data[(logits.rows - 1) * logits.cols..];
+
+        let oracle = read_f32_le(&lg);
+        let oracle = &oracle[oracle.len() - cfg.vocab_size..];
+
+        assert_eq!(
+            argmax(ours),
+            argmax(oracle),
+            "next-token argmax diverged from the torch oracle"
+        );
+        let dot: f64 = ours
+            .iter()
+            .zip(oracle)
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let na: f64 = ours
+            .iter()
+            .map(|&a| f64::from(a) * f64::from(a))
+            .sum::<f64>()
+            .sqrt();
+        let nb: f64 = oracle
+            .iter()
+            .map(|&b| f64::from(b) * f64::from(b))
+            .sum::<f64>()
+            .sqrt();
+        let cos = dot / (na * nb);
+        eprintln!(
+            "[C5 parity] argmax={} cos={cos:.6} (oracle argmax={})",
+            argmax(ours),
+            argmax(oracle)
+        );
+        assert!(
+            cos >= 0.99,
+            "logit cosine {cos:.6} < 0.99 — smolvlm2 decoder diverged"
+        );
+    }
+
+    /// **C5 L4 — the SmolVLM2 KV-cache greedy decode vs the oracle's greedy
+    /// id-stream** (mirrors `kvcache_greedy_matches_oracle_l4`). The expected
+    /// ids come from the COMMITTED `tests/fixtures/smolvlm2/oracle_fixtures.json`
+    /// (`l4_greedy.ids`), read at runtime so the cert self-arms once the oracle
+    /// has been generated; skips-with-success while either artifact is absent.
+    #[test]
+    fn smolvlm2_kvcache_greedy_matches_oracle_l4() {
+        let (Ok(model), Ok(h0)) = (
+            std::env::var("FOCR_SMOLVLM2_MODEL"),
+            std::env::var("FOCR_SMOLVLM2_ORACLE_HIDDEN0"),
+        ) else {
+            return;
+        };
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/smolvlm2/oracle_fixtures.json"
+        );
+        let Ok(raw) = std::fs::read_to_string(fixture_path) else {
+            eprintln!("skip-with-SUCCESS: {fixture_path} absent (oracle not yet generated)");
+            return;
+        };
+        // Minimal, dependency-free extraction of l4_greedy.ids from the fixture.
+        let ids_json = raw
+            .split("\"l4_greedy\"")
+            .nth(1)
+            .and_then(|s| s.split("\"ids\"").nth(1))
+            .and_then(|s| s.split('[').nth(1))
+            .and_then(|s| s.split(']').next())
+            .expect("l4_greedy.ids present in the fixture");
+        let expected: Vec<u32> = ids_json
+            .split(',')
+            .map(|t| t.trim().parse().expect("id parses"))
+            .collect();
+        assert!(!expected.is_empty(), "fixture carries a greedy stream");
+
+        let cfg = DecoderConfig::smolvlm2();
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load smolvlm2 weights");
+        let h0_flat = read_f32_le(&h0);
+        let n = h0_flat.len() / cfg.hidden_size;
+        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+
+        let ids = generate_greedy_kvcache(&weights, &cfg, &inputs, expected.len(), 49_279)
+            .expect("kvcache greedy decode");
+        assert_eq!(
+            ids, expected,
+            "smolvlm2 kvcache greedy id-stream != torch oracle L4"
+        );
+        eprintln!("[C5 L4] {} ids exact vs oracle", ids.len());
     }
 
     #[test]
     fn gqa_dims_and_grouping() {
-        let c = smolvlm2_like_cfg();
+        let c = DecoderConfig::smolvlm2();
         assert_eq!(c.q_dim(), 960);
         assert_eq!(c.kv_dim(), 320);
         assert_eq!(c.kv_group(), 3);
@@ -1031,7 +1273,7 @@ mod tests {
 
     #[test]
     fn broadcast_kv_repeats_each_kv_lane_group_times() {
-        let mut c = smolvlm2_like_cfg();
+        let mut c = DecoderConfig::smolvlm2();
         // tiny: 4 q heads over 2 kv heads, head_dim 2 → group 2.
         c.num_attention_heads = 4;
         c.num_key_value_heads = 2;
