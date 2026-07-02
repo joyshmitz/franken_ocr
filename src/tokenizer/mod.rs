@@ -25,9 +25,12 @@ use serde::Deserialize;
 
 use crate::error::{FocrError, FocrResult};
 
+mod ops;
 mod pretok;
 pub mod tiktoken;
 mod unicode_tables;
+
+pub use ops::TokenizerOps;
 
 /// Hardcoded special-token ids ([SPEC-014/019]). These are pinned by the model
 /// runtime (`modeling_unlimitedocr.py`) and cross-checked against
@@ -544,8 +547,9 @@ mod tests {
     /// covers the byte-level symbols for the lowercase letters used in tests
     /// plus the space glyph `Ġ`, and a couple of merges so we can prove merge
     /// ordering. Added tokens carry the pinned `<image>` id to exercise the
-    /// validation + splitting paths.
-    fn tiny_json() -> String {
+    /// validation + splitting paths. `pub(super)` so the [`super::ops`]
+    /// trait-level tests run BOTH impls over the same fixtures (no drift).
+    pub(super) fn tiny_json() -> String {
         // Byte-level: 'a'..'z' map to themselves; space → "Ġ".
         // vocab ids are arbitrary (we only test id-EXACTNESS of merge ordering
         // and round-trip, not against HF here).
@@ -711,7 +715,8 @@ mod tests {
     // snapshot path (gitignored, fetched out-of-band by scripts/fetch_sources.sh);
     // absent ⇒ skip (the model-gated pattern, matching tiktoken.rs).
 
-    fn load_real() -> Option<Tokenizer> {
+    // (`pub(super)` so the [`super::ops`] trait tests reuse the same gate.)
+    pub(super) fn load_real() -> Option<Tokenizer> {
         let path = std::env::var("FOCR_TOKENIZER_JSON").unwrap_or_else(|_| {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
