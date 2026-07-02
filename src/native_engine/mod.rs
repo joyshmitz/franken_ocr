@@ -189,9 +189,17 @@ fn got_format_requested() -> bool {
 
 static FORWARDS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FORWARDS_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static CACHE_GUARD_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FORWARD_UNDER_GUARD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Model-cache guards held by THIS thread. Thread-local (fresh-eyes fix):
+    /// the doctrine-#5 rayon-under-lock class is a SAME-thread pattern — a
+    /// forward beginning on thread A while an unrelated thread B briefly holds
+    /// the cache guard (e.g. concurrent engine construction) is legal and must
+    /// not trip the violation flag.
+    static CACHE_GUARD_HELD_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// RAII token for one live forward; dropping it decrements the gauge.
 pub(crate) struct ForwardPass(());
@@ -203,12 +211,12 @@ impl Drop for ForwardPass {
 }
 
 /// Enter a heavy forward: bump the live count, fold it into the observed max,
-/// and record whether the model-cache guard is currently held by ANY thread
+/// and record whether the model-cache guard is currently held by THIS thread
 /// (fanning out under a held lock is the deadlock class doctrine #5 bans).
 pub(crate) fn enter_forward() -> ForwardPass {
     let live = FORWARDS_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     FORWARDS_MAX.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
-    if CACHE_GUARD_HELD.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+    if CACHE_GUARD_HELD_HERE.with(std::cell::Cell::get) > 0 {
         FORWARD_UNDER_GUARD.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     ForwardPass(())
@@ -237,7 +245,10 @@ const BATCH_VISION_ENV: &str = "FOCR_BATCH_VISION";
 /// `FOCR_BATCH_VISION=0` (or `off`/`false`/`no`) reverts to the per-page loop.
 fn batch_vision_enabled() -> bool {
     !matches!(
-        std::env::var(BATCH_VISION_ENV).ok().as_deref(),
+        std::env::var(BATCH_VISION_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("0" | "off" | "false" | "no")
     )
 }
@@ -416,14 +427,15 @@ fn model_cache_guard() -> FocrResult<TrackedCacheGuard> {
     let guard = model_cache()
         .lock()
         .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))?;
-    CACHE_GUARD_HELD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CACHE_GUARD_HELD_HERE.with(|c| c.set(c.get() + 1));
     Ok(TrackedCacheGuard(guard))
 }
 
 /// The model-cache guard, instrumented for the one-live-forward gauge
-/// (bd-1azu.14): while ANY thread holds it, a forward beginning trips
-/// [`FORWARD_UNDER_GUARD`] — the rayon-under-lock deadlock class doctrine #5
-/// bans. Derefs to the plain cache entry; the count drops with the guard.
+/// (bd-1azu.14): while THIS thread holds it, a forward beginning on this
+/// thread trips [`FORWARD_UNDER_GUARD`] — the rayon-under-lock deadlock class
+/// doctrine #5 bans. Derefs to the plain cache entry; the count drops with the
+/// guard (same thread, RAII).
 struct TrackedCacheGuard(MutexGuard<'static, ModelCacheEntry>);
 
 impl std::ops::Deref for TrackedCacheGuard {
@@ -441,7 +453,7 @@ impl std::ops::DerefMut for TrackedCacheGuard {
 
 impl Drop for TrackedCacheGuard {
     fn drop(&mut self) {
-        CACHE_GUARD_HELD.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        CACHE_GUARD_HELD_HERE.with(|c| c.set(c.get() - 1));
     }
 }
 
@@ -1261,9 +1273,14 @@ impl OcrModel {
         // which `generate` selects only when int8 is requested AND the stateless
         // O(n^2) oracle is NOT forced. Engage the spine under EXACTLY that
         // condition so its output tracks whichever sequential oracle is in force.
+        // Arch gate (fresh-eyes fix): the spine pipeline is built for the
+        // default Unlimited-OCR arch (Baidu tensor names, R-SWA rings, the
+        // BASE_PROMPT tokenizer); a got-ocr2/zoo artifact must take the
+        // sequential loop, whose per-page forward() carries the arch dispatch.
         let spine = batch_scheduler::spine_enabled()
             && int8_decode_requested()
-            && std::env::var_os(DECODE_STATELESS_ENV).is_none();
+            && std::env::var_os(DECODE_STATELESS_ENV).is_none()
+            && self.arch().id() == model_arch::default_arch().id();
         if !spine {
             return image_paths.iter().map(|p| self.recognize(p)).collect();
         }
@@ -1323,6 +1340,7 @@ impl OcrModel {
         let admitted: Vec<usize> = (0..n).filter(|&gi| pres[gi].is_some()).collect();
         let mut feats: Vec<Option<Vec<Mat>>> = (0..n).map(|_| None).collect();
         if !admitted.is_empty() {
+            let mut batched_ok = false;
             if batch_vision_enabled() {
                 let prefs: Vec<&Preprocessed> = admitted
                     .iter()
@@ -1333,15 +1351,20 @@ impl OcrModel {
                         for (k, f) in all.into_iter().enumerate() {
                             feats[admitted[k]] = Some(f);
                         }
+                        batched_ok = true;
                     }
                     Err(e) => {
-                        let msg = format!("batched vision failed: {e}");
-                        for &gi in &admitted {
-                            out[gi] = Some(Err(FocrError::Other(anyhow::anyhow!("{msg}"))));
-                        }
+                        // Fall back to the per-page loop (the kill-switch path)
+                        // rather than stringifying the error onto every page:
+                        // the per-page tower reproduces the SAME failure as a
+                        // properly TYPED per-page error (FormatMismatch stays
+                        // exit 7, ModelNotFound stays exit 3), and a
+                        // batched-only bug degrades to correct results.
+                        eprintln!("[focr] batched vision failed ({e}); using the per-page tower");
                     }
                 }
-            } else {
+            }
+            if !batched_ok {
                 for &gi in &admitted {
                     let pre = pres[gi].as_ref().expect("admitted page has a preprocess");
                     match self.vision_tower(pre) {

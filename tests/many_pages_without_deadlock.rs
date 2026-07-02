@@ -286,9 +286,20 @@ fn many_sequential_pages_complete_within_budget() {
     // that owns exactly one asupersync runtime.
     let model_path_for_worker = model_path.clone();
     let heavy_branch = heavy.is_some();
+    // Heavy branch page selection (fresh-eyes fix): the synthetic /nonexistent
+    // page decode-errors before any forward, so a heavy run against it proved
+    // only orchestration while claiming full-forward coverage. With
+    // `FOCR_WATCHDOG_IMAGE` set (the spine scenario's contract) the heavy loop
+    // drives REAL forwards; without it the heavy branch stays an orchestration
+    // proof and says so in its log line.
+    let heavy_page = std::env::var_os("FOCR_WATCHDOG_IMAGE")
+        .map(PathBuf::from)
+        .filter(|p| heavy_branch && p.exists());
+    let heavy_forwards_real = heavy_page.is_some();
     let outcome = run_with_watchdog(budget, move || {
         let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
-        let page = Path::new(SYNTHETIC_PAGE);
+        let page_buf = heavy_page.unwrap_or_else(|| PathBuf::from(SYNTHETIC_PAGE));
+        let page = page_buf.as_path();
 
         let mut completed = 0usize;
         let mut model_not_found = 0usize;
@@ -383,21 +394,34 @@ fn many_sequential_pages_complete_within_budget() {
             );
 
             if heavy_branch {
-                // Heavy branch: at least one full forward must have produced
-                // output (or the run is not actually exercising weights).
-                assert!(
-                    ok_results > 0 || other_terminal > 0,
-                    "heavy branch (FOCR_MODEL_PATH set) drove {pages} pages but produced \
-                     no Ok and no post-resolution error — model path resolved to \
-                     ModelNotFound {model_not_found} times, which means the artifact \
-                     was not actually loaded"
-                );
+                if heavy_forwards_real {
+                    // A real decodable page was supplied: full forwards must
+                    // SUCCEED — an input-decode error would previously count
+                    // as "progress" here and fake full-forward coverage.
+                    assert!(
+                        ok_results > 0,
+                        "heavy branch drove {pages} real pages (FOCR_WATCHDOG_IMAGE) but \
+                         produced no Ok result (other_terminal={other_terminal}, \
+                         model_not_found={model_not_found})"
+                    );
+                } else {
+                    // Weights present but no real page: the loop progressed
+                    // through model-load + input-decode orchestration only.
+                    // Say so honestly instead of claiming forward coverage.
+                    assert!(
+                        ok_results > 0 || other_terminal > 0,
+                        "heavy branch (FOCR_MODEL_PATH set) drove {pages} pages but produced \
+                         no Ok and no post-resolution error — model path resolved to \
+                         ModelNotFound {model_not_found} times, which means the artifact \
+                         was not actually loaded"
+                    );
+                }
                 log_line(
                     case,
                     "assert",
                     "pass",
                     &format!(
-                        r#""assertion":"heavy_forward_progressed","pass":true,"ok_results":{ok_results},"other_terminal":{other_terminal}"#
+                        r#""assertion":"heavy_forward_progressed","pass":true,"ok_results":{ok_results},"other_terminal":{other_terminal},"real_forwards":{heavy_forwards_real}"#
                     ),
                 );
             } else {
@@ -445,7 +469,14 @@ fn spine_many_pages_one_live_forward_within_budget() {
     let pool = detected_pool();
 
     let heavy = heavy_model_path();
-    let spine_armed = std::env::var_os("FOCR_BATCH_SPINE").is_some();
+    // Value-parsed to MATCH the engine's kill-switch semantics (`=0` disables):
+    // the scenario arms only when the spine would actually engage.
+    let spine_armed = std::env::var("FOCR_BATCH_SPINE").is_ok_and(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        )
+    });
     let image = std::env::var_os("FOCR_WATCHDOG_IMAGE")
         .map(PathBuf::from)
         .filter(|p| p.exists());
@@ -535,10 +566,15 @@ fn spine_many_pages_one_live_forward_within_budget() {
                 err, 0,
                 "heavy spine run: every page should decode (got {err} errors)"
             );
-            assert!(
-                max_forwards <= 1,
+            // EXACTLY 1, not <= 1: pages completed, so forwards MUST have run — a max
+            // of 0 means the instrumentation got disconnected (a refactor that
+            // silently stops calling enter_forward would otherwise fake-pass).
+            assert_eq!(
+                max_forwards, 1,
                 "ONE-LIVE-FORWARD VIOLATION: the process-wide gauge saw \
-                 {max_forwards} concurrent forwards (vision/prefill/decode-step)"
+                 {max_forwards} concurrent forwards (vision/prefill/decode-step); \
+                 1 is the only healthy value once pages completed (0 = gauge \
+                 disconnected, >1 = concurrency violation)"
             );
             assert!(
                 !under_guard,

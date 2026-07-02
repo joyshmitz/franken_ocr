@@ -2661,10 +2661,23 @@ const DEFAULT_BATCH_SIZE: usize = 8;
 /// read ONCE into a process-wide bool — never touched per-token). The batched
 /// kernels themselves are pure and testable regardless of this flag; only the
 /// driver's decision to route through them is gated here.
+///
+/// Value-parsed, NOT presence-parsed (fresh-eyes fix): every doc site
+/// (`batch_scheduler`, `cli.rs`, the watchdog sweep) teaches `FOCR_BATCH_SPINE=0`
+/// as "spine off" — the old `is_some()` parse ARMED the spine on exactly the
+/// value users set to kill it, and made the sweep's `=0` control leg
+/// meaningless. `0`/`off`/`false`/`no` (any case) now disable; any other
+/// present value arms; unset stays off.
 #[must_use]
 pub fn batch_spine_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(BATCH_SPINE_ENV).is_some())
+    *FLAG.get_or_init(|| match std::env::var(BATCH_SPINE_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        ),
+        Err(_) => false,
+    })
 }
 
 /// The configured in-flight stream cap `B` ([`BATCH_SIZE_ENV`], read ONCE).
