@@ -134,9 +134,27 @@ const ORACLE_IDENTITY: &str = "unlimited-ocr-oracle";
 /// resolution (`tokenizer.json` ships beside the weights, exactly as the lib
 /// resolves it).
 fn subject_model_path() -> PathBuf {
-    std::env::var_os("FOCR_MODEL_PATH")
+    let p = std::env::var_os("FOCR_MODEL_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/unlimited-ocr.focrq"))
+        .unwrap_or_else(|| PathBuf::from("models/unlimited-ocr.focrq"));
+    // The engine's resolver accepts a safetensors DIRECTORY; the ladder's
+    // Weights::load wants the shard file. Resolve the common case here so
+    // `FOCR_MODEL_PATH=<model dir>` arms the ladder instead of panicking
+    // (fresh-eyes fix — this exact footgun cost a wasted armed run).
+    if p.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&p)
+    {
+        let mut shards: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|c| c.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        shards.sort();
+        if let Some(shard) = shards.into_iter().next() {
+            return shard;
+        }
+    }
+    p
 }
 
 /// Resolve + load the subject model weights via [`subject_model_path`]. Only
@@ -1085,9 +1103,15 @@ fn l0_preprocess_exact() {
                 let exact = exact_elements == oracle.data.len();
                 let mad = max_abs_diff(&subject.data, &oracle.data);
                 let c = cosine(&subject.data, &oracle.data);
-                // EXACT passes outright; otherwise the documented bd-30me
-                // resample envelope (max-abs within budget AND cosine gate).
-                let pass = exact || (mad <= L0_RESAMPLE_MAX_ABS_TOL && c >= COSINE_F32_THRESHOLD);
+                // EXACT passes outright. The bd-30me resample envelope exists
+                // ONLY to cover the default CatmullRom kernel's known delta vs
+                // the PIL oracle; with the FOCR_RESAMPLE=pil-bicubic
+                // kill-switch armed, the kernel CLAIMS bit-exactness — a
+                // non-exact result there is a real failure, and the envelope
+                // must not paper over it (fresh-eyes fix).
+                let pil_armed = format!("{:?}", preprocess::resample_kind()).contains("PilBicubic");
+                let pass = exact
+                    || (!pil_armed && mad <= L0_RESAMPLE_MAX_ABS_TOL && c >= COSINE_F32_THRESHOLD);
                 ran += 1;
                 all_pass &= pass;
                 log.parity(
@@ -1189,9 +1213,13 @@ fn l1_per_op_cosine() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let mut ran = 0usize;
@@ -1362,17 +1390,29 @@ fn l2_per_layer_cosine_and_ledger() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let mut ran = 0usize;
     let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else {
-            continue;
+        let golden = match loader.load_golden(&gpath) {
+            Ok(g) => g,
+            Err(e) => {
+                // Present-but-corrupt golden = a REAL failure (fresh-eyes fix):
+                // silently dropping it would let a broken fixture set pass the
+                // token-exact/CER gates with zero comparisons.
+                log.error("FixtureParse", 1, &e);
+                all_pass = false;
+                continue;
+            }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
@@ -1530,17 +1570,29 @@ fn l3_logits_measured_budget_and_argmax() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let mut ran = 0usize;
     let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else {
-            continue;
+        let golden = match loader.load_golden(&gpath) {
+            Ok(g) => g,
+            Err(e) => {
+                // Present-but-corrupt golden = a REAL failure (fresh-eyes fix):
+                // silently dropping it would let a broken fixture set pass the
+                // token-exact/CER gates with zero comparisons.
+                log.error("FixtureParse", 1, &e);
+                all_pass = false;
+                continue;
+            }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
@@ -1677,9 +1729,13 @@ fn l4_token_exact_prefix() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let captures = subject_decode_captures(&w, &loader);
@@ -1687,8 +1743,16 @@ fn l4_token_exact_prefix() {
     let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else {
-            continue;
+        let golden = match loader.load_golden(&gpath) {
+            Ok(g) => g,
+            Err(e) => {
+                // Present-but-corrupt golden = a REAL failure (fresh-eyes fix):
+                // silently dropping it would let a broken fixture set pass the
+                // token-exact/CER gates with zero comparisons.
+                log.error("FixtureParse", 1, &e);
+                all_pass = false;
+                continue;
+            }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
@@ -1826,9 +1890,13 @@ fn l5_end_to_end_cer_budget() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let tokenizer_path = subject_model_path()
@@ -1852,8 +1920,16 @@ fn l5_end_to_end_cer_budget() {
     let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else {
-            continue;
+        let golden = match loader.load_golden(&gpath) {
+            Ok(g) => g,
+            Err(e) => {
+                // Present-but-corrupt golden = a REAL failure (fresh-eyes fix):
+                // silently dropping it would let a broken fixture set pass the
+                // token-exact/CER gates with zero comparisons.
+                log.error("FixtureParse", 1, &e);
+                all_pass = false;
+                continue;
+            }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
@@ -2035,17 +2111,29 @@ fn differential_per_op_vs_bf16_oracle() {
     let w = match load_subject_weights() {
         Ok(w) => w,
         Err(e) => {
+            // The gate said the model is PRESENT; failing to load it is a real
+            // broken state, not an honest skip (fresh-eyes fix — the old xfail
+            // return let a corrupt/mispointed artifact turn every gated rung
+            // silently green).
             log.error("WeightsLoad", 1, &e);
-            log.result("xfail", t0.elapsed().as_micros());
-            return;
+            log.result("fail", t0.elapsed().as_micros());
+            panic!("subject weights present but failed to load: {e}");
         }
     };
     let mut ran = 0usize;
     let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else {
-            continue;
+        let golden = match loader.load_golden(&gpath) {
+            Ok(g) => g,
+            Err(e) => {
+                // Present-but-corrupt golden = a REAL failure (fresh-eyes fix):
+                // silently dropping it would let a broken fixture set pass the
+                // token-exact/CER gates with zero comparisons.
+                log.error("FixtureParse", 1, &e);
+                all_pass = false;
+                continue;
+            }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
