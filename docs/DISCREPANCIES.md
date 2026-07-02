@@ -74,6 +74,33 @@ since exact-token OCR fails in the tail.
 
 ---
 
+## DISC-002: SmolVLM2 int8 decode flips a near-tied greedy token vs the f32 oracle
+
+- claim_id / evidence_id: CLAIM-c5-int8-neartie → the armed C5 cert logs
+    (`smolvlm2_decoder_matches_torch_oracle` / `smolvlm2_kvcache_greedy_matches_oracle_l4`,
+    src/native_engine/decoder_qwen2.rs)
+- Provenance (model commit + fixture hash): HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+    model.safetensors sha256 b9bfd456… (zoo/smolvlm2/SHA256SUMS);
+    smolvlm2.int8.focrq from `focr convert --model-id smolvlm2` (C2, census-verified);
+    oracle fixtures `tests/fixtures/smolvlm2/oracle_fixtures.json`
+    (gen_reference_fixtures_smolvlm2.py, transformers in-tree ≥4.50, floor = 0.00e+00)
+- CPU feature string: aarch64+neon+dotprod (Apple M4)
+- Exact command + env: `FOCR_SMOLVLM2_MODEL=<zoo>/smolvlm2.int8.focrq
+    FOCR_SMOLVLM2_ORACLE_HIDDEN0=<zoo>/smolvlm2_decoder_input.bin cargo test --release
+    smolvlm2_ -- --nocapture`
+- Reference behavior: f32 greedy decode of the text-only C5 seam prompt — 24 ids,
+    "…France is Paris. It is a city located in the northern part of the country…"
+- Our impl: the int8 decode (both `generate_greedy` on the `.focrq` and the kvcache
+    path — MUTUALLY bit-identical, the B9 contract) flips the near-tied token at
+    step 7 ("It" → "Paris", both coherent continuations) and re-converges structurally.
+- MEASURED impact: int8 last-pos logit cosine 0.998301 vs oracle, argmax EXACT at the
+    seam; the f32 path (`model.safetensors`) is token-exact for all 24 ids (cos
+    1.000000). Divergence is decode-trajectory-only, first flip at generated index 7.
+- Kill-switch: run the f32 reference weights (`FOCR_MODEL_PATH=<dir with safetensors>`)
+    — the f32 decode is oracle-exact; the int8 artifact is the speed path.
+- Review date: when C8 (SmolVLM2 e2e quality gate) lands a caption/VQA quality budget —
+    re-measure whether near-tie flips move any quality metric.
+
 ## DISC-001: L0 resampling kernel — `image` crate CatmullRom in place of PIL BICUBIC
 
 - claim_id / evidence_id: CLAIM-l0-resample-catmullrom → artifacts/parity/bd-30me/
