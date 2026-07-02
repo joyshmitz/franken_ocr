@@ -17,7 +17,9 @@
 //! `DecoderWeightCacheI8::build` quantizes a fixed set of decoder GEMM tensors
 //! with `quant_oc(w, out) = nn::quantize_int8(w, out, in)` and leaves everything
 //! else high-precision. This converter classifies each tensor with
-//! [`is_decoder_int8_tensor`] — the *same* set, derived from that builder — and:
+//! [`is_decoder_int8_tensor_for`] — the *same* set, derived from that builder
+//! but keyed by the target [`ModelArch`] (the decoder-layers name prefix and the
+//! lm_head policy are arch facts, not name coincidences) — and:
 //!
 //! * for a decoder int8 tensor: widens the bf16 `[n, k]` weight to f32 and calls
 //!   the SAME [`nn::quantize_int8`], emitting a `QInt8PerChan` record whose int8
@@ -69,28 +71,43 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Whether `name` is one of the decoder GEMM tensors the LOAD-TIME int8 quantizer
-/// [`crate::native_engine::decoder::DecoderWeightCacheI8::build`] quantizes.
+/// Whether `name` is one of the decoder GEMM tensors the doctrine-#2 int8 set
+/// covers for the given target `arch`.
 ///
-/// A **pure function of the tensor name** (no I/O, no env) so it is deterministic
-/// and unit-testable. The set is, exactly as `build` enumerates it:
+/// A **pure function of the tensor name + the arch descriptor** (no I/O, no env)
+/// so it is deterministic and unit-testable. The classification is ARCH-AWARE,
+/// not name-coincidence — two facts come from [`ModelArch`]:
 ///
-/// * `lm_head.weight`;
-/// * per decoder layer `model.layers.{L}.…`:
-///   * attention `self_attn.{q,k,v,o}_proj.weight`;
-///   * the dense layer-0 SwiGLU and every MoE routed/shared expert
-///     `mlp.…{gate,up,down}_proj.weight`.
+/// * [`ModelArch::decoder_layers_prefix`] — WHERE the AR decoder lives.
+///   Unlimited-OCR/GOT put it at `model.layers.`; SmolVLM2's Idefics3 splice
+///   nests it at `model.text_model.layers.` (spec §12). The prefix is also what
+///   keeps look-alike vision tensors out: SigLIP's
+///   `model.vision_model.encoder.layers.{i}.self_attn.q_proj.weight` shares the
+///   leaf name with a decoder GEMM but is NOT under the decoder prefix, so it
+///   stays high-precision.
+/// * [`ModelArch::lm_head_stored_int8`] — whether a stored `lm_head.weight`
+///   joins the set. `true` for Unlimited-OCR (the historical
+///   [`crate::native_engine::decoder::DecoderWeightCacheI8::build`] byte image);
+///   `false` for SmolVLM2, whose UNTIED head stays high-precision per doctrine
+///   #2 (int8-lm_head only behind a measured quality kill-switch — spec §11).
+///
+/// Under the prefix the set is exactly what `build` enumerates:
+///
+/// * attention `self_attn.{q,k,v,o}_proj.weight` (GQA k/v panels like
+///   SmolVLM2's `[320, 960]` are just rank-2 `[n, k]` — nothing special);
+/// * the dense SwiGLU and every MoE routed/shared expert
+///   `mlp.…{gate,up,down}_proj.weight`.
 ///
 /// Everything else is high-precision and returns `false`: ALL norms
 /// (`*_layernorm.weight`, `model.norm.weight`), the MoE router `mlp.gate.weight`
-/// (note: `gate`, NOT `gate_proj`), `embed_tokens`, the projector, and the entire
-/// SAM+CLIP vision tower (their names do not start with `model.layers.`).
+/// (note: `gate`, NOT `gate_proj`), `embed_tokens`, the projector/connector, and
+/// the entire vision tower.
 #[must_use]
-pub fn is_decoder_int8_tensor(name: &str) -> bool {
+pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
     if name == "lm_head.weight" {
-        return true;
+        return arch.lm_head_stored_int8();
     }
-    let Some(rest) = name.strip_prefix("model.layers.") else {
+    let Some(rest) = name.strip_prefix(arch.decoder_layers_prefix()) else {
         return false;
     };
     if rest.contains(".self_attn.") {
@@ -107,6 +124,14 @@ pub fn is_decoder_int8_tensor(name: &str) -> bool {
             || rest.ends_with(".down_proj.weight");
     }
     false
+}
+
+/// [`is_decoder_int8_tensor_for`] instantiated at the default (Unlimited-OCR)
+/// arch — the historical name-only classifier, kept so the v1 byte contract has
+/// an explicit, testable anchor.
+#[must_use]
+pub fn is_decoder_int8_tensor(name: &str) -> bool {
+    is_decoder_int8_tensor_for(name, crate::native_engine::model_arch::default_arch())
 }
 
 /// Convert a loaded raw-safetensors [`Weights`] into a self-contained `.focrq`
@@ -156,6 +181,15 @@ pub fn safetensors_to_focrq(
     // from the stored embedding. Skips ~155 M params from the artifact.
     let omit_lm_head = arch.tie_word_embeddings();
 
+    // When the arch instead declares an UNTIED, high-precision-stored lm_head
+    // (SmolVLM2), re-verify the untie against the actual bytes — the census
+    // (docs/zoo/smolvlm2-spec.md §12) demands the full-tensor inequality be
+    // re-checked at convert time, so a tied checkpoint mislabeled with this
+    // arch id fails loud instead of silently shipping a redundant 47 M params.
+    if !omit_lm_head && !arch.lm_head_stored_int8() {
+        verify_untied_lm_head(weights, arch)?;
+    }
+
     // `names()` is already sorted (the directory is a `BTreeMap`); collect so the
     // immutable directory borrow is released before the per-tensor accessors run.
     let names: Vec<String> = weights.names().map(str::to_owned).collect();
@@ -163,13 +197,36 @@ pub fn safetensors_to_focrq(
         if omit_lm_head && name == "lm_head.weight" {
             continue;
         }
-        if is_decoder_int8_tensor(name) {
+        if is_decoder_int8_tensor_for(name, arch) {
             quantize_decoder_tensor(&mut builder, weights, name)?;
         } else {
             copy_high_precision_tensor(&mut builder, weights, name)?;
         }
     }
     Ok(builder.build())
+}
+
+/// Convert-time proof that an arch-declared UNTIED `lm_head` really is untied:
+/// when both `lm_head.weight` and the arch's `embed_tokens` tensor exist with
+/// identical shape/dtype, their raw bytes must DIFFER. Bytes-equal means the
+/// checkpoint is tied and the arch descriptor (or the `--model-id`) is wrong —
+/// refuse rather than store a silent duplicate. Either tensor missing is not
+/// this function's problem (the load path reports missing tensors itself).
+fn verify_untied_lm_head(weights: &Weights, arch: &dyn ModelArch) -> FocrResult<()> {
+    let embed_name = arch.embed_tokens_name();
+    let (Ok(head), Ok(embed)) = (weights.tensor("lm_head.weight"), weights.tensor(embed_name))
+    else {
+        return Ok(());
+    };
+    if head.dtype == embed.dtype && head.shape == embed.shape && head.data == embed.data {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: arch {:?} declares an UNTIED lm_head, but lm_head.weight is \
+             byte-identical to {embed_name:?} — this checkpoint ties its embeddings; \
+             the --model-id (or its descriptor) is wrong",
+            arch.id()
+        )));
+    }
+    Ok(())
 }
 
 /// Quantize one decoder `[n, k]` weight to per-output-channel symmetric int8 with
@@ -563,6 +620,309 @@ mod tests {
                 .dtype,
             DType::BF16
         );
+    }
+
+    // ── C2: arch-aware SmolVLM2-500M convert (bd-3jo6.3.2) ───────────────────
+
+    /// A SmolVLM2-shaped synthetic checkpoint (census names, docs/zoo/
+    /// smolvlm2-spec.md §12): an UNTIED `lm_head` (≠ `embed_tokens` bytes), the
+    /// Idefics3-nested SmolLM2 decoder GEMMs with GQA-shaped k/v panels
+    /// (narrower than hidden — the real ones are [320,960] vs [960,960]), the
+    /// SigLIP tower (whose blocks contain look-alike `self_attn.q_proj` names),
+    /// the pixel-shuffle connector, and all the norms.
+    fn synthetic_smolvlm2_safetensors() -> Vec<u8> {
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.25 - bias).collect()
+        };
+        build_safetensors(&[
+            // UNTIED: lm_head and embed_tokens carry DIFFERENT bytes (spec §12).
+            ("lm_head.weight", vec![6, 8], ramp(6, 8, 11.0)),
+            (
+                "model.text_model.embed_tokens.weight",
+                vec![6, 8],
+                ramp(6, 8, 3.0),
+            ),
+            // decoder int8 set (7 GEMMs; k/v are the GQA panels).
+            (
+                "model.text_model.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 7.0),
+            ),
+            (
+                "model.text_model.layers.0.self_attn.k_proj.weight",
+                vec![4, 8],
+                ramp(4, 8, 6.0),
+            ),
+            (
+                "model.text_model.layers.0.self_attn.v_proj.weight",
+                vec![4, 8],
+                ramp(4, 8, 5.0),
+            ),
+            (
+                "model.text_model.layers.0.self_attn.o_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 8.0),
+            ),
+            (
+                "model.text_model.layers.0.mlp.gate_proj.weight",
+                vec![10, 8],
+                ramp(10, 8, 9.0),
+            ),
+            (
+                "model.text_model.layers.0.mlp.up_proj.weight",
+                vec![10, 8],
+                ramp(10, 8, 2.0),
+            ),
+            (
+                "model.text_model.layers.0.mlp.down_proj.weight",
+                vec![8, 10],
+                ramp(8, 10, 4.0),
+            ),
+            // decoder norms — high-precision.
+            (
+                "model.text_model.layers.0.input_layernorm.weight",
+                vec![8],
+                ramp(1, 8, 1.0),
+            ),
+            (
+                "model.text_model.layers.0.post_attention_layernorm.weight",
+                vec![8],
+                ramp(1, 8, 1.5),
+            ),
+            ("model.text_model.norm.weight", vec![8], ramp(1, 8, 2.0)),
+            // SigLIP tower — the arch-aware discriminator: this block's
+            // `self_attn.q_proj.weight` leaf name matches a decoder GEMM's, but
+            // it is NOT under `model.text_model.layers.` so it stays HP.
+            (
+                "model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 2.5),
+            ),
+            (
+                "model.vision_model.encoder.layers.0.self_attn.q_proj.bias",
+                vec![8],
+                ramp(1, 8, 0.5),
+            ),
+            (
+                "model.vision_model.encoder.layers.0.mlp.fc1.weight",
+                vec![12, 8],
+                ramp(12, 8, 1.0),
+            ),
+            (
+                "model.vision_model.embeddings.patch_embedding.weight",
+                vec![8, 3, 2, 2],
+                ramp(8, 12, 1.0),
+            ),
+            (
+                "model.vision_model.post_layernorm.weight",
+                vec![8],
+                ramp(1, 8, 0.25),
+            ),
+            // connector — one high-precision GEMM (K=12288 in the real model).
+            (
+                "model.connector.modality_projection.proj.weight",
+                vec![8, 16],
+                ramp(8, 16, 1.0),
+            ),
+        ])
+    }
+
+    /// The SmolVLM2 decoder int8 set of the synthetic checkpoint (7 GEMMs).
+    const SMOLVLM2_INT8_NAMES: &[&str] = &[
+        "model.text_model.layers.0.self_attn.q_proj.weight",
+        "model.text_model.layers.0.self_attn.k_proj.weight",
+        "model.text_model.layers.0.self_attn.v_proj.weight",
+        "model.text_model.layers.0.self_attn.o_proj.weight",
+        "model.text_model.layers.0.mlp.gate_proj.weight",
+        "model.text_model.layers.0.mlp.up_proj.weight",
+        "model.text_model.layers.0.mlp.down_proj.weight",
+    ];
+
+    /// Everything else in the synthetic checkpoint stays high-precision —
+    /// INCLUDING the untied `lm_head` (the SmolVLM2 delta vs both GOT and the
+    /// default arch).
+    const SMOLVLM2_KEPT_NAMES: &[&str] = &[
+        "lm_head.weight",
+        "model.text_model.embed_tokens.weight",
+        "model.text_model.layers.0.input_layernorm.weight",
+        "model.text_model.layers.0.post_attention_layernorm.weight",
+        "model.text_model.norm.weight",
+        "model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "model.vision_model.encoder.layers.0.self_attn.q_proj.bias",
+        "model.vision_model.encoder.layers.0.mlp.fc1.weight",
+        "model.vision_model.embeddings.patch_embedding.weight",
+        "model.vision_model.post_layernorm.weight",
+        "model.connector.modality_projection.proj.weight",
+    ];
+
+    #[test]
+    fn smolvlm2_classifier_is_arch_aware_not_name_coincidence() {
+        let smol = crate::native_engine::model_arch::arch_by_id("smolvlm2").unwrap();
+        let default = crate::native_engine::model_arch::default_arch();
+        for name in SMOLVLM2_INT8_NAMES {
+            assert!(
+                is_decoder_int8_tensor_for(name, smol),
+                "{name} must be int8 under smolvlm2"
+            );
+            // …and the SAME names are NOT int8 under the default arch (whose
+            // decoder lives at `model.layers.`) — arch-aware, both directions.
+            assert!(
+                !is_decoder_int8_tensor_for(name, default),
+                "{name} must not be int8 under the default arch"
+            );
+        }
+        for name in SMOLVLM2_KEPT_NAMES {
+            assert!(
+                !is_decoder_int8_tensor_for(name, smol),
+                "{name} must stay high-precision under smolvlm2"
+            );
+        }
+        // The untied lm_head is the head-policy delta: HP under smolvlm2,
+        // int8 under the default (Unlimited-OCR byte image).
+        assert!(!is_decoder_int8_tensor_for("lm_head.weight", smol));
+        assert!(is_decoder_int8_tensor_for("lm_head.weight", default));
+        // A default-namespace decoder GEMM is NOT smolvlm2's decoder.
+        assert!(!is_decoder_int8_tensor_for(
+            "model.layers.0.self_attn.q_proj.weight",
+            smol
+        ));
+    }
+
+    #[test]
+    fn smolvlm2_convert_keeps_untied_lm_head_and_tags_arch() {
+        let w = Weights::from_bytes(synthetic_smolvlm2_safetensors())
+            .expect("synthetic SmolVLM2 parse");
+        let smol = crate::native_engine::model_arch::arch_by_id("smolvlm2").unwrap();
+        let blob = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [5u8; 32], smol)
+            .expect("smolvlm2 convert");
+        // the bytes physically declare the arch.
+        assert!(String::from_utf8_lossy(&blob).contains("\"model_id\":\"smolvlm2\""));
+
+        let out = Weights::from_bytes(blob).expect("smolvlm2 .focrq loads");
+        assert_eq!(out.model_id(), "smolvlm2");
+        assert_eq!(out.license_notice(), smol.license_notice());
+        // NOTHING is omitted: the untied head means every source tensor survives.
+        assert_eq!(out.len(), w.len());
+        // The UNTIED lm_head is KEPT — stored, high-precision, bytes verbatim
+        // (the opposite of GOT's omit AND of the default arch's int8 head).
+        let head = out.tensor("lm_head.weight").expect("lm_head stored");
+        assert_eq!(head.dtype, DType::BF16, "lm_head stays high-precision");
+        assert_eq!(head.data, w.tensor("lm_head.weight").unwrap().data);
+        assert!(
+            out.qint8("lm_head.weight").is_err(),
+            "lm_head must NOT be int8 (doctrine #2 / spec §11)"
+        );
+        // embed_tokens is stored high-precision alongside it (dual-matrix).
+        assert_eq!(
+            out.tensor("model.text_model.embed_tokens.weight")
+                .unwrap()
+                .dtype,
+            DType::BF16
+        );
+        // The 7 decoder GEMMs are int8, byte-identical to the load-time quant —
+        // including the GQA-shaped k/v panels.
+        for name in SMOLVLM2_INT8_NAMES {
+            let rec = w.record(name).expect("record");
+            let (n, k) = (rec.shape[0], rec.shape[1]);
+            let expected = nn::quantize_int8(&w.mat(name).unwrap().data, n, k);
+            let got = out.qint8(name).expect("qint8 readback");
+            assert_eq!((got.n, got.k), (n, k), "{name} [n,k]");
+            assert_eq!(got.w, expected.w, "{name} int8 payload bit-identical");
+            assert_eq!(got.scales, expected.scales, "{name} scales bit-identical");
+        }
+        // The SigLIP tower (incl. the look-alike q_proj), connector, and norms
+        // all stay high-precision verbatim.
+        for name in SMOLVLM2_KEPT_NAMES {
+            let before = w.tensor(name).expect("src view");
+            let after = out.tensor(name).expect("out view");
+            assert_eq!(after.dtype, DType::BF16, "{name} dtype preserved");
+            assert_eq!(after.shape, before.shape, "{name} shape preserved");
+            assert_eq!(after.data, before.data, "{name} raw bytes verbatim");
+        }
+    }
+
+    #[test]
+    fn smolvlm2_convert_rejects_a_tied_checkpoint() {
+        // A checkpoint whose lm_head bytes EQUAL embed_tokens, mislabeled as
+        // smolvlm2 (which is censused UNTIED): the convert-time re-verification
+        // (spec §12) must refuse rather than ship a silent duplicate.
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.25 - bias).collect()
+        };
+        let tied = ramp(6, 8, 11.0);
+        let blob = build_safetensors(&[
+            ("lm_head.weight", vec![6, 8], tied.clone()),
+            ("model.text_model.embed_tokens.weight", vec![6, 8], tied),
+            (
+                "model.text_model.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 7.0),
+            ),
+        ]);
+        let w = Weights::from_bytes(blob).expect("tied synthetic parse");
+        let smol = crate::native_engine::model_arch::arch_by_id("smolvlm2").unwrap();
+        let err = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [5u8; 32], smol)
+            .expect_err("tied bytes must be refused for an untied arch");
+        assert!(matches!(err, FocrError::FormatMismatch(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn default_and_got_classification_is_byte_unchanged() {
+        // REGRESSION (bd-3jo6.3.2): the arch-aware classifier instantiated at
+        // the default and GOT archs must equal the v1 name-only rule on EVERY
+        // name — including SmolVLM2-shaped names, which v1 never matched — so
+        // the historical `.focrq` byte images cannot drift.
+        let v1 = |name: &str| -> bool {
+            // The pre-arch-aware rule, transcribed literally.
+            if name == "lm_head.weight" {
+                return true;
+            }
+            let Some(rest) = name.strip_prefix("model.layers.") else {
+                return false;
+            };
+            if rest.contains(".self_attn.") {
+                return rest.ends_with(".q_proj.weight")
+                    || rest.ends_with(".k_proj.weight")
+                    || rest.ends_with(".v_proj.weight")
+                    || rest.ends_with(".o_proj.weight");
+            }
+            if rest.contains(".mlp.") {
+                return rest.ends_with(".gate_proj.weight")
+                    || rest.ends_with(".up_proj.weight")
+                    || rest.ends_with(".down_proj.weight");
+            }
+            false
+        };
+        let got = crate::native_engine::model_arch::arch_by_id("got-ocr2").unwrap();
+        let default = crate::native_engine::model_arch::default_arch();
+        let corpus: Vec<&str> = INT8_NAMES
+            .iter()
+            .chain(KEPT_NAMES)
+            .chain(SMOLVLM2_INT8_NAMES)
+            .chain(SMOLVLM2_KEPT_NAMES)
+            .copied()
+            .chain([
+                "model.layers.3.mlp.gate.weight",
+                "model.layers.3.mlp.gate_proj.weight",
+                "vision_model.encoder.layers.2.mlp.fc2.weight",
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+            ])
+            .collect();
+        for name in corpus {
+            assert_eq!(
+                is_decoder_int8_tensor_for(name, default),
+                v1(name),
+                "default-arch classification changed for {name}"
+            );
+            assert_eq!(
+                is_decoder_int8_tensor_for(name, got),
+                v1(name),
+                "got-arch classification changed for {name}"
+            );
+            // And the public name-only helper remains the default instance.
+            assert_eq!(is_decoder_int8_tensor(name), v1(name), "{name}");
+        }
     }
 
     #[test]

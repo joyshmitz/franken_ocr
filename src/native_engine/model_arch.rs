@@ -175,6 +175,34 @@ pub trait ModelArch: Send + Sync {
     fn vision_tower_prefix(&self) -> &'static str {
         "model.sam_model"
     }
+    /// The tensor-name prefix of this arch's autoregressive-decoder transformer
+    /// layers — the subtree `focr convert` classifies for the doctrine-#2 int8
+    /// GEMM set. Baidu Unlimited-OCR + GOT-OCR2 put the LM at the model top
+    /// (`model.layers.`); SmolVLM2's Idefics3 splice nests it under
+    /// `model.text_model.layers.` (census: `docs/zoo/smolvlm2-spec.md` §12).
+    /// Making the prefix an arch fact keeps the converter's classification
+    /// arch-aware instead of name-coincidence: a SigLIP vision block named
+    /// `model.vision_model.encoder.layers.{i}.self_attn.q_proj.weight` must
+    /// NEVER match the decoder int8 set.
+    fn decoder_layers_prefix(&self) -> &'static str {
+        "model.layers."
+    }
+    /// When `lm_head.weight` is stored (i.e. NOT tied/omitted): does the
+    /// converter quantize it int8? Default `true` — the Unlimited-OCR byte image
+    /// (`DecoderWeightCacheI8::build` quantizes `lm_head` unconditionally, and
+    /// the shipped artifact matches it byte-for-byte). SmolVLM2 says `false`:
+    /// its UNTIED head stays high-precision per doctrine #2 (int8-lm_head only
+    /// behind a measured quality kill-switch later — spec §11 / OQ-6).
+    fn lm_head_stored_int8(&self) -> bool {
+        true
+    }
+    /// The token-embedding tensor name — the untied-`lm_head` convert-time
+    /// verification compares `lm_head.weight` bytes against this tensor.
+    /// Default `model.embed_tokens.weight`; SmolVLM2 nests it under
+    /// `model.text_model.embed_tokens.weight`.
+    fn embed_tokens_name(&self) -> &'static str {
+        "model.embed_tokens.weight"
+    }
 }
 
 /// The Baidu Unlimited-OCR architecture — the FIRST [`ModelArch`] implementation
@@ -252,6 +280,14 @@ pub struct PlannedArch {
     /// The SAM-family vision tower `.focrq` tensor-name prefix; see
     /// [`ModelArch::vision_tower_prefix`].
     vision_tower_prefix: &'static str,
+    /// The AR-decoder transformer-layers tensor-name prefix (the int8 GEMM
+    /// subtree); see [`ModelArch::decoder_layers_prefix`].
+    decoder_layers_prefix: &'static str,
+    /// Whether a STORED (untied) `lm_head.weight` joins the converter's int8
+    /// set; see [`ModelArch::lm_head_stored_int8`].
+    lm_head_stored_int8: bool,
+    /// The token-embedding tensor name; see [`ModelArch::embed_tokens_name`].
+    embed_tokens_name: &'static str,
     /// Whether this arch's forward RUNS today (`focr models` "ready"). GOT-OCR2 does
     /// (its full pipeline + KV-cache decode ship); the rest are still descriptors.
     implemented: bool,
@@ -303,6 +339,15 @@ impl ModelArch for PlannedArch {
     fn vision_tower_prefix(&self) -> &'static str {
         self.vision_tower_prefix
     }
+    fn decoder_layers_prefix(&self) -> &'static str {
+        self.decoder_layers_prefix
+    }
+    fn lm_head_stored_int8(&self) -> bool {
+        self.lm_head_stored_int8
+    }
+    fn embed_tokens_name(&self) -> &'static str {
+        self.embed_tokens_name
+    }
 }
 
 // ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
@@ -337,20 +382,42 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     // Verified byte-identical lm_head == embed_tokens (spec §12) → omit lm_head.
     tie_word_embeddings: true,
     vision_tower_prefix: "model.vision_tower_high",
+    decoder_layers_prefix: "model.layers.", // Qwen2 LM at the model top (spec §13a)
+    lm_head_stored_int8: true,              // moot — tied lm_head is omitted entirely
+    embed_tokens_name: "model.embed_tokens.weight",
     implemented: true, // full pipeline + KV-cache decode ship (B1-B9,B11); focr ocr runs it
 };
+// SmolVLM2-500M — censused (docs/zoo/smolvlm2-spec.md, bd-3jo6.3.1): SigLIP-B/16@512²
+// encoder + pixel-shuffle×4 + Linear(12288→960) connector + SmolLM2-360M Llama-dense
+// decoder (32L, hidden 960, GQA 15q/5kv, UNTIED lm_head — byte-verified, spec §12).
+// The Idefics3 splice nests the LM under `model.text_model.*` and the SigLIP tower
+// under `model.vision_model.*` (exact tensor names: spec §12).
 static SMOLVLM2: PlannedArch = PlannedArch {
     id: "smolvlm2",
     display_name: "SmolVLM2-500M",
-    license_notice: "SmolVLM2 (HuggingFaceTB) - Apache-2.0",
+    license_notice: "SmolVLM2-500M-Video-Instruct (HuggingFaceTB) - Apache-2.0",
     default_artifact_basename: "smolvlm2.focrq",
     vision_encoder: VisionEncoder::Siglip,
     decoder: Decoder::LlamaDense,
     tokenizer: TokenizerKind::SmolLm2Bpe,
-    decode_contract: PLACEHOLDER_CONTRACT,
+    // Real config (census §8): greedy, eos=49279 (<end_of_utterance>), and NO
+    // repetition guard upstream (`no_repeat_ngram_size` absent ⇒ 0, window 0).
+    decode_contract: DecodeContract {
+        temperature: 0.0,
+        eos_token_id: 49_279,
+        no_repeat_ngram_size: 0,
+        ngram_window: 0,
+    },
     tasks: &[Task::Describe, Task::Vqa],
-    tie_word_embeddings: false, // placeholder until censused (sub-epic C)
-    vision_tower_prefix: "model.vision_tower", // SigLIP; placeholder until censused
+    // Censused UNTIED (top-level `tie_word_embeddings: false`; lm_head vs
+    // embed_tokens byte-verified DISTINCT — spec §12). The converter stores BOTH.
+    tie_word_embeddings: false,
+    vision_tower_prefix: "model.vision_model", // SigLIP tower (census §12)
+    decoder_layers_prefix: "model.text_model.layers.", // Idefics3-nested LM (census §12)
+    // Doctrine #2 / spec §11 (OQ-6): the untied lm_head [49280,960] stays
+    // high-precision; int8-lm_head only behind a measured quality kill-switch.
+    lm_head_stored_int8: false,
+    embed_tokens_name: "model.text_model.embed_tokens.weight",
     implemented: false,
 };
 static ONECHART: PlannedArch = PlannedArch {
@@ -365,6 +432,9 @@ static ONECHART: PlannedArch = PlannedArch {
     tasks: &[Task::Chart],
     tie_word_embeddings: false, // placeholder until censused (sub-epic D)
     vision_tower_prefix: "model.vision_tower_high", // GOT/Vary lineage
+    decoder_layers_prefix: "model.layers.", // GOT/Qwen2 lineage; confirm at census
+    lm_head_stored_int8: true,  // placeholder until censused (sub-epic D)
+    embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
 };
 static TROMR: PlannedArch = PlannedArch {
@@ -379,6 +449,9 @@ static TROMR: PlannedArch = PlannedArch {
     tasks: &[Task::Music],
     tie_word_embeddings: false, // placeholder until censused (sub-epic E)
     vision_tower_prefix: "model.sam_model", // ResNet stem; placeholder
+    decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic E)
+    lm_head_stored_int8: true,  // placeholder until censused (sub-epic E)
+    embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
 };
 static TROCR: PlannedArch = PlannedArch {
@@ -393,6 +466,9 @@ static TROCR: PlannedArch = PlannedArch {
     tasks: &[Task::Handwriting],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
     vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
+    decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic F)
+    lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
+    embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
 };
 static PIX2TEX: PlannedArch = PlannedArch {
@@ -407,6 +483,9 @@ static PIX2TEX: PlannedArch = PlannedArch {
     tasks: &[Task::Formula],
     tie_word_embeddings: false, // placeholder until censused (sub-epic F)
     vision_tower_prefix: "model.sam_model", // BeiT/ResNet; placeholder
+    decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic F)
+    lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
+    embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
 };
 
@@ -509,6 +588,61 @@ mod tests {
         // Same doctrine-#2 quant policy (vision high-precision; decoder GEMMs int8).
         assert!(got.quant_policy().vision_high_precision);
         assert!(got.quant_policy().decoder_gemms_int8);
+    }
+
+    /// The SmolVLM2 descriptor matches the census (docs/zoo/smolvlm2-spec.md,
+    /// bd-3jo6.3.1) — the C2 convert path keys its whole quant classification
+    /// off these facts, so they are pinned here.
+    #[test]
+    fn smolvlm2_descriptor_matches_the_census() {
+        let a = arch_by_id("smolvlm2").expect("smolvlm2 registered");
+        assert!(!a.implemented(), "sub-epic C forward has not landed yet");
+        assert_eq!(a.vision_encoder(), VisionEncoder::Siglip);
+        assert_eq!(a.decoder(), Decoder::LlamaDense);
+        assert_eq!(a.tokenizer(), TokenizerKind::SmolLm2Bpe);
+        assert_eq!(a.tasks(), &[Task::Describe, Task::Vqa]);
+        assert!(a.license_notice().contains("Apache-2.0"));
+        assert!(a.license_notice().contains("HuggingFaceTB"));
+        // Real config (census §8): greedy, eos=<end_of_utterance>(49279), and NO
+        // upstream repetition guard (ngram 0 / window 0).
+        let c = a.decode_contract();
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.eos_token_id, 49_279);
+        assert_eq!(c.no_repeat_ngram_size, 0);
+        assert_eq!(c.ngram_window, 0);
+        // UNTIED lm_head (byte-verified, spec §12): stored AND high-precision —
+        // the opposite of GOT's tie/omit AND of Unlimited-OCR's int8 lm_head.
+        assert!(!a.tie_word_embeddings());
+        assert!(!a.lm_head_stored_int8());
+        // Idefics3-nested tensor namespaces (spec §12) — the arch-aware convert
+        // classification hangs off these prefixes.
+        assert_eq!(a.vision_tower_prefix(), "model.vision_model");
+        assert_eq!(a.decoder_layers_prefix(), "model.text_model.layers.");
+        assert_eq!(
+            a.embed_tokens_name(),
+            "model.text_model.embed_tokens.weight"
+        );
+        // Same doctrine-#2 quant policy shape as every arch.
+        assert_eq!(a.quant_policy(), QuantPolicy::DOCTRINE);
+    }
+
+    /// The new arch-namespace accessors default to the Unlimited-OCR/GOT layout,
+    /// so every pre-existing arch is untouched by the SmolVLM2 additions.
+    #[test]
+    fn arch_namespace_defaults_are_the_historical_layout() {
+        for id in [
+            "unlimited-ocr",
+            "got-ocr2",
+            "onechart",
+            "tromr",
+            "trocr",
+            "pix2tex",
+        ] {
+            let a = arch_by_id(id).expect("registered");
+            assert_eq!(a.decoder_layers_prefix(), "model.layers.", "{id}");
+            assert!(a.lm_head_stored_int8(), "{id}");
+            assert_eq!(a.embed_tokens_name(), "model.embed_tokens.weight", "{id}");
+        }
     }
 
     /// The descriptor must match the LIVE engine constants, so it can never drift.

@@ -73,8 +73,17 @@ const MODEL_KS: &[KCase] = &[
         note: "GOT-OCR2 Qwen2 decoder width (q/k/v/o, gate/up at hidden 1024)",
     },
     KCase {
+        k: 960,
+        note: "SmolVLM2 SmolLM2 decoder width (q/k/v/o incl. GQA [320,960] panels, \
+               gate/up at hidden 960) — bead C2, docs/zoo/smolvlm2-spec.md §11",
+    },
+    KCase {
         k: 2048,
         note: "projector input width (2048 -> 1280)",
+    },
+    KCase {
+        k: 2560,
+        note: "SmolVLM2 SmolLM2 down_proj (intermediate 2560) — bead C2, spec §11",
     },
     KCase {
         k: 2816,
