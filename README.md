@@ -333,6 +333,7 @@ focr doctor --json                          # idempotent self-check / repair
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
 | `FOCR_FORCE_ARCH` | Force the SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`vnni`/`amx`) for CPU dispatch; used by `robot selftest` and SIMD detection. |
+| `FOCR_RESAMPLE` | Preprocess resampling kernel. Unset (default): the `image` crate's CatmullRom. `pil-bicubic`: a Pillow-bit-exact fixed-point BICUBIC at every resize site, for reference-exact comparison against the PIL/torch oracle (DISC-001 in `docs/DISCREPANCIES.md`). |
 | `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). |
 | `HOME` | Required for cache resolution; the model cache installs to `~/.cache/franken_ocr/models`. |
 

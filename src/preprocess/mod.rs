@@ -25,7 +25,14 @@
 //! **L0 parity = exact.** Where a Rust image-op cannot be bit-identical to PIL
 //! (the resampling kernel), the divergence is named in a comment and routed to
 //! the closest available filter; the *geometry* (tile counts, sizes, placeholder
-//! census) is exact.
+//! census) is exact. The one non-geometric divergence — CatmullRom in place of
+//! PIL BICUBIC — is ledgered as DISC-001 (`docs/DISCREPANCIES.md`, bd-30me) and
+//! carries a kill-switch: `FOCR_RESAMPLE=pil-bicubic` swaps every resize site
+//! onto [`pil_resample`], a Pillow-bit-exact fixed-point BICUBIC, for L0 EXACT
+//! oracle comparison. The default stays CatmullRom (byte-identical to the
+//! pre-DISC-001 pipeline, doctrine #2).
+
+pub mod pil_resample;
 
 use std::path::Path;
 
@@ -405,15 +412,79 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
     Ok(img)
 }
 
+// ── resample kernel selection (bd-30me, DISC-001) ───────────────────────────
+
+/// Kill-switch for the L0 resampling kernel (DISC-001, bd-30me). Unset (the
+/// default) keeps the shipped [`FilterType::CatmullRom`]; `pil-bicubic`
+/// restores the reference-bit-exact Pillow BICUBIC ([`pil_resample`]) at every
+/// resize site, for L0 EXACT comparison against the torch/PIL oracle.
+pub const RESAMPLE_ENV: &str = "FOCR_RESAMPLE";
+
+/// Which resampling kernel the preprocess resize sites use (see
+/// [`RESAMPLE_ENV`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResampleKind {
+    /// The shipped default: the `image` crate's Catmull-Rom cubic — the same
+    /// `a = -0.5` continuous kernel as PIL BICUBIC, but with clamp-at-edge
+    /// sampling and float accumulation, so NOT bit-identical (DISC-001).
+    CatmullRom,
+    /// The reference path: Pillow-bit-exact fixed-point BICUBIC
+    /// ([`pil_resample::resize_bicubic`]), for oracle-exact preprocessing.
+    PilBicubic,
+}
+
+/// Read the kernel selection from [`RESAMPLE_ENV`]. Re-read per resize (the
+/// pipeline resizes a handful of times per image, so there is no `OnceLock`
+/// cache to fight in tests or long-lived engine processes).
+#[must_use]
+pub fn resample_kind() -> ResampleKind {
+    resample_kind_from(std::env::var(RESAMPLE_ENV).ok().as_deref())
+}
+
+/// [`resample_kind`] over an explicit raw value (unit-testable without
+/// mutating the process environment). Unknown values keep the default — the
+/// same forgiving parse as the other `FOCR_*` toggles (`env_tristate`).
+fn resample_kind_from(raw: Option<&str>) -> ResampleKind {
+    match raw.map(str::trim) {
+        Some("pil-bicubic" | "pil_bicubic") => ResampleKind::PilBicubic,
+        _ => ResampleKind::CatmullRom,
+    }
+}
+
+/// Every preprocess resize funnels through here: `resize_exact` semantics
+/// with the kernel chosen by [`resample_kind`] ([SPEC-022/024], spec §13b).
+fn resample_exact(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    resample_exact_with(resample_kind(), img, w, h)
+}
+
+/// [`resample_exact`] with the kernel pinned by the caller (unit-testable
+/// without env mutation).
+///
+/// The CatmullRom arm is the pre-DISC-001 call verbatim — same filter, same
+/// color-type behavior — so the default output is byte-identical (doctrine
+/// #2). The PIL arm converts to RGB *first*, because the oracle does: both
+/// `load_images` (`modeling_unlimitedocr.py:303`) and `GOTImageEvalProcessor`
+/// `.convert("RGB")` before resizing, so reference resampling happens in RGB
+/// space.
+fn resample_exact_with(kind: ResampleKind, img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    match kind {
+        ResampleKind::CatmullRom => img.resize_exact(w, h, FilterType::CatmullRom),
+        ResampleKind::PilBicubic => {
+            DynamicImage::ImageRgb8(pil_resample::resize_bicubic(&img.to_rgb8(), w, h))
+        }
+    }
+}
+
 // ── global view: aspect-preserving resize + gray pad ([SPEC-022]) ───────────
 
 /// `ImageOps.pad`: resize aspect-preserving to fit inside `size × size`, then
 /// center-pad the short axis with the mean gray color `(127,127,127)`
 /// ([SPEC-022], `modeling_unlimitedocr.py:872-873`).
 ///
-/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; we route to
-/// `CatmullRom` (the crate's cubic filter) — the closest available kernel. The
-/// pad geometry (fit + centered placement + gray fill) is exact.
+/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; the default kernel
+/// here is `CatmullRom` (DISC-001; `FOCR_RESAMPLE=pil-bicubic` restores the
+/// bit-exact reference). The pad geometry (fit + centered placement + gray
+/// fill) is exact.
 fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
     let (w, h) = img.dimensions();
     // Aspect-preserving fit: scale so the longer side == size.
@@ -427,7 +498,7 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
         let rw = pillow_fit_edge(w, h, size);
         (rw, size)
     };
-    let resized = img.resize_exact(rw, rh, FilterType::CatmullRom).to_rgb8();
+    let resized = resample_exact(img, rw, rh).to_rgb8();
 
     // Center on a gray canvas.
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([PAD_FILL; 3]));
@@ -494,9 +565,10 @@ fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> FocrResult<(Vec<ViewTens
     // Resize to (tile*W, tile*H), then crop a row-major W×H grid of tiles.
     let target_w = checked_tile_extent(tile, wc, "width")?;
     let target_h = checked_tile_extent(tile, hc, "height")?;
-    // PIL `image.resize((W,H))` default resample is BICUBIC; CatmullRom is the
-    // closest crate cubic. Tile geometry (crop boxes) is exact.
-    let resized = img.resize_exact(target_w, target_h, FilterType::CatmullRom);
+    // PIL `image.resize((W,H))` default resample is BICUBIC; the default kernel
+    // here is CatmullRom (DISC-001; FOCR_RESAMPLE=pil-bicubic restores the
+    // bit-exact reference). Tile geometry (crop boxes) is exact.
+    let resized = resample_exact(img, target_w, target_h);
 
     let cols = wc; // target_width // tile
     let blocks = wc * hc;
@@ -610,8 +682,9 @@ pub const GOT_SIZE: u32 = 1024;
 /// bicubic resize to 1024×1024 (NO aspect-preserve, NO pad) + CLIP-norm →
 /// `[3, 1024*1024]` channel-major, the exact tensor `vision_sam::forward` reads.
 ///
-/// `CatmullRom ≈ PIL bicubic` is the one known sub-L0 divergence (spec §13b): the
-/// stats match the torch oracle to ~1e-4 but the resample is not bit-identical.
+/// `CatmullRom ≈ PIL bicubic` is the one known sub-L0 divergence (spec §13b,
+/// DISC-001): the stats match the torch oracle to ~1e-4 but the resample is not
+/// bit-identical. `FOCR_RESAMPLE=pil-bicubic` restores the bit-exact kernel.
 ///
 /// # Errors
 /// [`FocrError`] if the image cannot be decoded.
@@ -621,9 +694,7 @@ pub fn preprocess_got(path: &Path) -> FocrResult<crate::native_engine::tensor::M
 
 /// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
 pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
-    let rgb = img
-        .resize_exact(GOT_SIZE, GOT_SIZE, FilterType::CatmullRom)
-        .to_rgb8();
+    let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
     let side = GOT_SIZE as usize;
     let n = side * side;
     let mut data = vec![0.0f32; 3 * n];
@@ -909,6 +980,76 @@ mod tests {
         assert_eq!(rounded_offset.get_pixel(0, 20).0, color);
         assert_eq!(rounded_offset.get_pixel(0, 44).0, color);
         assert_eq!(rounded_offset.get_pixel(0, 45).0, pad);
+    }
+
+    // ── resample kernel selection (bd-30me / DISC-001) ──────────────────────
+
+    #[test]
+    fn resample_kind_default_and_kill_switch_parse() {
+        // Kill-switch OFF by default (doctrine #2): unset, empty, the default
+        // spelled out, and unknown junk all stay CatmullRom.
+        assert_eq!(resample_kind_from(None), ResampleKind::CatmullRom);
+        assert_eq!(resample_kind_from(Some("")), ResampleKind::CatmullRom);
+        assert_eq!(
+            resample_kind_from(Some("catmullrom")),
+            ResampleKind::CatmullRom
+        );
+        assert_eq!(resample_kind_from(Some("bogus")), ResampleKind::CatmullRom);
+        // The documented value (and its underscore spelling, trimmed) arms
+        // the PIL-bit-exact reference path.
+        assert_eq!(
+            resample_kind_from(Some("pil-bicubic")),
+            ResampleKind::PilBicubic
+        );
+        assert_eq!(
+            resample_kind_from(Some("pil_bicubic")),
+            ResampleKind::PilBicubic
+        );
+        assert_eq!(
+            resample_kind_from(Some(" pil-bicubic ")),
+            ResampleKind::PilBicubic
+        );
+    }
+
+    /// Doctrine #2 regression: the CatmullRom arm of the resample dispatch is
+    /// byte-identical to the pre-DISC-001 direct `resize_exact` call — same
+    /// bytes AND same color-type behavior (an RGBA input stays RGBA, exactly
+    /// as the old inline call left it for the later `to_rgb8()`).
+    #[test]
+    fn default_resample_is_catmullrom_byte_identical() {
+        let mut rgba = image::RgbaImage::new(13, 7);
+        for (x, y, p) in rgba.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 19 + y * 3) as u8, (x * 7) as u8, (y * 31) as u8, 255]);
+        }
+        let img = DynamicImage::ImageRgba8(rgba);
+        let via_dispatch = resample_exact_with(ResampleKind::CatmullRom, &img, 8, 5);
+        let direct = img.resize_exact(8, 5, FilterType::CatmullRom);
+        assert_eq!(
+            via_dispatch.color(),
+            direct.color(),
+            "default resample changed the color type"
+        );
+        assert_eq!(
+            via_dispatch.as_bytes(),
+            direct.as_bytes(),
+            "default resample output moved (doctrine #2 violation)"
+        );
+    }
+
+    /// The armed kill-switch routes to [`pil_resample::resize_bicubic`] over
+    /// the RGB-converted image (PIL converts to RGB before resizing) and
+    /// yields an RGB8 result.
+    #[test]
+    fn pil_kill_switch_dispatch_routes_to_pil_resampler() {
+        let mut rgb = RgbImage::new(5, 4);
+        for (x, y, p) in rgb.enumerate_pixels_mut() {
+            *p = Rgb([(x * 40) as u8, (y * 60) as u8, (x * y * 13) as u8]);
+        }
+        let img = DynamicImage::ImageRgb8(rgb.clone());
+        let via_dispatch = resample_exact_with(ResampleKind::PilBicubic, &img, 3, 6);
+        let direct = pil_resample::resize_bicubic(&rgb, 3, 6);
+        assert_eq!(via_dispatch.color(), image::ColorType::Rgb8);
+        assert_eq!(via_dispatch.as_bytes(), direct.as_raw().as_slice());
     }
 
     // ── Gundam tiling geometry ([SPEC-023/024]) ─────────────────────────────

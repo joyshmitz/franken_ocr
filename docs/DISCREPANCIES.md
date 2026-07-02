@@ -74,12 +74,69 @@ since exact-token OCR fails in the tail.
 
 ---
 
-_No discrepancies recorded yet. Nothing has been measured against the reference
-oracle — the inference path does not exist. This stays empty until a real,
-measured divergence appears; no placeholder or fabricated entries._
+## DISC-001: L0 resampling kernel — `image` crate CatmullRom in place of PIL BICUBIC
 
-The first real entry MUST carry full truth-pack provenance. Shape to follow (a
-**template**, not a measurement):
+- claim_id / evidence_id: CLAIM-l0-resample-catmullrom → artifacts/parity/bd-30me/
+    (directory to be populated when the armed L0 EXACT gate runs; today the evidence is
+    the in-tree Pillow-12.1.1 goldens + the differential log below)
+- Provenance (model commit + fixture hash): HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    + `modeling_unlimitedocr.py` sha256 268bdcbe…: `ImageOps.pad(image, (base_size,
+    base_size), …)` at :872-873 and `dynamic_preprocess`'s `resized_img =
+    image.resize((target_width, target_height))` at :197 (BICUBIC is `Image.resize`'s
+    default) — SOURCE_HASHES.md; GOT-OCR2's `GOTImageEvalProcessor` squash resize is the
+    same kernel (spec §13b). Oracle resampler pin: **Pillow 12.1.1** (PINNED_SOURCES.md
+    runtime pin). **No parity-corpus fixture hash yet** — the oracle preprocessed-tensor
+    fixture (bd-1gv.3.1) is still blocked, which is exactly why the impact below is TBD.
+- CPU feature string: n/a — preprocess is scalar integer/f64 image code with no SIMD
+    dispatch; the divergence is kernel-semantics, not arch-rounding (same output on
+    aarch64 and x86_64)
+- Exact command + env: `cargo test -p franken_ocr preprocess::` (Pillow-12.1.1 goldens +
+    default-path regression, no env); reference path armed via `FOCR_RESAMPLE=pil-bicubic`
+    (e.g. `FOCR_RESAMPLE=pil-bicubic focr ocr <img>`); golden generator + 370-case
+    differential: `scripts/gen_pil_bicubic_goldens.py` (header has the uv-venv recipe)
+- Reference behavior: PIL `Image.resize(…, Resampling.BICUBIC)` / `ImageOps.pad(…,
+    method=BICUBIC)` — Pillow's `src/libImaging/Resample.c` 8-bit path: two passes
+    (horizontal then vertical) with u8 clip between them; per-window f64 coefficients with
+    the sample window clamped to the image **before** weighting and renormalized by their
+    own sum; coefficients fixed-pointed at 2^22 (`PRECISION_BITS = 32-8-2`) rounded half
+    away from zero; accumulation from `1 << 21` with `clip8` (>>22, saturate 0..255).
+- Our impl: default `image::imageops::FilterType::CatmullRom` at the single resize funnel
+    `src/preprocess/mod.rs::resample_exact_with` (feeding `pad_to_square`,
+    `build_gundam_tiles`, `got_view_tensor`). Same `a = -0.5` continuous cubic, but
+    clamp-at-edge sampling + float accumulation ⇒ NOT bit-identical to PIL. The reference
+    path `src/preprocess/pil_resample.rs::resize_bicubic` is a step-for-step `Resample.c`
+    port proven bit-exact against Pillow 12.1.1: 370/370 randomized differential cases
+    (sources 1×1..640×480 → targets 1×1..1024×1024, random + solid-extreme pixels,
+    2026-07-01, `scripts/gen_pil_bicubic_goldens.py`) + 6 Pillow-generated goldens
+    embedded in its unit tests.
+- Fallback / kill-switch state: `FOCR_RESAMPLE` (default **unset** ⇒ CatmullRom,
+    byte-identical to the pre-DISC-001 pipeline — doctrine #2); `=pil-bicubic` restores
+    reference-bit-exact PIL BICUBIC at ALL preprocess resize sites for L0 EXACT
+    comparison. Note the polarity: unlike most entries, here the DEFAULT is the divergence
+    and the switch arms the reference.
+- Measured impact: **TBD — honestly not yet measured.** The CER/token-diff cost of
+    CatmullRom-vs-BICUBIC needs (a) the armed L0 EXACT gate over an oracle
+    preprocessed-tensor fixture (bd-1gv.3.1, blocked) and (b) an e2e A/B
+    (`FOCR_RESAMPLE` unset vs `=pil-bicubic`) over the parity corpus, on the pinned
+    oracle stack. Known today: aggregate tensor stats match the torch oracle to
+    ~5e-3 (`preprocess::tests::got_preprocess_matches_oracle_l0b` tolerances exist
+    BECAUSE of this divergence) — that bounds it as small but does NOT license calling
+    it zero, and per §above this entry may not be promoted to ACCEPTED until the real
+    numbers land here.
+- Resolution: INVESTIGATING (divergence ledgered + bit-exact reference path and
+    kill-switch shipped; measurement pending the armed L0 gate)
+- Tests affected: `preprocess::pil_resample::tests::*` (Pillow-12.1.1 goldens, copy /
+    solid / 1×1 / zero-dim semantics), `preprocess::tests::
+    resample_kind_default_and_kill_switch_parse`, `preprocess::tests::
+    default_resample_is_catmullrom_byte_identical` (doctrine-#2 byte-identity regression),
+    `preprocess::tests::pil_kill_switch_dispatch_routes_to_pil_resampler`,
+    `preprocess::tests::got_preprocess_matches_oracle_l0b` (stats-tolerance test; goes
+    EXACT under the kill-switch once the L0 fixture exists)
+- Review date: 2026-07-01
+
+---
+
+Entry shape reference (a **template**, not a measurement):
 
 ```
 ## DISC-001: <e.g. int8 attention q/k/v/o drifts a sub-script token on dense formulas>
