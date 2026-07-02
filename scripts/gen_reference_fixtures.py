@@ -233,6 +233,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "scripts/baseline/run_baidu_reference.py proved on the 20-page corpus. "
         "Rejected with --device cuda.",
     )
+    p.add_argument(
+        "--f32",
+        action="store_true",
+        help="Compute the whole reference graph in float32 (the KERNEL-parity "
+        "oracle, bd-31vc): load the model with torch_dtype=float32 (an exact "
+        "upcast of the bf16 weights) and rewrite the reference's hard-coded "
+        ".to(bfloat16) image casts to float32, so every captured seam AND the "
+        "greedy token stream are f32-computed — apples-to-apples with the f32 "
+        "Rust subject. Requires --device cpu + --cpu-patch. Provenance records "
+        "compute_dtype='float32'; oracle_is_correctness_golden stays false (the "
+        "CUDA bf16 run remains the correctness golden). Write these fixtures to "
+        "a SEPARATE --out dir so the bf16 set survives as the cross-precision "
+        "ledger.",
+    )
     return p.parse_args(argv)
 
 
@@ -307,6 +321,32 @@ def _install_cpu_patches(torch: Any) -> None:
     torch.cuda.is_available = lambda: False
 
 
+def _install_f32_patches(torch: Any) -> None:
+    """Make the whole reference pipeline compute in float32 (--f32 only).
+
+    The model weights themselves are loaded with torch_dtype=float32 (see
+    _load_model_and_tokenizer) — an EXACT upcast, bf16 is a truncated f32. But
+    the reference `infer()` preprocessing hard-codes
+    `image_transform(...).to(torch.bfloat16)` (modeling_unlimitedocr.py), which
+    would (a) round the f32 preprocessed pixels to bf16 and (b) dtype-clash
+    with the f32 conv weights inside sam_model. So `Tensor.to` is wrapped to
+    rewrite a bfloat16 target dtype (positional or kwarg) into float32; every
+    other call passes through untouched. Under --cpu-patch the cuda autocast is
+    already a nullcontext, so nothing else re-introduces bf16: the captured
+    seams and the greedy token stream are f32-computed end to end.
+    """
+    _orig_to = torch.Tensor.to
+
+    def _to_no_bf16(self: Any, *a: Any, **k: Any) -> Any:
+        a = tuple(torch.float32 if x is torch.bfloat16 else x for x in a)
+        if k.get("dtype") is torch.bfloat16:
+            k = dict(k)
+            k["dtype"] = torch.float32
+        return _orig_to(self, *a, **k)
+
+    torch.Tensor.to = _to_no_bf16
+
+
 def _resolve_model_dir(cli_dir: Path | None) -> Path:
     raw = cli_dir or os.environ.get("FOCR_MODEL_DIR")
     if not raw:
@@ -342,13 +382,16 @@ def _sha256_file(path: Path, chunk: int = 1 << 22) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_model_and_tokenizer(torch: Any, model_dir: Path, device: str):
-    """Load Unlimited-OCR + tokenizer in bf16, eval, on `device`.
+def _load_model_and_tokenizer(torch: Any, model_dir: Path, device: str, dtype: Any):
+    """Load Unlimited-OCR + tokenizer in `dtype`, eval, on `device`.
 
     Mirrors the README runtime (trust_remote_code=True, use_safetensors=True,
     torch_dtype=bfloat16, .eval().cuda()). trust_remote_code is required because
     the model class (UnlimitedOCRForCausalLM) lives in the repo's
     modeling_unlimitedocr.py — this is offline tooling the human runs knowingly.
+
+    `dtype` is bfloat16 for the reference runtime; float32 only for the --f32
+    KERNEL-parity oracle (an exact upcast of the bf16 weights, bd-31vc).
     """
     from transformers import AutoModel, AutoTokenizer  # noqa: WPS433
 
@@ -358,14 +401,14 @@ def _load_model_and_tokenizer(torch: Any, model_dir: Path, device: str):
     )
 
     print(
-        f"[fixtures] loading model from {model_dir} (bf16, {device}) ...",
+        f"[fixtures] loading model from {model_dir} ({dtype}, {device}) ...",
         file=sys.stderr,
     )
     model = AutoModel.from_pretrained(
         str(model_dir),
         trust_remote_code=True,
         use_safetensors=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
     )
     model = model.eval()
     if device == "cuda":
@@ -937,6 +980,7 @@ def _build_provenance(
     mode: str,
     device: str,
     cpu_patch: bool,
+    f32: bool,
     max_length: int,
     determinism: dict[str, Any],
     command_argv: list[str],
@@ -990,6 +1034,13 @@ def _build_provenance(
         # True ⇒ infer() ran through the .cuda()/autocast no-op shims (the
         # separate CPU-equivalence path) — never a correctness golden.
         "cpu_patched_infer": cpu_patch,
+        # The dtype the reference GRAPH computed in. bfloat16 = the reference
+        # runtime. float32 (--f32) = the KERNEL-parity oracle (bd-31vc): exact
+        # weight upcast + the .to(bfloat16) image casts rewritten to float32,
+        # so seams + greedy tokens are f32-computed, apples-to-apples with the
+        # f32 Rust subject. NEVER a correctness golden either way on CPU.
+        "compute_dtype": "float32" if f32 else "bfloat16",
+        "f32_upcast_patch": f32,
         "cuda": cuda_info,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
@@ -1028,6 +1079,7 @@ def _provenance_markdown(manifest: dict[str, Any]) -> str:
         f"- Exact command: `{provenance['exact_command']}`",
         f"- RNG seed: `{provenance['determinism']['seed']}`",
         f"- Model weights SHA-256: `{provenance['model_weights_sha256']}`",
+        f"- Compute dtype: `{provenance['compute_dtype']}`",
         f"- Correctness golden: `{provenance['oracle_is_correctness_golden']}`",
         "",
         "## Documents",
@@ -1115,6 +1167,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         _install_cpu_patches(torch)
 
+    # 1c. The f32 KERNEL-parity oracle (bd-31vc) rides on top of the CPU shims:
+    # the reference infer() hard-codes .cuda(), so an f32 run without them
+    # cannot execute. Refused with cuda — the correctness golden stays bf16.
+    if args.f32:
+        if not args.cpu_patch or args.device == "cuda":
+            raise SystemExit(
+                "gen_reference_fixtures: --f32 requires --device cpu "
+                "--cpu-patch (the f32 graph is the KERNEL-parity oracle, "
+                "bd-31vc; the bf16 CUDA run remains the correctness golden)."
+            )
+        _install_f32_patches(torch)
+
     # 2. Resolve + validate the model dir and corpus.
     model_dir = _resolve_model_dir(args.model_dir)
     docs = _list_corpus(args.corpus)
@@ -1126,14 +1190,17 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"[fixtures] mode={args.mode} prompt={args.prompt!r} "
-        f"device={args.device} docs={len(docs)} "
+        f"device={args.device} dtype={'float32' if args.f32 else 'bfloat16'} "
+        f"docs={len(docs)} "
         f"activations={'on' if args.activations else 'off'}",
         file=sys.stderr,
     )
 
-    # 3. Load the model + tokenizer (bf16, eval, device). This may allocate and
-    # consume RNG internally, so the replay seed is applied immediately after it.
-    model, tokenizer = _load_model_and_tokenizer(torch, model_dir, args.device)
+    # 3. Load the model + tokenizer (bf16 — or f32 for the KERNEL-parity
+    # oracle — eval, device). This may allocate and consume RNG internally, so
+    # the replay seed is applied immediately after it.
+    dtype = torch.float32 if args.f32 else torch.bfloat16
+    model, tokenizer = _load_model_and_tokenizer(torch, model_dir, args.device, dtype)
 
     # 4. Make generation as deterministic as the runtime allows (the oracle's own
     # nondeterminism floor is established by running this script twice — plan §8.1
@@ -1150,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
         device=args.device,
         cpu_patch=args.cpu_patch,
+        f32=args.f32,
         max_length=args.max_length,
         determinism=determinism,
         command_argv=[sys.executable, *sys.argv],
