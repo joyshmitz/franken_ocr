@@ -68,7 +68,11 @@ const GOT_INT8_LMHEAD_DEFAULT: bool = true;
 const GOT_PARALLEL_ATTN_DEFAULT: bool = true;
 
 fn env_tristate(var: &str, default: bool) -> bool {
-    match std::env::var(var).ok().as_deref() {
+    match std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("1" | "int8" | "on" | "true" | "yes") => true,
         Some("0" | "f32" | "off" | "false" | "no") => false,
         _ => default,
@@ -218,6 +222,26 @@ impl DecoderConfig {
     #[must_use]
     pub fn kv_group(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    /// Enforce the documented GQA invariant (`num_key_value_heads` divides
+    /// `num_attention_heads` evenly) — otherwise `broadcast_kv` leaves the
+    /// trailing query lanes zeroed and `decode_attn_head` reads out of a
+    /// too-short lane, both SILENT wrong-math paths (fresh-eyes fix). Called
+    /// at both forward entries; the registered configs pass by construction.
+    fn validate_gqa(&self) -> FocrResult<()> {
+        if self.num_key_value_heads == 0
+            || !self
+                .num_attention_heads
+                .is_multiple_of(self.num_key_value_heads)
+        {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "DecoderConfig: num_key_value_heads {} must divide num_attention_heads {} evenly",
+                self.num_key_value_heads,
+                self.num_attention_heads
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -397,6 +421,7 @@ pub fn forward_prefill(
     cfg: &DecoderConfig,
     inputs_embeds: &Mat,
 ) -> FocrResult<Mat> {
+    cfg.validate_gqa()?;
     if inputs_embeds.cols != cfg.hidden_size {
         return Err(FocrError::FormatMismatch(format!(
             "decoder_qwen2: inputs_embeds cols {} != hidden {}",
@@ -454,7 +479,10 @@ pub fn generate_greedy(
         let rows = data.len() / hidden;
         let cur = Mat::from_vec(rows, hidden, std::mem::take(&mut data));
         let logits = forward_prefill(weights, cfg, &cur)?;
-        let last = &logits.data[(logits.rows - 1) * vocab..];
+        // Slice by the LOGITS' own stride (== cfg.vocab_size, set by the
+        // lm_head) — `vocab` above comes from embed.rows, which an untied
+        // checkpoint could legitimately size differently (fresh-eyes fix).
+        let last = &logits.data[(logits.rows - 1) * logits.cols..];
         let next = argmax_no_repeat(last, &ids, cfg.no_repeat_ngram_size) as u32;
         ids.push(next);
         // reclaim the prefix embeds and append the chosen token's embedding.
@@ -664,6 +692,7 @@ impl GotDecodeWeights {
     }
 
     fn build(weights: &Weights, cfg: &DecoderConfig) -> FocrResult<Self> {
+        cfg.validate_gqa()?;
         let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
         let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -981,8 +1010,16 @@ fn qwen2_decode_step(
 /// with a full-causal KV cache instead of re-running prefill each step. The bit-for-bit
 /// equality is enforced by reusing [`nn::linear_int8_dynamic`] for every GEMM (the
 /// prefill kernel), so the decode never diverges from the certified path. Both paths
-/// apply the same [`argmax_no_repeat`] global no-repeat-n-gram guard (bd-ff4i), so
-/// their id-streams stay identical on repetition-prone pages too.
+/// apply the same [`argmax_no_repeat`] global no-repeat-n-gram guard (bd-ff4i).
+///
+/// Precision caveat: with the int8+top-K-refine lm_head lever ON, the identity
+/// to `generate_greedy` (whose head is always f32) holds as long as every
+/// guard-masked argmax lands inside the refined top-K — logits BEYOND the top-K
+/// are int8-approximate, so a ban deep enough to push the pick past K could in
+/// principle flip a near-tie the f32 head would order differently. K = 256 ≫
+/// any observed ban set (a 20-gram ban removes a handful of ids); the GOT
+/// oracle certs + the 20-page sweep ran with the lever ON and stayed exact.
+/// `FOCR_GOT_INT8_LMHEAD=0` removes the caveat entirely.
 ///
 /// # Errors
 /// Any prefill/decode-step error, or a missing `model.embed_tokens.weight`.

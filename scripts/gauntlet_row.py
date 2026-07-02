@@ -132,6 +132,16 @@ def validate_inputs(
     if focr.get("source") != "focr" or ref.get("source") != "reference":
         raise RowError("focr/reference inputs swapped or mislabeled (`source` field)")
 
+    # Same-input pairing (fresh-eyes fix): both measurement docs carry `page`;
+    # a ratio between two DIFFERENT pages is meaningless and previously landed
+    # silently if the operator passed mismatched files.
+    fpage = os.path.basename(str(focr.get("page") or ""))
+    rpage = os.path.basename(str(ref.get("page") or ""))
+    if not fpage or not rpage:
+        raise RowError("focr/reference measurement docs must both carry `page`")
+    if fpage != rpage:
+        raise RowError(f"page pairing broken: focr measured {fpage!r}, reference {rpage!r}")
+
     frec = stage_record(focr, stage)
     rrec = stage_record(ref, stage)
     if frec is None:
@@ -502,6 +512,7 @@ def _synthetic_inputs(tmp: str) -> tuple[str, str, str, dict]:
         "source": "focr",
         "created_utc": "2026-07-01T00:00:00Z",
         "run_dir": raw,
+        "page": "page.png",
         "command": ["focr", "ocr", "page.png"],
         "focr_env": {"FOCR_TIMING": "1", "FOCR_THREADS": "8"},
         "threads": 8,
@@ -514,6 +525,7 @@ def _synthetic_inputs(tmp: str) -> tuple[str, str, str, dict]:
     ref = {
         "schema": "focr-gauntlet-stages/v1",
         "source": "reference",
+        "page": "page.png",
         "command": ["python3", "gauntlet_reference.py"],
         "torch_version": "2.10.0",
         "transformers_version": "4.57.1",

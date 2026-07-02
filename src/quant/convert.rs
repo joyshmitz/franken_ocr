@@ -189,6 +189,14 @@ pub fn safetensors_to_focrq(
     if !omit_lm_head && !arch.lm_head_stored_int8() {
         verify_untied_lm_head(weights, arch)?;
     }
+    // The SYMMETRIC guard (fresh-eyes fix): omitting `lm_head.weight` on an
+    // arch's tie claim was previously taken on trust — a genuinely-untied
+    // checkpoint mislabeled with a tied arch id would silently DROP its real
+    // head (the loader would reconstruct from embed_tokens = wrong logits, no
+    // error anywhere). Verify the tie against the actual bytes before dropping.
+    if omit_lm_head {
+        verify_tied_lm_head(weights, arch)?;
+    }
 
     // `names()` is already sorted (the directory is a `BTreeMap`); collect so the
     // immutable directory borrow is released before the per-tensor accessors run.
@@ -222,6 +230,29 @@ fn verify_untied_lm_head(weights: &Weights, arch: &dyn ModelArch) -> FocrResult<
         return Err(FocrError::FormatMismatch(format!(
             "convert: arch {:?} declares an UNTIED lm_head, but lm_head.weight is \
              byte-identical to {embed_name:?} — this checkpoint ties its embeddings; \
+             the --model-id (or its descriptor) is wrong",
+            arch.id()
+        )));
+    }
+    Ok(())
+}
+
+/// The mirror of [`verify_untied_lm_head`]: an arch that DECLARES tied
+/// embeddings (and therefore omits `lm_head.weight` from the artifact) must
+/// actually have byte-identical head/embed tensors in the source checkpoint —
+/// otherwise the omission destroys the real head. Absent `lm_head.weight` is
+/// fine (already-tied checkpoints often don't store one at all).
+fn verify_tied_lm_head(weights: &Weights, arch: &dyn ModelArch) -> FocrResult<()> {
+    let embed_name = arch.embed_tokens_name();
+    let (Ok(head), Ok(embed)) = (weights.tensor("lm_head.weight"), weights.tensor(embed_name))
+    else {
+        return Ok(());
+    };
+    if head.dtype != embed.dtype || head.shape != embed.shape || head.data != embed.data {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: arch {:?} declares TIED embeddings (lm_head omitted from the \
+             artifact), but this checkpoint's lm_head.weight differs from \
+             {embed_name:?} — omitting it would silently destroy the real head; \
              the --model-id (or its descriptor) is wrong",
             arch.id()
         )));

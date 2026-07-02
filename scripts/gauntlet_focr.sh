@@ -132,6 +132,15 @@ fi
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/artifacts/perf/bd-re8.17/focr}"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
+# Refuse a dirty raw dir (fresh-eyes fix): the aggregator globs EVERY
+# run_*.meta.json under it, so re-running into the same out dir would fold a
+# previous session's samples into this one's best-of-N — silently mixed
+# measurements. Fail closed; the operator picks a fresh dir (nothing deleted).
+if compgen -G "$RAW_DIR/run_*.meta.json" > /dev/null 2>&1; then
+  echo "FATAL: $RAW_DIR already holds run_*.meta.json from a previous session;" >&2
+  echo "       re-aggregating would mix runs. Use a fresh out dir." >&2
+  exit 2
+fi
 
 CMD=("$BINARY" "ocr" "$PAGE")
 [[ -n "$MODEL" ]] && CMD+=("--model" "$MODEL")

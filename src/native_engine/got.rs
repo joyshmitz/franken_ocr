@@ -38,12 +38,16 @@ pub const EOS_ID: u32 = 151_645;
 /// The forward clamps any requested `--max-length` to this (bd-3j3p).
 pub const MAX_NEW_TOKENS: usize = 4096;
 
-/// `FOCR_GOT_NO_REPEAT_NGRAM` — override the GOT global no-repeat-n-gram size
-/// (bd-ff4i kill-switch; upstream `chat()` hard-codes 20, spec §12 OQ-8). `0`
-/// disables the guard, restoring the pre-guard unguarded greedy; unset or
-/// unparsable keeps the config default. Read once per process (mirrors the
-/// other `FOCR_GOT_*` decode levers).
+/// Resolve the GOT global no-repeat-n-gram size (bd-ff4i kill-switch; upstream
+/// `chat()` hard-codes 20, spec §12 OQ-8). Priority (fresh-eyes fix — the CLI
+/// `--no-repeat-ngram` used to be silently ignored on this arm):
+/// 1. the CLI decode override (`--no-repeat-ngram` / `FOCR_NO_REPEAT_NGRAM`),
+/// 2. the `FOCR_GOT_NO_REPEAT_NGRAM` env (read once per process),
+/// 3. the config default. `0` disables the guard at any level.
 fn no_repeat_ngram_override(default: usize) -> usize {
+    if let Some(n) = super::decode_overrides().no_repeat_ngram {
+        return n;
+    }
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     N.get_or_init(|| {
         std::env::var("FOCR_GOT_NO_REPEAT_NGRAM")

@@ -216,12 +216,13 @@ pub struct OcrRequestArgs {
     /// Reference local tile size from `infer(..., image_size=640)`.
     #[arg(long, default_value_t = DEFAULT_IMAGE_SIZE)]
     pub image_size: i64,
-    /// Vision preprocessing mode. `base` (the default) is the certified single
-    /// 1024-pixel global view — the mode every oracle cert and golden was
-    /// produced under, and what the engine has always actually run. `gundam`
-    /// selects the reference dynamic-resolution tiling (a 1024 global view plus
-    /// 640 local tiles); its connector path is unit-tested but has no e2e
-    /// oracle certification yet. (Until bd-1e9n this flag was parsed and
+    /// Vision preprocessing mode (unlimited-ocr only — got-ocr2 always uses its
+    /// own fixed squash-1024 preprocess). `base` (the default) is the certified
+    /// single 1024-pixel global view — the mode every oracle cert and golden
+    /// was produced under, and what the engine has always actually run.
+    /// `gundam` selects the reference dynamic-resolution tiling (a 1024 global
+    /// view plus 640 local tiles); its connector path is unit-tested but has no
+    /// e2e oracle certification yet. (Until bd-1e9n this flag was parsed and
     /// silently dropped with a `gundam` default label the engine never honored;
     /// the default now states the real, certified behavior.)
     #[arg(long, value_enum, default_value_t = CropMode::Base)]
@@ -229,17 +230,22 @@ pub struct OcrRequestArgs {
     /// Maximum generated sequence length.
     #[arg(long, default_value_t = DEFAULT_MAX_LENGTH)]
     pub max_length: i64,
-    /// Decode temperature; 0.0 means greedy.
+    /// Decode temperature; 0.0 means greedy. (unlimited-ocr only — got-ocr2
+    /// decodes greedy.)
     #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     pub temperature: f32,
-    /// Sliding no-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM).
+    /// No-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM). For
+    /// unlimited-ocr this is the sliding-window guard (with --ngram-window);
+    /// for got-ocr2 it overrides the model's global guard (default 20; 0
+    /// disables).
     #[arg(
         long,
         env = "FOCR_NO_REPEAT_NGRAM",
         default_value_t = DEFAULT_NO_REPEAT_NGRAM
     )]
     pub no_repeat_ngram: i64,
-    /// Sliding no-repeat n-gram lookback window.
+    /// Sliding no-repeat n-gram lookback window. (unlimited-ocr only —
+    /// got-ocr2's guard is global.)
     #[arg(long, default_value_t = DEFAULT_NGRAM_WINDOW)]
     pub ngram_window: i64,
     /// GOT-OCR2 structured output: use the model's `OCR with format:` mode instead
@@ -292,13 +298,6 @@ impl RobotRunArgs {
     }
 }
 
-/// Map the request's decode tuning flags onto engine
-/// [`native_engine::DecodeOverrides`]. A value becomes an override only when it
-/// differs from the compiled default (bit-exact for the float), so an untouched
-/// flag keeps the engine-side default AND leaves env overrides (e.g.
-/// `FOCR_MAX_NEW_TOKENS`) in force. The preprocess flags (`--base-size`,
-/// `--image-size`, `--crop-mode`) are a separate, still-unwired surface — see
-/// the tracking bead filed with this change.
 /// Map the request's preprocess tuning flags onto engine
 /// [`native_engine::PreprocessOverrides`] (bd-1e9n), with the same
 /// explicit-only rule as [`decode_overrides_from`] for the sizes. `--crop-mode`
@@ -314,6 +313,11 @@ fn preprocess_overrides_from(request: &OcrRequest) -> native_engine::PreprocessO
     }
 }
 
+/// Map the request's decode tuning flags onto engine
+/// [`native_engine::DecodeOverrides`]. A value becomes an override only when it
+/// differs from the compiled default (bit-exact for the float), so an untouched
+/// flag keeps the engine-side default AND leaves env overrides (e.g.
+/// `FOCR_MAX_NEW_TOKENS`) in force.
 fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides {
     native_engine::DecodeOverrides {
         max_length: (i64::from(request.max_length) != DEFAULT_MAX_LENGTH)
@@ -1406,6 +1410,19 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     }
     if !args.no_int8 {
         native_engine::force_int8_decode(true);
+    }
+    // ocr-batch has no per-flag tuning surface, but the README-documented
+    // FOCR_NO_REPEAT_NGRAM mitigation (int8 table-repetition) must work here
+    // too (fresh-eyes fix — it previously reached only the clap env fallback
+    // on `focr ocr`/`robot run` and was silently ignored by batch runs).
+    if let Some(n) = std::env::var("FOCR_NO_REPEAT_NGRAM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        native_engine::set_decode_overrides(native_engine::DecodeOverrides {
+            no_repeat_ngram: Some(n),
+            ..Default::default()
+        });
     }
     let engine = OcrEngine::new()?;
     let model = args.model.clone();

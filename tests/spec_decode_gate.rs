@@ -24,12 +24,9 @@
 //!    verifier's chooser hardwires. The guard's params half is the public
 //!    [`DecodeParams::matches_frozen_spec_ban`]; the tests below pin the frozen
 //!    constants and prove every override shape (`--no-repeat-ngram 20`,
-//!    `--ngram-window 1024`, multi-image, disabled blocker) fails it. NOTE: the
-//!    live dispatch in `OcrModel::generate_cached_i8` still spells the same two
-//!    comparisons inline (`src/native_engine/mod.rs` is owner-frozen this wave);
-//!    a one-hunk adoption diff replacing the inline expression with this
-//!    predicate was returned to the hot-cluster owner so guard and gate cannot
-//!    drift apart.
+//!    `--ngram-window 1024`, multi-image, disabled blocker) fails it. The live
+//!    dispatch in `OcrModel::generate_cached_i8` CALLS this same predicate
+//!    (adopted in `src/native_engine/mod.rs`), so guard and gate cannot drift.
 //! 3. **Model-gated ON-vs-OFF byte identity** is `scripts/spec_gate_e2e.sh`:
 //!    `FOCR_SPEC_DECODE` is a presence kill-switch read ONCE into a process-wide
 //!    `OnceLock`, and edition-2024 `set_var` is `unsafe` (this crate denies
