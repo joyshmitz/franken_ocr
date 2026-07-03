@@ -74,6 +74,52 @@ since exact-token OCR fails in the tail.
 
 ---
 
+## DISC-003: SmolVLM2 f32 describe e2e flips near-tied tokens via summation-order drift
+
+- claim_id / evidence_id: CLAIM-c8-neartie → the armed C8 cert logs
+    (`smolvlm2::tests::describe_e2e_matches_oracle_l4`, src/native_engine/smolvlm2.rs)
+- Provenance (model commit + fixture hash): HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+    model.safetensors (zoo/smolvlm2/SHA256SUMS); vision oracle fixtures
+    `tests/fixtures/smolvlm2/vision_oracle_fixtures.json` +
+    `sample_photo.png` sha256 c69c42d3… (gen_reference_fixtures_smolvlm2_vision.py,
+    transformers in-tree ≥4.50, ALL floors = 0.00e+00)
+- CPU feature string: aarch64+neon+dotprod (Apple M4)
+- Exact command + env: `FOCR_SMOLVLM2_DIR=<zoo> cargo test --lib -- --nocapture
+    describe_e2e_matches_oracle_l4`
+- Reference behavior: f32 greedy describe of the committed sample photo — 64 ids,
+    "…buildings are primarily rectangular and have multiple windows, suggesting…"
+- Our impl: the FULL native pipeline (L0b preprocess maxabs 0.0, SigLIP cert cos
+    1.00000000 / maxabs 4.4e-4, connector maxabs 2.6e-4, prompt id-EXACT 876/876)
+    matches the oracle for a 22-token exact prefix, then flips one near-tied token
+    ("multiple windows…" → "a uniform color scheme…" — both coherent, faithful
+    captions of the fixture image) and re-converges structurally.
+- MEASURED impact (fully attributed, 2026-07-03): divergence is
+    decode-trajectory-only and belongs to the **KV-cache fast path**, not the
+    decoder math. Three probes isolated it, all with the ORACLE's own
+    `connector_out.bin` vision rows:
+    * **prefill logits are essentially exact** — at the ledger's step-0 anchors
+      our drift is < 5e-5 (our top-2 gap 0.5699 vs oracle 0.5700), argmax exact;
+    * **the O(n²) `generate_greedy` path (same sdpa rounding as prefill) is
+      64/64 id-EXACT** vs the oracle — prompt + splice + decoder math certified;
+    * **the O(n) `generate_greedy_kvcache` path** (bespoke token-major
+      decode-attention, a different f32 summation order) first flips at step 20
+      on the oracle's rank-2 token at a top-2 gap of 0.353 — the per-step
+      rounding difference compounds along the autoregressive chain. The full
+      native pipeline (our vision) flips similarly at step 22. On the int8
+      artifact the C5 cert's kvcache==greedy BIT-identity still holds
+      (activation quantization absorbs the drift), which is why B9 never saw
+      this: it is f32-only, long-decode-only behavior.
+    ATTRIBUTION GATE: the oracle fixture carries a per-step top-2 logit ledger
+    (`l4_describe_greedy.step_top2`); the cert asserts every first divergence
+    lands on the oracle's rank-2 token at a gap ≤ 0.5 (median ledger gap ~1.0),
+    plus an opt-in `FOCR_SMOLVLM2_CERT_FULL=1` leg re-proving the greedy path
+    id-exact — a real defect (wrong math, not reordered math) fails both.
+- Kill-switch: none needed (f32-vs-f32 numerics, not a quant tier); for a
+    trajectory bit-faithful to the sdpa math, `generate_greedy` is the O(n²)
+    reference path.
+- Review date: when C8's L5 caption/VQA quality budget lands — score both captions
+    under the keyword-containment metric and confirm the flips move no metric.
+
 ## DISC-002: SmolVLM2 int8 decode flips a near-tied greedy token vs the f32 oracle
 
 - claim_id / evidence_id: CLAIM-c5-int8-neartie → the armed C5 cert logs

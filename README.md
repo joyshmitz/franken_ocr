@@ -241,9 +241,11 @@ PDFs name figures per page (`page{N}_figure_{M}`).
 `tables`, `chart`, `molecular`, `geometry`, `music` — are all served by GOT-OCR2's
 `OCR with format:` mode, so each implies `--format` (an explicit `--format` composes
 idempotently) and needs the got-ocr2 model: `focr pull got-ocr2`, then
-`--model got-ocr2.int8.focrq`. Pointing a specialized task at the default plain-text
-model fails with usage guidance before any weights load. `--task describe` (photo
-description / VQA) is planned for the smolvlm2 model and fails clean today.
+`--model got-ocr2.int8.focrq`. `--task describe` (photo description / VQA) is served
+by the smolvlm2 model: `--model smolvlm2.int8.focrq --task describe`, optionally with
+`--question "What color is the car?"` — SmolVLM2 has no instruction modes, the task IS
+the question (default: the model-card caption prompt). Pointing a specialized task at
+the wrong model family fails with usage guidance before any weights load.
 
 Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (sampling), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
 
@@ -285,6 +287,7 @@ focr models --json                          # machine-readable list
 |---|---|---|
 | **`unlimited-ocr`** *(default)* | **Plain-text document OCR** — general documents & PDFs. This is what `focr ocr` runs by default. | **Fast** (~seconds/page) |
 | **`got-ocr2`** | **Specialized *structured* output the default can't produce**: math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music. | Heavier per page |
+| **`smolvlm2`** | **Photo description and VQA** (`--task describe [--question "…"]`) — natural-language captions/answers about photographs, not document transcription. | ~0.5B, light |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` **only when you need format extraction** (formulas, tables, etc.) — it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
 
@@ -295,7 +298,14 @@ focr ocr --model got-ocr2.int8.focrq --format eq.png  # structured .mmd: LaTeX /
 focr ocr --model got-ocr2.int8.focrq --task tables page.png  # task shorthand (implies --format)
 ```
 
-The roadmap (epic `bd-3jo6`) adds further specialized models — SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
+Install and run smolvlm2 (photo description / VQA) the same way:
+
+```bash
+focr ocr --model smolvlm2.int8.focrq --task describe photo.jpg
+focr ocr --model smolvlm2.int8.focrq --task describe --question "How many dogs are there?" photo.jpg
+```
+
+The roadmap (epic `bd-3jo6`) adds further specialized models — OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
 
 ### `focr convert <input>`
 
@@ -343,6 +353,7 @@ focr doctor --json                          # idempotent self-check / repair
 | `FOCR_MANIFEST_URL` | Override the manifest source (a local path or an `https` URL). Defaults to the built-in repo manifest. |
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
+| `FOCR_SMOLVLM2_QUESTION` | The smolvlm2 describe/VQA question (the env analog of `--question`; the CLI flag outranks it; default: the model-card caption prompt). |
 | `FOCR_MAX_NEW_TOKENS` | Cap the number of generated tokens (the engine's `max_length`; default 32768). An explicit `--max-length` flag outranks it. Capping never changes the per-step math, so a capped run's tokens are a true prefix of the full run's. |
 | `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode all pages together, with `FOCR_BATCH_SIZE` streams in flight (default 8). Present ⇒ armed; unset (the default) runs the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |

@@ -259,10 +259,17 @@ pub struct OcrRequestArgs {
     /// `ocr` (the default) is today's behavior, unchanged. The specialized tasks
     /// are served by got-ocr2's `OCR with format:` mode, so they imply `--format`
     /// (an explicit `--format` composes idempotently) and need a got-ocr2 model:
-    /// `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `describe` is
-    /// planned (smolvlm2) and fails clean today.
+    /// `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `describe`
+    /// (photo description / VQA) is served by smolvlm2: `--model
+    /// smolvlm2.int8.focrq --task describe [--question "…"]`.
     #[arg(long, value_enum, default_value_t = OcrTask::Ocr)]
     pub task: OcrTask,
+    /// The natural-language question for `--task describe` (smolvlm2 VQA) —
+    /// SmolVLM2 has no instruction modes; the task IS the question. Defaults
+    /// to the model-card caption prompt ("Can you describe this image?").
+    /// Requires `--task describe`.
+    #[arg(long)]
+    pub question: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +284,7 @@ pub struct OcrRequest {
     pub no_repeat_ngram: u32,
     pub ngram_window: u32,
     pub format: bool,
+    pub question: Option<String>,
 }
 
 impl OcrArgs {
@@ -334,6 +342,11 @@ fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides
 impl OcrRequestArgs {
     fn to_request(&self) -> FocrResult<OcrRequest> {
         validate_task_selection(self.task, self.effective_model_spec().as_deref())?;
+        if self.question.is_some() && self.task != OcrTask::Describe {
+            return Err(FocrError::Usage(
+                "--question is the smolvlm2 VQA prompt and requires --task describe".into(),
+            ));
+        }
         Ok(OcrRequest {
             image: self.image.clone(),
             model: self.model.clone(),
@@ -347,6 +360,7 @@ impl OcrRequestArgs {
             // `--format` and a format-implying `--task` compose OR-wise: an
             // explicit `--format` wins / is idempotent alongside `--task`.
             format: self.format || self.task.implies_got_format(),
+            question: self.question.clone(),
         })
     }
 
@@ -364,19 +378,18 @@ impl OcrRequestArgs {
 /// CLI-level `--task` feasibility check (best-effort: no model file is opened
 /// here — the engine's `.focrq` arch tag stays the real dispatcher).
 ///
-/// * `describe` has no shipped model: fail clean (`NotImplemented`, the
-///   `convert --quant int4` precedent) naming the planned smolvlm2 model
-///   instead of silently running plain OCR.
+/// * `describe` (smolvlm2, C9) whose model spec is KNOWABLY not smolvlm2 gets
+///   the pull/model guidance now, before any weights load.
 /// * a got-only task whose model spec is KNOWABLY not got-ocr2 (see
-///   [`model_spec_is_knowably_not_got`]) gets the pull/model guidance now,
-///   before any weights load.
+///   [`model_spec_is_knowably_not_got`]) gets the pull/model guidance now.
 /// * an ambiguous explicit spec passes through: mislabeling would reject real
-///   got-ocr2 files, and `--format` is a documented no-op for non-GOT models.
+///   artifacts, and the engine's arch tag makes the final call.
 fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResult<()> {
-    if task == OcrTask::Describe {
-        return Err(FocrError::NotImplemented(
-            "--task describe (photo description/VQA) is planned for the smolvlm2 model; \
-             no shipped model serves it yet — see `focr models`"
+    if task == OcrTask::Describe && model_spec_is_knowably_not_smolvlm2(model_spec) {
+        return Err(FocrError::Usage(
+            "--task describe (photo description/VQA) needs the smolvlm2 model, but this \
+             run would use a different model. Re-run with `--model smolvlm2.int8.focrq` \
+             (see `focr models`)"
                 .into(),
         ));
     }
@@ -388,6 +401,21 @@ fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResu
         )));
     }
     Ok(())
+}
+
+/// True when the model spec is KNOWABLY not a smolvlm2 artifact: no spec at
+/// all (the default resolution is always unlimited-ocr) or a file name naming
+/// another family without `smolvlm`. An ambiguous name passes through to the
+/// engine's arch tag.
+fn model_spec_is_knowably_not_smolvlm2(spec: Option<&Path>) -> bool {
+    let Some(path) = spec else {
+        return true;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    !name.contains("smolvlm") && (name.contains("unlimited") || name.contains("got"))
 }
 
 /// True when the model spec is KNOWABLY not a got-ocr2 artifact: no spec at all
@@ -1037,6 +1065,7 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // format-implying `--task` (folded in `to_request`). MUST precede
     // `OcrEngine::new()`: the decode params are resolved at model load.
     native_engine::force_got_format(request.format);
+    native_engine::set_smolvlm2_question(request.question.clone());
     native_engine::set_decode_overrides(decode_overrides_from(&request));
     native_engine::set_preprocess_overrides(preprocess_overrides_from(&request));
     if let Some(err) = forced_test_error()? {
@@ -2150,6 +2179,7 @@ mod tests {
                     ngram_window: DEFAULT_NGRAM_WINDOW,
                     format: false,
                     task: OcrTask::Ocr,
+                    question: None,
                 },
                 json: false,
                 output: None,
@@ -2178,6 +2208,7 @@ mod tests {
                         ngram_window: DEFAULT_NGRAM_WINDOW,
                         format: false,
                         task: OcrTask::Ocr,
+                        question: None,
                     },
                 }),
             },
@@ -2200,6 +2231,7 @@ mod tests {
                 ngram_window: DEFAULT_NGRAM_WINDOW,
                 format: false,
                 task: OcrTask::Ocr,
+                question: None,
             },
             json: false,
             output: None,
@@ -2326,18 +2358,45 @@ mod tests {
 
     #[test]
     fn ocr_task_describe_fails_clean_naming_smolvlm2() {
-        // `describe` is advertised but its model (smolvlm2, sub-epic C) has not
-        // shipped: fail clean at request build — the `convert --quant int4`
-        // NotImplemented precedent — instead of silently running plain OCR.
+        // `describe` (C9) needs the smolvlm2 model: the default resolution is
+        // knowably unlimited-ocr, so guide (Usage, exit 2) instead of silently
+        // running plain OCR — the got-only-task precedent.
         let err = ocr_request_from(&["photo.jpg", "--task", "describe"])
-            .expect_err("describe has no shipped model");
-        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
-        assert_eq!(err.exit_code(), 1);
+            .expect_err("describe against the default model must guide");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 2);
         let msg = err.to_string();
         assert!(
             msg.contains("smolvlm2"),
-            "must name the planned model: {msg}"
+            "must name the required model: {msg}"
         );
+        // A smolvlm2 model spec passes through and carries the question.
+        let req = ocr_request_from(&[
+            "photo.jpg",
+            "--task",
+            "describe",
+            "--model",
+            "smolvlm2.int8.focrq",
+            "--question",
+            "What color is the car?",
+        ])
+        .expect("describe with a smolvlm2 model spec");
+        assert_eq!(req.question.as_deref(), Some("What color is the car?"));
+        assert!(!req.format, "describe must not imply GOT --format");
+        // `--question` without `--task describe` is a usage error.
+        let err = ocr_request_from(&["photo.jpg", "--question", "what?"])
+            .expect_err("--question requires --task describe");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        // A got/unlimited model spec is knowably wrong for describe.
+        let err = ocr_request_from(&[
+            "photo.jpg",
+            "--task",
+            "describe",
+            "--model",
+            "got-ocr2.int8.focrq",
+        ])
+        .expect_err("describe against a got model must guide");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
     }
 
     #[test]
@@ -2615,6 +2674,7 @@ mod tests {
                 ngram_window: DEFAULT_NGRAM_WINDOW,
                 format: false,
                 task: OcrTask::Ocr,
+                question: None,
             },
             json: false,
             output: None,

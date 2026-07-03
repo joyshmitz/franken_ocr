@@ -215,6 +215,32 @@ def main() -> int:
             **inputs, do_sample=False, max_new_tokens=MAX_NEW_TOKENS, use_cache=True
         )
     new_ids = [int(t) for t in gen[0][input_ids.shape[1] :].tolist()]
+
+    # Per-step top-2 logits along the ORACLE's own greedy path — the near-tie
+    # ledger: a reimplementation with a different f32 summation order can flip
+    # a step only where gap = logit#1 - logit#2 is comparable to the numeric
+    # drift; the Rust cert asserts every divergence step IS such a near-tie.
+    # KV-cached replay: vision + prefill run ONCE, then one cached step/token.
+    step_top2 = []
+    with torch.inference_mode():
+        out = model(**inputs, use_cache=True)
+        logits = out.logits[0, -1]
+        past = out.past_key_values
+        for tok in new_ids:
+            top = torch.topk(logits, 2)
+            step_top2.append(
+                {
+                    "top1": [int(top.indices[0]), float(top.values[0])],
+                    "top2": [int(top.indices[1]), float(top.values[1])],
+                    "gap": float(top.values[0] - top.values[1]),
+                }
+            )
+            assert int(top.indices[0]) == tok, "greedy replay drifted from generate()"
+            out = model(
+                input_ids=torch.tensor([[tok]]), past_key_values=past, use_cache=True
+            )
+            logits = out.logits[0, -1]
+            past = out.past_key_values
     decoded = processor.tokenizer.decode(
         [t for t in new_ids if t != EOS_ID], skip_special_tokens=True
     )
@@ -281,7 +307,7 @@ def main() -> int:
             "n": len(prompt_ids),
             "n_image_slots": prompt_ids.count(49190),
         },
-        "l4_describe_greedy": {"ids": new_ids, "text": decoded},
+        "l4_describe_greedy": {"ids": new_ids, "text": decoded, "step_top2": step_top2},
     }
 
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)

@@ -31,6 +31,7 @@ pub mod nn;
 pub mod postprocess;
 pub mod rswa;
 pub mod sampler;
+pub mod smolvlm2;
 pub(crate) mod spec;
 pub mod tensor;
 pub mod token_compress;
@@ -177,6 +178,38 @@ pub fn force_got_format(on: bool) {
 fn got_format_requested() -> bool {
     FORCE_GOT_FORMAT.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
+}
+
+/// Optional env override for the smolvlm2 describe/VQA question (the env
+/// analog of `--question`, mirroring [`GOT_FORMAT_ENV`]'s pattern). The CLI
+/// flag outranks it.
+const SMOLVLM2_QUESTION_ENV: &str = "FOCR_SMOLVLM2_QUESTION";
+
+/// Process-global smolvlm2 describe/VQA question, set by the CLI from
+/// `--question` (same process-global threading as [`FORCE_GOT_FORMAT`] — the
+/// shared engine signatures stay frozen). `None` ⇒ the env var, else the
+/// model-card describe prompt.
+static SMOLVLM2_QUESTION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set (or clear) the smolvlm2 describe/VQA question process-wide. Only
+/// affects the `smolvlm2` arm; a no-op for every other arch.
+pub fn set_smolvlm2_question(question: Option<String>) {
+    *SMOLVLM2_QUESTION
+        .lock()
+        .expect("smolvlm2 question mutex poisoned") = question;
+}
+
+/// The effective describe/VQA question: CLI flag > env var > the model-card
+/// caption prompt ([`smolvlm2::DESCRIBE_QUESTION`]).
+fn smolvlm2_question() -> String {
+    if let Some(q) = SMOLVLM2_QUESTION
+        .lock()
+        .expect("smolvlm2 question mutex poisoned")
+        .clone()
+    {
+        return q;
+    }
+    std::env::var(SMOLVLM2_QUESTION_ENV).unwrap_or_else(|_| smolvlm2::DESCRIBE_QUESTION.to_string())
 }
 
 // ── one-live-forward gauge (bd-1azu.14, the doctrine-#5 conscience) ─────────
@@ -954,6 +987,9 @@ impl OcrModel {
         if self.arch().id() == "got-ocr2" {
             return self.forward_got(&preprocess::decode_path(image_path)?);
         }
+        if self.arch().id() == "smolvlm2" {
+            return self.forward_smolvlm2(&preprocess::decode_path(image_path)?);
+        }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         // Mode = the certified Base-1024 default unless the CLI overrode it
@@ -973,6 +1009,9 @@ impl OcrModel {
     pub fn forward_dynamic(&self, img: image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         if self.arch().id() == "got-ocr2" {
             return self.forward_got(&img);
+        }
+        if self.arch().id() == "smolvlm2" {
+            return self.forward_smolvlm2(&img);
         }
         let t = std::time::Instant::now();
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
@@ -1006,6 +1045,31 @@ impl OcrModel {
             format,
         )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
+        Ok((text, w, h))
+    }
+
+    /// The SmolVLM2 describe/VQA forward path (C7/C9, bd-3jo6.3.7/.3.9):
+    /// Pillow-exact LANCZOS split preprocess → SigLIP + pixel-shuffle +
+    /// `modality_projection` → `<image>` splice → SmolLM2 KV-cache greedy →
+    /// BPE decode. The question comes from `--question` /
+    /// `FOCR_SMOLVLM2_QUESTION` (default: the model-card caption prompt); the
+    /// tokenizer is the shared BPE loader ([`Self::tokenizer`]) — the C6
+    /// scheme detection reads the SmolLM2 `pre_tokenizer` from the
+    /// `tokenizer.json` beside the model. `--max-length` caps generation,
+    /// clamped inside [`smolvlm2::recognize`] to the 8192 `max_position`
+    /// budget net of the prompt.
+    fn forward_smolvlm2(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        use image::GenericImageView;
+        let t = std::time::Instant::now();
+        let (w, h) = img.dimensions();
+        let tk = self.tokenizer()?;
+        let question = smolvlm2_question();
+        let max_new = self.decode_params.max_length;
+        let text = smolvlm2::recognize(&self.weights, tk, img, &question, max_new)?;
+        timing_log(&format!(
+            "smolvlm2 forward {:.2}s",
+            t.elapsed().as_secs_f64()
+        ));
         Ok((text, w, h))
     }
 

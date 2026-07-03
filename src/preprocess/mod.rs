@@ -692,6 +692,152 @@ pub fn preprocess_got(path: &Path) -> FocrResult<crate::native_engine::tensor::M
     Ok(got_view_tensor(&decode_path(path)?))
 }
 
+// ── SmolVLM2 preprocess (C7, bd-3jo6.3.7) ───────────────────────────────────
+
+/// SmolVLM2 frame side (`preprocessor_config.json max_image_size.longest_edge`).
+const SMOLVLM2_FRAME: u32 = 512;
+/// SmolVLM2 step-1 long-side target (`size.longest_edge`) — always rescaled TO
+/// this, so still images are always split (spec §6).
+const SMOLVLM2_LONGEST: u32 = 2048;
+
+/// SmolVLM2 preprocess output: `n_frames` normalized 512² frames (tiles
+/// row-major, the global thumbnail LAST) + the tile grid the prompt builder
+/// needs for the `<row_r_col_c>` expansion.
+#[derive(Debug, Clone)]
+pub struct Smolvlm2Preprocessed {
+    /// `[n_frames, 3, 512, 512]` flat f32 (CHW per frame), the `x/255 → ±1`
+    /// normalized rail the SigLIP tower reads.
+    pub frames: Vec<f32>,
+    /// Tile grid + global frame count (`rows * cols + 1`).
+    pub n_frames: usize,
+    /// Tile rows (`R` in the `<row_r_col_c>` markers).
+    pub rows: usize,
+    /// Tile cols.
+    pub cols: usize,
+}
+
+/// SmolVLM2 preprocess (`SmolVLMImageProcessor`, spec §6) — an exact
+/// transcription of `image_processing_smolvlm.py`, every resize
+/// Pillow-bit-exact LANCZOS ([`pil_resample::resize_lanczos`]; `resample: 1`):
+///
+/// 1. `_resize_output_size_rescale_to_max_len`: longest edge → exactly 2048
+///    (up- OR down-scale), short edge `int()`-truncated then `+1 if odd`.
+/// 2. `resize_for_vision_encoder`: ceil each side to a 512 multiple (long
+///    side first, short side recomputed from the aspect then ceiled).
+/// 3. `split_image`: `R×C` exact 512² crops row-major, then the step-2 image
+///    resized (squashed) to 512×512 appended as the global frame LAST — the
+///    upstream global is the image split_image was handed, i.e. the
+///    512-multiple step-2 result.
+/// 4. Per frame: `u8 → f64·(1/255) → f32` (numpy `rescale` casts to f32),
+///    then `(x - 0.5) / 0.5` in f32 (numpy `normalize` runs at image dtype).
+///
+/// # Errors
+/// [`FocrError::Other`] on a degenerate (zero-sized) input image.
+pub fn preprocess_smolvlm2(img: &DynamicImage) -> FocrResult<Smolvlm2Preprocessed> {
+    let rgb = img.to_rgb8();
+    let (w0, h0) = rgb.dimensions();
+    if w0 == 0 || h0 == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "smolvlm2 preprocess: degenerate {w0}x{h0} input image"
+        )));
+    }
+
+    // Step 1: longest edge → exactly 2048 (aspect preserved; int() truncation
+    // + `+1 if odd` on the derived edge; min clamp 1). Transcribed from
+    // `_resize_output_size_rescale_to_max_len`.
+    let aspect = f64::from(w0) / f64::from(h0);
+    let (w2, h2) = if w0 >= h0 {
+        let w = SMOLVLM2_LONGEST;
+        let mut h = (f64::from(w) / aspect) as u32; // Python int() truncates
+        if !h.is_multiple_of(2) {
+            h += 1;
+        }
+        (w, h.max(1))
+    } else {
+        let h = SMOLVLM2_LONGEST;
+        let mut w = (f64::from(h) * aspect) as u32;
+        if !w.is_multiple_of(2) {
+            w += 1;
+        }
+        (w.max(1), h)
+    };
+    let long2048 = pil_resample::resize_lanczos(&rgb, w2, h2);
+
+    // Step 2: ceil to 512 multiples (`resize_for_vision_encoder` — long side
+    // ceiled first, short side recomputed from the SAME aspect then ceiled).
+    let ceil512 = |v: u32| v.div_ceil(SMOLVLM2_FRAME) * SMOLVLM2_FRAME;
+    let aspect2 = f64::from(w2) / f64::from(h2);
+    let (w3, h3) = if w2 >= h2 {
+        let w = ceil512(w2);
+        let h = ceil512((f64::from(w) / aspect2) as u32);
+        (w, h)
+    } else {
+        let h = ceil512(h2);
+        let w = ceil512((f64::from(h) * aspect2) as u32);
+        (w, h)
+    };
+    let ceiled512 = if (w3, h3) == (w2, h2) {
+        long2048.clone()
+    } else {
+        pil_resample::resize_lanczos(&long2048, w3, h3)
+    };
+
+    // Step 3: split into exact 512² tiles row-major + the global frame LAST.
+    // Step 1 always makes the long side 2048 > 512, so the split always
+    // engages (`split_image`'s no-split branch is unreachable here).
+    let rows = (h3 / SMOLVLM2_FRAME) as usize;
+    let cols = (w3 / SMOLVLM2_FRAME) as usize;
+    let n_frames = rows * cols + 1;
+    let side = SMOLVLM2_FRAME as usize;
+    let frame_len = 3 * side * side;
+    let mut frames = vec![0.0f32; n_frames * frame_len];
+
+    // The exact numpy rescale→normalize chain (f64 mul, f32 cast, f32 affine).
+    let norm = |px: u8| -> f32 {
+        let r = (f64::from(px) * (1.0 / 255.0)) as f32;
+        (r - 0.5) / 0.5
+    };
+    let mut write_frame = |idx: usize, tile: &image::RgbImage, ox: u32, oy: u32| {
+        let dst = &mut frames[idx * frame_len..(idx + 1) * frame_len];
+        for y in 0..side {
+            for x in 0..side {
+                let px = tile.get_pixel(ox + x as u32, oy + y as u32).0;
+                let s = y * side + x;
+                dst[s] = norm(px[0]);
+                dst[side * side + s] = norm(px[1]);
+                dst[2 * side * side + s] = norm(px[2]);
+            }
+        }
+    };
+    for r in 0..rows {
+        for c in 0..cols {
+            write_frame(
+                r * cols + c,
+                &ceiled512,
+                c as u32 * SMOLVLM2_FRAME,
+                r as u32 * SMOLVLM2_FRAME,
+            );
+        }
+    }
+    let global = pil_resample::resize_lanczos(&ceiled512, SMOLVLM2_FRAME, SMOLVLM2_FRAME);
+    write_frame(n_frames - 1, &global, 0, 0);
+
+    Ok(Smolvlm2Preprocessed {
+        frames,
+        n_frames,
+        rows,
+        cols,
+    })
+}
+
+/// [`preprocess_smolvlm2`] from an image file path.
+///
+/// # Errors
+/// [`FocrError`] if the image cannot be decoded, plus [`preprocess_smolvlm2`]'s.
+pub fn preprocess_smolvlm2_path(path: &Path) -> FocrResult<Smolvlm2Preprocessed> {
+    preprocess_smolvlm2(&decode_path(path)?)
+}
+
 /// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
 pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
     let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
@@ -1238,5 +1384,102 @@ mod tests {
         // Channel 2 (B): [px0=+1, px1=-1].
         assert!((vt.pixels.get(2, 0) - 1.0).abs() < 1e-6);
         assert!((vt.pixels.get(2, 1) - (-1.0)).abs() < 1e-6);
+    }
+
+    // ── SmolVLM2 preprocess (C7) ─────────────────────────────────────────────
+
+    /// Layout math across aspect ratios (spec §6 / OQ-3): landscape,
+    /// portrait, square, and the odd-derived-edge `+1` bump.
+    #[test]
+    fn smolvlm2_layout_across_aspects() {
+        let mk = |w, h| DynamicImage::ImageRgb8(RgbImage::new(w, h));
+        // 1024×768 → 2048×1536 → 2048×1536 (multiples) → 3 rows × 4 cols + 1.
+        let p = preprocess_smolvlm2(&mk(1024, 768)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (3, 4, 13));
+        assert_eq!(p.frames.len(), 13 * 3 * 512 * 512);
+        // Portrait mirror: 768×1024 → 4 rows × 3 cols.
+        let p = preprocess_smolvlm2(&mk(768, 1024)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 3, 13));
+        // Square: 640×640 → 2048×2048 → 4×4 + 1 = 17 frames (the cap shape).
+        let p = preprocess_smolvlm2(&mk(640, 640)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 4, 17));
+        // Odd derived edge: 999×500 → aspect 1.998; h=int(2048/1.998)=1025
+        // → odd → 1026 → ceil512 → 1536 → 3 rows.
+        let p = preprocess_smolvlm2(&mk(999, 500)).unwrap();
+        assert_eq!((p.rows, p.cols), (3, 4));
+        // Tiny image upscales (long side ALWAYS → 2048; still splits).
+        let p = preprocess_smolvlm2(&mk(10, 10)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 4, 17));
+    }
+
+    /// The normalize rail: a mid-gray 128 maps to (128/255 - 0.5)/0.5 and a
+    /// solid image survives every resize (solid-color invariance), so every
+    /// frame is exactly that constant.
+    #[test]
+    fn smolvlm2_normalize_rail() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 600, Rgb([128, 0, 255])));
+        let p = preprocess_smolvlm2(&img).unwrap();
+        let want_r = ((128.0f64 * (1.0 / 255.0)) as f32 - 0.5) / 0.5;
+        let n = 512 * 512;
+        for f in 0..p.n_frames {
+            let fr = &p.frames[f * 3 * n..(f + 1) * 3 * n];
+            assert!((fr[0] - want_r).abs() < 1e-7, "frame {f} R rail");
+            assert!((fr[n] - (-1.0)).abs() < 1e-7, "frame {f} G rail");
+            assert!((fr[2 * n] - 1.0).abs() < 1e-7, "frame {f} B rail");
+        }
+    }
+
+    #[test]
+    fn smolvlm2_degenerate_image_errors() {
+        // A zero-dimension image cannot come from a decoder, but the guard
+        // must fail loud, not panic in the resampler.
+        let img = DynamicImage::ImageRgb8(RgbImage::new(0, 5));
+        assert!(preprocess_smolvlm2(&img).is_err());
+    }
+
+    /// **C7 L0b — preprocess EXACT vs the torch oracle** (skip-with-SUCCESS
+    /// without `FOCR_SMOLVLM2_DIR`): our LANCZOS+split+normalize pipeline on
+    /// the committed sample photo must reproduce the oracle's
+    /// `pixel_values.bin` — the resample is Pillow-bit-exact by construction,
+    /// so the only allowed drift is the final f32 normalize ULP.
+    #[test]
+    fn smolvlm2_preprocess_matches_torch_oracle() {
+        let Ok(dir) = std::env::var("FOCR_SMOLVLM2_DIR") else {
+            return;
+        };
+        let pv_path = format!("{dir}/smolvlm2_pixel_values.bin");
+        if !std::path::Path::new(&pv_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {pv_path} absent (run the vision oracle script)");
+            return;
+        }
+        let want: Vec<f32> = std::fs::read(&pv_path)
+            .expect("oracle blob reads")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let photo = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/smolvlm2/sample_photo.png"
+        );
+        let p = preprocess_smolvlm2_path(std::path::Path::new(photo)).expect("preprocess");
+        assert_eq!((p.rows, p.cols, p.n_frames), (3, 4, 13), "tile layout");
+        assert_eq!(p.frames.len(), want.len(), "frame count/shape");
+        let mut max_abs = 0.0f32;
+        let mut n_diff = 0usize;
+        for (a, b) in p.frames.iter().zip(&want) {
+            let d = (a - b).abs();
+            if d > 0.0 {
+                n_diff += 1;
+            }
+            max_abs = max_abs.max(d);
+        }
+        eprintln!(
+            "[C7 L0b] maxabs={max_abs:.3e} n_diff={n_diff}/{}",
+            want.len()
+        );
+        assert!(
+            max_abs <= 1e-6,
+            "preprocess maxabs {max_abs:.3e} > 1e-6 — the resample or normalize drifted"
+        );
     }
 }

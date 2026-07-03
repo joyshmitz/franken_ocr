@@ -418,7 +418,10 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     // high-precision; int8-lm_head only behind a measured quality kill-switch.
     lm_head_stored_int8: false,
     embed_tokens_name: "model.text_model.embed_tokens.weight",
-    implemented: false,
+    // C1-C9 shipped: convert (C2), decoder (C5), tokenizer (C6), SigLIP +
+    // pixel-shuffle connector (C3/C4, cert cos 1.0), prompt/preprocess (C7,
+    // L0b maxabs 0.0 + L0c id-exact), `--task describe` routing (C9).
+    implemented: true,
 };
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
@@ -533,17 +536,18 @@ mod tests {
         // The default (Unlimited-OCR) is first + implemented.
         assert_eq!(archs[0].id(), "unlimited-ocr");
         assert!(archs[0].implemented());
-        // The IMPLEMENTED set: Unlimited-OCR (fast plain OCR) + GOT-OCR2 (specialized
-        // structured OCR — both run today via `focr ocr`).
+        // The IMPLEMENTED set: Unlimited-OCR (fast plain OCR) + GOT-OCR2
+        // (specialized structured OCR) + SmolVLM2 (photo describe/VQA, C1-C9)
+        // — all run today via `focr ocr`.
         let mut implemented: Vec<&str> = archs
             .iter()
             .filter(|a| a.implemented())
             .map(|a| a.id())
             .collect();
         implemented.sort_unstable();
-        assert_eq!(implemented, ["got-ocr2", "unlimited-ocr"]);
+        assert_eq!(implemented, ["got-ocr2", "smolvlm2", "unlimited-ocr"]);
         // The remaining zoo models are present but NOT yet implemented (descriptors).
-        for id in ["smolvlm2", "onechart", "tromr", "trocr", "pix2tex"] {
+        for id in ["onechart", "tromr", "trocr", "pix2tex"] {
             let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
@@ -596,7 +600,7 @@ mod tests {
     #[test]
     fn smolvlm2_descriptor_matches_the_census() {
         let a = arch_by_id("smolvlm2").expect("smolvlm2 registered");
-        assert!(!a.implemented(), "sub-epic C forward has not landed yet");
+        assert!(a.implemented(), "sub-epic C shipped C1-C9 (describe/VQA)");
         assert_eq!(a.vision_encoder(), VisionEncoder::Siglip);
         assert_eq!(a.decoder(), Decoder::LlamaDense);
         assert_eq!(a.tokenizer(), TokenizerKind::SmolLm2Bpe);
