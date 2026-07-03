@@ -59,10 +59,17 @@ Param split (safetensors, exact): vision 86.43 M, connector 11.80 M, decoder bod
 | block | pre-LN: `x += attn(LN1(x)); x += fc2(act(fc1(LN2(x))))`; final `post_layernorm` on the encoder output | modeling_smolvlm.py |
 
 **Position ids (NaViT bucketize):** upstream supports variable aspect via fractional
-bucketize over `patch_attention_mask`. For our path every frame is exactly 512×512
-with a full mask → `bucketize` degenerates to **identity ids 0..1023** (checked
-against the formula: `arange(0,1-1e-6,1/32)` bucketized right over `arange(1/32,1,1/32)`
-= 0..31 per axis). Port the identity path; keep the general path out of scope.
+bucketize over `patch_attention_mask`. **CORRECTION (2026-07-02, caught by the C3
+embeddings-seam parity gate — this paragraph originally claimed identity ids):**
+the reference computes `fractional_coords = (i/32) * (1 - 1e-6)`, and that scale
+pushes every exact multiple JUST BELOW its own `i/32` boundary, so
+`bucketize(·, right=True)` yields per-axis buckets **`[0, 0, 1, 2, …, 30]`** —
+coordinates 0 and 1 share bucket 0 and bucket 31 is never used. For the fixed
+full-mask 512² path this is exactly `max(i-1, 0)` per axis
+(`pos_id = max(r-1,0)*32 + max(c-1,0)`), verified bit-level against the live
+module (`vision_siglip::embed_frame`; manual identity-ids conv+pos scored only
+cos 0.8416 against the true `hidden_states[0]`). Port THIS path; keep the
+general variable-aspect path out of scope.
 
 **vs SAM-ViT-B (GOT/Baidu):** same patch-embed geometry (k16 s16 — the A8 conv
 leaf reuses), but SigLIP has separate q/k/v (not fused qkv), no windowed layers,

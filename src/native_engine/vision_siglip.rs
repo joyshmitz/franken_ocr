@@ -427,8 +427,8 @@ mod tests {
         let a = forward_frame(&w, &px).unwrap();
         for c in 0..3 {
             let plane = (c + 1) * IMG_SIDE * IMG_SIDE;
-            for i in (plane - PATCH)..plane {
-                px[i] += 0.5;
+            for v in &mut px[plane - PATCH..plane] {
+                *v += 0.5;
             }
         }
         let b = forward_frame(&w, &px).unwrap();
@@ -510,9 +510,8 @@ mod tests {
         };
         let pv = read_f32(&pv_path);
         let frame0 = &pv[..3 * IMG_SIDE * IMG_SIDE];
-        let weights =
-            Weights::load(std::path::Path::new(&format!("{dir}/model.safetensors")))
-                .expect("weights load");
+        let weights = Weights::load(std::path::Path::new(&format!("{dir}/model.safetensors")))
+            .expect("weights load");
         let w = siglip_weights_from(&weights, "model.vision_model").expect("hydrate");
 
         let emb = embed_frame(&w, frame0).expect("embed");
