@@ -2,9 +2,10 @@
 //! tower, a NEW machine per `docs/zoo/smolvlm2-spec.md` §2 (NOT a
 //! `vision_sam.rs` variant): separate q/k/v/out projections **with bias**
 //! (SAM fuses qkv), full **bidirectional** attention (no causal mask, no
-//! windows, no decomposed rel-pos), a plain learned 1-D position table added
-//! by identity ids (every frame is exactly 512² with a full patch mask, so the
-//! NaViT bucketize degenerates to 0..1023 — spec §2), **tanh-GELU** (OQ-1,
+//! windows, no decomposed rel-pos), a plain learned 1-D position table looked
+//! up by the reference NaViT bucketize (NOT identity — the `(1-1e-6)` scale
+//! makes the per-axis buckets `[0,0,1,…,30]`; see [`embed_frame`]),
+//! **tanh-GELU** (OQ-1,
 //! [`nn::gelu_tanh`] — SAM is erf, CLIP is quick), pre-LN blocks, and a final
 //! `post_layernorm`. No neck / compressor — the SmolVLM2 connector
 //! (pixel-shuffle, [`super::token_compress`]) follows this tower.
@@ -192,17 +193,33 @@ pub fn forward_frame(w: &SiglipWeights, pixels: &[f32]) -> FocrResult<Mat> {
 }
 
 /// The embeddings stage: patch-embed conv (A8 leaf: im2col+GEMM, pad 0,
-/// stride 16) → `[1024, 768]` token rows + the learned pos table added by
-/// identity ids 0..1023 (spec §2 — full-mask frames). This is the oracle's
+/// stride 16) → `[1024, 768]` token rows + the learned pos table looked up by
+/// the reference NaViT bucketize ids. This is the oracle's
 /// `hidden_states[0]` seam.
+///
+/// **The bucketize is NOT identity** (a census transcription error, caught by
+/// this seam's parity gate 2026-07-02): `modeling_smolvlm.py` scales every
+/// fractional coordinate by `(1 - 1e-6)` — `(i/32)*(1-1e-6)` — which pushes
+/// each exact multiple JUST BELOW its own `i/32` boundary, so
+/// `bucketize(·, right=True)` yields per-axis buckets `[0, 0, 1, 2, …, 30]`:
+/// coordinate 0 and 1 share bucket 0 and bucket 31 is never used. For the
+/// fixed full-mask 512² geometry this is exactly `i.saturating_sub(1)`
+/// (proven: `(i/32)(1-1e-6)` is strictly below `i/32` and strictly above
+/// `(i-1)/32` in f32 for `1 ≤ i ≤ 31`), verified bit-level against the live
+/// module.
 pub(crate) fn embed_frame(w: &SiglipWeights, pixels: &[f32]) -> FocrResult<Mat> {
     let nchw = vision_sam::conv_apply(&w.patch_embed, pixels, IMG_SIDE, IMG_SIDE, 0, PATCH)?;
     let mut x = vision_sam::nchw_to_nhwc_rows(&nchw, EMBED_DIM, GRID, GRID);
-    for t in 0..TOKENS {
-        let row = x.row_mut(t);
-        let pos = &w.pos_embed[t * EMBED_DIM..(t + 1) * EMBED_DIM];
-        for (v, p) in row.iter_mut().zip(pos) {
-            *v += p;
+    let bucket = |i: usize| i.saturating_sub(1);
+    for r in 0..GRID {
+        for c in 0..GRID {
+            let t = r * GRID + c;
+            let pos_id = bucket(r) * GRID + bucket(c);
+            let row = x.row_mut(t);
+            let pos = &w.pos_embed[pos_id * EMBED_DIM..(pos_id + 1) * EMBED_DIM];
+            for (v, p) in row.iter_mut().zip(pos) {
+                *v += p;
+            }
         }
     }
     Ok(x)
