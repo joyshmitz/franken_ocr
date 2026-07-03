@@ -33,9 +33,11 @@ pub mod rswa;
 pub mod sampler;
 pub(crate) mod spec;
 pub mod tensor;
+pub mod token_compress;
 pub mod vision_bridge;
 pub mod vision_clip;
 pub mod vision_sam;
+pub mod vision_siglip;
 pub mod weights;
 
 use std::ffi::OsStr;

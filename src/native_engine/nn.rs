@@ -368,6 +368,34 @@ pub fn quick_gelu_scalar(x: f32) -> f32 {
     x / (1.0 + (-1.702 * x).exp())
 }
 
+/// In-place tanh-approximation GELU (`gelu_pytorch_tanh`) — the SigLIP MLP
+/// activation (SmolVLM2 C3, OQ-1; `docs/zoo/smolvlm2-spec.md` §2):
+///
+/// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
+///
+/// Distinct from the SAM erf-[`gelu`] and the CLIP [`quick_gelu`] — a third
+/// named variant so a wrong-GELU vision divergence stays loud. f32 math end to
+/// end, matching torch's f32 CPU `gelu(approximate="tanh")` kernel; the SigLIP
+/// seam parity gate (vision_siglip.rs) measures the residual ULP drift against
+/// the oracle floor.
+pub fn gelu_tanh(x: &mut Mat) {
+    for v in &mut x.data {
+        *v = gelu_tanh_scalar(*v);
+    }
+}
+
+/// `gelu_tanh` on a single scalar — the hand-verifiable kernel of
+/// [`gelu_tanh`].
+#[inline]
+#[must_use]
+pub fn gelu_tanh_scalar(x: f32) -> f32 {
+    // sqrt(2/pi) as f32 — the constant torch's tanh-GELU uses (M_SQRT2/M_2_SQRTPI
+    // composition lands on the same f32 value).
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
 /// Error function on f64 — an Abramowitz & Stegun 7.1.26 rational-poly
 /// approximation (max abs error ~1.5e-7), used by the exact-form [`gelu`].
 ///

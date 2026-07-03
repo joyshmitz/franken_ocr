@@ -125,3 +125,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Dev/test builds: keep OUR crate at opt-level 0 (fast rebuilds, full debug),
+# but compile the kernel backend optimized — an unoptimized ft-kernel-cpu makes
+# every real-geometry vision/decoder unit test ~50x slower (a single synthetic
+# SigLIP forward took ~87s at opt0 vs ~2s at opt3). debug_assertions stay ON
+# (the dev profile flag, independent of opt-level), and opt-level changes no
+# IEEE semantics — no numerics drift vs release.
+[profile.dev.package.ft-kernel-cpu]
+opt-level = 3
+debug-assertions = false

@@ -1206,10 +1206,15 @@ fn layer_norm_2d(
 }
 
 // ── conv + layout helpers ──────────────────────────────────────────────────
+// `pub(crate)` where noted: these are the A8 shared vision conv leaves
+// (bd-3jo6.1.8) — the SigLIP patch-embed (vision_siglip.rs) drives the SAME
+// im2col+GEMM conv path SAM/GOT certify, exactly like GOT reuses
+// `forward_prefix`/`Linear` (B3's precedent: share by import, never relocate
+// certified code).
 
 /// Apply a [`Conv`] over an NCHW-flat `[in_ch, gh*gw]` buffer with symmetric
 /// zero padding `pad` and stride `stride`, returning the NCHW-flat output.
-fn conv_apply(
+pub(crate) fn conv_apply(
     conv: &Conv,
     input: &[f32],
     gh: usize,
@@ -1343,7 +1348,7 @@ fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> FocrR
 
 /// `[1, ch, gh, gw]` channel-major conv output -> NHWC token rows
 /// `[gh*gw, ch]`.
-fn nchw_to_nhwc_rows(nchw: &[f32], ch: usize, gh: usize, gw: usize) -> Mat {
+pub(crate) fn nchw_to_nhwc_rows(nchw: &[f32], ch: usize, gh: usize, gw: usize) -> Mat {
     let n = gh * gw;
     let mut data = vec![0.0f32; n * ch];
     for s in 0..n {
