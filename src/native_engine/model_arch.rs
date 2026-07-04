@@ -39,10 +39,14 @@ pub enum Decoder {
     /// DeepSeek-V2 MoE (64 routed + 2 shared experts, top-6) with R-SWA
     /// (Reference Sliding Window Attention, window 128) — the Baidu decoder.
     DeepSeekV2MoeRswa,
-    /// Qwen2 dense (GOT-OCR2.0, OneChart). [planned: shared engine A7]
+    /// Qwen2 dense (GOT-OCR2.0). [shared engine A7]
     Qwen2Dense,
-    /// SmolLM2 / Llama-style dense (SmolVLM2). [planned: A7]
+    /// SmolLM2 / Llama-style dense (SmolVLM2). [A7]
     LlamaDense,
+    /// OPT-125M dense (OneChart, D-census §4: pre-LN, ReLU fc1/fc2, learned
+    /// absolute positions offset-2, NO RoPE, all-linears-biased, tied head).
+    /// [planned: D4 on A7]
+    OptDense,
     /// mBART / RoBERTa-style seq2seq decoder (TrOCR, pix2tex). [planned: A7]
     Seq2SeqDense,
 }
@@ -52,10 +56,13 @@ pub enum Decoder {
 pub enum TokenizerKind {
     /// DeepSeek BPE over the committed `tokenizer.json` (Baidu Unlimited-OCR).
     DeepSeekBpe,
-    /// Qwen2 BPE (GOT-OCR2.0, OneChart). [planned: A6/B6/D9]
+    /// Qwen2 BPE (GOT-OCR2.0). [A6/B6]
     Qwen2Bpe,
-    /// SmolLM2 BPE (SmolVLM2). [planned: A6/C6]
+    /// SmolLM2 BPE (SmolVLM2). [A6/C6]
     SmolLm2Bpe,
+    /// OPT / GPT-2 byte-level BPE over `vocab.json`+`merges.txt` (OneChart —
+    /// D-census §7: NOT tiktoken, NOT Qwen). [planned: D9]
+    Gpt2Bpe,
     /// A music-symbol vocabulary (Polyphonic-TrOMR). [planned: A6/E6]
     MusicVocab,
     /// SentencePiece / BART (TrOCR, pix2tex). [planned: A6/F]
@@ -426,18 +433,35 @@ static SMOLVLM2: PlannedArch = PlannedArch {
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
     display_name: "OneChart",
-    license_notice: "OneChart - Apache-2.0",
+    license_notice: "OneChart (kppkkp) - Apache-2.0",
     default_artifact_basename: "onechart.focrq",
+    // CENSUSED (docs/zoo/onechart-spec.md, D1): SAM-ViT-B tower (GOT/Vary
+    // lineage, prefix `model.vision_tower.` — NOT `vision_tower_high`), a
+    // Linear(1024→768,bias) projector, an OPT-125M decoder (§4: pre-LN, ReLU
+    // fc1/fc2, learned absolute positions offset-2, NO RoPE, MHA 12/12, all
+    // linears biased), and the novel `num_decoder` number head (§8).
     vision_encoder: VisionEncoder::SamVit,
-    decoder: Decoder::Qwen2Dense,
-    tokenizer: TokenizerKind::Qwen2Bpe,
-    decode_contract: PLACEHOLDER_CONTRACT,
+    decoder: Decoder::OptDense,
+    tokenizer: TokenizerKind::Gpt2Bpe,
+    // §10: greedy, eos 2 (`</s>`), NO upstream repetition guard; hard cap
+    // total-seq ≤ 4096 (the learned position table, §4/OQ-D7).
+    decode_contract: DecodeContract {
+        temperature: 0.0,
+        eos_token_id: 2,
+        no_repeat_ngram_size: 0,
+        ngram_window: 0,
+    },
     tasks: &[Task::Chart],
-    tie_word_embeddings: false, // placeholder until censused (sub-epic D)
-    vision_tower_prefix: "model.vision_tower_high", // GOT/Vary lineage
-    decoder_layers_prefix: "model.layers.", // GOT/Qwen2 lineage; confirm at census
-    lm_head_stored_int8: true,  // placeholder until censused (sub-epic D)
-    embed_tokens_name: "model.embed_tokens.weight",
+    // §4: `lm_head.weight` and `model.decoder.embed_tokens.weight` are stored
+    // byte-identical (SHA-proven) — TIED; the `.focrq` keeps ONE copy (the
+    // GOT precedent; convert byte-verifies the tie before dropping).
+    tie_word_embeddings: true,
+    vision_tower_prefix: "model.vision_tower",
+    decoder_layers_prefix: "model.decoder.layers.",
+    // Tied head via embed_tokens stays high-precision until a measured
+    // kill-switched int8 lever lands (doctrine #2).
+    lm_head_stored_int8: false,
+    embed_tokens_name: "model.decoder.embed_tokens.weight",
     implemented: false,
 };
 static TROMR: PlannedArch = PlannedArch {
@@ -632,21 +656,42 @@ mod tests {
 
     /// The new arch-namespace accessors default to the Unlimited-OCR/GOT layout,
     /// so every pre-existing arch is untouched by the SmolVLM2 additions.
+    /// (OneChart left this list at its D1 census — see the dedicated test.)
     #[test]
     fn arch_namespace_defaults_are_the_historical_layout() {
-        for id in [
-            "unlimited-ocr",
-            "got-ocr2",
-            "onechart",
-            "tromr",
-            "trocr",
-            "pix2tex",
-        ] {
+        for id in ["unlimited-ocr", "got-ocr2", "tromr", "trocr", "pix2tex"] {
             let a = arch_by_id(id).expect("registered");
             assert_eq!(a.decoder_layers_prefix(), "model.layers.", "{id}");
             assert!(a.lm_head_stored_int8(), "{id}");
             assert_eq!(a.embed_tokens_name(), "model.embed_tokens.weight", "{id}");
         }
+    }
+
+    /// The OneChart descriptor matches the census (docs/zoo/onechart-spec.md,
+    /// bd-3jo6.4.1) — the D2 convert classification hangs off these facts.
+    #[test]
+    fn onechart_descriptor_matches_the_census() {
+        let a = arch_by_id("onechart").expect("onechart registered");
+        assert!(!a.implemented(), "sub-epic D forward has not landed yet");
+        assert_eq!(a.vision_encoder(), VisionEncoder::SamVit);
+        assert_eq!(a.decoder(), Decoder::OptDense);
+        assert_eq!(a.tokenizer(), TokenizerKind::Gpt2Bpe);
+        assert_eq!(a.tasks(), &[Task::Chart]);
+        assert!(a.license_notice().contains("Apache-2.0"));
+        // §10: greedy, eos 2 (`</s>`), no upstream repetition guard.
+        let c = a.decode_contract();
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.eos_token_id, 2);
+        assert_eq!(c.no_repeat_ngram_size, 0);
+        // §4: TIED head (both source tensors byte-identical, SHA-proven) —
+        // the `.focrq` keeps ONE high-precision copy.
+        assert!(a.tie_word_embeddings());
+        assert!(!a.lm_head_stored_int8());
+        // §13: OPT namespaces — the vision tower is `model.vision_tower.`
+        // (NOT GOT's `vision_tower_high`), the LM nests under `model.decoder.`.
+        assert_eq!(a.vision_tower_prefix(), "model.vision_tower");
+        assert_eq!(a.decoder_layers_prefix(), "model.decoder.layers.");
+        assert_eq!(a.embed_tokens_name(), "model.decoder.embed_tokens.weight");
     }
 
     /// The descriptor must match the LIVE engine constants, so it can never drift.

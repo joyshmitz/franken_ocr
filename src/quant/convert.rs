@@ -110,6 +110,22 @@ pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
     let Some(rest) = name.strip_prefix(arch.decoder_layers_prefix()) else {
         return false;
     };
+    // The per-layer GEMM naming is a fact of the arch's DECODER FAMILY
+    // (D-census §13): OPT (OneChart) names them `self_attn.{q,k,v,out}_proj`
+    // + bare `fc1`/`fc2` (all `.bias` and the two per-layer LayerNorms stay
+    // high-precision); every other family keeps the historical Qwen/Llama/
+    // DeepSeek rule VERBATIM — `self_attn.{q,k,v,o}_proj` plus anything under
+    // the `.mlp.` subtree ending in `{gate,up,down}_proj.weight` (which is
+    // what quantizes the MoE `mlp.experts.N.*` / `mlp.shared_experts.*`
+    // GEMMs), with the bare router `.mlp.gate.weight` excluded.
+    if arch.decoder() == crate::native_engine::model_arch::Decoder::OptDense {
+        return rest.ends_with(".self_attn.q_proj.weight")
+            || rest.ends_with(".self_attn.k_proj.weight")
+            || rest.ends_with(".self_attn.v_proj.weight")
+            || rest.ends_with(".self_attn.out_proj.weight")
+            || rest.ends_with(".fc1.weight")
+            || rest.ends_with(".fc2.weight");
+    }
     if rest.contains(".self_attn.") {
         return rest.ends_with(".q_proj.weight")
             || rest.ends_with(".k_proj.weight")
@@ -117,8 +133,6 @@ pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
             || rest.ends_with(".o_proj.weight");
     }
     if rest.contains(".mlp.") {
-        // `.gate_proj`/`.up_proj`/`.down_proj` are the FFN/expert GEMMs (int8);
-        // the bare router `.mlp.gate.weight` is excluded — it stays high-precision.
         return rest.ends_with(".gate_proj.weight")
             || rest.ends_with(".up_proj.weight")
             || rest.ends_with(".down_proj.weight");
@@ -894,6 +908,188 @@ mod tests {
         let smol = crate::native_engine::model_arch::arch_by_id("smolvlm2").unwrap();
         let err = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [5u8; 32], smol)
             .expect_err("tied bytes must be refused for an untied arch");
+        assert!(matches!(err, FocrError::FormatMismatch(_)), "got {err:?}");
+    }
+
+    // ── D2: arch-aware OneChart convert (bd-3jo6.4.2) ────────────────────────
+
+    /// A OneChart-shaped synthetic checkpoint (census names,
+    /// docs/zoo/onechart-spec.md §13): a TIED head (`lm_head.weight` byte-equal
+    /// to `model.decoder.embed_tokens.weight` — the source stores both), the
+    /// OPT decoder GEMMs (`out_proj`, bare `fc1`/`fc2` — NOT the Qwen names),
+    /// all-biased linears, per-layer + model-level LayerNorms (the naming
+    /// hazard: the per-layer pre-MLP norm is also called `final_layer_norm`),
+    /// the learned `embed_positions`, the SAM tower under `model.vision_tower.`,
+    /// the `mm_projector`, and the novel `num_decoder` number head.
+    fn synthetic_onechart_safetensors() -> Vec<u8> {
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.25 - bias).collect()
+        };
+        let tied = ramp(6, 8, 4.0);
+        build_safetensors(&[
+            // TIED: both stored, byte-identical (census §4 SHA-proof).
+            ("lm_head.weight", vec![6, 8], tied.clone()),
+            ("model.decoder.embed_tokens.weight", vec![6, 8], tied),
+            ("model.decoder.embed_positions.weight", vec![10, 8], ramp(10, 8, 1.0)),
+            // decoder int8 set (6 OPT GEMMs).
+            (
+                "model.decoder.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 7.0),
+            ),
+            (
+                "model.decoder.layers.0.self_attn.k_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 6.0),
+            ),
+            (
+                "model.decoder.layers.0.self_attn.v_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 5.0),
+            ),
+            (
+                "model.decoder.layers.0.self_attn.out_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 8.0),
+            ),
+            ("model.decoder.layers.0.fc1.weight", vec![16, 8], ramp(16, 8, 9.0)),
+            ("model.decoder.layers.0.fc2.weight", vec![8, 16], ramp(8, 16, 2.0)),
+            // biases + norms stay HP (enable_bias=true: EVERY linear has one).
+            ("model.decoder.layers.0.self_attn.q_proj.bias", vec![8], ramp(1, 8, 0.1)),
+            ("model.decoder.layers.0.self_attn.out_proj.bias", vec![8], ramp(1, 8, 0.2)),
+            ("model.decoder.layers.0.fc1.bias", vec![16], ramp(1, 16, 0.3)),
+            ("model.decoder.layers.0.fc2.bias", vec![8], ramp(1, 8, 0.4)),
+            (
+                "model.decoder.layers.0.self_attn_layer_norm.weight",
+                vec![8],
+                ramp(1, 8, 0.5),
+            ),
+            (
+                "model.decoder.layers.0.final_layer_norm.weight",
+                vec![8],
+                ramp(1, 8, 0.6),
+            ),
+            ("model.decoder.final_layer_norm.weight", vec![8], ramp(1, 8, 0.7)),
+            // connector + number head + SAM tower: HP.
+            ("model.mm_projector.weight", vec![8, 4], ramp(8, 4, 1.5)),
+            ("model.mm_projector.bias", vec![8], ramp(1, 8, 1.6)),
+            ("num_decoder.0.weight", vec![4, 8], ramp(4, 8, 1.7)),
+            ("num_decoder.0.bias", vec![4], ramp(1, 4, 1.8)),
+            (
+                "model.vision_tower.blocks.0.attn.qkv.weight",
+                vec![24, 8],
+                ramp(24, 8, 1.9),
+            ),
+        ])
+    }
+
+    #[test]
+    fn onechart_classifier_matches_opt_names_only() {
+        let one = crate::native_engine::model_arch::arch_by_id("onechart").unwrap();
+        // The OPT GEMMs match…
+        for name in [
+            "model.decoder.layers.0.self_attn.q_proj.weight",
+            "model.decoder.layers.11.self_attn.out_proj.weight",
+            "model.decoder.layers.3.fc1.weight",
+            "model.decoder.layers.3.fc2.weight",
+        ] {
+            assert!(is_decoder_int8_tensor_for(name, one), "{name}");
+        }
+        // …and biases, norms, positions, projector, number head, vision, and
+        // QWEN-shaped names do NOT.
+        for name in [
+            "model.decoder.layers.0.self_attn.q_proj.bias",
+            "model.decoder.layers.0.fc1.bias",
+            "model.decoder.layers.0.self_attn_layer_norm.weight",
+            "model.decoder.layers.0.final_layer_norm.weight",
+            "model.decoder.final_layer_norm.weight",
+            "model.decoder.embed_tokens.weight",
+            "model.decoder.embed_positions.weight",
+            "model.mm_projector.weight",
+            "num_decoder.0.weight",
+            "model.vision_tower.blocks.0.attn.qkv.weight",
+            "model.layers.0.mlp.gate_proj.weight", // Qwen name, wrong prefix
+            "model.decoder.layers.0.mlp.gate_proj.weight", // Qwen suffix, OPT arch
+        ] {
+            assert!(!is_decoder_int8_tensor_for(name, one), "{name}");
+        }
+        // lm_head stays high-precision for the tied OneChart head.
+        assert!(!is_decoder_int8_tensor_for("lm_head.weight", one));
+    }
+
+    #[test]
+    fn onechart_convert_dedups_tied_head_and_tags_arch() {
+        let w = Weights::from_bytes(synthetic_onechart_safetensors())
+            .expect("synthetic OneChart parse");
+        let one = crate::native_engine::model_arch::arch_by_id("onechart").unwrap();
+        let blob = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [7u8; 32], one)
+            .expect("onechart convert");
+        assert!(String::from_utf8_lossy(&blob).contains("\"model_id\":\"onechart\""));
+
+        let out = Weights::from_bytes(blob).expect("onechart .focrq loads");
+        assert_eq!(out.model_id(), "onechart");
+        assert_eq!(out.license_notice(), one.license_notice());
+        // TIED: lm_head is byte-verified equal then OMITTED (the GOT
+        // precedent) — one copy survives as embed_tokens.
+        assert_eq!(out.len(), w.len() - 1);
+        assert!(out.tensor("lm_head.weight").is_err(), "tied head dropped");
+        assert_eq!(
+            out.tensor("model.decoder.embed_tokens.weight").unwrap().dtype,
+            DType::BF16
+        );
+        // The 6 OPT GEMMs are int8, byte-identical to the load-time quant.
+        for name in [
+            "model.decoder.layers.0.self_attn.q_proj.weight",
+            "model.decoder.layers.0.self_attn.k_proj.weight",
+            "model.decoder.layers.0.self_attn.v_proj.weight",
+            "model.decoder.layers.0.self_attn.out_proj.weight",
+            "model.decoder.layers.0.fc1.weight",
+            "model.decoder.layers.0.fc2.weight",
+        ] {
+            let q = out.qint8(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let src = w.mat(name).unwrap();
+            let expect = crate::native_engine::nn::quantize_int8(&src.data, src.rows, src.cols);
+            assert_eq!(q.w, expect.w, "{name} int8 bytes");
+            assert_eq!(q.scales, expect.scales, "{name} scales");
+        }
+        // Everything else is high-precision, bytes verbatim.
+        for name in [
+            "model.decoder.layers.0.self_attn.q_proj.bias",
+            "model.decoder.layers.0.self_attn_layer_norm.weight",
+            "model.decoder.layers.0.final_layer_norm.weight",
+            "model.decoder.embed_positions.weight",
+            "model.mm_projector.weight",
+            "num_decoder.0.weight",
+            "model.vision_tower.blocks.0.attn.qkv.weight",
+        ] {
+            let t = out.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(t.dtype, DType::BF16, "{name} stays HP");
+        }
+    }
+
+    #[test]
+    fn onechart_convert_rejects_an_untied_checkpoint() {
+        // Mutate lm_head so it no longer byte-matches embed_tokens: the tied
+        // arch must refuse rather than silently dropping a REAL head.
+        let mut tensors = synthetic_onechart_safetensors();
+        // Rebuild with a different lm_head ramp instead of byte surgery.
+        let _ = &mut tensors;
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.25 - bias).collect()
+        };
+        let blob = build_safetensors(&[
+            ("lm_head.weight", vec![6, 8], ramp(6, 8, 11.0)),
+            ("model.decoder.embed_tokens.weight", vec![6, 8], ramp(6, 8, 4.0)),
+            (
+                "model.decoder.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 7.0),
+            ),
+        ]);
+        let w = Weights::from_bytes(blob).expect("untied synthetic parse");
+        let one = crate::native_engine::model_arch::arch_by_id("onechart").unwrap();
+        let err = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [7u8; 32], one)
+            .expect_err("untied bytes must be refused for a tied arch");
         assert!(matches!(err, FocrError::FormatMismatch(_)), "got {err:?}");
     }
 
