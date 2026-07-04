@@ -56,6 +56,26 @@ pub mod special_smollm2 {
     pub const END_OF_UTTERANCE: u32 = 49279;
 }
 
+/// OneChart / OPT special-token ids (D9, bd-3jo6.4.9) — pinned by
+/// `docs/zoo/onechart-spec.md` §4/§7 (verified against `added_tokens.json` +
+/// `config.json`) and cross-checked against the loaded table under the
+/// [`PretokScheme::Gpt2`] scheme.
+pub mod special_opt {
+    /// `<pad>` (OPT config `pad_token_id`).
+    pub const PAD: u32 = 1;
+    /// `</s>` — OPT's bos AND eos (config `bos/eos_token_id` = 2). The prompt
+    /// builder owns the leading `</s>`; encode adds nothing.
+    pub const BOS_EOS: u32 = 2;
+    /// `<imgpad>` — the 256 vision splice slots (GOT lineage).
+    pub const IMG_PAD: u32 = 50_265;
+    /// `<img>` opening bracket.
+    pub const IMG_START: u32 = 50_266;
+    /// `</img>` closing bracket.
+    pub const IMG_END: u32 = 50_267;
+    /// `<Number>` — the number-head trigger token (census §8).
+    pub const NUMBER: u32 = 50_268;
+}
+
 /// Hardcoded special-token ids ([SPEC-014/019]). These are pinned by the model
 /// runtime (`modeling_unlimitedocr.py`) and cross-checked against
 /// `tokenizer.json .added_tokens`; the loader asserts the loaded table agrees.
@@ -174,6 +194,11 @@ pub enum PretokScheme {
     /// `Digits(individual_digits=true)` + `ByteLevel(use_regex=true)` (the
     /// GPT-2 word regex) — SmolLM2 / SmolVLM2 ([`pretok::pretokenize_smollm2`]).
     SmolLm2,
+    /// The plain GPT-2 word regex, no Digits stage — OneChart / OPT over
+    /// `vocab.json`+`merges.txt` ([`pretok::pretokenize_gpt2`]; selected by
+    /// [`Tokenizer::from_opt_files`], never by `pre_tokenizer` detection —
+    /// the slow-tokenizer files carry no such declaration).
+    Gpt2,
 }
 
 /// Classify the `.pre_tokenizer` section into a supported [`PretokScheme`].
@@ -348,10 +373,115 @@ impl Tokenizer {
         Ok(tk)
     }
 
+    /// Load the OneChart / OPT slow-tokenizer file triple (D9): `vocab.json`
+    /// (token→id), `merges.txt` (`#version` header + one space-joined merge
+    /// per line), and `added_tokens.json` (content→id; all treated as
+    /// specials, HF `AddedVocabulary` semantics). Selects
+    /// [`PretokScheme::Gpt2`] and validates the census §4/§7 pins.
+    ///
+    /// # Errors
+    /// [`FocrError::ModelNotFound`] for missing files;
+    /// [`FocrError::FormatMismatch`] on parse failure or a pin disagreement.
+    pub fn from_opt_dir(dir: &Path) -> FocrResult<Self> {
+        let read = |name: &str| -> FocrResult<Vec<u8>> {
+            std::fs::read(dir.join(name)).map_err(|e| {
+                FocrError::ModelNotFound(format!("{} at {}: {e}", name, dir.display()))
+            })
+        };
+        Self::from_opt_files(
+            &read("vocab.json")?,
+            &read("merges.txt")?,
+            &read("added_tokens.json")?,
+        )
+    }
+
+    /// [`Tokenizer::from_opt_dir`] over in-memory bytes (tests / synthetic
+    /// fixtures).
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] on parse failure or pin disagreement.
+    pub fn from_opt_files(
+        vocab_json: &[u8],
+        merges_txt: &[u8],
+        added_tokens_json: &[u8],
+    ) -> FocrResult<Self> {
+        let vocab: HashMap<String, u32> = serde_json::from_slice(vocab_json)
+            .map_err(|e| FocrError::FormatMismatch(format!("vocab.json parse: {e}")))?;
+        let merges_text = std::str::from_utf8(merges_txt)
+            .map_err(|e| FocrError::FormatMismatch(format!("merges.txt not UTF-8: {e}")))?;
+        let mut merge_ranks = HashMap::new();
+        let mut rank = 0u32;
+        for line in merges_text.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with("#version") {
+                continue;
+            }
+            let Some((l, r)) = line.split_once(' ') else {
+                return Err(FocrError::FormatMismatch(format!(
+                    "merges.txt line without a space: {line:?}"
+                )));
+            };
+            merge_ranks
+                .entry((l.to_string(), r.to_string()))
+                .or_insert(rank);
+            rank += 1;
+        }
+        let added_map: HashMap<String, u32> = serde_json::from_slice(added_tokens_json)
+            .map_err(|e| FocrError::FormatMismatch(format!("added_tokens.json parse: {e}")))?;
+
+        let mut id_to_token: HashMap<u32, String> = HashMap::with_capacity(vocab.len());
+        for (tok, &id) in &vocab {
+            id_to_token.insert(id, tok.clone());
+        }
+        let mut added = Vec::with_capacity(added_map.len());
+        let mut added_by_content = HashMap::with_capacity(added_map.len());
+        let mut special_ids = std::collections::HashSet::new();
+        for (content, id) in added_map {
+            id_to_token.insert(id, content.clone());
+            added_by_content.insert(content.clone(), id);
+            special_ids.insert(id);
+            added.push(AddedToken {
+                content,
+                id,
+                special: true,
+            });
+        }
+        // The OPT control tokens live in the BASE vocab but are splittable
+        // specials (`special_tokens_map.json`: bos/eos/pad/unk) — the slow
+        // `GPT2Tokenizer` resolves a literal `"</s>"` to id 2, never BPE.
+        for surface in ["<s>", "<pad>", "</s>", "<unk>"] {
+            if let Some(&id) = vocab.get(surface)
+                && !added_by_content.contains_key(surface)
+            {
+                added_by_content.insert(surface.to_string(), id);
+                special_ids.insert(id);
+                added.push(AddedToken {
+                    content: surface.to_string(),
+                    id,
+                    special: true,
+                });
+            }
+        }
+        added.sort_by(|a, b| b.content.len().cmp(&a.content.len()).then(a.id.cmp(&b.id)));
+
+        let tk = Tokenizer {
+            vocab,
+            id_to_token,
+            merge_ranks,
+            added,
+            added_by_content,
+            special_ids,
+            scheme: PretokScheme::Gpt2,
+        };
+        tk.validate_pinned_ids()?;
+        Ok(tk)
+    }
+
     /// Cross-check the pinned special-token ids against the loaded added-token
-    /// table (per scheme: OQ-16 §6 for Baidu, spec §5 for SmolLM2). A
-    /// disagreement means the wrong `tokenizer.json` was supplied and every
-    /// downstream id would be wrong — fail loud.
+    /// table (per scheme: OQ-16 §6 for Baidu, spec §5 for SmolLM2, the
+    /// OneChart census §4/§7 for OPT). A disagreement means the wrong
+    /// tokenizer files were supplied and every downstream id would be wrong —
+    /// fail loud.
     fn validate_pinned_ids(&self) -> FocrResult<()> {
         let checks: &[(&str, u32)] = match self.scheme {
             PretokScheme::DeepSeekV2 => &[
@@ -375,6 +505,12 @@ impl Tokenizer {
                 ),
                 ("<image>", special_smollm2::IMAGE),
                 ("<end_of_utterance>", special_smollm2::END_OF_UTTERANCE),
+            ],
+            PretokScheme::Gpt2 => &[
+                ("<imgpad>", special_opt::IMG_PAD),
+                ("<img>", special_opt::IMG_START),
+                ("</img>", special_opt::IMG_END),
+                ("<Number>", special_opt::NUMBER),
             ],
         };
         for &(content, want) in checks {
@@ -418,6 +554,7 @@ impl Tokenizer {
         let pieces = match self.scheme {
             PretokScheme::DeepSeekV2 => pretok::pretokenize(text),
             PretokScheme::SmolLm2 => pretok::pretokenize_smollm2(text),
+            PretokScheme::Gpt2 => pretok::pretokenize_gpt2(text),
         };
         for piece in pieces {
             // `piece` is already byte-level remapped → its chars are vocab
@@ -598,6 +735,7 @@ impl Tokenizer {
         match self.scheme {
             PretokScheme::DeepSeekV2 => special::BOS,
             PretokScheme::SmolLm2 => special_smollm2::BOS,
+            PretokScheme::Gpt2 => special_opt::BOS_EOS,
         }
     }
     /// EOS / generation-stop id — Baidu `<｜end▁of▁sentence｜>` (1) or SmolVLM2
@@ -606,6 +744,7 @@ impl Tokenizer {
         match self.scheme {
             PretokScheme::DeepSeekV2 => special::EOS,
             PretokScheme::SmolLm2 => special_smollm2::END_OF_UTTERANCE,
+            PretokScheme::Gpt2 => special_opt::BOS_EOS,
         }
     }
     /// PAD id — Baidu `<｜▁pad▁｜>` (2) or SmolLM2 `<|im_end|>` (2).
@@ -613,6 +752,7 @@ impl Tokenizer {
         match self.scheme {
             PretokScheme::DeepSeekV2 => special::PAD,
             PretokScheme::SmolLm2 => special_smollm2::PAD,
+            PretokScheme::Gpt2 => special_opt::PAD,
         }
     }
     /// `<image>` splice-slot id — Baidu 128815 ([SPEC-035]) or SmolVLM2 49190
@@ -621,6 +761,7 @@ impl Tokenizer {
         match self.scheme {
             PretokScheme::DeepSeekV2 => special::IMAGE,
             PretokScheme::SmolLm2 => special_smollm2::IMAGE,
+            PretokScheme::Gpt2 => special_opt::IMG_PAD,
         }
     }
 }
@@ -1240,5 +1381,81 @@ mod tests {
             mismatches, 0,
             "tok_id_mismatch_count must be 0 (got {mismatches})"
         );
+    }
+
+    // ── OneChart / OPT scheme (D9, bd-3jo6.4.9) ──────────────────────────────
+
+    #[test]
+    fn opt_files_load_and_scheme_dispatch() {
+        // Tiny synthetic triple: vocab covers letters + Ġ, merges drive the
+        // BPE loop, added tokens carry the census pins.
+        let vocab = r#"{"a":0,"b":1,"c":2,"1":3,"2":4,"Ġ":5,"ab":6,"12":7}"#.as_bytes();
+        let merges = b"#version: 0.2\na b\n1 2\n";
+        let added = br#"{"<imgpad>":50265,"<img>":50266,"</img>":50267,"<Number>":50268}"#;
+        let t = Tokenizer::from_opt_files(vocab, merges, added).expect("opt files load");
+        assert_eq!(t.scheme(), PretokScheme::Gpt2);
+        // GPT-2 scheme has NO Digits stage: "12" stays one piece and merges.
+        assert_eq!(t.encode("12").unwrap(), vec![7]);
+        assert_eq!(t.encode("ab").unwrap(), vec![6]);
+        // Added tokens split + resolve; skip_special drops them.
+        assert_eq!(
+            t.encode("ab<imgpad>ab").unwrap(),
+            vec![6, special_opt::IMG_PAD, 6]
+        );
+        assert_eq!(
+            t.decode_skip_special(&t.encode("ab<Number>").unwrap())
+                .unwrap(),
+            "ab"
+        );
+        // Scheme-aware ids (census §4).
+        assert_eq!(t.bos_id(), special_opt::BOS_EOS);
+        assert_eq!(t.eos_id(), special_opt::BOS_EOS);
+        assert_eq!(t.pad_id(), special_opt::PAD);
+        assert_eq!(t.image_id(), special_opt::IMG_PAD);
+        // A wrong pin fails loud.
+        let bad = br#"{"<imgpad>":999}"#;
+        let err = Tokenizer::from_opt_files(vocab, merges, bad).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)), "got {err:?}");
+        // Missing dir → ModelNotFound.
+        let err = Tokenizer::from_opt_dir(Path::new("/nonexistent")).unwrap_err();
+        assert!(matches!(err, FocrError::ModelNotFound(_)), "got {err:?}");
+    }
+
+    /// **D9 — the OneChart tokenizer token-id-EXACT conformance gate**
+    /// (skip-with-SUCCESS without `FOCR_ONECHART_DIR`): our OPT loader +
+    /// GPT-2 scheme must reproduce every id stream of the committed golden
+    /// fixtures (generated by the slow `transformers` `GPT2Tokenizer` over
+    /// the pinned `vocab.json`+`merges.txt`+`added_tokens.json`).
+    #[test]
+    fn onechart_token_id_conformance_gate() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            eprintln!("SKIP onechart tokenizer conformance: set FOCR_ONECHART_DIR");
+            return;
+        };
+        let t = Tokenizer::from_opt_dir(Path::new(&dir)).expect("onechart tokenizer loads");
+        assert_eq!(t.vocab_size(), 50_265);
+        const EXPECTED: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tokenizer_onechart/expected.json"
+        ));
+        let v: serde_json::Value = serde_json::from_str(EXPECTED).unwrap();
+        let cases = v["fixtures"].as_object().expect("fixtures object");
+        assert!(cases.len() >= 25, "conformance corpus shrank");
+        let mut mismatches = 0usize;
+        for (text, want) in cases {
+            let want: Vec<u32> = want
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            let got = t.encode(text).unwrap();
+            if got != want {
+                eprintln!("ENC MISMATCH {text:?}\n  got  {got:?}\n  want {want:?}");
+                mismatches += 1;
+            }
+        }
+        eprintln!("[D9] {} cases, {mismatches} mismatches", cases.len());
+        assert_eq!(mismatches, 0, "tok_id_mismatch_count must be 0");
     }
 }

@@ -163,6 +163,18 @@ pub fn pretokenize_smollm2(text: &str) -> Vec<String> {
     pieces.iter().map(|p| byte_level_map(p)).collect()
 }
 
+/// Pre-tokenize `text` for the plain GPT-2 scheme (OneChart / OPT, D9):
+/// JUST the classic GPT-2 word regex + the byte-level remap — no Digits
+/// stage (the slow `GPT2Tokenizer` over `vocab.json`+`merges.txt`; the
+/// fixture `_meta.pat_str` pins the exact pattern [`split_gpt2_word`]
+/// implements).
+pub fn pretokenize_gpt2(text: &str) -> Vec<String> {
+    split_gpt2_word(text)
+        .iter()
+        .map(|p| byte_level_map(p))
+        .collect()
+}
+
 /// Run one split stage over every input piece, concatenating the results.
 fn split_stage(pieces: &[String], f: fn(&str) -> Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(pieces.len());
