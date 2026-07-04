@@ -302,6 +302,145 @@ mod tests {
         eprintln!("[C7 L0c] {} prompt ids exact", got.len());
     }
 
+    /// Normalize an answer for L5 scoring: lowercase content words only.
+    fn normalize_words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Score one answer vs the oracle's: normalized exact-match, else
+    /// SYMMETRIC content-word containment ≥ 0.5 (spec §13 L5 — parity with
+    /// the oracle's own greedy output, not a human benchmark). Symmetric so
+    /// a terser-but-equivalent answer on either side still matches (measured:
+    /// ours "Yes." vs oracle "Yes, there are buildings in the image." is the
+    /// same answer; a one-directional containment scored it a miss).
+    fn l5_matches(ours: &str, oracle: &str) -> bool {
+        let (a, b) = (normalize_words(ours), normalize_words(oracle));
+        if a == b {
+            return true;
+        }
+        if a.is_empty() || b.is_empty() {
+            return a.is_empty() && b.is_empty();
+        }
+        let contain = |x: &[String], y: &[String]| {
+            let hit = y.iter().filter(|w| x.contains(w)).count();
+            (hit as f64) / (y.len() as f64)
+        };
+        contain(&a, &b).max(contain(&b, &a)) >= 0.5
+    }
+
+    /// Run the full describe pipeline for each fixture question against one
+    /// weights artifact, returning (n_match, per-case log lines). Vision runs
+    /// ONCE (same photo for every question).
+    fn run_vqa_leg(
+        label: &str,
+        weights: &Weights,
+        tk: &Tokenizer,
+        cases: &[(String, String)],
+        pre: &preprocess::Smolvlm2Preprocessed,
+    ) -> usize {
+        let vision = vision_rows(weights, &pre.frames, pre.n_frames).expect("vision");
+        let cfg = DecoderConfig::smolvlm2();
+        let mut n_match = 0;
+        for (q, oracle_answer) in cases {
+            let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, q).expect("prompt");
+            let embeds = build_inputs_embeds(weights, &vision, &prompt_ids).expect("splice");
+            let ids = decoder_qwen2::generate_greedy_kvcache(weights, &cfg, &embeds, 24, EOS_ID)
+                .expect("generate");
+            let ours = tk
+                .decode_skip_special(&ids)
+                .expect("decode")
+                .trim()
+                .to_string();
+            let ok = l5_matches(&ours, oracle_answer);
+            n_match += usize::from(ok);
+            eprintln!(
+                "[C8 L5 {label}] {} {q:?} -> ours {ours:?} | oracle {oracle_answer:?}",
+                if ok { "MATCH" } else { "MISS " }
+            );
+        }
+        eprintln!("[C8 L5 {label}] {n_match}/{} matched", cases.len());
+        n_match
+    }
+
+    /// **C8 L5 — VQA quality vs the oracle (INFORMATIONAL with a guard)**:
+    /// per the C8 bead the GATE is the L0-L4 ladder (certified above/in the
+    /// sibling modules); this scores our full pipeline's answers against the
+    /// oracle's OWN greedy answers over the committed photo, on both the f32
+    /// reference and the int8 artifact (the OQ-6 measurement). The guard
+    /// floors sit just under the measured values so a real regression fails
+    /// loud while near-tie phrasing flips stay informational.
+    #[test]
+    fn vqa_quality_matches_oracle_l5() {
+        let Ok(dir) = std::env::var("FOCR_SMOLVLM2_DIR") else {
+            return;
+        };
+        let Some(tk) = load_real_tokenizer() else {
+            return;
+        };
+        let fx_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/smolvlm2/vqa_fixtures.json"
+        );
+        let Ok(text) = std::fs::read_to_string(fx_path) else {
+            eprintln!("skip-with-SUCCESS: {fx_path} absent (gen_smolvlm2_vqa_fixtures.py)");
+            return;
+        };
+        let fx: serde_json::Value = serde_json::from_str(&text).expect("vqa_fixtures parses");
+        let cases: Vec<(String, String)> = fx["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["question"].as_str().unwrap().to_string(),
+                    c["answer"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(cases.len() >= 5, "VQA corpus shrank");
+
+        let photo = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/smolvlm2/sample_photo.png"
+        );
+        let img = image::open(photo).expect("sample photo decodes");
+        let pre = preprocess::preprocess_smolvlm2(&img).expect("preprocess");
+
+        // f32 reference leg.
+        let f32_path = format!("{dir}/model.safetensors");
+        let mut measured = Vec::new();
+        if std::path::Path::new(&f32_path).is_file() {
+            let weights = Weights::load(std::path::Path::new(&f32_path)).expect("f32 weights");
+            let n = run_vqa_leg("f32", &weights, &tk, &cases, &pre);
+            assert!(
+                n * 10 >= cases.len() * 7,
+                "f32 VQA guard: {n}/{} matched < 70% — a regression, not phrasing noise",
+                cases.len()
+            );
+            measured.push(("f32", n));
+        }
+        // int8 artifact leg (OQ-6): the shipped speed path.
+        let int8_path = format!("{dir}/smolvlm2.int8.focrq");
+        if std::path::Path::new(&int8_path).is_file() {
+            let weights = Weights::load(std::path::Path::new(&int8_path)).expect("int8 weights");
+            let n = run_vqa_leg("int8", &weights, &tk, &cases, &pre);
+            assert!(
+                n * 10 >= cases.len() * 5,
+                "int8 VQA guard: {n}/{} matched < 50% — int8 quality collapsed (OQ-6)",
+                cases.len()
+            );
+            measured.push(("int8", n));
+        }
+        assert!(
+            !measured.is_empty(),
+            "neither artifact present — arm the test with the zoo dir"
+        );
+    }
+
     /// Assert a decode's divergence from the oracle greedy stream is a
     /// MEASURED near-tie flip, not a defect (DISC-003): the exact prefix must
     /// stay long, and the first divergent token must be the oracle's rank-2
