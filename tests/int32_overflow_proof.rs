@@ -90,6 +90,16 @@ const MODEL_KS: &[KCase] = &[
         note: "GOT-OCR2 Qwen2 dense down_proj (intermediate 2816) — bead B5",
     },
     KCase {
+        k: 768,
+        note: "OneChart OPT decoder width (q/k/v/out_proj, fc1 at hidden 768) — \
+               bead D2, docs/zoo/onechart-spec.md §13",
+    },
+    KCase {
+        k: 3072,
+        note: "OneChart OPT fc2 (ffn_dim 3072 — the D-lane worst-case K) — \
+               bead D2, docs/zoo/onechart-spec.md §13",
+    },
+    KCase {
         k: 4096,
         note: "wide intermediate contraction",
     },

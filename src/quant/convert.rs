@@ -930,7 +930,11 @@ mod tests {
             // TIED: both stored, byte-identical (census §4 SHA-proof).
             ("lm_head.weight", vec![6, 8], tied.clone()),
             ("model.decoder.embed_tokens.weight", vec![6, 8], tied),
-            ("model.decoder.embed_positions.weight", vec![10, 8], ramp(10, 8, 1.0)),
+            (
+                "model.decoder.embed_positions.weight",
+                vec![10, 8],
+                ramp(10, 8, 1.0),
+            ),
             // decoder int8 set (6 OPT GEMMs).
             (
                 "model.decoder.layers.0.self_attn.q_proj.weight",
@@ -952,12 +956,32 @@ mod tests {
                 vec![8, 8],
                 ramp(8, 8, 8.0),
             ),
-            ("model.decoder.layers.0.fc1.weight", vec![16, 8], ramp(16, 8, 9.0)),
-            ("model.decoder.layers.0.fc2.weight", vec![8, 16], ramp(8, 16, 2.0)),
+            (
+                "model.decoder.layers.0.fc1.weight",
+                vec![16, 8],
+                ramp(16, 8, 9.0),
+            ),
+            (
+                "model.decoder.layers.0.fc2.weight",
+                vec![8, 16],
+                ramp(8, 16, 2.0),
+            ),
             // biases + norms stay HP (enable_bias=true: EVERY linear has one).
-            ("model.decoder.layers.0.self_attn.q_proj.bias", vec![8], ramp(1, 8, 0.1)),
-            ("model.decoder.layers.0.self_attn.out_proj.bias", vec![8], ramp(1, 8, 0.2)),
-            ("model.decoder.layers.0.fc1.bias", vec![16], ramp(1, 16, 0.3)),
+            (
+                "model.decoder.layers.0.self_attn.q_proj.bias",
+                vec![8],
+                ramp(1, 8, 0.1),
+            ),
+            (
+                "model.decoder.layers.0.self_attn.out_proj.bias",
+                vec![8],
+                ramp(1, 8, 0.2),
+            ),
+            (
+                "model.decoder.layers.0.fc1.bias",
+                vec![16],
+                ramp(1, 16, 0.3),
+            ),
             ("model.decoder.layers.0.fc2.bias", vec![8], ramp(1, 8, 0.4)),
             (
                 "model.decoder.layers.0.self_attn_layer_norm.weight",
@@ -969,7 +993,11 @@ mod tests {
                 vec![8],
                 ramp(1, 8, 0.6),
             ),
-            ("model.decoder.final_layer_norm.weight", vec![8], ramp(1, 8, 0.7)),
+            (
+                "model.decoder.final_layer_norm.weight",
+                vec![8],
+                ramp(1, 8, 0.7),
+            ),
             // connector + number head + SAM tower: HP.
             ("model.mm_projector.weight", vec![8, 4], ramp(8, 4, 1.5)),
             ("model.mm_projector.bias", vec![8], ramp(1, 8, 1.6)),
@@ -1034,7 +1062,9 @@ mod tests {
         assert_eq!(out.len(), w.len() - 1);
         assert!(out.tensor("lm_head.weight").is_err(), "tied head dropped");
         assert_eq!(
-            out.tensor("model.decoder.embed_tokens.weight").unwrap().dtype,
+            out.tensor("model.decoder.embed_tokens.weight")
+                .unwrap()
+                .dtype,
             DType::BF16
         );
         // The 6 OPT GEMMs are int8, byte-identical to the load-time quant.
@@ -1079,7 +1109,11 @@ mod tests {
         };
         let blob = build_safetensors(&[
             ("lm_head.weight", vec![6, 8], ramp(6, 8, 11.0)),
-            ("model.decoder.embed_tokens.weight", vec![6, 8], ramp(6, 8, 4.0)),
+            (
+                "model.decoder.embed_tokens.weight",
+                vec![6, 8],
+                ramp(6, 8, 4.0),
+            ),
             (
                 "model.decoder.layers.0.self_attn.q_proj.weight",
                 vec![8, 8],
