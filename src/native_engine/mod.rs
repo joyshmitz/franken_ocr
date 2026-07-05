@@ -28,6 +28,7 @@ pub mod got;
 pub mod model_arch;
 pub mod moe;
 pub mod nn;
+pub mod onechart;
 pub mod postprocess;
 pub mod rswa;
 pub mod sampler;

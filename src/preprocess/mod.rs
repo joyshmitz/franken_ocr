@@ -838,6 +838,29 @@ pub fn preprocess_smolvlm2_path(path: &Path) -> FocrResult<Smolvlm2Preprocessed>
     preprocess_smolvlm2(&decode_path(path)?)
 }
 
+/// OneChart preprocess (census §6, D3): the SAME squash-bicubic 1024² resize
+/// as GOT, but the Normalize is a NO-OP — pixels stay raw `[0,1]` (mean 0,
+/// std 1; the CLIP constants are NOT used). Returns `[3, 1024*1024]`
+/// channel-major. Shares GOT's CatmullRom≈PIL-bicubic sub-L0 divergence
+/// class (`FOCR_RESAMPLE=pil-bicubic` restores exactness; OQ-D3 re-derives
+/// the tolerance at raw-pixel scale).
+pub fn onechart_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
+    let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
+    let side = GOT_SIZE as usize;
+    let n = side * side;
+    let mut data = vec![0.0f32; 3 * n];
+    for y in 0..side {
+        for x in 0..side {
+            let px = rgb.get_pixel(x as u32, y as u32).0;
+            let s = y * side + x;
+            for c in 0..3 {
+                data[c * n + s] = f32::from(px[c]) / 255.0;
+            }
+        }
+    }
+    crate::native_engine::tensor::Mat::from_vec(3, n, data)
+}
+
 /// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
 pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
     let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
