@@ -184,6 +184,97 @@ mod tests {
         assert!(cos >= 0.9999, "prefill logit cosine {cos:.8} < 0.9999");
     }
 
+    /// **D4-decode — the Opt KV-cache path** (skip-with-SUCCESS without
+    /// `FOCR_ONECHART_DIR`): from the same oracle-vision embeds as the prefill
+    /// cert, (a) the O(n) KV-cache greedy and the O(n²) re-prefill greedy must
+    /// agree on a 24-token window (the B9 identity at OPT geometry), (b) the
+    /// first generated id must be 50268 `<Number>` (the certified prefill
+    /// argmax / census §8 protocol), and (c) the decoded text must
+    /// prefix-match the oracle `chat()` answer.
+    #[test]
+    fn opt_kvcache_matches_greedy_and_oracle() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            return;
+        };
+        let proj_path = format!("{dir}/onechart_proj_out.bin");
+        let model_path = format!("{dir}/model.safetensors");
+        if !std::path::Path::new(&proj_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {proj_path} absent (run the oracle script)");
+            return;
+        }
+        let read_f32 = |p: &str| -> Vec<f32> {
+            std::fs::read(p)
+                .expect("oracle blob reads")
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let fx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/onechart/oracle_fixtures.json"
+            ))
+            .expect("oracle fixtures read"),
+        )
+        .expect("oracle fixtures parse");
+        let prompt_ids: Vec<u32> = fx["l0c_prompt"]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let weights = Weights::load(std::path::Path::new(&model_path)).expect("weights");
+        let vision = Mat::from_vec(VISION_TOKENS, HIDDEN, read_f32(&proj_path));
+        let embeds = build_inputs_embeds(&weights, &vision, &prompt_ids).expect("splice");
+        let cfg = super::super::decoder_qwen2::DecoderConfig::onechart();
+
+        let ids_kv = super::super::decoder_qwen2::generate_greedy_kvcache(
+            &weights,
+            &cfg,
+            &embeds,
+            24,
+            crate::tokenizer::special_opt::BOS_EOS,
+        )
+        .expect("kvcache greedy");
+        let ids_greedy = super::super::decoder_qwen2::generate_greedy(
+            &weights,
+            &cfg,
+            &embeds,
+            24,
+            crate::tokenizer::special_opt::BOS_EOS,
+        )
+        .expect("re-prefill greedy");
+        eprintln!("[D4 decode] kvcache: {ids_kv:?}");
+        assert_eq!(
+            ids_kv, ids_greedy,
+            "B9 identity: kvcache vs re-prefill greedy diverged at OPT geometry"
+        );
+        assert_eq!(
+            ids_kv[0],
+            crate::tokenizer::special_opt::NUMBER,
+            "first generated id must be the <Number> trigger (census §8)"
+        );
+
+        // Text prefix vs the oracle chat() answer (same greedy trajectory).
+        let tk = crate::tokenizer::Tokenizer::from_opt_dir(std::path::Path::new(&dir))
+            .expect("onechart tokenizer");
+        let ours = tk.decode_skip_special(&ids_kv).expect("decode");
+        let oracle = fx["l4_chat"]["answer"].as_str().unwrap();
+        eprintln!("[D4 decode] ours:   {:?}", ours.trim());
+        eprintln!("[D4 decode] oracle: {:?}", &oracle[..oracle.len().min(80)]);
+        let ours_t = ours.trim();
+        let prefix = ours_t
+            .chars()
+            .zip(oracle.trim().chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        eprintln!("[D4 decode] text prefix match: {prefix} chars");
+        assert!(
+            prefix >= 12,
+            "decoded text diverged from the oracle chat() answer too early ({prefix} chars)"
+        );
+    }
+
     /// **D3 — OneChart vision + projector vs the torch oracle**
     /// (skip-with-SUCCESS without `FOCR_ONECHART_DIR`): feed the oracle's own
     /// preprocessed tensor (seam-isolated from resize parity, OQ-D3) through

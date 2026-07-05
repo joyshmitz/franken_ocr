@@ -804,9 +804,63 @@ struct GotLayerW {
     /// skip the add on `None`.
     qkv_bias: Option<Vec<f32>>,
     o: QInt8,
-    gate: QInt8,
-    up: QInt8,
-    down: QInt8,
+    /// out_proj bias — `Some` only for the Opt family (every linear biased).
+    o_bias: Option<Vec<f32>>,
+    /// LayerNorm biases `(input_ln.bias, pre_mlp_ln.bias)` — `Some` selects
+    /// LayerNorm (Opt); `None` selects RMSNorm (QwenLlama). Bias presence IS
+    /// the family's norm choice, so the two can never drift apart.
+    ln_bias: Option<(Vec<f32>, Vec<f32>)>,
+    mlp: MlpW,
+}
+
+/// The per-layer MLP weights — gated SwiGLU (QwenLlama) or the plain biased
+/// ReLU pair (Opt).
+enum MlpW {
+    SwiGlu {
+        gate: QInt8,
+        up: QInt8,
+        down: QInt8,
+    },
+    ReluFc {
+        fc1: QInt8,
+        fc1_b: Vec<f32>,
+        fc2: QInt8,
+        fc2_b: Vec<f32>,
+    },
+}
+
+/// Add the learned absolute-position rows (Opt) to `x` in place: token `i`
+/// (absolute position `start + i`) gains table row `start + i + offset`
+/// (census §4: offset 2; OQ-D7 enforces the table bound loudly).
+fn add_learned_positions(x: &mut Mat, w: &GotDecodeWeights, start: usize) -> FocrResult<()> {
+    let Some((table, offset)) = &w.embed_positions else {
+        return Ok(());
+    };
+    let hidden = w.cfg.hidden_size;
+    let rows = table.len() / hidden;
+    if start + x.rows + offset > rows {
+        return Err(FocrError::FormatMismatch(format!(
+            "decoder: position {} + offset {offset} exceeds the {rows}-row learned table (OQ-D7)",
+            start + x.rows
+        )));
+    }
+    for i in 0..x.rows {
+        let p = (start + i + offset) * hidden;
+        let row = x.row_mut(i);
+        for (a, b) in row.iter_mut().zip(&table[p..p + hidden]) {
+            *a += b;
+        }
+    }
+    Ok(())
+}
+
+/// RMSNorm (bias `None`) or LayerNorm (bias `Some`) — the decode-path family
+/// norm switch (mirrors [`opt_layer`] vs the Qwen layer).
+fn family_norm(x: &Mat, w: &[f32], b: Option<&[f32]>, eps: f32) -> FocrResult<Mat> {
+    match b {
+        Some(b) => nn::layer_norm(x, Some(w), Some(b), eps),
+        None => nn::rms_norm(x, Some(w), eps),
+    }
 }
 
 /// Concatenate the row-major q/k/v `[d, h]` int8 panels + scales into one
@@ -830,6 +884,10 @@ fn concat_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
 struct GotDecodeWeights {
     layers: Vec<GotLayerW>,
     final_norm: Vec<f32>,
+    /// Model-level LayerNorm bias — `Some` for the Opt family only.
+    final_norm_bias: Option<Vec<f32>>,
+    /// Learned absolute positions `([rows, hidden] table, offset)` — Opt.
+    embed_positions: Option<(Vec<f32>, usize)>,
     /// `embed_tokens` `[vocab, hidden]`, row-major — the per-token embed lookup
     /// (also the lm_head SOURCE when the arch ties them; see `untied_head`).
     embed: Vec<f32>,
@@ -876,6 +934,31 @@ impl GotDecodeWeights {
             } else {
                 None
             };
+            if cfg.family == DecoderFamily::Opt {
+                layers.push(GotLayerW {
+                    input_ln: weights.vec(&format!("{p}.self_attn_layer_norm.weight"))?,
+                    post_attn_ln: weights.vec(&format!("{p}.final_layer_norm.weight"))?,
+                    qkv: concat_qkv(&q, &k, &v),
+                    qkv_bias,
+                    o: decoder::quant_oc_loaded(
+                        weights,
+                        &format!("{p}.self_attn.out_proj.weight"),
+                        hidden,
+                    )?,
+                    o_bias: Some(weights.vec(&format!("{p}.self_attn.out_proj.bias"))?),
+                    ln_bias: Some((
+                        weights.vec(&format!("{p}.self_attn_layer_norm.bias"))?,
+                        weights.vec(&format!("{p}.final_layer_norm.bias"))?,
+                    )),
+                    mlp: MlpW::ReluFc {
+                        fc1: decoder::quant_oc_loaded(weights, &format!("{p}.fc1.weight"), inter)?,
+                        fc1_b: weights.vec(&format!("{p}.fc1.bias"))?,
+                        fc2: decoder::quant_oc_loaded(weights, &format!("{p}.fc2.weight"), hidden)?,
+                        fc2_b: weights.vec(&format!("{p}.fc2.bias"))?,
+                    },
+                });
+                continue;
+            }
             layers.push(GotLayerW {
                 input_ln: weights.vec(&format!("{p}.input_layernorm.weight"))?,
                 post_attn_ln: weights.vec(&format!("{p}.post_attention_layernorm.weight"))?,
@@ -886,17 +969,25 @@ impl GotDecodeWeights {
                     &format!("{p}.self_attn.o_proj.weight"),
                     hidden,
                 )?,
-                gate: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    inter,
-                )?,
-                up: decoder::quant_oc_loaded(weights, &format!("{p}.mlp.up_proj.weight"), inter)?,
-                down: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    hidden,
-                )?,
+                o_bias: None,
+                ln_bias: None,
+                mlp: MlpW::SwiGlu {
+                    gate: decoder::quant_oc_loaded(
+                        weights,
+                        &format!("{p}.mlp.gate_proj.weight"),
+                        inter,
+                    )?,
+                    up: decoder::quant_oc_loaded(
+                        weights,
+                        &format!("{p}.mlp.up_proj.weight"),
+                        inter,
+                    )?,
+                    down: decoder::quant_oc_loaded(
+                        weights,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        hidden,
+                    )?,
+                },
             });
         }
         let embed = weights.mat(cfg.embed_tokens)?.data;
@@ -904,6 +995,15 @@ impl GotDecodeWeights {
         // alias the embed table (never duplicate GOT's ~0.6 GB).
         let untied_head = match cfg.lm_head {
             Some(name) => Some(weights.mat(name)?.data),
+            None => None,
+        };
+        let final_norm_bias = if cfg.family == DecoderFamily::Opt {
+            Some(weights.vec(&cfg.final_norm.replace(".weight", ".bias"))?)
+        } else {
+            None
+        };
+        let embed_positions = match cfg.embed_positions {
+            Some((name, off)) => Some((weights.mat(name)?.data, off)),
             None => None,
         };
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
@@ -940,6 +1040,8 @@ impl GotDecodeWeights {
         Ok(Self {
             layers,
             final_norm: weights.vec(cfg.final_norm)?,
+            final_norm_bias,
+            embed_positions,
             embed,
             untied_head,
             lm_head,
@@ -964,6 +1066,19 @@ const GOT_LMHEAD_REFINE_K: usize = 256;
 /// the top candidates, then those are recomputed in exact f32 so the greedy pick matches the
 /// f32 head (the argmax lives in the int8 top-K with overwhelming probability).
 fn got_lm_head(w: &GotDecodeWeights, x_row: &Mat, eps: f32) -> FocrResult<Vec<f32>> {
+    if let Some(fb) = &w.final_norm_bias {
+        // Opt: model-level LayerNorm WITH bias, then the (pretransposed) head.
+        let normed = nn::layer_norm(x_row, Some(&w.final_norm), Some(fb), eps)?;
+        return match &w.lm_head {
+            LmHead::F32(wt) => Ok(nn::matmul(&normed, wt)?.data),
+            LmHead::Int8(q) => {
+                let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
+                let mut logits = decoder::gemv_i8_bias_prequant(&xq, a, q, None);
+                refine_topk_f32(&mut logits, &normed.data, w.head_matrix(), w.cfg.hidden_size);
+                Ok(logits)
+            }
+        };
+    }
     match &w.lm_head {
         LmHead::F32(wt) => {
             Ok(decoder::norm_and_lm_head_pretransposed(x_row, &w.final_norm, wt, eps)?.data)
@@ -1021,24 +1136,41 @@ fn forward_prefill_seed(
     let cfg = &w.cfg;
     let eps = cfg.rms_norm_eps;
     let mut x = inputs_embeds.clone();
+    add_learned_positions(&mut x, w, 0)?;
     let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
     let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
     for (l, cl) in w.layers.iter().enumerate() {
-        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+        let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
+        let normed = family_norm(&x, &cl.input_ln, ln1_b, eps)?;
         // one fused q|k|v GEMM (m=N, row-parallel), then split the columns.
         let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, cl.qkv_bias.as_deref())?;
         let (mut q, mut k, v) = split_qkv_rows(&qkv, q_dim, kv_dim);
-        decoder::apply_rope(&mut q, &rope)?;
-        decoder::apply_rope(&mut k, &rope)?;
+        if w.embed_positions.is_none() {
+            decoder::apply_rope(&mut q, &rope)?;
+            decoder::apply_rope(&mut k, &rope)?;
+        }
         // The cache holds the GQA-native (unbroadcast) K/V; the decode step's
         // per-head kv mapping reads it at kv_dim stride.
         caches[l].seed(&k.data, &v.data);
         let ctx = prefill_attention_gqa(&q, &k, &v, cfg)?;
-        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, None)?;
+        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, cl.o_bias.as_deref())?;
         let h = decoder::add_residual(&x, &attn)?;
-        let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-        let mlp = decoder::expert_mlp_i8(&normed2, &cl.gate, &cl.up, &cl.down)?;
+        let ln2_b = cl.ln_bias.as_ref().map(|(_, b)| b.as_slice());
+        let normed2 = family_norm(&h, &cl.post_attn_ln, ln2_b, eps)?;
+        let mlp = match &cl.mlp {
+            MlpW::SwiGlu { gate, up, down } => decoder::expert_mlp_i8(&normed2, gate, up, down)?,
+            MlpW::ReluFc {
+                fc1,
+                fc1_b,
+                fc2,
+                fc2_b,
+            } => {
+                let mut m = nn::linear_int8_dynamic(&normed2, fc1, Some(fc1_b))?;
+                nn::relu(&mut m);
+                nn::linear_int8_dynamic(&m, fc2, Some(fc2_b))?
+            }
+        };
         x = decoder::add_residual(&h, &mlp)?;
     }
     let last = x.rows - 1;
@@ -1128,40 +1260,64 @@ fn qwen2_decode_step(
     let (q_dim, kv_dim, kv_group) = (cfg.q_dim(), cfg.kv_dim(), cfg.kv_group());
     let rope = decoder::RopeTable::build(&[position], head_dim, cfg.rope_theta);
     let mut x = x.clone();
+    add_learned_positions(&mut x, w, position)?;
     let tlayers = std::time::Instant::now();
     for (l, cl) in w.layers.iter().enumerate() {
         // ── attention: quantize the normed row ONCE, fused q|k|v GEMV (n-parallel) ──
-        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+        let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
+        let normed = family_norm(&x, &cl.input_ln, ln1_b, eps)?;
         let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
         let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, cl.qkv_bias.as_deref());
         let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
         let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
         let v = &qkv[q_dim + kv_dim..q_dim + 2 * kv_dim];
-        decoder::apply_rope(&mut q, &rope)?;
-        decoder::apply_rope(&mut k, &rope)?;
+        if w.embed_positions.is_none() {
+            decoder::apply_rope(&mut q, &rope)?;
+            decoder::apply_rope(&mut k, &rope)?;
+        }
         caches[l].append(&k.data, v);
         let ta = std::time::Instant::now();
         let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim, kv_group);
         DECODE_ATTN_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let (xqc, ac) = decoder::quantize_row_i8_te(&ctx);
-        let attn = decoder::gemv_i8_bias_prequant(&xqc, ac, &cl.o, None);
+        let attn = decoder::gemv_i8_bias_prequant(&xqc, ac, &cl.o, cl.o_bias.as_deref());
         let h = decoder::add_residual(&x, &Mat::from_vec(1, hidden, attn))?;
-        // ── dense SwiGLU: quantize normed2 ONCE, share it for gate + up ──────────
-        let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+        // ── MLP: quantize normed2 ONCE (SwiGLU shares it for gate + up) ──────────
+        let ln2_b = cl.ln_bias.as_ref().map(|(_, b)| b.as_slice());
+        let normed2 = family_norm(&h, &cl.post_attn_ln, ln2_b, eps)?;
         let (xq2, a2) = decoder::quantize_row_i8_te(&normed2.data);
-        let mut gate = Mat::from_vec(
-            1,
-            cfg.intermediate_size,
-            decoder::gemv_i8_bias_prequant(&xq2, a2, &cl.gate, None),
-        );
-        let up = decoder::gemv_i8_bias_prequant(&xq2, a2, &cl.up, None);
-        nn::silu(&mut gate);
-        for (g, &u) in gate.data.iter_mut().zip(up.iter()) {
-            *g *= u;
-        }
-        let (xq3, a3) = decoder::quantize_row_i8_te(&gate.data);
-        let down = decoder::gemv_i8_bias_prequant(&xq3, a3, &cl.down, None);
-        x = decoder::add_residual(&h, &Mat::from_vec(1, hidden, down))?;
+        let mlp_out = match &cl.mlp {
+            MlpW::SwiGlu { gate, up, down } => {
+                let mut g = Mat::from_vec(
+                    1,
+                    cfg.intermediate_size,
+                    decoder::gemv_i8_bias_prequant(&xq2, a2, gate, None),
+                );
+                let u = decoder::gemv_i8_bias_prequant(&xq2, a2, up, None);
+                nn::silu(&mut g);
+                for (gv, &uv) in g.data.iter_mut().zip(u.iter()) {
+                    *gv *= uv;
+                }
+                let (xq3, a3) = decoder::quantize_row_i8_te(&g.data);
+                decoder::gemv_i8_bias_prequant(&xq3, a3, down, None)
+            }
+            MlpW::ReluFc {
+                fc1,
+                fc1_b,
+                fc2,
+                fc2_b,
+            } => {
+                let mut m = Mat::from_vec(
+                    1,
+                    cfg.intermediate_size,
+                    decoder::gemv_i8_bias_prequant(&xq2, a2, fc1, Some(fc1_b)),
+                );
+                nn::relu(&mut m);
+                let (xq3, a3) = decoder::quantize_row_i8_te(&m.data);
+                decoder::gemv_i8_bias_prequant(&xq3, a3, fc2, Some(fc2_b))
+            }
+        };
+        x = decoder::add_residual(&h, &Mat::from_vec(1, hidden, mlp_out))?;
     }
     DECODE_GEMV_NS.fetch_add(tlayers.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let thead = std::time::Instant::now();
@@ -1342,6 +1498,8 @@ mod tests {
         let mk = |untied: Option<Vec<f32>>| GotDecodeWeights {
             layers: Vec::new(),
             final_norm: Vec::new(),
+            final_norm_bias: None,
+            embed_positions: None,
             embed: vec![1.0],
             untied_head: untied,
             lm_head: LmHead::F32(Mat::from_vec(1, 1, vec![0.0])),
