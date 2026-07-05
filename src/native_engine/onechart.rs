@@ -6,8 +6,12 @@
 //! `mm_projector` → 256 `<imgpad>` (50265) slots → the OPT-125M decoder (D4,
 //! pending on the shared dense engine) + the `num_decoder` number head (D5).
 //!
-//! This module currently ships the D3 vision seam ([`vision_features`]); the
-//! decoder/recognize assembly lands with D4/D5.
+//! Shipped here: the D3 vision seam ([`vision_features`]), the D4 embeds
+//! splice ([`build_inputs_embeds`] — the decoder itself is
+//! `DecoderConfig::onechart()` in the shared engine), and the D5 number head
+//! + self-verify math ([`number_head`], [`extract_gt_values`],
+//! [`normalize_gt`], [`reliable_distance`]). The end-to-end `recognize`
+//! assembly + CLI routing land with D6-D8.
 
 use crate::error::FocrResult;
 
@@ -61,6 +65,141 @@ pub fn build_inputs_embeds(weights: &Weights, vision: &Mat, prompt_ids: &[u32]) 
         .collect();
     connector::masked_scatter(&mut inputs_embeds, vision, &mask)?;
     Ok(inputs_embeds)
+}
+
+/// D5: the `num_decoder` number head (census §8) —
+/// `Linear(768→384)·ReLU·Linear(384→384)·ReLU·Linear(384→256)`, all biased,
+/// applied to the **post-`final_layer_norm`** hidden of the decode step whose
+/// INPUT token is the generated `<Number>` (50268). `pred_locs[i]` ≈ the
+/// i-th chart value min-max normalized to [0,1] (upstream keeps the first
+/// 100). Port contract: computed PER REQUEST — never a stale attribute
+/// (OQ-D4).
+///
+/// # Errors
+/// A missing tensor or a shape violation.
+pub fn number_head(weights: &Weights, hidden_row: &[f32]) -> FocrResult<Vec<f32>> {
+    let lin = |i: usize, out, in_| -> FocrResult<Linear> {
+        Ok(Linear {
+            w: weights.vec(&format!("num_decoder.{i}.weight"))?,
+            b: weights.vec(&format!("num_decoder.{i}.bias"))?,
+            out,
+            in_,
+        })
+    };
+    let x = Mat::from_vec(1, HIDDEN, hidden_row.to_vec());
+    let mut x = lin(0, 384, HIDDEN)?.apply(&x)?;
+    super::nn::relu(&mut x);
+    let mut x = lin(2, 384, 384)?.apply(&x)?;
+    super::nn::relu(&mut x);
+    Ok(lin(4, 256, 384)?.apply(&x)?.data)
+}
+
+/// The `reliable_check` verdict threshold (census §8: mean-L1 < 0.1 ⇒
+/// "reliable").
+pub const RELIABLE_THRESHOLD: f64 = 0.1;
+
+/// D5: extract the ground-truth numeric list from a parsed `values` JSON
+/// object (census §8 step 1): dicts recurse (multi-series), a LIST anywhere
+/// aborts (`None` = unverifiable), numeric leaves pass through, string
+/// leaves drop `(\d+)`/`[\d+]` spans then every char outside `[0-9.-]`, and
+/// the residues `-`/`*`/`none`/`None`/`` are skipped.
+#[must_use]
+pub fn extract_gt_values(values: &serde_json::Value) -> Option<Vec<f64>> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<f64>) -> bool {
+        match v {
+            serde_json::Value::Object(map) => map.values().all(|x| walk(x, out)),
+            serde_json::Value::Array(_) => false,
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    out.push(f);
+                }
+                true
+            }
+            serde_json::Value::String(s) => {
+                let cleaned = strip_index_spans(s);
+                let filtered: String = cleaned
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                if matches!(filtered.as_str(), "-" | "*" | "none" | "None" | "") {
+                    return true;
+                }
+                if let Ok(f) = filtered.parse::<f64>() {
+                    out.push(f);
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+    let mut out = Vec::new();
+    walk(values, &mut out).then_some(out)
+}
+
+/// `re.sub(r'\(\d+\)|\[\d+\]', '', s)` — drop parenthesized/bracketed pure
+/// digit spans (footnote markers) before the numeric filter.
+fn strip_index_spans(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let (open, close) = match chars[i] {
+            '(' => ('(', ')'),
+            '[' => ('[', ']'),
+            _ => {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+        };
+        let _ = open;
+        // A span matches only if ≥1 digit then the matching close bracket.
+        let mut j = i + 1;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i + 1 && j < chars.len() && chars[j] == close {
+            i = j + 1; // drop the whole span
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// D5: min-max normalize the GT list (census §8 step 2): `len < 2` is the
+/// identity (rounded); else `(x−min)/(max−min+1e-9)`, each rounded to 4
+/// decimals with round-half-even (python `round`).
+#[must_use]
+pub fn normalize_gt(xs: &[f64]) -> Vec<f64> {
+    let round4 = |x: f64| (x * 10_000.0).round_ties_even() / 10_000.0;
+    if xs.len() < 2 {
+        return xs.iter().map(|&x| round4(x)).collect();
+    }
+    let (lo, hi) = xs
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &x| {
+            (l.min(x), h.max(x))
+        });
+    xs.iter()
+        .map(|&x| round4((x - lo) / (hi - lo + 1e-9)))
+        .collect()
+}
+
+/// D5: `reliable_distance = mean-L1(pred_locs[..n], gt)` (census §8 step 3).
+#[must_use]
+pub fn reliable_distance(pred_locs: &[f32], gt: &[f64]) -> f64 {
+    if gt.is_empty() {
+        return f64::INFINITY;
+    }
+    let n = gt.len().min(pred_locs.len());
+    gt[..n]
+        .iter()
+        .zip(&pred_locs[..n])
+        .map(|(&g, &p)| (g - f64::from(p)).abs())
+        .sum::<f64>()
+        / n as f64
 }
 
 /// `[r, c]` row-major → `[c, r]` row-major (channel-major SAM output →
@@ -182,6 +321,93 @@ mod tests {
         );
         assert_eq!(argmax(ours), argmax(&want), "next-token argmax diverged");
         assert!(cos >= 0.9999, "prefill logit cosine {cos:.8} < 0.9999");
+    }
+
+    /// D5: the reliable_check pure math vs upstream-exact golden vectors
+    /// (computed with the reference python: the two regex subs, min-max
+    /// `(x−min)/(max−min+1e-9)`, python banker's `round(x,4)`).
+    #[test]
+    fn reliable_check_matches_upstream_goldens() {
+        let case = |json: &str| -> Option<Vec<f64>> {
+            extract_gt_values(&serde_json::from_str(json).unwrap()).map(|v| normalize_gt(&v))
+        };
+        assert_eq!(
+            case(r#"{"A":"30","B":"45","C":"25","D":"10"}"#).unwrap(),
+            vec![0.5714, 1.0, 0.4286, 0.0]
+        );
+        assert_eq!(
+            case(r#"{"x":"6.12%","y":"1,234"}"#).unwrap(),
+            vec![0.0, 1.0]
+        );
+        assert_eq!(
+            case(r#"{"s1":{"a":1,"b":3},"s2":{"c":5}}"#).unwrap(),
+            vec![0.0, 0.5, 1.0]
+        );
+        // len<2 identity + skip tokens.
+        assert_eq!(case(r#"{"a":"none","b":"5","c":"-"}"#).unwrap(), vec![5.0]);
+        // Footnote spans removed BEFORE the numeric filter.
+        assert_eq!(case(r#"{"t":"ab(3)cd [7] 12.5x"}"#).unwrap(), vec![12.5]);
+        // A list anywhere aborts (unverifiable).
+        assert_eq!(case(r#"{"a":[1,2]}"#), None);
+        // Distance + verdict.
+        let gt = vec![0.5714, 1.0, 0.4286, 0.0];
+        let pred: Vec<f32> = vec![0.57, 1.0, 0.43, 0.0];
+        let d = reliable_distance(&pred, &gt);
+        assert!(d < RELIABLE_THRESHOLD, "near-exact pred must verify ({d})");
+        assert!(reliable_distance(&[0.9, 0.1], &[0.0, 1.0]) > RELIABLE_THRESHOLD);
+        assert!(reliable_distance(&pred, &[]).is_infinite());
+    }
+
+    /// **D5 — the num_decoder MLP vs the numpy-over-real-weights golden**
+    /// (skip-with-SUCCESS without `FOCR_ONECHART_DIR`): same input hidden,
+    /// cosine ≥ 0.9999 + tight max-abs (an f32 3-layer MLP).
+    #[test]
+    fn number_head_matches_golden() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            return;
+        };
+        let model_path = format!("{dir}/model.safetensors");
+        if !std::path::Path::new(&model_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {model_path} absent");
+            return;
+        }
+        let fx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/onechart/num_decoder_golden.json"
+            ))
+            .expect("golden read"),
+        )
+        .expect("golden parse");
+        let hidden: Vec<f32> = fx["input_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let want: Vec<f32> = fx["pred_locs_256"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let weights = Weights::load(std::path::Path::new(&model_path)).expect("weights");
+        let ours = number_head(&weights, &hidden).expect("number head");
+        assert_eq!(ours.len(), 256);
+        let mut max_abs = 0.0f64;
+        let mut dot = 0.0f64;
+        let (mut na, mut nb) = (0.0f64, 0.0f64);
+        for (a, b) in ours.iter().zip(&want) {
+            let (a, b) = (f64::from(*a), f64::from(*b));
+            max_abs = max_abs.max((a - b).abs());
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        eprintln!("[D5 parity] num_decoder cos={cos:.8} maxabs={max_abs:.3e}");
+        assert!(cos >= 0.9999, "num_decoder cosine {cos:.8}");
+        assert!(max_abs <= 1e-4, "num_decoder maxabs {max_abs:.3e}");
     }
 
     /// **D4-decode — the Opt KV-cache path** (skip-with-SUCCESS without
