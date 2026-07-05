@@ -564,7 +564,10 @@ mod tests {
             .filter(|v| res.json_text.contains(**v))
             .count();
         eprintln!("[D6 e2e f32] text values: {n_vals}/4");
-        assert!(n_vals >= 2, "text values collapsed below the measured floor");
+        assert!(
+            n_vals >= 2,
+            "text values collapsed below the measured floor"
+        );
         let locs = res.pred_locs.as_ref().expect("<Number> must fire");
         // The head's first four slots vs the normalized truth (census §8
         // training semantics) — generous per-slot budget, this is a 0.5M-param
