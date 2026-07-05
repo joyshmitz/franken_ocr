@@ -384,6 +384,15 @@ pub fn gelu_tanh(x: &mut Mat) {
     }
 }
 
+/// In-place ReLU — the OPT MLP activation (OneChart D4; census §4
+/// `activation_function: relu`, the plain non-gated `fc1`/`fc2` pair).
+/// Distinct from SiLU/GELU so a wrong-activation divergence stays loud.
+pub fn relu(x: &mut Mat) {
+    for v in &mut x.data {
+        *v = v.max(0.0);
+    }
+}
+
 /// `gelu_tanh` on a single scalar — the hand-verifiable kernel of
 /// [`gelu_tanh`].
 #[inline]

@@ -11,6 +11,8 @@
 
 use crate::error::FocrResult;
 
+use super::connector;
+use super::decoder;
 use super::tensor::Mat;
 use super::vision_sam::{self, Linear};
 use super::weights::Weights;
@@ -40,6 +42,25 @@ pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResu
         in_: 1024,
     };
     proj.apply(&sam_t) // [256, 768]
+}
+
+/// Build the OPT decoder `inputs_embeds`: embed the prompt ids against the
+/// tied `model.decoder.embed_tokens.weight`, then scatter the vision rows
+/// into the 256 `<imgpad>` (50265) slots in prompt order. (The learned
+/// position table is added INSIDE the decoder prefill — census §4/OQ-D6.)
+///
+/// # Errors
+/// An embed error, or a [`connector::masked_scatter`] slot-count mismatch.
+pub fn build_inputs_embeds(weights: &Weights, vision: &Mat, prompt_ids: &[u32]) -> FocrResult<Mat> {
+    let embed = weights.mat("model.decoder.embed_tokens.weight")?;
+    let (vocab, hidden) = (embed.rows, embed.cols);
+    let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, prompt_ids)?;
+    let mask: Vec<bool> = prompt_ids
+        .iter()
+        .map(|&id| id == crate::tokenizer::special_opt::IMG_PAD)
+        .collect();
+    connector::masked_scatter(&mut inputs_embeds, vision, &mask)?;
+    Ok(inputs_embeds)
 }
 
 /// `[r, c]` row-major → `[c, r]` row-major (channel-major SAM output →
@@ -75,6 +96,92 @@ mod tests {
         let w = Weights::default();
         let img = Mat::from_vec(3, 4, vec![0.0; 12]);
         assert!(vision_features(&w, &img, "model.vision_tower").is_err());
+    }
+
+    /// **D4-prefill — the OPT decoder vs the torch oracle** (skip-with-SUCCESS
+    /// without `FOCR_ONECHART_DIR`): embed the committed 309-id prompt, splice
+    /// the ORACLE's own projector rows into the 256 `<imgpad>` slots
+    /// (seam-isolated from the D3 vision drift), run the new
+    /// `DecoderConfig::onechart()` prefill (LayerNorm+bias, learned offset-2
+    /// positions, ReLU fc1/fc2, tied head), and hold the last-pos logits to
+    /// argmax-exact + cosine ≥ 0.9999 vs `onechart_final_logits.bin`.
+    #[test]
+    fn opt_prefill_matches_torch_oracle() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            return;
+        };
+        let proj_path = format!("{dir}/onechart_proj_out.bin");
+        let logits_path = format!("{dir}/onechart_final_logits.bin");
+        let model_path = format!("{dir}/model.safetensors");
+        if !std::path::Path::new(&proj_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {proj_path} absent (run the oracle script)");
+            return;
+        }
+        let read_f32 = |p: &str| -> Vec<f32> {
+            std::fs::read(p)
+                .expect("oracle blob reads")
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let fx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/onechart/oracle_fixtures.json"
+            ))
+            .expect("oracle fixtures read"),
+        )
+        .expect("oracle fixtures parse");
+        let prompt_ids: Vec<u32> = fx["l0c_prompt"]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        // 308 measured ids (the census §5 estimated 309; the fixture's own
+        // `n` is the truth — 256 <imgpad> + 52 text/bracket ids, no bos).
+        assert_eq!(
+            prompt_ids.len(),
+            fx["l0c_prompt"]["n"].as_u64().unwrap() as usize,
+            "prompt drifted from its own fixture"
+        );
+        assert_eq!(prompt_ids.len(), 308, "measured census prompt length");
+
+        let weights = Weights::load(std::path::Path::new(&model_path)).expect("weights");
+        let vision = Mat::from_vec(VISION_TOKENS, HIDDEN, read_f32(&proj_path));
+        let embeds = build_inputs_embeds(&weights, &vision, &prompt_ids).expect("splice");
+        let cfg = super::super::decoder_qwen2::DecoderConfig::onechart();
+        let logits =
+            super::super::decoder_qwen2::forward_prefill(&weights, &cfg, &embeds).expect("prefill");
+        let ours = &logits.data[(logits.rows - 1) * logits.cols..];
+        let want = read_f32(&logits_path);
+        assert_eq!(ours.len(), want.len(), "vocab width");
+
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let mut dot = 0.0f64;
+        let (mut na, mut nb) = (0.0f64, 0.0f64);
+        let mut max_abs = 0.0f64;
+        for (a, b) in ours.iter().zip(&want) {
+            let (a, b) = (f64::from(*a), f64::from(*b));
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+            max_abs = max_abs.max((a - b).abs());
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        eprintln!(
+            "[D4 prefill] argmax={} (oracle {}) cos={cos:.8} maxabs={max_abs:.3e}",
+            argmax(ours),
+            argmax(&want)
+        );
+        assert_eq!(argmax(ours), argmax(&want), "next-token argmax diverged");
+        assert!(cos >= 0.9999, "prefill logit cosine {cos:.8} < 0.9999");
     }
 
     /// **D3 — OneChart vision + projector vs the torch oracle**

@@ -110,8 +110,27 @@ static DECODE_LMHEAD_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Config of a dense (Qwen2/Llama-style) decoder — the parameters the shared leaf
 /// kernels need, so one driver serves GOT-OCR2 (and later SmolVLM2/OneChart).
+/// The dense-decoder FAMILY — which per-layer op set / tensor naming the
+/// engine runs. Additive: every certified config stays `QwenLlama` and takes
+/// byte-identical branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderFamily {
+    /// RMSNorm + RoPE + gated SwiGLU (`gate/up/down`) — GOT-OCR2, SmolVLM2.
+    QwenLlama,
+    /// LayerNorm(+bias) + LEARNED absolute positions (offset table, no RoPE),
+    /// plus a plain ReLU `fc1`/`fc2` MLP with all linears biased — OneChart's
+    /// OPT-125M (census docs/zoo/onechart-spec.md §4; D4, bd-3jo6.4.4).
+    Opt,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecoderConfig {
+    /// The op-set / naming family ([`DecoderFamily`]).
+    pub family: DecoderFamily,
+    /// `Some((table_name, offset))` = learned absolute positions: row
+    /// `i + offset` of the named `[rows, hidden]` table is ADDED to token `i`'s
+    /// embedding before layer 0 (OPT: offset 2). `None` = RoPE.
+    pub embed_positions: Option<(&'static str, usize)>,
     /// Residual-stream width (GOT 1024).
     pub hidden_size: usize,
     /// Dense SwiGLU inner width (GOT 2816).
@@ -160,6 +179,8 @@ impl DecoderConfig {
     #[must_use]
     pub fn got_ocr2() -> Self {
         Self {
+            family: DecoderFamily::QwenLlama,
+            embed_positions: None,
             hidden_size: 1024,
             intermediate_size: 2816,
             num_hidden_layers: 24,
@@ -185,6 +206,8 @@ impl DecoderConfig {
     #[must_use]
     pub fn smolvlm2() -> Self {
         Self {
+            family: DecoderFamily::QwenLlama,
+            embed_positions: None,
             hidden_size: 960,
             intermediate_size: 2560,
             num_hidden_layers: 32,
@@ -200,6 +223,34 @@ impl DecoderConfig {
             embed_tokens: "model.text_model.embed_tokens.weight",
             final_norm: "model.text_model.norm.weight",
             lm_head: Some("lm_head.weight"),
+        }
+    }
+
+    /// The OneChart (OPT-125M) decoder configuration (census
+    /// docs/zoo/onechart-spec.md §4, pinned from the real config.json; D4):
+    /// pre-LN LayerNorm+bias, learned offset-2 positions (NO RoPE), plain
+    /// ReLU fc1/fc2 with ALL linears biased, MHA 12/12, TIED head, eos 2,
+    /// no upstream repetition guard.
+    #[must_use]
+    pub fn onechart() -> Self {
+        Self {
+            family: DecoderFamily::Opt,
+            embed_positions: Some(("model.decoder.embed_positions.weight", 2)),
+            hidden_size: 768,
+            intermediate_size: 3072,
+            num_hidden_layers: 12,
+            num_attention_heads: 12,
+            head_dim: 64,
+            vocab_size: 50_269,
+            rope_theta: 10_000.0, // unused (learned positions)
+            rms_norm_eps: 1e-5,   // nn.LayerNorm default (HF OPT)
+            attn_qkv_bias: true,
+            no_repeat_ngram_size: 0,
+            num_key_value_heads: 12,
+            layers_prefix: "model.decoder.layers.",
+            embed_tokens: "model.decoder.embed_tokens.weight",
+            final_norm: "model.decoder.final_layer_norm.weight",
+            lm_head: None,
         }
     }
 
@@ -315,6 +366,9 @@ fn qwen2_layer(
     rope: &decoder::RopeTable,
     cfg: &DecoderConfig,
 ) -> FocrResult<Mat> {
+    if cfg.family == DecoderFamily::Opt {
+        return opt_layer(weights, x, layer, cfg);
+    }
     let p = format!("{}{layer}", cfg.layers_prefix);
     assert_no_qk_norm(weights, &p)?;
     let eps = cfg.rms_norm_eps;
@@ -406,6 +460,91 @@ fn qwen2_layer(
     decoder::add_residual(&h, &mlp)
 }
 
+/// One OPT (OneChart) decoder layer (census §4, HF `modeling_opt.py` with
+/// `do_layer_norm_before=true`): `h += out_proj(attn(LN1(h)))` then
+/// `h += fc2(relu(fc1(LN2(h))))` — LayerNorm WITH bias (the per-layer
+/// pre-MLP norm is *named* `final_layer_norm`, the census naming hazard),
+/// every linear biased, NO RoPE (learned positions were added before layer
+/// 0), full-causal MHA. The q pre-scaling stays inside our attention kernel
+/// (OQ-D5: one placement, mathematically equal to HF's q-side scale; the
+/// armed oracle cert measures the residual drift).
+fn opt_layer(weights: &Weights, x: &Mat, layer: usize, cfg: &DecoderConfig) -> FocrResult<Mat> {
+    let p = format!("{}{layer}", cfg.layers_prefix);
+    let eps = cfg.rms_norm_eps;
+    let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
+    let q_dim = cfg.q_dim();
+
+    // ── attention (pre-LN, all linears biased) ──────────────────────────────
+    let ln1_w = weights.vec(&format!("{p}.self_attn_layer_norm.weight"))?;
+    let ln1_b = weights.vec(&format!("{p}.self_attn_layer_norm.bias"))?;
+    let normed = nn::layer_norm(x, Some(&ln1_w), Some(&ln1_b), eps)?;
+
+    let q_b = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
+    let k_b = weights.vec(&format!("{p}.self_attn.k_proj.bias"))?;
+    let v_b = weights.vec(&format!("{p}.self_attn.v_proj.bias"))?;
+    let q = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.q_proj.weight"),
+        hidden,
+        q_dim,
+        Some(&q_b),
+    )?;
+    let k = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.k_proj.weight"),
+        hidden,
+        q_dim,
+        Some(&k_b),
+    )?;
+    let v = linear_auto(
+        weights,
+        &normed,
+        &format!("{p}.self_attn.v_proj.weight"),
+        hidden,
+        q_dim,
+        Some(&v_b),
+    )?;
+    // NO RoPE — OPT positions are the learned table added before layer 0.
+    let ctx = prefill_attention_gqa(&q, &k, &v, cfg)?;
+    let out_b = weights.vec(&format!("{p}.self_attn.out_proj.bias"))?;
+    let attn = linear_auto(
+        weights,
+        &ctx,
+        &format!("{p}.self_attn.out_proj.weight"),
+        q_dim,
+        hidden,
+        Some(&out_b),
+    )?;
+    let h = decoder::add_residual(x, &attn)?;
+
+    // ── plain ReLU MLP (fc1/fc2, biased; pre-LN named `final_layer_norm`) ───
+    let ln2_w = weights.vec(&format!("{p}.final_layer_norm.weight"))?;
+    let ln2_b = weights.vec(&format!("{p}.final_layer_norm.bias"))?;
+    let normed2 = nn::layer_norm(&h, Some(&ln2_w), Some(&ln2_b), eps)?;
+    let fc1_b = weights.vec(&format!("{p}.fc1.bias"))?;
+    let mut m = linear_auto(
+        weights,
+        &normed2,
+        &format!("{p}.fc1.weight"),
+        hidden,
+        inter,
+        Some(&fc1_b),
+    )?;
+    nn::relu(&mut m);
+    let fc2_b = weights.vec(&format!("{p}.fc2.bias"))?;
+    let mlp = linear_auto(
+        weights,
+        &m,
+        &format!("{p}.fc2.weight"),
+        inter,
+        hidden,
+        Some(&fc2_b),
+    )?;
+    decoder::add_residual(&h, &mlp)
+}
+
 /// Run the dense decoder prefill over `inputs_embeds: [seq, hidden]` (the
 /// post-`<imgpad>`-splice decoder input) through all layers and the final norm +
 /// **tied** lm_head, returning logits `[seq, vocab]`.
@@ -432,6 +571,25 @@ pub fn forward_prefill(
     let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
 
     let mut x = inputs_embeds.clone();
+    // Learned absolute positions (OPT): row `i + offset` of the table is
+    // added to token i's embedding before layer 0 (census §4: offset 2, ids
+    // 0..L-1 for our unpadded single sequence — OQ-D6).
+    if let Some((table, offset)) = cfg.embed_positions {
+        let pos = weights.mat(table)?;
+        if x.rows + offset > pos.rows {
+            return Err(FocrError::FormatMismatch(format!(
+                "decoder: seq {} + offset {offset} exceeds the {} learned positions (OQ-D7)",
+                x.rows, pos.rows
+            )));
+        }
+        for i in 0..x.rows {
+            let row = x.row_mut(i);
+            let p = &pos.data[(i + offset) * cfg.hidden_size..(i + offset + 1) * cfg.hidden_size];
+            for (a, b) in row.iter_mut().zip(p) {
+                *a += b;
+            }
+        }
+    }
     for layer in 0..cfg.num_hidden_layers {
         x = qwen2_layer(weights, &x, layer, &rope, cfg)?;
     }
@@ -443,6 +601,12 @@ pub fn forward_prefill(
         Some(name) => weights.mat(name)?,
         None => weights.mat(cfg.embed_tokens)?,
     };
+    if cfg.family == DecoderFamily::Opt {
+        // Model-level LayerNorm WITH bias, then the tied head.
+        let fb = weights.vec(&cfg.final_norm.replace(".weight", ".bias"))?;
+        let normed = nn::layer_norm(&x, Some(&final_norm), Some(&fb), cfg.rms_norm_eps)?;
+        return decoder::linear_no_bias(&normed, &embed.data, cfg.hidden_size, cfg.vocab_size);
+    }
     decoder::norm_and_lm_head(
         &x,
         &final_norm,
