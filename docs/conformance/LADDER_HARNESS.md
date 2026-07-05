@@ -245,3 +245,47 @@ Differential = "same as reference (any input)"; metamorphic = "self-consistent
 under transforms (no oracle)"; golden = "no regression vs frozen good output". This
 harness is the L0–L5 spine all three hang off, and its comparator is the single
 shared kernel.
+
+---
+
+## 9. The per-model generalization (model zoo, `bd-3jo6.1.10`)
+
+`tests/parity_ladder.rs` is the **Unlimited-OCR** instantiation. Every zoo
+model re-instantiates the same ladder, but its rungs live **in the module that
+implements the model** (armed `#[test]`s, env-gated) rather than in a second
+top-level harness file — the module owns its own conformance the same way it
+owns its math. Four instantiations exist; B8/C8/D6 each closed against this
+pattern with measured budgets:
+
+| Model | Oracle fixtures (own floor FIRST) | Rungs live in | e2e NDJSON script | Arming env |
+|-------|-----------------------------------|---------------|-------------------|------------|
+| Unlimited-OCR | `scripts/gen_reference_fixtures.py` | `tests/parity_ladder.rs` | `scripts/e2e_smoke.sh` | `FOCR_FIXTURES_DIR` + `FOCR_MODEL_PATH` |
+| GOT-OCR2 | `scripts/gen_reference_fixtures_got.py`, `gen_got_token_id_fixtures.py`, `gen_got_format_corpus.py` | `src/native_engine/got.rs`, `vision_sam.rs`, `decoder_qwen2.rs`, `postprocess.rs` | `scripts/spec_gate_e2e.sh` | `FOCR_GOT_DIR` |
+| SmolVLM2-500M | `scripts/gen_reference_fixtures_smolvlm2.py`, `…_smolvlm2_vision.py`, `gen_smolvlm2_token_id_fixtures.py`, `gen_smolvlm2_vqa_fixtures.py` | `src/native_engine/smolvlm2.rs`, `vision_siglip.rs`, `token_compress.rs` | `scripts/smolvlm2_convert_e2e.sh`, `smolvlm2_describe_e2e.sh` | `FOCR_SMOLVLM2_DIR` |
+| OneChart | `scripts/gen_reference_fixtures_onechart.py` | `src/native_engine/onechart.rs`, `decoder_qwen2.rs` | `scripts/onechart_chart_e2e.sh` | `FOCR_ONECHART_DIR` |
+
+**The recipe a new model lane (TrOMR E, TrOCR/pix2tex F) follows:**
+
+1. **Census spec first** (`docs/zoo/<model>-spec.md`) — architecture, seams,
+   prompt contract, quant policy. No rung ships against an unresolved `[OPEN]`.
+2. **Oracle fixture script** `scripts/gen_reference_fixtures_<model>.py` — runs
+   the pinned torch oracle **twice** (two thread counts) and records the
+   model's **own** nondeterminism floor in the fixture JSON *before* any
+   tolerance exists (§6 applies per model; floors are NOT transferable between
+   models).
+3. **Armed in-module rungs**, mirroring the L0–L5 ladder: L0 preprocess exact →
+   prompt ids exact (tokenizer conformance gate) → per-op/per-seam cosine ≈ 1 →
+   prefill logits/argmax vs oracle → greedy decode token-exact over the
+   **measured** exact-prefix (near-tie flips are ledger-gated — see
+   DISCREPANCIES DISC-003: same-precision kvcache-vs-prefill reduction-order
+   divergence compounds autoregressively) → task-quality budget (CER / VQA
+   containment / number-head distance) measured in BOTH precisions.
+4. **Skip-with-SUCCESS gating**: without the model dir the rung logs a skip
+   and passes; with it, the rung is a hard gate. Negative-path proof via a
+   `/nonexistent` model (clean `ModelNotFound`, never a fallback).
+5. **e2e NDJSON script** `scripts/<model>_*_e2e.sh` — versioned schema,
+   data-only stdout, gate/bin/negative/task steps (D8's
+   `onechart_chart_e2e.sh` is the current template).
+6. **Budget provenance**: every numeric tolerance in a rung cites the
+   measurement that produced it (fixture floor, ledger entry, or an
+   in-test comment with the measured value and date). Never `0.055`.
