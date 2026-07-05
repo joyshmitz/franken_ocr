@@ -991,6 +991,9 @@ impl OcrModel {
         if self.arch().id() == "smolvlm2" {
             return self.forward_smolvlm2(&preprocess::decode_path(image_path)?);
         }
+        if self.arch().id() == "onechart" {
+            return self.forward_onechart(&preprocess::decode_path(image_path)?);
+        }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         // Mode = the certified Base-1024 default unless the CLI overrode it
@@ -1013,6 +1016,9 @@ impl OcrModel {
         }
         if self.arch().id() == "smolvlm2" {
             return self.forward_smolvlm2(&img);
+        }
+        if self.arch().id() == "onechart" {
+            return self.forward_onechart(&img);
         }
         let t = std::time::Instant::now();
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
@@ -1072,6 +1078,30 @@ impl OcrModel {
             t.elapsed().as_secs_f64()
         ));
         Ok((text, w, h))
+    }
+
+    /// The OneChart chart→dict forward path (D6-D8, bd-3jo6.4.5+): raw-[0,1]
+    /// squash preprocess → the certified SAM tower + `mm_projector` →
+    /// `<imgpad>` splice → OPT KV-cache greedy → the `<Number>` number-head
+    /// tap → strip/brace-complete → the self-verify verdict. The text output
+    /// is the repaired chart dict; the verdict + `pred_locs` are logged via
+    /// [`timing_log`] (a structured robot field is future surface — the
+    /// census's 'structured fields' contract is [`onechart::ChartResult`],
+    /// already the library return type).
+    fn forward_onechart(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        use image::GenericImageView;
+        let t = std::time::Instant::now();
+        let (w, h) = img.dimensions();
+        let tk = self.tokenizer()?;
+        let max_new = self.decode_params.max_length;
+        let res = onechart::recognize(&self.weights, tk, img, max_new)?;
+        timing_log(&format!(
+            "onechart forward {:.2}s (reliable_distance {:?} reliable {:?})",
+            t.elapsed().as_secs_f64(),
+            res.reliable_distance,
+            res.reliable
+        ));
+        Ok((res.json_text, w, h))
     }
 
     /// The GOT Qwen tiktoken tokenizer, loaded from `qwen.tiktoken` beside the
@@ -1562,11 +1592,17 @@ impl OcrModel {
         if let Some(t) = self.tokenizer.get() {
             return Ok(t);
         }
-        // The tokenizer.json ships beside the weights; the resolver hands us the
+        // The tokenizer ships beside the weights; the resolver hands us the
         // model path, the tokenizer sits in the same directory (or is the same
-        // bundle dir). We look next to the resolved model path.
+        // bundle dir). OneChart is the one arch with NO tokenizer.json — its
+        // slow-tokenizer file triple (vocab.json + merges.txt +
+        // added_tokens.json) loads through the OPT path (D9).
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let loaded = crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))?;
+        let loaded = if self.arch().id() == "onechart" {
+            crate::tokenizer::Tokenizer::from_opt_dir(dir)?
+        } else {
+            crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))?
+        };
         let _ = self.tokenizer.set(loaded);
         Ok(self.tokenizer.get().expect("tokenizer just set"))
     }

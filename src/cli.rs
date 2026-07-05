@@ -385,6 +385,14 @@ impl OcrRequestArgs {
 /// * an ambiguous explicit spec passes through: mislabeling would reject real
 ///   artifacts, and the engine's arch tag makes the final call.
 fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResult<()> {
+    if task == OcrTask::ChartData && model_spec_is_knowably_not_onechart(model_spec) {
+        return Err(FocrError::Usage(
+            "--task chart-data (chart→dict + number-head self-verify) needs the onechart \
+             model, but this run would use a different model. Re-run with \
+             `--model onechart.int8.focrq` (see `focr models`)"
+                .into(),
+        ));
+    }
     if task == OcrTask::Describe && model_spec_is_knowably_not_smolvlm2(model_spec) {
         return Err(FocrError::Usage(
             "--task describe (photo description/VQA) needs the smolvlm2 model, but this \
@@ -407,6 +415,20 @@ fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResu
 /// all (the default resolution is always unlimited-ocr) or a file name naming
 /// another family without `smolvlm`. An ambiguous name passes through to the
 /// engine's arch tag.
+/// True when the model spec is KNOWABLY not a onechart artifact (mirrors
+/// [`model_spec_is_knowably_not_smolvlm2`]).
+fn model_spec_is_knowably_not_onechart(spec: Option<&Path>) -> bool {
+    let Some(path) = spec else {
+        return true;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    !name.contains("onechart")
+        && (name.contains("unlimited") || name.contains("got") || name.contains("smolvlm"))
+}
+
 fn model_spec_is_knowably_not_smolvlm2(spec: Option<&Path>) -> bool {
     let Some(path) = spec else {
         return true;
@@ -471,6 +493,10 @@ pub enum OcrTask {
     Music,
     /// Photo description / VQA — planned (smolvlm2); errors cleanly today.
     Describe,
+    /// Chart → structured python-dict data + number-head self-verify
+    /// (onechart; needs `--model onechart.int8.focrq`). Distinct from
+    /// `chart`, which is GOT-OCR2's format-mode rendering.
+    ChartData,
 }
 
 impl OcrTask {
@@ -501,6 +527,7 @@ impl std::fmt::Display for OcrTask {
             Self::Geometry => "geometry",
             Self::Music => "music",
             Self::Describe => "describe",
+            Self::ChartData => "chart-data",
         })
     }
 }

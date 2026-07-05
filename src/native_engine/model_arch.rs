@@ -462,7 +462,10 @@ static ONECHART: PlannedArch = PlannedArch {
     // kill-switched int8 lever lands (doctrine #2).
     lm_head_stored_int8: false,
     embed_tokens_name: "model.decoder.embed_tokens.weight",
-    implemented: false,
+    // D1-D9 shipped: convert (D2), tokenizer (D9), vision (D3), OPT decoder
+    // both paths (D4), number head + self-verify + recognize (D5),
+    // `--task chart-data` routing (D7).
+    implemented: true,
 };
 static TROMR: PlannedArch = PlannedArch {
     id: "tromr",
@@ -569,9 +572,12 @@ mod tests {
             .map(|a| a.id())
             .collect();
         implemented.sort_unstable();
-        assert_eq!(implemented, ["got-ocr2", "smolvlm2", "unlimited-ocr"]);
+        assert_eq!(
+            implemented,
+            ["got-ocr2", "onechart", "smolvlm2", "unlimited-ocr"]
+        );
         // The remaining zoo models are present but NOT yet implemented (descriptors).
-        for id in ["onechart", "tromr", "trocr", "pix2tex"] {
+        for id in ["tromr", "trocr", "pix2tex"] {
             let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
@@ -672,7 +678,7 @@ mod tests {
     #[test]
     fn onechart_descriptor_matches_the_census() {
         let a = arch_by_id("onechart").expect("onechart registered");
-        assert!(!a.implemented(), "sub-epic D forward has not landed yet");
+        assert!(a.implemented(), "sub-epic D shipped D1-D9 (chart-data)");
         assert_eq!(a.vision_encoder(), VisionEncoder::SamVit);
         assert_eq!(a.decoder(), Decoder::OptDense);
         assert_eq!(a.tokenizer(), TokenizerKind::Gpt2Bpe);
