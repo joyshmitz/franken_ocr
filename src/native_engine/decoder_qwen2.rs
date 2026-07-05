@@ -567,6 +567,34 @@ pub fn forward_prefill(
             inputs_embeds.cols, cfg.hidden_size
         )));
     }
+    let normed = prefill_final_hidden(weights, cfg, inputs_embeds)?;
+    let embed = match cfg.lm_head {
+        Some(name) => weights.mat(name)?,
+        None => weights.mat(cfg.embed_tokens)?,
+    };
+    decoder::linear_no_bias(&normed, &embed.data, cfg.hidden_size, cfg.vocab_size)
+}
+
+/// The prefill through all layers + the FINAL norm, WITHOUT the lm_head —
+/// the post-final-norm hidden stream `[seq, hidden]` (the same values that
+/// feed `lm_head`, and what OneChart's `num_decoder` taps at the `<Number>`
+/// step — census §8 / bd-3jo6.4.5). [`forward_prefill`] is exactly this plus
+/// the head projection.
+///
+/// # Errors
+/// As [`forward_prefill`].
+pub fn prefill_final_hidden(
+    weights: &Weights,
+    cfg: &DecoderConfig,
+    inputs_embeds: &Mat,
+) -> FocrResult<Mat> {
+    cfg.validate_gqa()?;
+    if inputs_embeds.cols != cfg.hidden_size {
+        return Err(FocrError::FormatMismatch(format!(
+            "decoder_qwen2: inputs_embeds cols {} != hidden {}",
+            inputs_embeds.cols, cfg.hidden_size
+        )));
+    }
     let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
 
@@ -594,26 +622,13 @@ pub fn forward_prefill(
         x = qwen2_layer(weights, &x, layer, &rope, cfg)?;
     }
 
-    // final RMSNorm + lm_head (f32): the tied embed table (GOT) or the arch's
-    // untied head tensor (SmolVLM2), per cfg.lm_head.
     let final_norm = weights.vec(cfg.final_norm)?;
-    let embed = match cfg.lm_head {
-        Some(name) => weights.mat(name)?,
-        None => weights.mat(cfg.embed_tokens)?,
-    };
     if cfg.family == DecoderFamily::Opt {
-        // Model-level LayerNorm WITH bias, then the tied head.
+        // Model-level LayerNorm WITH bias.
         let fb = weights.vec(&cfg.final_norm.replace(".weight", ".bias"))?;
-        let normed = nn::layer_norm(&x, Some(&final_norm), Some(&fb), cfg.rms_norm_eps)?;
-        return decoder::linear_no_bias(&normed, &embed.data, cfg.hidden_size, cfg.vocab_size);
+        return nn::layer_norm(&x, Some(&final_norm), Some(&fb), cfg.rms_norm_eps);
     }
-    decoder::norm_and_lm_head(
-        &x,
-        &final_norm,
-        &embed.data,
-        cfg.vocab_size,
-        cfg.rms_norm_eps,
-    )
+    nn::rms_norm(&x, Some(&final_norm), cfg.rms_norm_eps)
 }
 
 /// Greedy (argmax, temperature-0) autoregressive decode from `inputs_embeds`,
