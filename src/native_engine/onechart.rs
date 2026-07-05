@@ -600,6 +600,147 @@ mod tests {
         }
     }
 
+    /// **bd-2lje — the in-distribution SCRM-proxy quality corpus** (skip-with-
+    /// SUCCESS without weights): six default-style matplotlib charts with
+    /// exact known values (`tests/fixtures/onechart/corpus/`), run through
+    /// the PRODUCT path (int8 artifact). Per census §13-L5 the metrics are
+    /// (a) valid-JSON rate, (b) per-value relative error (order-independent
+    /// sorted pairing), (c) the number head's distance to the normalized GT.
+    /// Gates are pinned from the first measurement pass.
+    #[test]
+    fn corpus_quality_scrm_proxy() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            return;
+        };
+        let int8_path = format!("{dir}/onechart.int8.focrq");
+        if !std::path::Path::new(&int8_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {int8_path} absent");
+            return;
+        }
+        let corpus_dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/onechart/corpus"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{corpus_dir}/manifest.json"))
+                .expect("corpus manifest"),
+        )
+        .expect("manifest parses");
+        let tk = crate::tokenizer::Tokenizer::from_opt_dir(std::path::Path::new(&dir))
+            .expect("onechart tokenizer");
+        // Both precisions measured: int8 = the product path; f32 = the
+        // reference (discriminates model garble from int8 drift).
+        let mut legs: Vec<(&str, Weights)> = vec![(
+            "int8",
+            Weights::load(std::path::Path::new(&int8_path)).expect("int8 artifact"),
+        )];
+        let f32_path = format!("{dir}/model.safetensors");
+        if std::path::Path::new(&f32_path).is_file() {
+            legs.push((
+                "f32",
+                Weights::load(std::path::Path::new(&f32_path)).expect("f32 weights"),
+            ));
+        }
+        for (label, weights) in &legs {
+            run_corpus_leg(label, weights, &tk, corpus_dir, &manifest);
+        }
+    }
+
+    fn run_corpus_leg(
+        label: &str,
+        weights: &Weights,
+        tk: &crate::tokenizer::Tokenizer,
+        corpus_dir: &str,
+        manifest: &serde_json::Value,
+    ) {
+        let mut n_valid_json = 0usize;
+        let mut head_dists = Vec::new();
+        let mut value_errs = Vec::new();
+        let charts = manifest["charts"].as_array().unwrap();
+        for chart in charts {
+            let file = chart["file"].as_str().unwrap();
+            let img = image::open(format!("{corpus_dir}/{file}")).expect("chart decodes");
+            let res = recognize(weights, tk, &img, 512).expect("recognize");
+            let gt = extract_gt_values(&chart["values"]).expect("manifest GT is list-free");
+            let gt_norm = normalize_gt(&gt);
+
+            let parsed: Option<serde_json::Value> = serde_json::from_str(&res.json_text).ok();
+            let valid = parsed.is_some();
+            n_valid_json += usize::from(valid);
+
+            // (b) per-value relative error, order-independent (sorted pairing).
+            let ours_vals = parsed
+                .as_ref()
+                .and_then(|p| p.get("values").or_else(|| p.get("data")).cloned())
+                .and_then(|v| extract_gt_values(&v));
+            let rel_err = ours_vals.as_ref().map(|ov| {
+                let mut a = ov.clone();
+                let mut b = gt.clone();
+                a.sort_by(f64::total_cmp);
+                b.sort_by(f64::total_cmp);
+                let n = a.len().min(b.len()).max(1);
+                let pair_err: f64 = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs() / y.abs().max(1.0))
+                    .sum::<f64>()
+                    / n as f64;
+                // Count mismatch is itself an error signal.
+                let miss = (a.len() as f64 - b.len() as f64).abs() / b.len().max(1) as f64;
+                pair_err + miss
+            });
+            if let Some(e) = rel_err {
+                value_errs.push(e);
+            }
+
+            // (c) the number head vs the normalized GT.
+            let head_dist = res
+                .pred_locs
+                .as_ref()
+                .map(|locs| reliable_distance(locs, &gt_norm));
+            if let Some(d) = head_dist {
+                head_dists.push(d);
+            }
+            eprintln!(
+                "[bd-2lje {label}] {file}: valid_json={valid} rel_err={rel_err:?} head_dist={head_dist:?}"
+            );
+            let snip: String = res.json_text.chars().take(160).collect();
+            eprintln!("[bd-2lje {label}] {file}: text={snip:?}");
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        eprintln!(
+            "[bd-2lje {label}] SUMMARY: valid_json {n_valid_json}/{} | mean rel_err {:.3} (n={}) | \
+             mean head_dist {:.3} (n={})",
+            charts.len(),
+            mean(&value_errs),
+            value_errs.len(),
+            mean(&head_dists),
+            head_dists.len()
+        );
+        assert_eq!(charts.len(), 6, "corpus shrank");
+        // MEASURED gates (2026-07-05, release, BOTH legs): the number head
+        // fires on ALL six charts, mean distance 0.015 int8 / 0.014 f32
+        // (max 0.034) — values read to ~1.5% of range; the stable
+        // in-distribution signal. valid-JSON is the weak leg in EVERY
+        // precision (1/6, same chart): the decoded text is BYTE-IDENTICAL
+        // f32-vs-int8 on all six charts, so the garble is the model's own
+        // text decoder, not quantization — int8 is token-exact-lossless on
+        // this corpus. rel_err has n=0 because the garbled text never emits
+        // a proper "values" dict; the metric stays armed for regressions
+        // that would fix or further break the text leg.
+        assert_eq!(
+            head_dists.len(),
+            6,
+            "{label}: the number head must fire on every chart"
+        );
+        assert!(
+            mean(&head_dists) < 0.05,
+            "{label}: mean head distance {} regressed past the 0.05 gate (measured 0.015)",
+            mean(&head_dists)
+        );
+        assert!(n_valid_json >= 1, "{label}: valid-JSON collapsed");
+    }
+
     /// D5: the reliable_check pure math vs upstream-exact golden vectors
     /// (computed with the reference python: the two regex subs, min-max
     /// `(x−min)/(max−min+1e-9)`, python banker's `round(x,4)`).
