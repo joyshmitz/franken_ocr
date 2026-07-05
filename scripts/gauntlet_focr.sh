@@ -35,6 +35,7 @@ PRECISION=""
 OUT_DIR=""
 SELF_TEST=0
 SYNTHETIC=0
+EXTRA_ARGS=()   # zoo lanes: e.g. --extra-arg --task --extra-arg chart-data
 
 usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     --synthetic) SYNTHETIC=1; shift ;;   # stamp records synthetic (stub runs)
+    --extra-arg) EXTRA_ARGS+=("$2"); shift 2 ;;  # appended AFTER --model (A11 zoo tasks)
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -144,6 +146,8 @@ fi
 
 CMD=("$BINARY" "ocr" "$PAGE")
 [[ -n "$MODEL" ]] && CMD+=("--model" "$MODEL")
+# Extras go LAST so the meta writer's fixed cmd indices (page=2, model=4) hold.
+(( ${#EXTRA_ARGS[@]} )) && CMD+=("${EXTRA_ARGS[@]}")
 
 # Thread parity pins: focr's own budget plus the pool knobs a helper could
 # read. Recorded verbatim into every run's meta (the ledger `command/env`).

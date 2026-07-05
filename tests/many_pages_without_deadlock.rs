@@ -585,6 +585,258 @@ fn spine_many_pages_one_live_forward_within_budget() {
     }
 }
 
+// ───────────────────────────── scenario 1c: the zoo lanes ─────────────────────────────
+
+/// One zoo model lane the A11 watchdog drives.
+struct ZooLane {
+    /// Scenario-case suffix + log label.
+    name: &'static str,
+    /// The lane's arming env var, pointing at its zoo model dir.
+    dir_env: &'static str,
+    /// The int8 artifact filename inside that dir.
+    artifact: &'static str,
+    /// A COMMITTED, really-decodable fixture image (repo-relative) — the same
+    /// per-model sample the lane's own certs use, so a heavy run drives REAL
+    /// full forwards, never an input-decode error masquerading as coverage.
+    image: &'static str,
+}
+
+const ZOO_LANES: [ZooLane; 3] = [
+    ZooLane {
+        name: "got_ocr2",
+        dir_env: "FOCR_GOT_DIR",
+        artifact: "got-ocr2.int8.focrq",
+        image: "tests/fixtures/got/sample_text.png",
+    },
+    ZooLane {
+        name: "smolvlm2",
+        dir_env: "FOCR_SMOLVLM2_DIR",
+        artifact: "smolvlm2.int8.focrq",
+        image: "tests/fixtures/smolvlm2/sample_photo.png",
+    },
+    ZooLane {
+        name: "onechart",
+        dir_env: "FOCR_ONECHART_DIR",
+        artifact: "onechart.int8.focrq",
+        image: "tests/fixtures/onechart/sample_chart.png",
+    },
+];
+
+/// Sequential real forwards per armed zoo lane. Unlike the no-weights batch
+/// (microsecond `ModelNotFound` returns, so pages ≫ pool is nearly free), a
+/// zoo forward costs seconds-to-tens-of-seconds, so the base multiplier would
+/// blow any honest budget. The doctrine-#5 regressions this scenario guards —
+/// a nested runtime, rayon under a held lock, a gauge violation — manifest on
+/// the FIRST forward or on the first weak-cache REUSE call; several sequential
+/// forwards through one engine cover both plus steady-state repetition.
+const ZOO_PAGES_PER_LANE: usize = 6;
+
+/// Interleave rounds for the cross-lane cache-swap pass (each round visits
+/// every armed lane once through ONE shared engine).
+const ZOO_INTERLEAVE_ROUNDS: usize = 2;
+
+/// Resolve a lane's artifact + image, if armed. `None` = skip-with-SUCCESS.
+fn zoo_lane_paths(lane: &ZooLane) -> Option<(PathBuf, PathBuf)> {
+    let dir = std::env::var_os(lane.dir_env).map(PathBuf::from)?;
+    let model = dir.join(lane.artifact);
+    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join(lane.image);
+    (model.is_file() && image.is_file()).then_some((model, image))
+}
+
+/// Drive `pages` items through `engine.recognize_with_model` sequentially,
+/// counting terminal outcomes (the shared batch body of both zoo passes).
+fn drive_zoo_batch(engine: &OcrEngine, items: &[(PathBuf, PathBuf)]) -> BatchReport {
+    let mut report = BatchReport {
+        completed: 0,
+        ok_results: 0,
+        model_not_found: 0,
+        other_terminal: 0,
+    };
+    for (model, image) in items {
+        match engine.recognize_with_model(model, image) {
+            Ok(_) => report.ok_results += 1,
+            Err(FocrError::ModelNotFound(_)) => report.model_not_found += 1,
+            Err(_) => report.other_terminal += 1,
+        }
+        report.completed += 1;
+    }
+    report
+}
+
+/// bd-3jo6.1.11 (A11): the ZOO watchdog. Doctrine #5 applies to every model
+/// lane, not just the base model — each zoo forward (GOT / SmolVLM2 /
+/// OneChart) fans out through the SAME kernel rayon pool under the same
+/// one-live-forward discipline, and sequential calls share the weak model
+/// cache and per-model tokenizer state. Two passes, both watchdog-bounded:
+///
+/// 1. **Per-lane**: one engine, `ZOO_PAGES_PER_LANE` sequential REAL forwards
+///    over the lane's committed cert image. Every call must return `Ok` — the
+///    artifact and image are both known-good, so any error is a real defect,
+///    not "progress".
+/// 2. **Cross-lane interleave**: ONE engine, the armed lanes visited
+///    round-robin. Each adjacent pair forces a model swap through the weak
+///    cache (drop + reload + tokenizer switch) — the multi-model risk surface
+///    the per-lane pass cannot reach.
+///
+/// Heavy-only, model-gated skip-with-SUCCESS per lane: the no-weights fast
+/// path CANNOT reach zoo dispatch (`arch()` is read from the loaded artifact,
+/// so an absent model is `ModelNotFound` before any zoo code runs) and is
+/// already proved by `many_sequential_pages_complete_within_budget`; the skip
+/// line says so instead of claiming coverage. Arming contract (env is
+/// process-immutable in-test, so the caller sets these): `FOCR_GOT_DIR` /
+/// `FOCR_SMOLVLM2_DIR` / `FOCR_ONECHART_DIR`, plus optionally
+/// `FOCR_MAX_NEW_TOKENS` to bound per-forward decode cost (a capped run's
+/// tokens are a true prefix — it never alters per-step math).
+#[test]
+fn zoo_models_sequential_pages_complete_within_budget() {
+    let pool = detected_pool();
+    let mut armed: Vec<(&ZooLane, PathBuf, PathBuf)> = Vec::new();
+
+    for lane in &ZOO_LANES {
+        let case = format!("zoo_sequential_{}", lane.name);
+        match zoo_lane_paths(lane) {
+            None => {
+                log_line(
+                    &case,
+                    "skip",
+                    "skip_no_model",
+                    &format!(
+                        r#""reason":"{env} unset or {artifact}/fixture image absent — the zoo dispatch is unreachable without the loaded artifact (arch() comes from the weights), and the no-weights orchestration path is already proved by many_sequential_pages_complete_within_budget","native_path_ran":true,"fallback_target":"{ABSENT_MODEL}""#,
+                        env = lane.dir_env,
+                        artifact = lane.artifact,
+                    ),
+                );
+                continue;
+            }
+            Some((model, image)) => {
+                log_line(
+                    &case,
+                    "setup",
+                    "pass",
+                    &format!(
+                        r#""seed":0,"pool":{pool},"pages_issued":{ZOO_PAGES_PER_LANE},"timeout_budget_secs":{budget},"mode":"heavy_forward","model_path":{mp},"image_path":{ip}"#,
+                        budget = WATCHDOG_BUDGET_HEAVY.as_secs(),
+                        mp = json_str(&model.display().to_string()),
+                        ip = json_str(&image.display().to_string()),
+                    ),
+                );
+
+                let items: Vec<(PathBuf, PathBuf)> = (0..ZOO_PAGES_PER_LANE)
+                    .map(|_| (model.clone(), image.clone()))
+                    .collect();
+                let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+                    let engine =
+                        OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+                    drive_zoo_batch(&engine, &items)
+                });
+                report_zoo_outcome(&case, lane.name, pool, ZOO_PAGES_PER_LANE, outcome);
+                armed.push((lane, model, image));
+            }
+        }
+    }
+
+    // Cross-lane interleave: only meaningful with ≥ 2 armed lanes (one lane
+    // has no swap seam; zero lanes was fully skip-logged above).
+    let case = "zoo_interleaved_cache_swap";
+    if armed.len() < 2 {
+        log_line(
+            case,
+            "skip",
+            "skip_no_model",
+            &format!(
+                r#""reason":"needs >= 2 armed zoo lanes for a model-swap seam (armed: {})","native_path_ran":true,"fallback_target":"{ABSENT_MODEL}""#,
+                armed.len(),
+            ),
+        );
+        return;
+    }
+
+    let items: Vec<(PathBuf, PathBuf)> = (0..ZOO_INTERLEAVE_ROUNDS)
+        .flat_map(|_| {
+            armed
+                .iter()
+                .map(|(_, model, image)| (model.clone(), image.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let pages = items.len();
+    log_line(
+        case,
+        "setup",
+        "pass",
+        &format!(
+            r#""seed":0,"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{budget},"mode":"heavy_forward","lanes":{lanes},"rounds":{ZOO_INTERLEAVE_ROUNDS}"#,
+            budget = WATCHDOG_BUDGET_HEAVY.as_secs(),
+            lanes = armed.len(),
+        ),
+    );
+    let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        drive_zoo_batch(&engine, &items)
+    });
+    report_zoo_outcome(case, "interleave", pool, pages, outcome);
+}
+
+/// Shared assertion + logging tail for both zoo passes: completion within
+/// budget, every page driven terminal, and every call `Ok` (known-good
+/// artifact + committed image ⇒ an error is a defect, never "progress").
+fn report_zoo_outcome(
+    case: &str,
+    label: &str,
+    pool: usize,
+    pages: usize,
+    outcome: Watch<BatchReport>,
+) {
+    match outcome {
+        Watch::TimedOut => {
+            log_line(
+                case,
+                "error",
+                "fail",
+                &format!(
+                    r#""diag":{{"error_kind":"DEADLOCK_SUSPECTED","focr_exit_code":5,"message":"zoo batch did not complete within watchdog budget"}},"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{}"#,
+                    WATCHDOG_BUDGET_HEAVY.as_secs(),
+                ),
+            );
+            panic!(
+                "DEADLOCK SUSPECTED ({label}): the sequential {pages}-page zoo batch \
+                 (pool={pool}) did NOT complete within the {}s wall-clock watchdog \
+                 budget. Doctrine #5 regression in a zoo lane: nested runtime, \
+                 rayon under a held lock, or a cache-swap hang.",
+                WATCHDOG_BUDGET_HEAVY.as_secs(),
+            );
+        }
+        Watch::Finished { payload, elapsed } => {
+            let BatchReport {
+                completed,
+                ok_results,
+                model_not_found,
+                other_terminal,
+            } = payload;
+            assert_eq!(
+                completed, pages,
+                "{label}: expected all {pages} pages driven to completion, got {completed}"
+            );
+            assert_eq!(
+                ok_results, pages,
+                "{label}: every zoo forward must succeed on the committed cert image \
+                 (ok={ok_results}, model_not_found={model_not_found}, \
+                 other_terminal={other_terminal})"
+            );
+            log_line(
+                case,
+                "result",
+                "pass",
+                &format!(
+                    r#""elapsed_us":{elapsed_us},"pool":{pool},"pages_issued":{pages},"completed":{completed},"ok_results":{ok_results},"per_page_avg_us":{per_page}"#,
+                    elapsed_us = elapsed.as_micros(),
+                    per_page = elapsed.as_micros() / (completed.max(1) as u128),
+                ),
+            );
+        }
+    }
+}
+
 // ───────────────────────────── scenario 2 ─────────────────────────────
 
 /// Engine-construction-under-concurrency: many threads each build their OWN

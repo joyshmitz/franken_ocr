@@ -112,6 +112,34 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("got_vision_splice", re.compile(r"^got\.vision\+splice (?P<s>\d+(?:\.\d+)?)s$")),
     ("got_generate", re.compile(r"^got\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$")),
     ("got_forward", re.compile(r"^got forward (?P<s>\d+(?:\.\d+)?)s$")),
+    # The SmolVLM2 / OneChart lanes (A11, bd-3jo6.1.11) — same shape as GOT's:
+    # vision+splice, generate, forward-total. Their decode/seed(prefill)
+    # breakdown arrives via the SHARED engine line (`got_decode` above —
+    # `generate_greedy_kvcache` emits it for every dense lane).
+    (
+        "smolvlm2_vision_splice",
+        re.compile(
+            r"^smolvlm2\.vision\+splice (?P<s>\d+(?:\.\d+)?)s"
+            r" \((?P<frames>\d+) frames, (?P<prompt>\d+) prompt ids\)$"
+        ),
+    ),
+    (
+        "smolvlm2_generate",
+        re.compile(r"^smolvlm2\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    ("smolvlm2_forward", re.compile(r"^smolvlm2 forward (?P<s>\d+(?:\.\d+)?)s$")),
+    (
+        "onechart_vision_splice",
+        re.compile(r"^onechart\.vision\+splice (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "onechart_generate",
+        re.compile(r"^onechart\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "onechart_forward",
+        re.compile(r"^onechart forward (?P<s>\d+(?:\.\d+)?)s \(reliable_distance .*\)$"),
+    ),
 ]
 
 
@@ -208,8 +236,10 @@ def infer_precision(runs: list[dict]) -> str | None:
     saw_marked = False
     saw_int8 = False
     for run in runs:
-        if "got_forward" in run:
-            continue  # GOT timing lines carry no `_i8` marker; they prove nothing
+        if any(k in run for k in ("got_forward", "smolvlm2_forward", "onechart_forward")):
+            # Zoo-lane timing lines carry no `_i8` marker; their shared-engine
+            # `prefill` fan-out would otherwise read as an UNMARKED f32 claim.
+            continue
         for name in ("prefill", "decode_total", "weight_cache_build"):
             entry = run.get(name)
             if entry is None:
