@@ -1074,7 +1074,12 @@ fn got_lm_head(w: &GotDecodeWeights, x_row: &Mat, eps: f32) -> FocrResult<Vec<f3
             LmHead::Int8(q) => {
                 let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
                 let mut logits = decoder::gemv_i8_bias_prequant(&xq, a, q, None);
-                refine_topk_f32(&mut logits, &normed.data, w.head_matrix(), w.cfg.hidden_size);
+                refine_topk_f32(
+                    &mut logits,
+                    &normed.data,
+                    w.head_matrix(),
+                    w.cfg.hidden_size,
+                );
                 Ok(logits)
             }
         };

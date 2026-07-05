@@ -117,6 +117,12 @@ since exact-token OCR fails in the tail.
 - Kill-switch: none needed (f32-vs-f32 numerics, not a quant tier); for a
     trajectory bit-faithful to the sdpa math, `generate_greedy` is the O(n²)
     reference path.
+- ALSO OBSERVED at OPT geometry (OneChart D4, 2026-07-05): on the SAME int8
+    artifact, the kvcache and re-prefill greedy paths agree for a measured
+    13-step prefix at ~320 positions, then flip a whitespace/quote-class JSON
+    near-tie — the same reduction-order compounding; the D4 cert gates
+    prefix ≥ 12 plus the `<Number>`-first and dict-open structural anchors
+    (`onechart.rs::opt_kvcache_matches_greedy_and_oracle`).
 - Review date: when C8's L5 caption/VQA quality budget lands — score both captions
     under the keyword-containment metric and confirm the flips move no metric.
 
