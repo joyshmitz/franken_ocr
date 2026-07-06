@@ -1127,6 +1127,37 @@ struct XmlNote {
 /// # Errors
 /// A token that parses as none of the §9 vocabulary classes.
 pub fn semantic_to_musicxml(merged: &str) -> FocrResult<String> {
+    staves_to_musicxml(std::slice::from_ref(&merged.to_owned()))
+}
+
+/// Multi-staff MusicXML: one `<part>` per staff (P1..PN, top-to-bottom —
+/// the E5 full-page contract; cross-staff beat alignment is the deferred
+/// `**kern` follow-up's concern).
+///
+/// # Errors
+/// As [`semantic_to_musicxml`], per staff.
+pub fn staves_to_musicxml(semantics: &[String]) -> FocrResult<String> {
+    let mut part_list = String::new();
+    let mut parts = String::new();
+    for (i, merged) in semantics.iter().enumerate() {
+        let id = i + 1;
+        part_list.push_str(&format!(
+            "<score-part id=\"P{id}\"><part-name>Staff {id}</part-name></score-part>"
+        ));
+        parts.push_str(&format!(
+            "  <part id=\"P{id}\">\n{}\n  </part>\n",
+            part_measures(merged)?
+        ));
+    }
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <score-partwise version=\"4.0\">\n\
+         \x20 <part-list>{part_list}</part-list>\n{parts}</score-partwise>\n"
+    ))
+}
+
+/// The per-part measure builder (the body of one `<part>`).
+fn part_measures(merged: &str) -> FocrResult<String> {
     let mut measures: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut attributes = String::new();
@@ -1315,14 +1346,7 @@ pub fn semantic_to_musicxml(merged: &str) -> FocrResult<String> {
         }
     }
     flush(&mut current, &mut measures);
-
-    Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <score-partwise version=\"4.0\">\n\
-         \x20 <part-list><score-part id=\"P1\"><part-name>Music</part-name></score-part></part-list>\n\
-         \x20 <part id=\"P1\">\n{}\n  </part>\n</score-partwise>\n",
-        measures.join("\n")
-    ))
+    Ok(measures.join("\n"))
 }
 
 // ───────────────── E9: the recognize assembly ─────────────────
@@ -1336,6 +1360,12 @@ pub struct MusicResult {
     /// Partwise MusicXML 4.0.
     pub musicxml: String,
 }
+
+/// Page-space staff bounding box `(x, y, w, h)`.
+pub type StaffBBox = (usize, usize, usize, usize);
+
+/// One recognized staff and its page-space bbox.
+pub type StaffRecognition = (MusicResult, StaffBBox);
 
 /// The full E9 single-staff pipeline: §6 preprocess → the certified encoder →
 /// deterministic argmax generate → §8 merge → MusicXML. The input must be a
@@ -1369,6 +1399,39 @@ pub fn recognize(
     let semantic = merge_semantic(tk, &streams)?;
     let musicxml = semantic_to_musicxml(&semantic)?;
     Ok(MusicResult { semantic, musicxml })
+}
+
+/// The E5 full-page pipeline: staff detection → per-staff [`recognize`]
+/// (SEQUENTIAL, doctrine #5) → `(per-staff results, page bboxes)`.
+///
+/// Contract: 0 or 1 detected staves ⇒ the image is treated as a single
+/// pre-cropped staff and recognized WHOLE (preserves the certified
+/// single-staff path exactly — detection adds nothing there); ≥ 2 staves ⇒
+/// the per-crop path, top-to-bottom.
+///
+/// # Errors
+/// A detection or per-staff recognition failure.
+pub fn recognize_page(
+    weights: &Weights,
+    tk: &crate::tokenizer::music::MusicTokenizer,
+    img: &image::DynamicImage,
+) -> FocrResult<Vec<StaffRecognition>> {
+    let crops = crate::preprocess::staff_detect::detect_staves(img)?;
+    if crops.len() < 2 {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let res = recognize(weights, tk, img)?;
+        return Ok(vec![(res, (0, 0, w, h))]);
+    }
+    super::timing_log(&format!("  tromr.staff_detect {} staves", crops.len()));
+    let mut out = Vec::with_capacity(crops.len());
+    for crop in crops {
+        let buf = image::GrayImage::from_raw(crop.w as u32, crop.h as u32, crop.gray).ok_or_else(
+            || FocrError::Other(anyhow::anyhow!("tromr page: crop buffer shape mismatch")),
+        )?;
+        let res = recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf))?;
+        out.push((res, crop.bbox));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1777,6 +1840,83 @@ mod tests {
             sers.iter().all(|&s| s <= 0.45),
             "a per-example SER regressed past 0.45 (measured max 0.375): {sers:?}"
         );
+    }
+
+    /// The E5 page cert: examples 1 and 2 stacked into one tall page (white
+    /// gaps) must detect as TWO staves, top-to-bottom, and each staff's
+    /// recognition must score against ITS OWN ground truth (order proof) at
+    /// a measured SER. Model-gated skip-with-SUCCESS.
+    #[test]
+    fn tromr_page_detects_and_reads_stacked_examples() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let examples = dir.join("../tromr-upstream/examples");
+        if !examples.join("1.png").is_file() {
+            eprintln!("[tromr-test] skip_no_model: upstream examples absent");
+            return;
+        }
+        // Stack ex1 over ex2 on a white canvas with generous gaps.
+        let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
+        let b = image::open(examples.join("2.png")).expect("ex2").to_rgb8();
+        let w = a.width().max(b.width());
+        let gap = 160u32;
+        let h = a.height() + b.height() + 3 * gap;
+        let mut page = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut page, &a, 0, i64::from(gap));
+        image::imageops::overlay(&mut page, &b, 0, i64::from(2 * gap + a.height()));
+        let page = image::DynamicImage::ImageRgb8(page);
+
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let tk = fixture_tokenizer();
+        let staves = recognize_page(&weights, &tk, &page).expect("page runs");
+        assert_eq!(staves.len(), 2, "two staves detected on the stacked page");
+        assert!(
+            staves[0].1.1 < staves[1].1.1,
+            "top-to-bottom order: {:?} vs {:?}",
+            staves[0].1,
+            staves[1].1
+        );
+
+        fn ser(ours: &str, gt: &str) -> f64 {
+            let a: Vec<&str> = ours.split('+').collect();
+            let b: Vec<&str> = gt.split('+').collect();
+            let (n, m) = (a.len(), b.len());
+            let mut prev: Vec<usize> = (0..=m).collect();
+            let mut cur = vec![0usize; m + 1];
+            for i in 1..=n {
+                cur[0] = i;
+                for j in 1..=m {
+                    let cost = usize::from(a[i - 1] != b[j - 1]);
+                    cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+                }
+                std::mem::swap(&mut prev, &mut cur);
+            }
+            prev[m] as f64 / m.max(1) as f64
+        }
+        let gt1 = std::fs::read_to_string(examples.join("1.txt")).unwrap();
+        let gt2 = std::fs::read_to_string(examples.join("2.txt")).unwrap();
+        let (gt1, gt2) = (
+            gt1.trim().trim_matches('\'').trim().to_owned(),
+            gt2.trim().trim_matches('\'').trim().to_owned(),
+        );
+        let s00 = ser(&staves[0].0.semantic, &gt1);
+        let s01 = ser(&staves[0].0.semantic, &gt2);
+        let s11 = ser(&staves[1].0.semantic, &gt2);
+        let s10 = ser(&staves[1].0.semantic, &gt1);
+        eprintln!(
+            "[tromr-cert] E5 page: staff0 SER-vs-gt1 {s00:.3} (vs-gt2 {s01:.3}); \
+             staff1 SER-vs-gt2 {s11:.3} (vs-gt1 {s10:.3})"
+        );
+        // Order proof: each staff matches ITS OWN ground truth best.
+        assert!(s00 < s01, "staff0 must read as example 1");
+        assert!(s11 < s10, "staff1 must read as example 2");
+        // MEASURED gates (2026-07-06): 0.125 / 0.040 — IDENTICAL to the
+        // direct-crop SERs; the detector's crops cost nothing. Pinned with
+        // headroom (deterministic pipeline).
+        assert!(s00 <= 0.25, "staff0 SER {s00} regressed (measured 0.125)");
+        assert!(s11 <= 0.15, "staff1 SER {s11} regressed (measured 0.040)");
     }
 
     /// The E3 L1/L2 cert: every oracle seam (stem, stages, patch proj, each

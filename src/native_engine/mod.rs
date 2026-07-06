@@ -1124,13 +1124,20 @@ impl OcrModel {
         let t = std::time::Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tromr_tokenizer()?;
-        let res = tromr::recognize(&self.weights, tk, img)?;
+        let staves = tromr::recognize_page(&self.weights, tk, img)?;
         timing_log(&format!(
-            "tromr forward {:.2}s (semantic {} chars)",
+            "tromr forward {:.2}s ({} staves, semantic {} chars total)",
             t.elapsed().as_secs_f64(),
-            res.semantic.len()
+            staves.len(),
+            staves.iter().map(|(r, _)| r.semantic.len()).sum::<usize>()
         ));
-        Ok((res.musicxml, w, h))
+        let xml = if staves.len() == 1 {
+            staves.into_iter().next().expect("one staff").0.musicxml
+        } else {
+            let semantics: Vec<String> = staves.into_iter().map(|(r, _)| r.semantic).collect();
+            tromr::staves_to_musicxml(&semantics)?
+        };
+        Ok((xml, w, h))
     }
 
     /// The TrOMR 4-table WordLevel music tokenizer, loaded from the

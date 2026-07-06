@@ -70,8 +70,8 @@ fn otsu_threshold(gray: &[u8]) -> u8 {
         .map(|(i, &c)| i as f64 * c as f64)
         .sum();
     let (mut w_b, mut sum_b, mut best_t, mut best_var) = (0u64, 0.0f64, 0u8, -1.0f64);
-    for t in 0..256 {
-        w_b += hist[t];
+    for (t, &count) in hist.iter().enumerate() {
+        w_b += count;
         if w_b == 0 {
             continue;
         }
@@ -79,7 +79,7 @@ fn otsu_threshold(gray: &[u8]) -> u8 {
         if w_f == 0 {
             break;
         }
-        sum_b += t as f64 * hist[t] as f64;
+        sum_b += t as f64 * count as f64;
         let m_b = sum_b / w_b as f64;
         let m_f = (sum_all - sum_b) / w_f as f64;
         let var = w_b as f64 * w_f as f64 * (m_b - m_f) * (m_b - m_f);
