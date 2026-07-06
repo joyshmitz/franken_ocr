@@ -653,12 +653,20 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum SyncCmd {
-    /// Export run-state audit records as JSONL.
-    ExportJsonl,
-    /// Import run-state audit records from JSONL.
-    ImportJsonl,
+    /// Export run-state audit records as JSONL (atomic, locked).
+    ExportJsonl {
+        /// Output path (default: `<run store>.jsonl`).
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Import (replay) run-state audit records from JSONL.
+    ImportJsonl {
+        /// Input JSONL path.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1133,6 +1141,50 @@ impl FigureWriter {
 }
 
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
+    // Best-effort run telemetry (bd-223.4): capture the logging fields before
+    // the args move, record the outcome after — a store failure NEVER fails
+    // the user's run (stderr note only).
+    let telemetry_input = args.request.image.display().to_string();
+    let telemetry_model = args
+        .request
+        .model
+        .as_ref()
+        .map_or_else(|| "default".to_owned(), |p| p.display().to_string());
+    let started = crate::storage::now_millis();
+    let outcome = run_ocr_inner(args, robot_mode);
+    let quant = if telemetry_model.contains("int8") {
+        "int8"
+    } else if telemetry_model.contains("int4") {
+        "int4"
+    } else {
+        "f32-or-default"
+    };
+    let (status, exit_code) = match &outcome {
+        Ok(()) => ("ok", 0i64),
+        Err(FocrError::Cancelled) => ("cancelled", 6),
+        Err(e) => ("error", i64::from(e.exit_code())),
+    };
+    let record = crate::storage::RunRecord {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        started_at: started,
+        finished_at: Some(crate::storage::now_millis()),
+        input_path: telemetry_input,
+        mode: "ocr".into(),
+        quant: quant.into(),
+        model_version_tag: telemetry_model,
+        exit_code,
+        status: status.into(),
+    };
+    if let Err(e) = crate::storage::RunStore::default_path()
+        .and_then(|p| crate::storage::RunStore::open(&p))
+        .and_then(|store| store.insert_run(&record))
+    {
+        eprintln!("[focr] run-store note (telemetry only, run unaffected): {e}");
+    }
+    outcome
+}
+
+fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let request = args.to_request()?;
     // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
     // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
@@ -1704,47 +1756,89 @@ fn hex_encode32(bytes: &[u8; 32]) -> String {
 }
 
 fn run_runs(args: &RunsArgs) -> FocrResult<()> {
-    let _limit = non_negative_u32("limit", args.limit)?;
-    if args.json || args.format != OutputFormat::Plain {
-        let format = if args.json {
-            "json".to_owned()
-        } else {
-            args.format.to_string()
-        };
-        emit(&serde_json::json!({
+    let limit = i64::from(non_negative_u32("limit", args.limit)?);
+    let store = crate::storage::RunStore::open(&crate::storage::RunStore::default_path()?)?;
+    let records = store.query(args.id.as_deref(), limit)?;
+    let format = if args.json {
+        OutputFormat::Json
+    } else {
+        args.format
+    };
+    let record_json = |r: &crate::storage::RunRecord| {
+        serde_json::json!({
+            "schema_version": crate::storage::SCHEMA_VERSION,
+            "run_id": r.run_id,
+            "started_at": r.started_at,
+            "finished_at": r.finished_at,
+            "input_path": r.input_path,
+            "mode": r.mode,
+            "quant": r.quant,
+            "model_version_tag": r.model_version_tag,
+            "exit_code": r.exit_code,
+            "status": r.status,
+        })
+    };
+    match format {
+        OutputFormat::Json => emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "command": "runs",
-            "status": "scaffold",
-            "implemented": false,
-            "landing_phase": "Phase 0",
-            "plan_section": "§7.2",
-            "id": args.id,
-            "format": format,
-        }));
+            "store": store.path(),
+            "count": records.len(),
+            "runs": records.iter().map(record_json).collect::<Vec<_>>(),
+        })),
+        OutputFormat::Ndjson => {
+            for r in &records {
+                emit(&record_json(r));
+            }
+        }
+        OutputFormat::Plain => {
+            if records.is_empty() {
+                println!("no recorded runs ({})", store.path().display());
+            }
+            for r in &records {
+                println!(
+                    "{}  {}  {}  exit {}  {}  {}",
+                    r.run_id, r.status, r.mode, r.exit_code, r.quant, r.input_path
+                );
+            }
+        }
     }
-    Err(FocrError::NotImplemented(
-        "focr runs — durable run history lands with the fsqlite RunStore in Phase 0 (see plan §7.2)".into(),
-    ))
+    Ok(())
 }
 
 fn run_sync(args: &SyncArgs) -> FocrResult<()> {
+    let store = crate::storage::RunStore::open(&crate::storage::RunStore::default_path()?)?;
+    let (subcommand, file, n) = match &args.cmd {
+        SyncCmd::ExportJsonl { file } => {
+            let out = file.clone().unwrap_or_else(|| {
+                let mut p = store.path().to_path_buf();
+                p.set_extension("jsonl");
+                p
+            });
+            let n = crate::storage::export_jsonl(&store, &out)?;
+            ("export-jsonl", out, n)
+        }
+        SyncCmd::ImportJsonl { file } => {
+            let n = crate::storage::import_jsonl(&store, file)?;
+            ("import-jsonl", file.clone(), n)
+        }
+    };
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "command": "sync",
-            "subcommand": match args.cmd {
-                SyncCmd::ExportJsonl => "export-jsonl",
-                SyncCmd::ImportJsonl => "import-jsonl",
-            },
-            "status": "scaffold",
-            "implemented": false,
-            "landing_phase": "Phase 0",
-            "plan_section": "§7.2",
+            "subcommand": subcommand,
+            "store": store.path(),
+            "file": file,
+            "records": n,
         }));
+    } else {
+        eprintln!(
+            "[focr] sync {subcommand}: {n} records via {}",
+            file.display()
+        );
     }
-    Err(FocrError::NotImplemented(
-        "focr sync — JSONL audit export/import lands with the fsqlite RunStore in Phase 0 (see plan §7.2)".into(),
-    ))
+    Ok(())
 }
 
 /// A stable lowercase name for a [`crate::model_arch::Task`] (the machine

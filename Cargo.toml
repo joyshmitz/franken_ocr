@@ -87,6 +87,8 @@ rayon = "1"
 # framework. Used by lib code (src/quant/convert.rs) — must be a normal dependency,
 # not dev-only, or the lib fails to build outside the test profile.
 sha2 = "0.10"
+# RunStore run ids (bd-223.4).
+uuid = { version = "1", features = ["v4"] }
 
 # Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
 # "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg

@@ -63,6 +63,7 @@ use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
 
 const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
+const RUN_STORE_ENV: &str = "FOCR_RUN_STORE";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Structured NDJSON test logging (docs/conformance/GOLDEN.md §6; the shape mirrors
@@ -113,6 +114,7 @@ fn run_focr(args: &[&str]) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
@@ -124,6 +126,7 @@ fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
         .args(args)
         .env("FOCR_MODEL_PATH", model_path.as_os_str())
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
@@ -135,6 +138,7 @@ fn run_focr_with_model_dir(args: &[&str], model_dir: &Path) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env(MODEL_DIR_ENV, model_dir.as_os_str())
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
@@ -146,9 +150,22 @@ fn run_focr_with_forced_error(args: &[&str], forced_error: &str) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env(FORCE_TEST_ERROR_ENV, forced_error);
     run_focr_command(command, args)
+}
+
+fn fresh_run_store_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "focr_golden_run_store_{}_{}.db",
+        std::process::id(),
+        nanos
+    ))
 }
 
 fn future_focrq_preamble() -> Vec<u8> {
@@ -1906,28 +1923,23 @@ fn robot_run_routes_to_streaming() {
     );
 }
 
-/// The run-history / audit-sync scaffold surfaces already obey the Phase-0
-/// exit-category split: malformed args are Usage(exit 2), valid but unlanded
-/// bodies are NotImplemented(exit 1).
+/// The run-history / audit-sync surfaces are live: malformed args are
+/// Usage(exit 2), valid queries/JSONL sync commands succeed, and all test
+/// invocations point `FOCR_RUN_STORE` at temp paths rather than the user's
+/// real cache.
 #[test]
 fn runs_and_sync_args_obey_exit_categories() {
     let test = "runs_and_sync_args_obey_exit_categories";
-    let cases: &[(&str, &[&str], i32)] = &[
+    let usage_cases: &[(&str, &[&str], i32)] = &[
         ("runs_negative_limit", &["runs", "--limit=-1"], 2),
-        ("runs_json_stub", &["runs", "--format", "json"], 1),
         ("sync_unknown_subcommand", &["sync", "frobnicate"], 2),
         (
-            "sync_export_json_stub",
-            &["sync", "--json", "export-jsonl"],
-            1,
-        ),
-        (
-            "sync_import_json_stub",
+            "sync_import_missing_file",
             &["sync", "--json", "import-jsonl"],
-            1,
+            2,
         ),
     ];
-    for (name, argv, expected) in cases {
+    for (name, argv, expected) in usage_cases {
         let out = run_focr(argv);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1951,6 +1963,73 @@ fn runs_and_sync_args_obey_exit_categories() {
             "{name} expected exit {expected}; stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
+
+    let out = run_focr(&["runs", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let runs = parse_json_line(&stdout, "runs --format json");
+    let pass = out.status.code() == Some(0)
+        && runs["command"].as_str() == Some("runs")
+        && runs["count"].as_u64() == Some(0)
+        && runs["runs"].as_array().is_some_and(Vec::is_empty);
+    tlog!(test,
+        "case": "runs_json_live",
+        "event": "assert",
+        "assertion": "runs --format json reads the hermetic run store and exits zero",
+        "inputs": {"argv": ["runs", "--format", "json"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected runs JSON output:\n{stdout}");
+
+    let out = run_focr(&["sync", "--json", "export-jsonl"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let exported = parse_json_line(&stdout, "sync export-jsonl --json");
+    let pass = out.status.code() == Some(0)
+        && exported["command"].as_str() == Some("sync")
+        && exported["subcommand"].as_str() == Some("export-jsonl")
+        && exported["records"].as_u64() == Some(0);
+    tlog!(test,
+        "case": "sync_export_json_live",
+        "event": "assert",
+        "assertion": "sync export-jsonl writes an empty hermetic audit file and exits zero",
+        "inputs": {"argv": ["sync", "--json", "export-jsonl"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected sync export JSON output:\n{stdout}");
+
+    let input = std::env::temp_dir().join(format!(
+        "focr_golden_import_empty_{}_{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::write(&input, "").expect("write empty sync import fixture");
+    let input_s = input.to_string_lossy().into_owned();
+    let out = run_focr(&["sync", "--json", "import-jsonl", "--file", &input_s]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let imported = parse_json_line(&stdout, "sync import-jsonl --json");
+    let pass = out.status.code() == Some(0)
+        && imported["command"].as_str() == Some("sync")
+        && imported["subcommand"].as_str() == Some("import-jsonl")
+        && imported["records"].as_u64() == Some(0);
+    tlog!(test,
+        "case": "sync_import_json_live",
+        "event": "assert",
+        "assertion": "sync import-jsonl replays an empty audit file and exits zero",
+        "inputs": {"argv": ["sync", "--json", "import-jsonl", "--file", "[temp]"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected sync import JSON output:\n{stdout}");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

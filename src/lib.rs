@@ -30,6 +30,7 @@ pub mod preprocess;
 pub mod quant;
 pub mod robot;
 pub mod simd;
+pub mod storage;
 pub mod tokenizer;
 
 pub use cli::cli_main;
