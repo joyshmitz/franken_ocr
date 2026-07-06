@@ -49,6 +49,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
 | **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
 | **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. |
+| **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
@@ -385,14 +386,34 @@ focr robot selftest                          # int8 kernel vs scalar oracle on t
 
 `focr robot selftest` runs the dispatched int8 GEMM against a bit-identical scalar oracle across a shape battery, including the worst-case `K=6848` i32-accumulation overflow case, and emits a single JSON verdict; it exits 1 if any parity case diverges. It has passed 24/24 on Apple SDOT and on a real x86 AVX2 box. Set `FOCR_FORCE_ARCH` to verify a specific ISA tier.
 
-### Scaffolded subcommands (not yet implemented)
+### `focr runs` and `focr sync`
 
-These emit a JSON structure but return a not-yet-implemented status (exit code 1). They are Phase-0/Phase-5 scaffolds.
+`focr ocr` records each run in a local fsqlite store on a best-effort basis. A
+store failure prints a note to stderr and never fails the OCR run itself. The
+default store is `~/.cache/franken_ocr/runs.db`; set `FOCR_RUN_STORE` to use a
+different path.
 
 ```bash
-focr runs --limit 10 --format json          # query durable run history
-focr sync export-jsonl --json               # export run-state audit records
-focr sync import-jsonl --json               # import run-state audit records
+focr runs --limit 10                         # recent runs, plain table
+focr runs --limit 10 --format json           # one JSON object with a runs array
+focr runs --format ndjson                    # one run record per line
+focr runs --id <run-id> --json               # inspect one run
+
+focr sync export-jsonl --json                # export the canonical audit log
+focr sync export-jsonl --file runs.jsonl     # choose the export path
+focr sync import-jsonl --file runs.jsonl --json
+```
+
+Exports are canonical and atomic: the writer takes an exclusive lock, writes a
+temporary file beside the target, fsyncs it, then renames it into place. Imports
+are idempotent because records replace by `run_id`.
+
+### Scaffolded subcommand
+
+`doctor` still emits its planned JSON contract and returns a not-yet-implemented
+status (exit code 1).
+
+```bash
 focr doctor --json                          # idempotent self-check / repair
 ```
 
@@ -401,6 +422,12 @@ focr doctor --json                          # idempotent self-check / repair
 ## CPU Backend and Optimizations
 
 The hot path is not a generic tensor interpreter. Each model is converted into a `.focrq` artifact, then executed through fixed-shape Rust code that calls model-specific kernels and keeps allocations out of the decode loop.
+
+The backend keeps handwritten SIMD narrow. Ordinary Rust loops stay in place
+where LLVM autovectorizes well; audited SIMD is reserved for int8 matmul kernels
+whose scalar oracle is bit-identical and whose speedup is measured. That is why
+`robot backends` reports the exact dispatched tier, and why AMX and int4 remain
+gated until real kernels and parity evidence land.
 
 **Apple Silicon / ARM64.** The aarch64 backend detects NEON dot-product (`SDOT`) and matrix-multiply int8 (`SMMLA` / i8mm) at runtime. The hot decoder linears use packed int8 matmul kernels where the scalar fallback proves the exact result, while norms, softmax, preprocessing, and TrOMR's f32 vision/decoder glue stay as simple loops that LLVM can autovectorize. On macOS, dispatch prefers SDOT over SMMLA because measured M-series cores issue i8mm at a rate that does not beat the dot-product path once operand packing is included. On non-Apple ARM64, the order can favor SMMLA when the hardware makes it faster. Both tiers share the same scalar oracle, and `FOCR_FORCE_ARCH=sdot|smmla|scalar focr robot selftest` verifies the selected path on the current host.
 
@@ -424,6 +451,7 @@ The hot path is not a generic tensor interpreter. Each model is converted into a
 | `FOCR_MODEL_DIR` | Add one or more model search roots before the default cache. A bare `focr ocr` can resolve pulled artifacts from this directory without `--model`. |
 | `FOCR_QUANT` | Pick the quant-suffixed artifact name during cache resolution when multiple variants are present. |
 | `FOCR_MANIFEST_URL` | Override the manifest source (a local path or an `https` URL). Defaults to the built-in repo manifest. |
+| `FOCR_RUN_STORE` | Override the local run-history database path. Defaults to `~/.cache/franken_ocr/runs.db`. |
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
 | `FOCR_GOT_FORMAT` | Force GOT-OCR2's `OCR with format:` structured-output mode, the env analog of `--format` and the format-implying `--task` values. |
@@ -520,7 +548,7 @@ On an interactive terminal, `focr ocr` with no model present offers to download.
 Check what the binary detected on this host, then confirm the int8 kernel is correct:
 
 ```bash
-focr robot backends     # detected SIMD tiers (SMMLA/SDOT/VNNI/AMX/scalar) + core count
+focr robot backends     # selected SIMD tier + available exact backends
 focr robot health       # model present, arch features, thread budget
 focr robot selftest     # int8 GEMM bit-identical to scalar oracle (exit 1 on divergence)
 ```
