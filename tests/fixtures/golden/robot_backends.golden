@@ -12,5 +12,6 @@
     "selected": "[simd-tier]",
     "selected_feature": "[simd-feature]",
     "status": "runtime detection active"
-  }
+  },
+  "threads": "[threads]"
 }

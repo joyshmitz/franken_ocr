@@ -228,6 +228,9 @@ fn scrub(s: &str) -> String {
     out = out.replace(pkg_version(), "[version]");
     // host logical-cpu count in `robot backends` -> [cpus]
     out = scrub_json_int_field(&out, "logical_cpus");
+    // the resolved FOCR_THREADS/physical-core budget (bd-223.2) is equally
+    // host-dependent -> scrubbed the same way
+    out = scrub_json_int_field(&out, "threads");
     // host-specific model search paths in model-not-found stderr -> stable token
     out = scrub_model_search_dirs(&out);
     out

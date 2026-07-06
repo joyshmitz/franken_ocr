@@ -655,6 +655,7 @@ pub fn generate_greedy(
     let mut data = inputs_embeds.data.clone();
     let mut ids = Vec::new();
     for _ in 0..max_new {
+        crate::cancel_checkpoint()?;
         let rows = data.len() / hidden;
         let cur = Mat::from_vec(rows, hidden, std::mem::take(&mut data));
         let logits = forward_prefill(weights, cfg, &cur)?;
@@ -1388,6 +1389,7 @@ pub fn generate_greedy_kvcache(
     let mut ids = Vec::new();
     let mut next = argmax_no_repeat(&last_logits, &ids, cfg.no_repeat_ngram_size) as u32;
     for _ in 0..max_new {
+        crate::cancel_checkpoint()?;
         ids.push(next);
         if next == eos {
             break;

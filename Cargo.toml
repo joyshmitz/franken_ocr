@@ -38,6 +38,12 @@ anyhow = "1"
 asupersync = { version = ">=0.3.5, <0.4", default-features = false, features = [
     "tls-webpki-roots",
 ] }
+# Ctrl+C -> cooperative shutdown (bd-223.2): the CLI installs the handler; the
+# library exposes request_shutdown() so embedders can drive it themselves.
+ctrlc = "3.4"
+# Physical-core count for the FOCR_THREADS budget (hyperthreads oversubscribe
+# the int8 GEMMs — plan §7.5; logical count stays a robot diagnostic only).
+num_cpus = "1.16"
 # FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
 # linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
 ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }

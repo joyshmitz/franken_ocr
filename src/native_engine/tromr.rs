@@ -895,6 +895,7 @@ pub fn generate_with(w: &TromrDecoderW, ctx: &Mat, pick: DecodePick) -> FocrResu
     let mut pitch = vec![SEED_NONOTE];
     let mut lift = vec![SEED_NONOTE];
     for _ in 0..MAX_SEQ {
+        crate::cancel_checkpoint()?;
         // Upstream windows the prefix to the LAST max_seq_len positions.
         let start = rhythm.len().saturating_sub(MAX_SEQ);
         let hidden = decoder_forward(w, ctx, &rhythm[start..], &pitch[start..], &lift[start..])?;

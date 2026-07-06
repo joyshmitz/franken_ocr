@@ -47,6 +47,22 @@ pub fn cli_main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Cooperative Ctrl+C (bd-223.2): the first signal requests shutdown —
+    // every decode-step/page checkpoint aborts with Cancelled (exit 6) at its
+    // next boundary; a second signal hard-exits 130 (the shell convention)
+    // for a wedged stage. Installation failure (e.g. no signal handling in
+    // odd sandboxes) is non-fatal: the engine still works, just without
+    // graceful interrupt.
+    let _ = ctrlc::set_handler(|| {
+        if crate::shutdown_requested() {
+            std::process::exit(130);
+        }
+        crate::request_shutdown();
+        eprintln!(
+            "focr: interrupt received — finishing the current step then aborting (Ctrl+C again to force)"
+        );
+    });
+
     let cli = Cli::parse();
     let error_mode = ErrorMode::from_cli(&cli);
     match run(cli) {
@@ -2072,7 +2088,10 @@ fn robot_backends_payload() -> serde_json::Value {
             "override_env": "FOCR_FORCE_ARCH",
             "status": "runtime detection active"
         },
-        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        // The ONE process-wide budget (bd-223.2 addendum: FOCR_THREADS else
+        // physical cores — pool-sizing consumers read this, never logical).
+        "threads": crate::thread_budget()
     })
 }
 
@@ -2111,6 +2130,7 @@ fn run_robot_selftest() -> FocrResult<()> {
         "available": available,
         "override_env": "FOCR_FORCE_ARCH",
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "threads": crate::thread_budget(),
         "cases_total": report.cases.len(),
         "cases_passed": passed,
         "all_ok": report.all_ok,

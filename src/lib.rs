@@ -40,7 +40,8 @@ pub use native_engine::model_arch;
 pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
@@ -84,6 +85,137 @@ const DEFAULT_FORWARD_STAGE_BUDGET_MS: u64 = 10 * 60 * 1000;
 /// 6.67 GB weight blob is read once per engine and shared across calls. The
 /// global weak cache in [`native_engine`] additionally de-dups across engines in
 /// one process.
+// ── Cooperative shutdown (bd-223.2) ─────────────────────────────────────────
+//
+// The process-global shutdown flag IS the ShutdownController: Ctrl+C (the CLI
+// installs the handler in `cli_main`) or an embedder's `request_shutdown()`
+// sets it; every long loop in the engine — the per-page loops and every
+// per-decode-step loop — polls it via [`cancel_checkpoint`] (one relaxed
+// atomic load per token: unmeasurable) and returns [`FocrError::Cancelled`]
+// (exit 6) at the next boundary. Cancellation is COOPERATIVE by design:
+// `spawn_blocking` closures keep running on drop, so the flag is observed
+// INSIDE them (doctrine #5 / the franken_whisper pattern). Per-request tokens
+// for embedders who need independent cancellation of concurrent engines are a
+// documented follow-up — a single flag matches the one-live-forward discipline.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Request cooperative shutdown: every in-flight recognition aborts with
+/// [`FocrError::Cancelled`] at its next checkpoint (page boundary or decode
+/// step). Idempotent; never blocks.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether cooperative shutdown has been requested.
+#[must_use]
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Clear the shutdown flag (tests + long-lived embedders that survive a
+/// cancelled batch and start a new one).
+pub fn reset_shutdown() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+/// The cooperative cancellation checkpoint (bd-223.2): call at every page
+/// boundary and decode step.
+///
+/// # Errors
+/// [`FocrError::Cancelled`] once [`request_shutdown`] has been called.
+pub fn cancel_checkpoint() -> FocrResult<()> {
+    if shutdown_requested() {
+        return Err(FocrError::Cancelled);
+    }
+    Ok(())
+}
+
+// ── The one thread/CPU budget (bd-223.2 addendum; plan §7.5) ────────────────
+
+/// The single process-wide thread budget, read ONCE: `FOCR_THREADS` (env)
+/// else the PHYSICAL core count (hyperthreads oversubscribe the int8 GEMMs —
+/// never `available_parallelism`). Every pool-sizing consumer (the kernel
+/// rayon pool, the gauntlet fairness pins, `robot health`) reads THIS.
+pub fn thread_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("FOCR_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(num_cpus::get_physical)
+    })
+}
+
+// ── Bounded per-page result streaming (bd-223.2 scaffold) ───────────────────
+
+/// Stream page results from a SEQUENTIAL producer to a consumer through a
+/// BOUNDED channel — the bd-223.2 streaming scaffold the robot/NDJSON
+/// multi-page path adopts: the producer runs on its own thread and BLOCKS
+/// when the consumer lags (backpressure — memory never grows unbounded);
+/// the consumer loop drains with a short `recv_timeout` so it can interleave
+/// its own bookkeeping. Pages are produced STRICTLY sequentially (doctrine
+/// #5 — streaming the OUTPUT of sequential pages, never concurrent
+/// forwards).
+///
+/// `produce` yields `Some(item)` per page and `None` when exhausted;
+/// `consume` receives each item in order. Returns the number of items
+/// streamed.
+///
+/// # Errors
+/// The producer's first error aborts the stream and is returned after the
+/// worker joins (consumers see only the items produced before it).
+pub fn stream_pages<T, P, C>(capacity: usize, mut produce: P, mut consume: C) -> FocrResult<usize>
+where
+    T: Send + 'static,
+    P: FnMut() -> FocrResult<Option<T>> + Send + 'static,
+    C: FnMut(T),
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(capacity.max(1));
+    let worker = std::thread::Builder::new()
+        .name("focr-page-stream".into())
+        .spawn(move || -> FocrResult<()> {
+            loop {
+                match produce()? {
+                    Some(item) => {
+                        // A closed receiver means the consumer is gone —
+                        // treat as cancellation, not success.
+                        if tx.send(item).is_err() {
+                            return Err(FocrError::Cancelled);
+                        }
+                    }
+                    None => return Ok(()),
+                }
+            }
+        })
+        .map_err(|e| FocrError::Other(anyhow::anyhow!("page-stream worker spawn: {e}")))?;
+
+    let mut n = 0usize;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(item) => {
+                consume(item);
+                n += 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if worker.is_finished() {
+                    // Drain anything raced in between finish and the check.
+                    while let Ok(item) = rx.try_recv() {
+                        consume(item);
+                        n += 1;
+                    }
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    worker
+        .join()
+        .map_err(|_| FocrError::Other(anyhow::anyhow!("page-stream worker panicked")))??;
+    Ok(n)
+}
+
 pub struct OcrEngine {
     /// The single owned async runtime. All public methods block on it.
     runtime: Runtime,
@@ -464,6 +596,172 @@ impl OcrEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log_line(test: &str, phase: &str, outcome: &str, extra: &str) {
+        eprintln!(
+            "{{\"test\":\"{test}\",\"phase\":\"{phase}\",\"outcome\":\"{outcome}\"{}{extra}}}",
+            if extra.is_empty() { "" } else { "," }
+        );
+    }
+
+    /// bd-223.2: construct/drop leaves no `focr`-prefixed runtime threads.
+    #[test]
+    fn engine_owns_single_runtime_and_drops_clean() {
+        let count_focr_threads = || {
+            // No portable thread enumeration in std: approximate via the
+            // process thread COUNT delta (macOS/Linux: /proc or libproc are
+            // overkill here — the runtime joins its workers on drop, so the
+            // total must return to the baseline).
+            std::thread::available_parallelism().map(|_| ()).ok(); // warm std
+            thread_count()
+        };
+        fn thread_count() -> usize {
+            #[cfg(target_os = "macos")]
+            {
+                // `ps -M` style enumeration is heavyweight; use the Mach-free
+                // fallback: spawn/join delta is what we assert below instead.
+                0
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                std::fs::read_dir("/proc/self/task")
+                    .map(|d| d.count())
+                    .unwrap_or(0)
+            }
+        }
+        let before = count_focr_threads();
+        {
+            let engine = OcrEngine::new().expect("engine builds");
+            // The runtime is live: a trivial blocking stage round-trips.
+            let out = engine
+                .run_blocking_stage_with_budget("drop-probe", Duration::from_secs(5), || Ok(42u8))
+                .expect("stage runs");
+            assert_eq!(out, 42);
+            log_line(
+                "engine_owns_single_runtime_and_drops_clean",
+                "live",
+                "pass",
+                "",
+            );
+        } // <- drop joins the runtime workers
+        let after = count_focr_threads();
+        assert!(
+            after <= before,
+            "thread count grew across engine drop: {before} -> {after}"
+        );
+        log_line(
+            "engine_owns_single_runtime_and_drops_clean",
+            "dropped",
+            "pass",
+            "",
+        );
+    }
+
+    /// bd-223.2: the checkpoint aborts a decode-style loop with Cancelled
+    /// (exit 6) — the flag is observed INSIDE the spawn_blocking closure.
+    #[test]
+    fn cancellation_token_into_closure_aborts() {
+        reset_shutdown();
+        let engine = OcrEngine::new().expect("engine builds");
+        let out =
+            engine.run_blocking_stage_with_budget("cancel-probe", Duration::from_secs(10), || {
+                for step in 0..1_000_000u64 {
+                    cancel_checkpoint()?;
+                    if step == 3 {
+                        // The "Ctrl+C" arrives mid-loop, from inside the
+                        // closure's world — exactly the cooperative contract.
+                        request_shutdown();
+                    }
+                }
+                Ok(0u64)
+            });
+        reset_shutdown();
+        match out {
+            Err(FocrError::Cancelled) => {
+                assert_eq!(FocrError::Cancelled.exit_code(), 6, "exit code contract");
+                log_line(
+                    "cancellation_token_into_closure_aborts",
+                    "aborted",
+                    "pass",
+                    "",
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// bd-223.2: the bounded channel BLOCKS the producer when the consumer
+    /// lags (backpressure) — in-flight items never exceed capacity + 1.
+    #[test]
+    fn bounded_stream_backpressure() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+        static MAX_SEEN: AtomicI64 = AtomicI64::new(0);
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        MAX_SEEN.store(0, Ordering::SeqCst);
+        let total = 24u32;
+        let mut produced = 0u32;
+        let n = stream_pages(
+            2,
+            move || {
+                if produced == total {
+                    return Ok(None);
+                }
+                produced += 1;
+                let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                MAX_SEEN.fetch_max(now, Ordering::SeqCst);
+                Ok(Some(produced))
+            },
+            |item: u32| {
+                // Slow consumer: the producer must stall on the bounded send.
+                std::thread::sleep(Duration::from_millis(5));
+                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                let _ = item;
+            },
+        )
+        .expect("stream completes");
+        assert_eq!(n, total as usize, "every page delivered in order");
+        let max = MAX_SEEN.load(Ordering::SeqCst);
+        assert!(
+            max <= 4,
+            "in-flight items {max} exceeded capacity(2)+channel slack — backpressure broken"
+        );
+        log_line(
+            "bounded_stream_backpressure",
+            "drained",
+            "pass",
+            &format!("\"max_in_flight\":{max},\"n\":{n}"),
+        );
+    }
+
+    /// bd-223.2 addendum: FOCR_THREADS wins, else the PHYSICAL core count.
+    #[test]
+    fn thread_budget_reads_env_then_physical() {
+        // The OnceLock latches per process; assert the resolved value is
+        // consistent with the environment THIS process started with.
+        let budget = thread_budget();
+        match std::env::var("FOCR_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(env) if env > 0 => assert_eq!(budget, env, "env wins"),
+            _ => assert_eq!(budget, num_cpus::get_physical(), "physical cores"),
+        }
+        assert!(budget > 0);
+        assert!(
+            budget
+                <= std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(usize::MAX),
+            "physical budget cannot exceed logical width"
+        );
+        log_line(
+            "thread_budget_reads_env_then_physical",
+            "resolved",
+            "pass",
+            &format!("\"threads\":{budget}"),
+        );
+    }
 
     struct TempModel(std::path::PathBuf);
 

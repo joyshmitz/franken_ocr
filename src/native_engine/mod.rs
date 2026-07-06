@@ -1977,6 +1977,7 @@ impl OcrModel {
         let mut emitted: Vec<u32> = Vec::new();
 
         while emitted.len() < params.max_length {
+            crate::cancel_checkpoint()?;
             let logits = decoder::lm_head_cached(&wc, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
@@ -2093,6 +2094,7 @@ impl OcrModel {
             )?;
         }
         while !spec_decode && emitted.len() < params.max_length {
+            crate::cancel_checkpoint()?;
             // When armed AND the blocker can ban (enough history), mask in the
             // lm_head epilogue and argmax the already-masked logits; otherwise the
             // exact default `lm_head_cached_i8` -> `sampler::decode_step`. The chosen
@@ -2197,6 +2199,7 @@ impl OcrModel {
         // decoded row, exactly as the sequential loop reassigns its `last_hidden`.
         let mut last_hidden = last_hidden.clone();
         while emitted.len() < params.max_length {
+            crate::cancel_checkpoint()?;
             let draft = spec::draft_ngram(generated, spec::SPEC_DRAFT_MAX, spec::SPEC_DRAFT_NGRAM);
             if draft.is_empty() {
                 // EMPTY-DRAFT FALLBACK: nothing to verify, so take exactly ONE
@@ -2379,6 +2382,7 @@ impl OcrModel {
         // SEQUENTIAL greedy decode loop (no nested runtime, no rayon-under-lock).
         // Bounded by `max_length` so a non-converging model can never hang.
         while emitted.len() < params.max_length {
+            crate::cancel_checkpoint()?;
             // Full-sequence forward, then lm_head over ONLY the last hidden row
             // -> [1, vocab] logits (the next-token logits depend solely on the
             // final position; per decoder::lm_head_last_row_is_full_last_row).
