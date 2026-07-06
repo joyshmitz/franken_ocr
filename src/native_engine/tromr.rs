@@ -1554,9 +1554,6 @@ pub struct MusicResult {
 /// Page-space staff bounding box `(x, y, w, h)`.
 pub type StaffBBox = (usize, usize, usize, usize);
 
-/// One recognized staff and its page-space bbox.
-pub type StaffRecognition = (MusicResult, StaffBBox);
-
 /// The full E9 single-staff pipeline: §6 preprocess → the certified encoder →
 /// deterministic argmax generate → §8 merge → MusicXML. The input must be a
 /// single-staff crop (the width guard rejects > 1280 at h=128; full-page
@@ -1591,37 +1588,99 @@ pub fn recognize(
     Ok(MusicResult { semantic, musicxml })
 }
 
+/// One staff the page path could NOT recognize: its detection index
+/// (0-based, top-to-bottom over ALL detected staves), page-space bbox, and
+/// the per-staff error text. The page as a whole still succeeds with the
+/// staves that worked (bd-av64.2).
+#[derive(Debug, Clone)]
+pub struct StaffSkip {
+    /// 0-based detection index over all detected staves, top-to-bottom.
+    pub index: usize,
+    /// Page-space bbox of the detected staff band.
+    pub bbox: StaffBBox,
+    /// The per-staff error, verbatim.
+    pub reason: String,
+}
+
+/// The full-page result: recognized staves (with their detection index and
+/// bbox, top-to-bottom) plus the staves that were skipped.
+pub struct PageRecognition {
+    /// `(detection index, result, bbox)` per recognized staff.
+    pub staves: Vec<(usize, MusicResult, StaffBBox)>,
+    /// Staves that failed per-staff recognition (empty on a clean page).
+    pub skips: Vec<StaffSkip>,
+}
+
 /// The E5 full-page pipeline: staff detection → per-staff [`recognize`]
-/// (SEQUENTIAL, doctrine #5) → `(per-staff results, page bboxes)`.
+/// (SEQUENTIAL, doctrine #5) → [`PageRecognition`].
 ///
 /// Contract: 0 or 1 detected staves ⇒ the image is treated as a single
 /// pre-cropped staff and recognized WHOLE (preserves the certified
-/// single-staff path exactly — detection adds nothing there); ≥ 2 staves ⇒
-/// the per-crop path, top-to-bottom.
+/// single-staff path exactly — detection adds nothing there, and its error
+/// IS the page error); ≥ 2 staves ⇒ the per-crop path, top-to-bottom, where
+/// ONE bad crop must never abort the page (bd-av64.2: a real book page with
+/// one over-wide staff band previously died whole via `?`-propagation —
+/// Cadwallader p169, 2026-07-06). A failed staff becomes a [`StaffSkip`];
+/// the page errors only when EVERY detected staff fails, and that error
+/// names each staff's reason.
 ///
 /// # Errors
-/// A detection or per-staff recognition failure.
+/// A detection failure, the single-staff fallback's failure, or all-staves
+/// failure on the per-crop path.
 pub fn recognize_page(
     weights: &Weights,
     tk: &crate::tokenizer::music::MusicTokenizer,
     img: &image::DynamicImage,
-) -> FocrResult<Vec<StaffRecognition>> {
+) -> FocrResult<PageRecognition> {
     let crops = crate::preprocess::staff_detect::detect_staves(img)?;
     if crops.len() < 2 {
         let (w, h) = (img.width() as usize, img.height() as usize);
         let res = recognize(weights, tk, img)?;
-        return Ok(vec![(res, (0, 0, w, h))]);
+        return Ok(PageRecognition {
+            staves: vec![(0, res, (0, 0, w, h))],
+            skips: Vec::new(),
+        });
     }
     super::timing_log(&format!("  tromr.staff_detect {} staves", crops.len()));
-    let mut out = Vec::with_capacity(crops.len());
-    for crop in crops {
-        let buf = image::GrayImage::from_raw(crop.w as u32, crop.h as u32, crop.gray).ok_or_else(
-            || FocrError::Other(anyhow::anyhow!("tromr page: crop buffer shape mismatch")),
-        )?;
-        let res = recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf))?;
-        out.push((res, crop.bbox));
+    let mut staves = Vec::with_capacity(crops.len());
+    let mut skips = Vec::new();
+    for (index, crop) in crops.into_iter().enumerate() {
+        let (cw, ch, bbox) = (crop.w, crop.h, crop.bbox);
+        let outcome = image::GrayImage::from_raw(cw as u32, ch as u32, crop.gray)
+            .ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr page: crop buffer shape mismatch"))
+            })
+            .and_then(|buf| recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf)));
+        match outcome {
+            Ok(res) => {
+                super::timing_log(&format!(
+                    "  tromr.staff {index} ok ({cw}x{ch}, semantic {} chars)",
+                    res.semantic.len()
+                ));
+                staves.push((index, res, bbox));
+            }
+            Err(e) => {
+                super::timing_log(&format!("  tromr.staff {index} SKIP ({cw}x{ch}): {e}"));
+                skips.push(StaffSkip {
+                    index,
+                    bbox,
+                    reason: e.to_string(),
+                });
+            }
+        }
     }
-    Ok(out)
+    if staves.is_empty() {
+        let reasons: Vec<String> = skips
+            .iter()
+            .map(|s| format!("staff {}: {}", s.index, s.reason))
+            .collect();
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr page: all {} detected staves failed — {}",
+            skips.len(),
+            reasons.join("; ")
+        )));
+    }
+    Ok(PageRecognition { staves, skips })
 }
 
 #[cfg(test)]
@@ -2249,13 +2308,24 @@ mod tests {
 
         let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
         let tk = fixture_tokenizer();
-        let staves = recognize_page(&weights, &tk, &page).expect("page runs");
-        assert_eq!(staves.len(), 2, "two staves detected on the stacked page");
+        let result = recognize_page(&weights, &tk, &page).expect("page runs");
         assert!(
-            staves[0].1.1 < staves[1].1.1,
+            result.skips.is_empty(),
+            "clean page must skip nothing: {:?}",
+            result.skips
+        );
+        let staves = result.staves;
+        assert_eq!(staves.len(), 2, "two staves detected on the stacked page");
+        assert_eq!(
+            (staves[0].0, staves[1].0),
+            (0, 1),
+            "detection indices in order"
+        );
+        assert!(
+            staves[0].2.1 < staves[1].2.1,
             "top-to-bottom order: {:?} vs {:?}",
-            staves[0].1,
-            staves[1].1
+            staves[0].2,
+            staves[1].2
         );
 
         fn ser(ours: &str, gt: &str) -> f64 {
@@ -2280,10 +2350,10 @@ mod tests {
             gt1.trim().trim_matches('\'').trim().to_owned(),
             gt2.trim().trim_matches('\'').trim().to_owned(),
         );
-        let s00 = ser(&staves[0].0.semantic, &gt1);
-        let s01 = ser(&staves[0].0.semantic, &gt2);
-        let s11 = ser(&staves[1].0.semantic, &gt2);
-        let s10 = ser(&staves[1].0.semantic, &gt1);
+        let s00 = ser(&staves[0].1.semantic, &gt1);
+        let s01 = ser(&staves[0].1.semantic, &gt2);
+        let s11 = ser(&staves[1].1.semantic, &gt2);
+        let s10 = ser(&staves[1].1.semantic, &gt1);
         eprintln!(
             "[tromr-cert] E5 page: staff0 SER-vs-gt1 {s00:.3} (vs-gt2 {s01:.3}); \
              staff1 SER-vs-gt2 {s11:.3} (vs-gt1 {s10:.3})"
@@ -2296,6 +2366,114 @@ mod tests {
         // headroom (deterministic pipeline).
         assert!(s00 <= 0.25, "staff0 SER {s00} regressed (measured 0.125)");
         assert!(s11 <= 0.15, "staff1 SER {s11} regressed (measured 0.040)");
+    }
+
+    /// bd-av64.2: ONE over-wide staff band must not abort the page — the
+    /// real failure class from Cadwallader p169 (2026-07-06: a detected
+    /// band whose resized width exceeded the 1280 position clamp killed the
+    /// whole run via `?`-propagation). Self-calibrating geometry: the
+    /// resized width of a full-page-width band is 128*page_w/band_h, so a
+    /// page 7.5 band-heights wide keeps the natural staff under the clamp
+    /// (128*7.5 = 960) while a half-scale staff violates it (128*15 =
+    /// 1920). Model-gated skip-with-SUCCESS.
+    #[test]
+    fn tromr_page_skips_overwide_staff_and_keeps_the_rest() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let examples = dir.join("../tromr-upstream/examples");
+        if !examples.join("1.png").is_file() {
+            eprintln!("[tromr-test] skip_no_model: upstream examples absent");
+            return;
+        }
+        let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
+        let bands = crate::preprocess::staff_detect::detect_staves(
+            &image::DynamicImage::ImageRgb8(a.clone()),
+        )
+        .expect("detect runs on ex1");
+        let band_h = bands.first().map_or(a.height() as usize, |c| c.h);
+        let page_w = (band_h * 15 / 2) as u32; // 7.5 x band_h
+        let b = image::imageops::resize(
+            &a,
+            a.width() / 2,
+            a.height() / 2,
+            image::imageops::FilterType::Triangle,
+        );
+        let gap = 160u32;
+        let h = a.height() + b.height() + 3 * gap;
+        let mut page = image::RgbImage::from_pixel(page_w, h, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut page, &a, 0, i64::from(gap));
+        image::imageops::overlay(&mut page, &b, 0, i64::from(2 * gap + a.height()));
+        let page = image::DynamicImage::ImageRgb8(page);
+
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let tk = fixture_tokenizer();
+        let result = recognize_page(&weights, &tk, &page)
+            .expect("page with one over-wide staff must still succeed (bd-av64.2)");
+        eprintln!(
+            "[tromr-cert] resilience: {} recognized, {} skipped ({:?})",
+            result.staves.len(),
+            result.skips.len(),
+            result.skips.iter().map(|s| &s.reason).collect::<Vec<_>>()
+        );
+        assert_eq!(result.staves.len(), 1, "the in-clamp staff recognizes");
+        assert_eq!(result.skips.len(), 1, "the over-wide staff skips");
+        assert!(
+            result.skips[0].reason.contains("1280"),
+            "skip reason names the clamp: {}",
+            result.skips[0].reason
+        );
+        assert!(
+            !result.staves[0].1.semantic.is_empty(),
+            "the surviving staff carries real content"
+        );
+    }
+
+    /// bd-av64.2: when EVERY detected staff fails, the page error names each
+    /// staff's reason (never a silent empty success). Same geometry trick at
+    /// 20 band-heights wide — both staves blow the clamp. Model-gated.
+    #[test]
+    fn tromr_page_all_staves_failing_is_a_named_error() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let examples = dir.join("../tromr-upstream/examples");
+        if !examples.join("1.png").is_file() {
+            eprintln!("[tromr-test] skip_no_model: upstream examples absent");
+            return;
+        }
+        let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
+        let bands = crate::preprocess::staff_detect::detect_staves(
+            &image::DynamicImage::ImageRgb8(a.clone()),
+        )
+        .expect("detect runs on ex1");
+        let band_h = bands.first().map_or(a.height() as usize, |c| c.h);
+        let page_w = (band_h * 20) as u32;
+        let gap = 160u32;
+        let h = 2 * a.height() + 3 * gap;
+        let mut page = image::RgbImage::from_pixel(page_w, h, image::Rgb([255, 255, 255]));
+        image::imageops::overlay(&mut page, &a, 0, i64::from(gap));
+        image::imageops::overlay(&mut page, &a, 0, i64::from(2 * gap + a.height()));
+        let page = image::DynamicImage::ImageRgb8(page);
+
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let tk = fixture_tokenizer();
+        let err = match recognize_page(&weights, &tk, &page) {
+            Ok(r) => panic!(
+                "both staves violate the clamp; expected a named error, got {} staves / {} skips",
+                r.staves.len(),
+                r.skips.len()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("all 2 detected staves failed"),
+            "error names the total: {err}"
+        );
+        assert!(err.contains("staff 0:"), "error names staff 0: {err}");
+        assert!(err.contains("staff 1:"), "error names staff 1: {err}");
     }
 
     /// The E3 L1/L2 cert: every oracle seam (stem, stages, patch proj, each

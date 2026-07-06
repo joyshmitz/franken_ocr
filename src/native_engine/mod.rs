@@ -1148,17 +1148,46 @@ impl OcrModel {
         let t = std::time::Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tromr_tokenizer()?;
-        let staves = tromr::recognize_page(&self.weights, tk, img)?;
+        let page = tromr::recognize_page(&self.weights, tk, img)?;
+        let total = page.staves.len() + page.skips.len();
+        for skip in &page.skips {
+            // Human-visible skip note on stderr (the bd-fck1 PDF page-skip
+            // precedent) — stdout stays the data surface. The MusicXML still
+            // carries every staff that recognized (bd-av64.2).
+            eprintln!(
+                "[focr] staff {}/{} skipped: {} (bbox x{} y{} w{} h{})",
+                skip.index + 1,
+                total,
+                skip.reason,
+                skip.bbox.0,
+                skip.bbox.1,
+                skip.bbox.2,
+                skip.bbox.3
+            );
+        }
         timing_log(&format!(
-            "tromr forward {:.2}s ({} staves, semantic {} chars total)",
+            "tromr forward {:.2}s ({}/{} staves recognized, semantic {} chars total)",
             t.elapsed().as_secs_f64(),
-            staves.len(),
-            staves.iter().map(|(r, _)| r.semantic.len()).sum::<usize>()
+            page.staves.len(),
+            total,
+            page.staves
+                .iter()
+                .map(|(_, r, _)| r.semantic.len())
+                .sum::<usize>()
         ));
-        let xml = if staves.len() == 1 {
-            staves.into_iter().next().expect("one staff").0.musicxml
+        let xml = if page.staves.len() == 1 {
+            page.staves
+                .into_iter()
+                .next()
+                .expect("one staff")
+                .1
+                .musicxml
         } else {
-            let semantics: Vec<String> = staves.into_iter().map(|(r, _)| r.semantic).collect();
+            let semantics: Vec<String> = page
+                .staves
+                .into_iter()
+                .map(|(_, r, _)| r.semantic)
+                .collect();
             tromr::staves_to_musicxml(&semantics)?
         };
         Ok((xml, w, h))
