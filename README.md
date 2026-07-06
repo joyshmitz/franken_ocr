@@ -16,7 +16,7 @@
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, and OneChart extracts chart data when pointed at a local or converted artifact. All of it runs through model-specific Rust kernels with no general ML framework, no Python, no CUDA, no FFI at inference, and no GPU. It parses document images and PDFs into Markdown, structured JSON, or versioned NDJSON from a single static binary that fits in about 5 MB.
+**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, and OneChart extracts chart data when pointed at a local or converted artifact. The Polyphonic-TrOMR sheet-music lane is underway with conversion, tokenizer, native encoder, and deterministic decoder foundations already in-tree, while its public OCR runtime remains gated. All of it runs through model-specific Rust kernels with no general ML framework, no Python, no CUDA, no FFI at inference, and no GPU. It parses document images and PDFs into Markdown, structured JSON, or versioned NDJSON from a single static binary that fits in about 5 MB.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -44,9 +44,10 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **One static binary** | No Python, no CUDA, no FFI at inference, no GPU. About 5 MB; portable to hosts where `ort`/CUDA cannot build. |
 | **Works offline** | `focr pull` fetches and verifies the weights once into `~/.cache/franken_ocr/models`; inference never touches the network. |
 | **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
-| **Model zoo** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart. Planned descriptors: Polyphonic-TrOMR, TrOCR, pix2tex. |
+| **Model zoo** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart. In progress: Polyphonic-TrOMR converter, tokenizer, native encoder, and argmax decoder foundations. Planned descriptors: TrOCR, pix2tex. |
 | **int8 decode, ~2.5x faster** | Custom `.focrq` int8 expert/FFN weights, byte-identical to the f32 path on typical pages. The vision tower stays high precision, where quantizing it would wreck OCR. |
 | **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
+| **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
 | **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, stable documented exit codes, deterministic output under fixed sampling. |
@@ -91,6 +92,9 @@ focr robot selftest
 
 # 9. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
+
+# TrOMR conversion is available for conformance work; runtime OCR is still planned.
+focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
 ```
 
 After step 1 the weights live in `~/.cache/franken_ocr/models` and every later command runs fully offline.
@@ -101,7 +105,9 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 **A few models, every dimension fixed.** A general ML framework pays a generality tax on every operation: dynamic dtype dispatch, arbitrary shapes, autograd bookkeeping, broadcast machinery, and a device abstraction. `franken_ocr` runs a small set of hand-ported models whose important dimensions are known up front. For the default Unlimited-OCR path that means hidden 1280, 10 heads, head_dim 128, 64 experts, top-6 routing, MoE intermediate 896, R-SWA window 128, and vocab 129280. That buys shape-specialized kernels with no runtime shape branching in the hot loop. The scope is a few hand-tuned, certified models, not any model; there is no generic runtime underneath.
 
-**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. OneChart is runtime-ready for `--task chart-data` when you supply a local or converted `onechart.int8.focrq`; its public `focr pull onechart` manifest entry is still pending.
+**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. OneChart is runtime-ready for `--task chart-data` when you supply a local or converted `onechart.int8.focrq`; its public `focr pull onechart` manifest entry is still pending. TrOMR is not runtime-ready yet, but the port now has a census-backed descriptor, weight-standardized checkpoint export, deterministic high-precision `.focrq` conversion, four decode-only WordLevel tokenizers, a Torch-parity hybrid ResNetV2 plus ViT encoder, and a deterministic four-head autoregressive decoder checked token-exact against the argmax oracle.
+
+**Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
 
 **Offline at inference.** The only network step is `focr pull`, which runs ahead of time. There is no Python, no CUDA, no FFI, and no GPU in the inference path. The async runtime that orchestrates I/O and cancellation is an owned internal detail; the library API is synchronous and blocking, so there is no async plumbing to thread through your code.
 
@@ -307,7 +313,8 @@ focr models --json                          # machine-readable list
 | **`got-ocr2`** | ready | Specialized structured output the default cannot produce: formulas, tables, charts, molecular diagrams, geometry, and sheet music. | Heavier per page; `--task formula|tables|chart|molecular|geometry|music` implies `--format`. |
 | **`smolvlm2`** | ready engine | Photo description and VQA through `--task describe [--question "..."]`. | Use a local or converted `smolvlm2.int8.focrq` artifact until the public manifest publishes it. |
 | **`onechart`** | ready engine | Chart-to-data extraction through `--task chart-data`. | Use a local or converted `onechart.int8.focrq` artifact until the public manifest publishes it. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
-| **`tromr`**, **`trocr`**, **`pix2tex`** | planned | Sheet music, handwriting, and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
+| **`tromr`** | planned runtime | Polyphonic sheet-music OMR. | Descriptor, WS-folded checkpoint export, deterministic high-precision `.focrq` conversion, decode-only WordLevel tokenizer, Torch-parity encoder, deterministic argmax decoder, GroupNorm, and TF-SAME primitives are in place. `focr ocr --model tromr.focrq` still returns not implemented until the public runtime path ships. |
+| **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
 
@@ -333,6 +340,15 @@ focr ocr --model /path/to/onechart.int8.focrq --task chart-data chart.png
 
 The OneChart runtime path is ready, but the public pull manifest has not published the artifact yet. Use a local or converted `onechart.int8.focrq` until `focr pull onechart` appears in `models/manifest.json`.
 
+Prepare a TrOMR artifact for converter and tokenizer conformance work:
+
+```bash
+focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
+scripts/tromr_convert_e2e.sh
+```
+
+That command path is intentionally ahead of public runtime OCR. The native TrOMR encoder and deterministic decoder foundations are present, but assembly into `focr ocr --model tromr.focrq` remains a not-yet-implemented surface.
+
 ### `focr convert <input>`
 
 Offline weight transformation: a bf16 safetensors checkpoint into a custom int8 `.focrq` artifact.
@@ -342,6 +358,7 @@ focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 focr convert got.safetensors -o got-ocr2.int8.focrq --quant int8 --model-id got-ocr2
 focr convert smolvlm2.safetensors -o smolvlm2.int8.focrq --quant int8 --model-id smolvlm2
 focr convert onechart.safetensors -o onechart.int8.focrq --quant int8 --model-id onechart
+focr convert tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
 focr convert model.safetensors -o out.focrq --quant int8 --json
 ```
 
@@ -383,6 +400,10 @@ The hot path is not a generic tensor interpreter. Each model is converted into a
 **Intel / AMD x86-64.** The x86 backend detects AVX-512-VNNI, AVX-VNNI, and AVX2 in that order, then falls back to scalar. AVX2 uses an exact non-saturating path rather than a shortcut that could corrupt accumulation. AMX is not advertised until there is a real AMX backend; `robot backends` reports the tier this binary will actually dispatch.
 
 **Quantization policy.** The validated int8 path targets decoder GEMMs: dense MLPs, MoE expert/FFN matrices, and the per-token decode matmuls. The vision tower, projector, embeddings, MoE router, and all norms stay high precision. That split is deliberate: quantizing the vision side breaks OCR quality, while decoder int8 delivers the bandwidth win where it is safe.
+
+**TrOMR-specific CPU primitives.** The ResNetV2 plus ViT encoder lane now has TF-SAME padding arithmetic, TF-SAME max-pool support, a Torch-parity GroupNorm kernel with optional fused ReLU, and the hybrid encoder forward checked at cosine 1.0 against oracle seams. Weight-standardized convolutions are folded during checkpoint export so the runtime can keep the conv path simple. The E4 decoder adds the self-attention, cross-attention, GEGLU, stream embeddings, and four output heads needed for deterministic per-head argmax generation. These pieces are scalar Rust loops designed for LLVM autovectorization across Apple Silicon and Intel/AMD CPUs; hand-written wide SIMD is reserved for the int8 matmul kernels where the proof and measurement support it.
+
+**Zoo performance evidence.** The latest zoo gauntlet keeps paired reference rows for GOT-OCR2, SmolVLM2, and OneChart. On an aarch64 host with NEON dotprod at eight threads, the native decode-per-token path measured 3.37x over Hugging Face CPU for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2. The ledger also records the full end-to-end rows, including the current artifact-load tax, so the project can improve throughput without hiding unfavorable totals.
 
 **Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, proving i32 accumulation stays in range. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
 
@@ -535,7 +556,7 @@ What this is and is not:
 - **int8 can repeat on hard tables.** int8 decode is roughly 2.5x faster and byte-identical to f32 on typical pages, but some dense tables (for example `page_0590`) can trigger repetition runs. The no-repeat n-gram guard and the f32 fallback are the documented kill-switches. The vision tower stays high precision because quantizing it breaks OCR.
 - **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes each page (pure-Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. The fast path covers common scanned-PDF codecs: JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported. Rasterize that PDF out of band and retry.
 - **Native Windows (x86_64) is supported and proven end-to-end; ARM64 is not yet.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10: the same 3.9 GB int8 weights, vision tower, and DeepSeek-V2 decoder produce the same markdown a Mac or Linux host does. `focr.exe robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle, including the K=6848 overflow case). `focr pull` works on Windows too; the full 3.9 GB multi-part download, reassembly, and SHA-256 verify complete over the native async HTTP/TLS stack. The earlier send-path bug that surfaced as `WSAENOTCONN` / os error 10057 (`bd-15ow`) is fixed. The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`. The one remaining gap, tracked under epic `bd-3u97`, is that ARM64 Windows is not published.
-- **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, and OneChart for chart-to-data extraction. Planned descriptors such as Polyphonic-TrOMR, TrOCR, and pix2tex stay visible in the registry until their native paths ship. Each ready model is transformed offline and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
+- **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, and OneChart for chart-to-data extraction. TrOMR now has conversion, tokenizer, encoder, and deterministic decoder support, but its public OCR runtime path is still planned. TrOCR and pix2tex remain descriptor-only roadmap items. Each ready model is transformed offline and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
 - **Not benchmark SOTA.** Unlimited-OCR is strong but not the OmniDocBench leader. The aim is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
 - **CPU only.** No GPU. CUDA is a deferred stretch goal; CPU stays the product.
 
@@ -545,7 +566,7 @@ What this is and is not:
 
 **Is this affiliated with Baidu?** No. It is an independent pure-Rust reimplementation that runs Baidu's openly-licensed (MIT) model weights. The weights and any quantized derivative this project distributes carry the model notice surfaced by the binary and `.focrq` metadata: `Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License`.
 
-**Why not just use llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused build: a small fixed set of hand-ported models lets the kernels specialize to each model's exact shapes and skip the generality tax, and the whole thing ships as one Rust binary with no FFI. It is portable to targets where `ort` or CUDA cannot build.
+**Why use this instead of llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused build: a small fixed set of hand-ported models lets the kernels specialize to each model's exact shapes and skip the generality tax. The whole thing ships as one Rust binary with no FFI and is portable to targets where `ort` or CUDA cannot build.
 
 **Why Rust, and why forbid `unsafe`?** Memory safety for a multi-gigabyte weight loader and a tight decode loop, with `unsafe` confined to small, audited SIMD modules that each carry a bit-identical scalar fallback.
 
