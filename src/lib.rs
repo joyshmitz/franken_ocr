@@ -851,11 +851,15 @@ mod tests {
     /// default `models/unlimited-ocr.focrq` does not exist in the test CWD.)
     #[test]
     fn public_recognize_without_weights_is_model_not_found() {
-        // Only assert when the env override is unset AND the default is absent —
-        // the normal CI/dev condition. If a sibling test or the developer has a
-        // real model, skip rather than misfire.
+        // Only assert when the env override is unset AND the engine's own
+        // resolver finds nothing — the normal CI condition. Checking the
+        // repo-relative default alone is NOT enough: since bd-3u6x the
+        // default spec also resolves via the user cache
+        // (~/.cache/franken_ocr/models/unlimited-ocr.int8.focrq), so a dev
+        // box with a pulled artifact must skip rather than misfire.
         if std::env::var_os(MODEL_PATH_ENV).is_none()
             && !std::path::Path::new(DEFAULT_MODEL_PATH).exists()
+            && native_engine::OcrModel::resolve_model(Path::new(DEFAULT_MODEL_PATH)).is_err()
         {
             let engine = OcrEngine::new().expect("runtime builds");
             let err = engine
