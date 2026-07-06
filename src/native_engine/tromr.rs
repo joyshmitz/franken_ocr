@@ -17,9 +17,15 @@
 //! backbone; the backbone final norm is Identity (both census-confirmed
 //! absent from the checkpoint).
 //!
-//! The 4-head AR decoder (E4) is deliberately NOT here yet — it is a
-//! self-contained x-transformers graph (cross-attention every layer, GEGLU,
-//! GLU-gated `on_attn`) that does not ride `decoder_qwen2` (§10 non-fit).
+//! The 4-head AR decoder (E4, spec §4/§5) lives here too — a self-contained
+//! x-transformers graph that does NOT ride `decoder_qwen2` (§10 non-fit):
+//! 4 layers of ('a' causal self-attn, 'c' cross-attn over the encoder
+//! context, 'f' GEGLU ff), all pre-LN (eps 1e-5) + residual, inner 512 ≠ dim
+//! 256, GLU-gated bias-free `on_attn` out-projections, a summed 3-embedding
+//! input (+ scaled learned positions), and FOUR parallel heads off one final
+//! norm. [`generate`] is the port's DETERMINISTIC per-head-argmax default;
+//! upstream's top-k/T=0.2 sampling is the `FOCR_TROMR_SAMPLE` kill-switch
+//! (measured divergence — a DISCREPANCIES entry when it lands, spec §5).
 
 use crate::error::{FocrError, FocrResult};
 
@@ -491,6 +497,355 @@ pub fn encode(w: &TromrEncoderW, pixels: &[f32], width: usize) -> FocrResult<Mat
     nn::layer_norm(&tok, Some(&w.final_ln_w), Some(&w.final_ln_b), LN_EPS)
 }
 
+// ───────────────────────── E4: the 4-head AR decoder ─────────────────────────
+
+/// Decoder pre-branch LayerNorm eps (torch default — x-transformers passes
+/// none; spec §4. NOTE: 1e-5, unlike the encoder's 1e-6).
+const DEC_LN_EPS: f32 = 1e-5;
+/// Attention inner width (8 heads × 64 — inner 512 ≠ dim 256, spec §4).
+const DEC_INNER: usize = 512;
+const DEC_HEADS: usize = 8;
+const DEC_HEAD_DIM: usize = 64;
+/// `max_seq_len` (config): the position table height AND the generate cap.
+pub const MAX_SEQ: usize = 256;
+/// Learned positions are scaled by `dim^-0.5 = 1/16` (x_transformers §4).
+const POS_SCALE: f32 = 1.0 / 16.0;
+/// Rhythm-stream generate seeds (config `bos_token`/`nonote_token`).
+const SEED_RHYTHM: u32 = 1;
+const SEED_NONOTE: u32 = 0;
+
+/// One attention sublayer's weights: `to_{q,k,v} [512, 256]` and the
+/// `on_attn` out projection `[512, 512]` — ALL bias-free (census §12/§16).
+struct AttnW {
+    to_q: Vec<f32>,
+    to_k: Vec<f32>,
+    to_v: Vec<f32>,
+    to_out: Vec<f32>,
+}
+
+/// A pre-branch LayerNorm's affine params.
+struct Ln {
+    w: Vec<f32>,
+    b: Vec<f32>,
+}
+
+/// One of the 4 decoder layers: ('a' self-attn, 'c' cross-attn, 'f' GEGLU
+/// feed-forward), each pre-norm + residual (spec §4).
+struct DecLayer {
+    ln_a: Ln,
+    self_attn: AttnW,
+    ln_c: Ln,
+    cross_attn: AttnW,
+    ln_f: Ln,
+    ff_proj: Linear,
+    ff_out: Linear,
+}
+
+/// The hydrated TrOMR decoder (spec §12 names verbatim).
+pub struct TromrDecoderW {
+    rhythm_emb: Vec<f32>,
+    pitch_emb: Vec<f32>,
+    lift_emb: Vec<f32>,
+    pos_emb: Vec<f32>,
+    layers: Vec<DecLayer>,
+    final_ln: Ln,
+    /// The four parallel per-stream heads (spec §4) — public: E7's assembly
+    /// applies rhythm/pitch/lift per step, and the note head (inference-dead
+    /// upstream, spec §5) stays exposed for the cert + future consistency
+    /// diagnostics.
+    pub head_rhythm: Linear,
+    /// Pitch head `[71, 256]`.
+    pub head_pitch: Linear,
+    /// Lift head `[7, 256]`.
+    pub head_lift: Linear,
+    /// Note head `[2, 256]` (output-only; discarded at inference upstream).
+    pub head_note: Linear,
+}
+
+impl TromrDecoderW {
+    /// Hydrate from the artifact. The flat x-transformers layout indexes
+    /// sublayers `layers.{i}` with `i%3` ⇒ 0='a', 1='c', 2='f' (spec §4);
+    /// `layers.{i}.0.0` is the pre-branch norm, `layers.{i}.1` the branch.
+    ///
+    /// # Errors
+    /// A missing tensor or a shape violation.
+    pub fn build(weights: &Weights) -> FocrResult<Self> {
+        let ln = |name: String| -> FocrResult<Ln> {
+            Ok(Ln {
+                w: weights.vec(&format!("{name}.weight"))?,
+                b: weights.vec(&format!("{name}.bias"))?,
+            })
+        };
+        let attn = |i: usize| -> FocrResult<AttnW> {
+            let p = format!("decoder.net.attn_layers.layers.{i}.1.");
+            Ok(AttnW {
+                to_q: weights.vec(&format!("{p}to_q.weight"))?,
+                to_k: weights.vec(&format!("{p}to_k.weight"))?,
+                to_v: weights.vec(&format!("{p}to_v.weight"))?,
+                to_out: weights.vec(&format!("{p}to_out.0.weight"))?,
+            })
+        };
+        let head = |stream: &str, vocab: usize| -> FocrResult<Linear> {
+            Ok(Linear {
+                w: weights.vec(&format!("decoder.net.to_logits_{stream}.weight"))?,
+                b: weights.vec(&format!("decoder.net.to_logits_{stream}.bias"))?,
+                out: vocab,
+                in_: DIM,
+            })
+        };
+        let mut layers = Vec::with_capacity(4);
+        for l in 0..4 {
+            let base = 3 * l;
+            layers.push(DecLayer {
+                ln_a: ln(format!("decoder.net.attn_layers.layers.{base}.0.0"))?,
+                self_attn: attn(base)?,
+                ln_c: ln(format!("decoder.net.attn_layers.layers.{}.0.0", base + 1))?,
+                cross_attn: attn(base + 1)?,
+                ln_f: ln(format!("decoder.net.attn_layers.layers.{}.0.0", base + 2))?,
+                ff_proj: Linear {
+                    w: weights.vec(&format!(
+                        "decoder.net.attn_layers.layers.{}.1.net.0.proj.weight",
+                        base + 2
+                    ))?,
+                    b: weights.vec(&format!(
+                        "decoder.net.attn_layers.layers.{}.1.net.0.proj.bias",
+                        base + 2
+                    ))?,
+                    out: 2048,
+                    in_: DIM,
+                },
+                ff_out: Linear {
+                    w: weights.vec(&format!(
+                        "decoder.net.attn_layers.layers.{}.1.net.3.weight",
+                        base + 2
+                    ))?,
+                    b: weights.vec(&format!(
+                        "decoder.net.attn_layers.layers.{}.1.net.3.bias",
+                        base + 2
+                    ))?,
+                    out: DIM,
+                    in_: 1024,
+                },
+            });
+        }
+        Ok(Self {
+            rhythm_emb: weights.vec("decoder.net.rhythm_emb.emb.weight")?,
+            pitch_emb: weights.vec("decoder.net.pitch_emb.emb.weight")?,
+            lift_emb: weights.vec("decoder.net.lift_emb.emb.weight")?,
+            pos_emb: weights.vec("decoder.net.pos_emb.emb.weight")?,
+            layers,
+            final_ln: ln("decoder.net.norm".into())?,
+            head_rhythm: head("rhythm", 260)?,
+            head_pitch: head("pitch", 71)?,
+            head_lift: head("lift", 7)?,
+            head_note: head("note", 2)?,
+        })
+    }
+}
+
+/// Bias-free `[out, in]` projection: `y = x @ w^T`.
+fn proj_no_bias(x: &Mat, w: &[f32], out: usize) -> FocrResult<Mat> {
+    let lin = Linear {
+        w: w.to_vec(),
+        b: Vec::new(),
+        out,
+        in_: x.cols,
+    };
+    lin.apply(x)
+}
+
+/// One `on_attn` attention branch (self or cross — spec §4): q from `x_q`,
+/// k/v from `kv`, 8 heads × 64 at scale 1/8 (stable softmax inside the sdpa
+/// kernel — OQ-T4), then `Linear(512→512, no bias)` + GLU (`a · σ(b)`).
+fn glu_attention(a: &AttnW, x_q: &Mat, kv: &Mat, causal: bool) -> FocrResult<Mat> {
+    let (seq_q, seq_k) = (x_q.rows, kv.rows);
+    let q = proj_no_bias(x_q, &a.to_q, DEC_INNER)?;
+    let k = proj_no_bias(kv, &a.to_k, DEC_INNER)?;
+    let v = proj_no_bias(kv, &a.to_v, DEC_INNER)?;
+
+    // Repack [seq, 512] → head-major [8, seq, 64].
+    let pack = |m: &Mat, seq: usize| -> Vec<f32> {
+        let span = seq * DEC_HEAD_DIM;
+        let mut out = vec![0.0f32; DEC_HEADS * span];
+        for s in 0..seq {
+            let row = m.row(s);
+            for h in 0..DEC_HEADS {
+                let dst = h * span + s * DEC_HEAD_DIM;
+                out[dst..dst + DEC_HEAD_DIM]
+                    .copy_from_slice(&row[h * DEC_HEAD_DIM..(h + 1) * DEC_HEAD_DIM]);
+            }
+        }
+        out
+    };
+    let (qf, kf, vf) = (pack(&q, seq_q), pack(&k, seq_k), pack(&v, seq_k));
+    let scale = 1.0 / (DEC_HEAD_DIM as f32).sqrt();
+    let ctx = nn::sdpa(
+        &qf,
+        &kf,
+        &vf,
+        DEC_HEADS,
+        seq_q,
+        seq_k,
+        DEC_HEAD_DIM,
+        DEC_HEAD_DIM,
+        scale,
+        causal,
+    );
+    // Merge back to [seq_q, 512].
+    let span = seq_q * DEC_HEAD_DIM;
+    let mut merged = vec![0.0f32; seq_q * DEC_INNER];
+    for h in 0..DEC_HEADS {
+        for s in 0..seq_q {
+            let src = h * span + s * DEC_HEAD_DIM;
+            let dst = s * DEC_INNER + h * DEC_HEAD_DIM;
+            merged[dst..dst + DEC_HEAD_DIM].copy_from_slice(&ctx[src..src + DEC_HEAD_DIM]);
+        }
+    }
+    // on_attn: Linear(512→512, no bias) then GLU split 2×256: `a · σ(b)`.
+    let o = proj_no_bias(
+        &Mat::from_vec(seq_q, DEC_INNER, merged),
+        &a.to_out,
+        DEC_INNER,
+    )?;
+    let mut out = vec![0.0f32; seq_q * DIM];
+    for s in 0..seq_q {
+        let row = o.row(s);
+        for d in 0..DIM {
+            out[s * DIM + d] = row[d] * (1.0 / (1.0 + (-row[DIM + d]).exp()));
+        }
+    }
+    Ok(Mat::from_vec(seq_q, DIM, out))
+}
+
+/// The full-prefix decoder forward (upstream-faithful: NO KV cache — spec §4
+/// notes upstream re-forwards the whole prefix; at 256×256 this is trivially
+/// cheap, and a cache is a later bit-proven lever). Returns the final-normed
+/// hidden `[t, 256]` for the (rhythm, pitch, lift) prefix over the encoder
+/// `ctx` (`[1+8·wp, 256]`).
+///
+/// # Errors
+/// Length mismatches between the three streams, an empty prefix, or a
+/// prefix past [`MAX_SEQ`].
+pub fn decoder_forward(
+    w: &TromrDecoderW,
+    ctx: &Mat,
+    rhythm: &[u32],
+    pitch: &[u32],
+    lift: &[u32],
+) -> FocrResult<Mat> {
+    let t = rhythm.len();
+    if t == 0 || t > MAX_SEQ || pitch.len() != t || lift.len() != t {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr decoder: stream lens (r {}, p {}, l {}) must be equal, 1..={MAX_SEQ}",
+            rhythm.len(),
+            pitch.len(),
+            lift.len()
+        )));
+    }
+    // x_t = rhythm_emb[r] + pitch_emb[p] + lift_emb[l] + pos[t]/16 (spec §4).
+    let mut x = Mat::from_vec(t, DIM, vec![0.0f32; t * DIM]);
+    for (i, ((&r, &p), &l)) in rhythm.iter().zip(pitch).zip(lift).enumerate() {
+        let (r, p, l) = (r as usize, p as usize, l as usize);
+        if r >= 260 || p >= 71 || l >= 7 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "tromr decoder: id out of table at step {i} (r {r}, p {p}, l {l})"
+            )));
+        }
+        for d in 0..DIM {
+            x.data[i * DIM + d] = w.rhythm_emb[r * DIM + d]
+                + w.pitch_emb[p * DIM + d]
+                + w.lift_emb[l * DIM + d]
+                + w.pos_emb[i * DIM + d] * POS_SCALE;
+        }
+    }
+    for layer in &w.layers {
+        let h = nn::layer_norm(&x, Some(&layer.ln_a.w), Some(&layer.ln_a.b), DEC_LN_EPS)?;
+        let a = glu_attention(&layer.self_attn, &h, &h, true)?;
+        add_assign(&mut x, &a)?;
+        let h = nn::layer_norm(&x, Some(&layer.ln_c.w), Some(&layer.ln_c.b), DEC_LN_EPS)?;
+        let c = glu_attention(&layer.cross_attn, &h, ctx, false)?;
+        add_assign(&mut x, &c)?;
+        let h = nn::layer_norm(&x, Some(&layer.ln_f.w), Some(&layer.ln_f.b), DEC_LN_EPS)?;
+        // GEGLU: proj → chunk (x, gate) 2×1024 → x · GELU(gate) → out. The
+        // gate halves are gathered into one Mat so the exact-erf GELU runs
+        // vectorized, then multiplied back against the value halves.
+        let pr = layer.ff_proj.apply(&h)?;
+        let mut gate = Mat::from_vec(t, 1024, vec![0.0f32; t * 1024]);
+        for s in 0..t {
+            gate.data[s * 1024..(s + 1) * 1024].copy_from_slice(&pr.row(s)[1024..2048]);
+        }
+        nn::gelu(&mut gate);
+        let mut gated = Mat::from_vec(t, 1024, vec![0.0f32; t * 1024]);
+        for s in 0..t {
+            let row = pr.row(s);
+            for (g, (&x_val, &g_val)) in gated.data[s * 1024..(s + 1) * 1024].iter_mut().zip(
+                row[..1024]
+                    .iter()
+                    .zip(gate.data[s * 1024..(s + 1) * 1024].iter()),
+            ) {
+                *g = x_val * g_val;
+            }
+        }
+        let f = layer.ff_out.apply(&gated)?;
+        add_assign(&mut x, &f)?;
+    }
+    nn::layer_norm(&x, Some(&w.final_ln.w), Some(&w.final_ln.b), DEC_LN_EPS)
+}
+
+/// The three generated id streams (seeds excluded), positionally rhythm /
+/// pitch / lift end-to-end (the §4 naming-swap trap cancels; never "fix" it).
+pub struct MusicStreams {
+    /// Rhythm ids (the stream that carries `[EOS]`; includes it when emitted).
+    pub rhythm: Vec<u32>,
+    /// Pitch ids.
+    pub pitch: Vec<u32>,
+    /// Lift (accidental) ids.
+    pub lift: Vec<u32>,
+}
+
+/// Greedy (per-head argmax) generation — the port's DETERMINISTIC default
+/// (spec §5 port decision; upstream samples at T=0.2 behind top-k, which is
+/// the `FOCR_TROMR_SAMPLE` kill-switch, NOT implemented here). Seeds
+/// rhythm=[BOS]=1, pitch=lift=nonote=0; stops on rhythm `[EOS]`=2 or after
+/// [`MAX_SEQ`] steps. The note head is inference-dead (spec §5) and skipped.
+///
+/// # Errors
+/// A decoder-forward failure.
+pub fn generate(w: &TromrDecoderW, ctx: &Mat) -> FocrResult<MusicStreams> {
+    let mut rhythm = vec![SEED_RHYTHM];
+    let mut pitch = vec![SEED_NONOTE];
+    let mut lift = vec![SEED_NONOTE];
+    for _ in 0..MAX_SEQ {
+        // Upstream windows the prefix to the LAST max_seq_len positions.
+        let start = rhythm.len().saturating_sub(MAX_SEQ);
+        let hidden = decoder_forward(w, ctx, &rhythm[start..], &pitch[start..], &lift[start..])?;
+        let last = Mat::from_vec(1, DIM, hidden.row(hidden.rows - 1).to_vec());
+        let argmax = |head: &Linear| -> FocrResult<u32> {
+            let logits = head.apply(&last)?;
+            Ok(logits
+                .data
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv { (i, v) } else { (bi, bv) }
+                })
+                .0 as u32)
+        };
+        let r = argmax(&w.head_rhythm)?;
+        rhythm.push(r);
+        pitch.push(argmax(&w.head_pitch)?);
+        lift.push(argmax(&w.head_lift)?);
+        if r == crate::tokenizer::music::EOS_ID {
+            break;
+        }
+    }
+    Ok(MusicStreams {
+        rhythm: rhythm[1..].to_vec(),
+        pitch: pitch[1..].to_vec(),
+        lift: lift[1..].to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +895,73 @@ mod tests {
         assert!(encode(&w, &[], 0).is_err());
         assert!(encode(&w, &vec![0.0; IMG_H * 1296], 1296).is_err());
         assert!(encode(&w, &[0.0; 7], 800).is_err());
+    }
+
+    /// The E4 L3 cert (step-0 head logits) + L4 cert (argmax generate
+    /// token-exact): the decoder runs over the ORACLE's encoder context
+    /// (isolation — the encoder has its own cert), so any divergence is the
+    /// decoder's. The oracle's argmax generate is proven deterministic in
+    /// the fixture (`argmax_generate_deterministic: true`), so L4 expects
+    /// EXACT streams. Model-gated skip-with-SUCCESS.
+    #[test]
+    fn tromr_decoder_matches_argmax_oracle() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let fx_path = dir.join("tromr_oracle_fixtures.json");
+        if !fx_path.is_file() || !dir.join("tromr_seam_head0_rhythm.bin").is_file() {
+            eprintln!("[tromr-test] skip_no_model: decoder fixtures absent");
+            return;
+        }
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fx_path).unwrap()).unwrap();
+        assert_eq!(
+            fx["nondeterminism_floor"]["argmax_generate_deterministic"],
+            serde_json::Value::Bool(true),
+            "the oracle argmax run must be deterministic for an exact L4 gate"
+        );
+
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let dec = TromrDecoderW::build(&weights).expect("decoder hydrates");
+        let ctx_flat = read_f32(&dir.join("tromr_seam_encoder_out.bin"));
+        let seq = ctx_flat.len() / DIM;
+        let ctx = Mat::from_vec(seq, DIM, ctx_flat);
+
+        // L3: step-0 hidden over the seeds → all four heads vs the oracle.
+        let hidden = decoder_forward(&dec, &ctx, &[1], &[0], &[0]).expect("prefill runs");
+        let last = Mat::from_vec(1, DIM, hidden.row(hidden.rows - 1).to_vec());
+        for (stream, head) in [
+            ("rhythm", &dec.head_rhythm),
+            ("pitch", &dec.head_pitch),
+            ("lift", &dec.head_lift),
+            ("note", &dec.head_note),
+        ] {
+            let ours = head.apply(&last).expect("head applies");
+            let oracle = read_f32(&dir.join(format!("tromr_seam_head0_{stream}.bin")));
+            assert_eq!(ours.data.len(), oracle.len(), "{stream} head width");
+            let (c, m) = (cos(&ours.data, &oracle), maxabs(&ours.data, &oracle));
+            eprintln!("[tromr-cert] head0_{stream} cos {c:.8} maxabs {m:.3e}");
+            assert!(c >= 0.9999, "head0_{stream} cos {c}");
+        }
+
+        // L4: full argmax generate over the oracle context — token-EXACT.
+        let streams = generate(&dec, &ctx).expect("generate runs");
+        let want = |k: &str| -> Vec<u32> {
+            fx["argmax_generate"][k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+                .collect()
+        };
+        assert_eq!(streams.rhythm, want("rhythm"), "rhythm stream");
+        assert_eq!(streams.pitch, want("pitch"), "pitch stream");
+        assert_eq!(streams.lift, want("lift"), "lift stream");
+        eprintln!(
+            "[tromr-cert] L4 argmax generate EXACT: {} steps, rhythm ends [barline, EOS]",
+            streams.rhythm.len()
+        );
     }
 
     /// The E3 L1/L2 cert: every oracle seam (stem, stages, patch proj, each

@@ -20,6 +20,11 @@ committed example staff `examples/1.png` through:
 3. **floor**: the full encoder runs twice @1 torch thread and once @2 threads;
    the fixture records the same-thread and cross-thread maxabs of the FINAL
    output — the L1/L2 tolerances derive from these, never guessed.
+4. **decoder leg (E4)**: `torch.multinomial` is monkeypatched to argmax (the
+   port's deterministic default — spec §5 port decision; upstream sampling is
+   the FOCR_TROMR_SAMPLE kill-switch) and the full `model.generate` runs on
+   the same staff: the three id streams (POSITIONAL rhythm/pitch/lift — the
+   §4 naming-swap trap cancels) and each head's step-0 logits are dumped.
 
 Outputs (beside the zoo model, NOT committed — multi-MB):
     <zoo>/tromr_preproc.bin          f32 LE, the (1,128,W) readimg tensor
@@ -96,7 +101,7 @@ def main() -> int:
     model = TrOMR(conf)
     state = torch.load(ckpt, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
-    model.eval()
+    model.train(False)
 
     page = os.path.join(args.upstream, "examples", "1.png")
     x = readimg(cv2, np, page)
@@ -129,6 +134,41 @@ def main() -> int:
         with torch.inference_mode():
             return enc(xt).detach().float().numpy()
 
+    # ── E4 decoder leg: argmax-forced full generate + step-0 head logits ──
+    head_step0: dict = {}
+
+    def grab_head(name):
+        def hook(_m, _i, out):
+            if name not in head_step0:  # step 0 only
+                head_step0[name] = out.detach().float().numpy()
+
+        return hook
+
+    head_hooks = [
+        getattr(model.decoder.net, f"to_logits_{h}").register_forward_hook(grab_head(h))
+        for h in ("rhythm", "pitch", "lift", "note")
+    ]
+    real_multinomial = torch.multinomial
+    torch.multinomial = lambda probs, n, **kw: probs.argmax(-1, keepdim=True)
+    try:
+        torch.set_num_threads(1)
+        with torch.inference_mode():
+            g_rhythm, g_pitch, g_lift = model.generate(xt, temperature=0.2)
+        with torch.inference_mode():
+            g2_rhythm, g2_pitch, g2_lift = model.generate(xt, temperature=0.2)
+    finally:
+        torch.multinomial = real_multinomial
+        for h in head_hooks:
+            h.remove()
+    streams = {
+        "rhythm": [int(v) for v in g_rhythm[0].tolist()],
+        "pitch": [int(v) for v in g_pitch[0].tolist()],
+        "lift": [int(v) for v in g_lift[0].tolist()],
+    }
+    argmax_deterministic = (
+        g_rhythm.equal(g2_rhythm) and g_pitch.equal(g2_pitch) and g_lift.equal(g2_lift)
+    )
+
     # ── the oracle's own floor FIRST (two runs @1 thread, one @2) ────────
     torch.set_num_threads(1)
     out1 = run()
@@ -147,6 +187,8 @@ def main() -> int:
     pre_path = os.path.join(args.zoo, "tromr_preproc.bin")
     x.astype("<f4").tofile(pre_path)
     seams["encoder_out"] = final
+    for name, arr in head_step0.items():
+        seams[f"head0_{name}"] = arr
     seam_files = {}
     for name, arr in seams.items():
         p = os.path.join(args.zoo, f"tromr_seam_{name}.bin")
@@ -168,7 +210,9 @@ def main() -> int:
         "nondeterminism_floor": {
             "encoder_out_maxabs_same_thread": floor_same,
             "encoder_out_maxabs_cross_thread": floor_threads,
+            "argmax_generate_deterministic": argmax_deterministic,
         },
+        "argmax_generate": streams,
         "files_sha256": {
             os.path.basename(p): sha256_file(p)
             for p in [pre_path, *seam_files.values()]
@@ -187,6 +231,8 @@ def main() -> int:
                 "encoder_out_shape": list(final.shape),
                 "floor_same": floor_same,
                 "floor_threads": floor_threads,
+                "argmax_deterministic": argmax_deterministic,
+                "stream_lens": {k: len(v) for k, v in streams.items()},
                 "seams": sorted(seams.keys()),
                 "out": fx_path,
             }
