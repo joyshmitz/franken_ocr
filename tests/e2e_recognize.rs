@@ -135,6 +135,23 @@ fn resolve_present_model() -> Option<PathBuf> {
     franken_ocr::native_engine::OcrModel::resolve_model(&OcrEngine::model_path()).ok()
 }
 
+/// Env that arms the REAL-FORWARD e2e branches. A resolvable model alone
+/// must not arm them: a debug-profile full vision+decode forward is a
+/// multi-minute affair per test (measured 2026-07-06: a repopulated dev
+/// cache sent three present-model branches into the 600s forward budget on
+/// an M4 — exit 5, `cargo test` red for ~30 minutes). Set
+/// `FOCR_E2E_REAL_MODEL=1` — typically with a release-built harness — to
+/// run them; unset ⇒ skip-with-SUCCESS even when a model is cached.
+const REAL_MODEL_ARM_ENV: &str = "FOCR_E2E_REAL_MODEL";
+
+/// The model path for the real-forward branches: resolvable AND armed.
+fn armed_present_model() -> Option<PathBuf> {
+    match std::env::var_os(REAL_MODEL_ARM_ENV) {
+        Some(v) if !v.is_empty() && v != "0" => resolve_present_model(),
+        _ => None,
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // A tiny fixture image, generated at runtime.
 //
@@ -662,7 +679,7 @@ fn recognize_real_model_when_present_else_skip_with_success() {
     let case = "tiny_fixture";
 
     // ── GUARD 1: absent ⇒ skip-with-SUCCESS ─────────────────────────────────
-    let Some(model_path) = resolve_present_model() else {
+    let Some(model_path) = armed_present_model() else {
         let target = OcrEngine::model_path();
         log_line(
             test,
@@ -675,7 +692,7 @@ fn recognize_real_model_when_present_else_skip_with_success() {
             test,
             case,
             &format!(
-                "e2e skipped: model not present at {}; native path unverified",
+                "e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed (target {}); native path unverified",
                 target.display()
             ),
         );
@@ -922,7 +939,7 @@ fn cli_ocr_output_file_contract_when_model_present_else_skip() {
     let test = "cli_ocr_output_file_contract_when_model_present_else_skip";
     let case = "output_flag";
 
-    let Some(model_path) = resolve_present_model() else {
+    let Some(model_path) = armed_present_model() else {
         log_line(
             test,
             case,
@@ -1061,7 +1078,7 @@ fn cli_ocr_extract_figures_when_model_present_else_skip() {
     let test = "cli_ocr_extract_figures_when_model_present_else_skip";
     let case = "extract_figures";
 
-    let Some(model_path) = resolve_present_model() else {
+    let Some(model_path) = armed_present_model() else {
         log_success(
             test,
             case,
