@@ -1639,6 +1639,69 @@ fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     y
 }
 
+/// `M=B` batched twin of [`gemv_i8_bias_prequant`] for the DENSE decoder's batch
+/// spine (A7.5, bd-3jo6.1.7.5): every stream's activation row arrives ALREADY
+/// quantized on its own ties-to-even `(xq, a_scale)` (exactly what the m=1 dense
+/// decode step produces), the i32 contraction runs as ONE `M=B`
+/// [`simd::igemm_s8s8`] per channel block (M-independent — the weight panel is
+/// read once and reused across all `B` rows), and the dequant
+/// `acc as f32 * a_scale[r] * scales[o]` plus the optional per-output f32 bias
+/// use the SAME operands in the SAME order as [`gemv_i8_prequant`] +
+/// [`gemv_i8_bias_prequant`] — so row `r` is BYTE-FOR-BYTE the m=1 result for
+/// stream `r` alone (the lossless contract; gated in-module and by the dense
+/// bit-identity suite).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn gemm_i8_bias_prequant_batched(
+    rows: &[(&[i8], f32)],
+    qw: &QInt8,
+    bias: Option<&[f32]>,
+) -> Vec<Vec<f32>> {
+    let b = rows.len();
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.scales.len(), n);
+    if b == 0 {
+        return Vec::new();
+    }
+    // Pack the prequantized rows `[b, k]` (no re-quantize — the scales are the
+    // streams' own ties-to-even scales).
+    let mut xq = vec![0i8; b * k];
+    for (r, (row, _)) in rows.iter().enumerate() {
+        debug_assert_eq!(row.len(), k);
+        xq[r * k..(r + 1) * k].copy_from_slice(row);
+    }
+    // Channel-major `[n, b]` scratch: disjoint contiguous chunks per channel
+    // block, race-free fan-out (the gemv_i8_batched pattern).
+    let mut ycm = vec![0.0f32; n * b];
+    ycm.par_chunks_mut(I8_GEMV_BLOCK * b)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len() / b;
+            let mut acc = vec![0i32; b * cnt];
+            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], b, k, cnt, &mut acc);
+            for j in 0..cnt {
+                let scale_o = qw.scales[base + j];
+                let bias_o = bias.map_or(0.0, |bb| bb[base + j]);
+                for (r, &(_, a_scale)) in rows.iter().enumerate() {
+                    // Same expression shape as gemv_i8_prequant (+ the bias add
+                    // gemv_i8_bias_prequant performs after dequant).
+                    ys[j * b + r] = acc[r * cnt + j] as f32 * a_scale * scale_o + bias_o;
+                }
+            }
+        });
+    // Transpose channel-major `[n, b]` -> per-stream rows `[b][n]`.
+    let mut out: Vec<Vec<f32>> = (0..b).map(|_| vec![0.0f32; n]).collect();
+    for o in 0..n {
+        let col = o * b;
+        for (r, row) in out.iter_mut().enumerate() {
+            row[o] = ycm[col + r];
+        }
+    }
+    out
+}
+
 /// Ties-to-even twin of [`quantize_row_i8`] — matches the prefill's
 /// `nn::linear_int8_dynamic` (which quantizes activations ties-to-even), so a decode
 /// m=1 GEMV built on it is numerically consistent with the certified prefill. Same

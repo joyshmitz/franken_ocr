@@ -1347,6 +1347,201 @@ fn qwen2_decode_step(
     Ok(logits)
 }
 
+// ─────────── A7.5: the batched dense decode step (bd-3jo6.1.7.5) ───────────
+//
+// The multi-stream twin of [`qwen2_decode_step`] for the dense zoo decoders
+// (GOT/SmolVLM2 QwenLlama, OneChart Opt). The LOSSLESS contract: stream `s`'s
+// logits are BYTE-FOR-BYTE the m=1 step run on stream `s` alone. That holds by
+// construction:
+//
+//  * every per-stream op (family norm, ties-to-even quantize, RoPE at the
+//    stream's own absolute position, learned-position add, full-causal
+//    attention over the stream's own cache, residuals, SiLU/ReLU) is the SAME
+//    code the m=1 step runs, on the same per-stream data;
+//  * the six projections (qkv, o, gate, up / fc1, down / fc2) run as ONE
+//    `M=B` [`decoder::gemm_i8_bias_prequant_batched`] each — M-independent
+//    integer accumulation with per-row dequant identical to
+//    [`decoder::gemv_i8_bias_prequant`] (the in-module gates prove both).
+
+/// Per-stream full-causal KV for the dense batch spine: stream-major
+/// `[stream][layer]` [`Qwen2KvCache`]s, each stream at its OWN length. The
+/// dense analogue of `rswa::BatchedRingCache` (dense models attend the whole
+/// prefix — no ring, no eviction).
+// Wired into the dense `BatchStep` in the next A7.5 chunk (bd-3jo6.1.7.5);
+// until then the in-module bit-identity gates are the only callers.
+#[cfg_attr(not(test), allow(dead_code))]
+struct BatchedQwen2KvCache {
+    streams: Vec<Vec<Qwen2KvCache>>,
+}
+
+impl BatchedQwen2KvCache {
+    /// Build from per-stream seeded caches (one inner `Vec` per stream,
+    /// `n_layers` caches each — exactly what per-stream prefill seeding
+    /// produces).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn from_streams(streams: Vec<Vec<Qwen2KvCache>>) -> Self {
+        Self { streams }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn num_streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Stream `s`'s next absolute position (== its cached row count).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn position(&self, s: usize) -> usize {
+        self.streams[s][0].n_kv
+    }
+}
+
+/// One batched decode step over `B` streams: `xs[s]` is stream `s`'s `[1, hidden]`
+/// token embedding, `positions[s]` its absolute position (== `caches.position(s)`
+/// in the steady state; passed explicitly so the caller stays in charge, exactly
+/// like the m=1 signature). Returns `B` `[vocab]` logit rows.
+///
+/// # Errors
+/// Any shape/norm error from the underlying kernels.
+#[cfg_attr(not(test), allow(dead_code))]
+fn qwen2_batched_decode_step(
+    w: &GotDecodeWeights,
+    caches: &mut BatchedQwen2KvCache,
+    xs: &[Mat],
+    positions: &[usize],
+) -> FocrResult<Vec<Vec<f32>>> {
+    let b = xs.len();
+    debug_assert_eq!(b, positions.len());
+    debug_assert_eq!(b, caches.num_streams());
+    let cfg = &w.cfg;
+    let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
+    let (num_heads, head_dim) = (cfg.num_attention_heads, cfg.head_dim);
+    let (q_dim, kv_dim, kv_group) = (cfg.q_dim(), cfg.kv_dim(), cfg.kv_group());
+
+    // Per-stream working rows + per-stream RoPE tables at each TRUE position.
+    let mut x: Vec<Mat> = Vec::with_capacity(b);
+    let mut ropes: Vec<decoder::RopeTable> = Vec::with_capacity(b);
+    for (s, xin) in xs.iter().enumerate() {
+        let mut row = xin.clone();
+        add_learned_positions(&mut row, w, positions[s])?;
+        x.push(row);
+        ropes.push(decoder::RopeTable::build(
+            &[positions[s]],
+            head_dim,
+            cfg.rope_theta,
+        ));
+    }
+
+    for (l, cl) in w.layers.iter().enumerate() {
+        // ── attention: per-stream norm + ties-to-even quantize, ONE M=B qkv GEMM ──
+        let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
+        let mut prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+        for xs_row in &x {
+            let normed = family_norm(xs_row, &cl.input_ln, ln1_b, eps)?;
+            prequant.push(decoder::quantize_row_i8_te(&normed.data));
+        }
+        let rows: Vec<(&[i8], f32)> = prequant.iter().map(|(q, a)| (q.as_slice(), *a)).collect();
+        let qkv_rows =
+            decoder::gemm_i8_bias_prequant_batched(&rows, &cl.qkv, cl.qkv_bias.as_deref());
+
+        // ── per-stream: split/RoPE/append/attend, then ONE M=B o_proj ──
+        let mut ctx_prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+        for (s, qkv) in qkv_rows.iter().enumerate() {
+            let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
+            let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
+            let v = &qkv[q_dim + kv_dim..q_dim + 2 * kv_dim];
+            if w.embed_positions.is_none() {
+                decoder::apply_rope(&mut q, &ropes[s])?;
+                decoder::apply_rope(&mut k, &ropes[s])?;
+            }
+            caches.streams[s][l].append(&k.data, v);
+            let ctx = qwen2_decode_attention(
+                &caches.streams[s][l],
+                &q.data,
+                num_heads,
+                head_dim,
+                kv_group,
+            );
+            ctx_prequant.push(decoder::quantize_row_i8_te(&ctx));
+        }
+        let ctx_rows: Vec<(&[i8], f32)> = ctx_prequant
+            .iter()
+            .map(|(q, a)| (q.as_slice(), *a))
+            .collect();
+        let attn_rows =
+            decoder::gemm_i8_bias_prequant_batched(&ctx_rows, &cl.o, cl.o_bias.as_deref());
+        let mut h: Vec<Mat> = Vec::with_capacity(b);
+        for (s, attn) in attn_rows.into_iter().enumerate() {
+            h.push(decoder::add_residual(
+                &x[s],
+                &Mat::from_vec(1, hidden, attn),
+            )?);
+        }
+
+        // ── MLP: per-stream norm2 + quantize ONCE, batched projections ──
+        let ln2_b = cl.ln_bias.as_ref().map(|(_, bb)| bb.as_slice());
+        let mut mlp_prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+        for hs in &h {
+            let normed2 = family_norm(hs, &cl.post_attn_ln, ln2_b, eps)?;
+            mlp_prequant.push(decoder::quantize_row_i8_te(&normed2.data));
+        }
+        let mlp_rows: Vec<(&[i8], f32)> = mlp_prequant
+            .iter()
+            .map(|(q, a)| (q.as_slice(), *a))
+            .collect();
+        let mlp_out: Vec<Vec<f32>> = match &cl.mlp {
+            MlpW::SwiGlu { gate, up, down } => {
+                let g_rows = decoder::gemm_i8_bias_prequant_batched(&mlp_rows, gate, None);
+                let u_rows = decoder::gemm_i8_bias_prequant_batched(&mlp_rows, up, None);
+                let mut act_prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+                for (g_row, u_row) in g_rows.into_iter().zip(&u_rows) {
+                    let mut g = Mat::from_vec(1, cfg.intermediate_size, g_row);
+                    nn::silu(&mut g);
+                    for (gv, &uv) in g.data.iter_mut().zip(u_row.iter()) {
+                        *gv *= uv;
+                    }
+                    act_prequant.push(decoder::quantize_row_i8_te(&g.data));
+                }
+                let act_rows: Vec<(&[i8], f32)> = act_prequant
+                    .iter()
+                    .map(|(q, a)| (q.as_slice(), *a))
+                    .collect();
+                decoder::gemm_i8_bias_prequant_batched(&act_rows, down, None)
+            }
+            MlpW::ReluFc {
+                fc1,
+                fc1_b,
+                fc2,
+                fc2_b,
+            } => {
+                let m_rows = decoder::gemm_i8_bias_prequant_batched(&mlp_rows, fc1, Some(fc1_b));
+                let mut act_prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+                for m_row in m_rows {
+                    let mut m = Mat::from_vec(1, cfg.intermediate_size, m_row);
+                    nn::relu(&mut m);
+                    act_prequant.push(decoder::quantize_row_i8_te(&m.data));
+                }
+                let act_rows: Vec<(&[i8], f32)> = act_prequant
+                    .iter()
+                    .map(|(q, a)| (q.as_slice(), *a))
+                    .collect();
+                decoder::gemm_i8_bias_prequant_batched(&act_rows, fc2, Some(fc2_b))
+            }
+        };
+        for (s, out) in mlp_out.into_iter().enumerate() {
+            x[s] = decoder::add_residual(&h[s], &Mat::from_vec(1, hidden, out))?;
+        }
+    }
+
+    // lm_head stays per-stream through the SAME [`got_lm_head`] (its int8+top-K
+    // refine lever composes per stream; batching the head is a ledgered perf
+    // follow-on — correctness first).
+    let mut logits = Vec::with_capacity(b);
+    for xs_row in &x {
+        logits.push(got_lm_head(w, xs_row, eps)?);
+    }
+    Ok(logits)
+}
+
 /// **O(n)-per-token** greedy decode: identical id-stream to [`generate_greedy`] but
 /// with a full-causal KV cache instead of re-running prefill each step. The bit-for-bit
 /// equality is enforced by reusing [`nn::linear_int8_dynamic`] for every GEMM (the
@@ -1511,6 +1706,237 @@ mod tests {
         assert_eq!(g.layers_prefix, got.decoder_layers_prefix());
         assert_eq!(g.embed_tokens, got.embed_tokens_name());
         assert!(got.tie_word_embeddings() && g.lm_head.is_none());
+    }
+
+    // ── A7.5: the batched dense decode bit-identity gates (bd-3jo6.1.7.5) ──
+
+    /// Deterministic pseudo-random i8 weights / f32 rows (no rand dep; values
+    /// span sign + magnitude so quant/dequant paths are exercised).
+    fn det_i8(i: usize) -> i8 {
+        (((i * 31 + 7) % 251) as i64 - 125) as i8
+    }
+    fn det_f32(i: usize) -> f32 {
+        ((((i * 37 + 11) % 199) as f32) - 99.0) / 37.0
+    }
+
+    fn synth_q(n: usize, k: usize, seed: usize) -> QInt8 {
+        let w: Vec<i8> = (0..n * k).map(|i| det_i8(i + seed)).collect();
+        let scales: Vec<f32> = (0..n)
+            .map(|i| 0.01 + det_f32(i + seed).abs() * 0.003)
+            .collect();
+        QInt8::new(w, scales, n, k)
+    }
+
+    /// A tiny synthetic dense model for a family: 2 layers, hidden 8, 2 heads,
+    /// head_dim 4, inner 16, vocab 12 — every code path of the real shapes at
+    /// unit-test cost.
+    fn synth_weights(family: DecoderFamily) -> GotDecodeWeights {
+        let (hidden, inter, vocab, layers_n) = (8usize, 16usize, 12usize, 2usize);
+        let opt = matches!(family, DecoderFamily::Opt);
+        let layers = (0..layers_n)
+            .map(|l| {
+                let seed = l * 10_000;
+                GotLayerW {
+                    input_ln: (0..hidden)
+                        .map(|i| 1.0 + det_f32(i + seed) * 0.01)
+                        .collect(),
+                    post_attn_ln: (0..hidden)
+                        .map(|i| 1.0 + det_f32(i + seed + 77) * 0.01)
+                        .collect(),
+                    qkv: synth_q(3 * hidden, hidden, seed + 1),
+                    qkv_bias: Some(
+                        (0..3 * hidden)
+                            .map(|i| det_f32(i + seed + 2) * 0.05)
+                            .collect(),
+                    ),
+                    o: synth_q(hidden, hidden, seed + 3),
+                    o_bias: opt
+                        .then(|| (0..hidden).map(|i| det_f32(i + seed + 4) * 0.05).collect()),
+                    ln_bias: opt.then(|| {
+                        (
+                            (0..hidden).map(|i| det_f32(i + seed + 5) * 0.02).collect(),
+                            (0..hidden).map(|i| det_f32(i + seed + 6) * 0.02).collect(),
+                        )
+                    }),
+                    mlp: if opt {
+                        MlpW::ReluFc {
+                            fc1: synth_q(inter, hidden, seed + 7),
+                            fc1_b: (0..inter).map(|i| det_f32(i + seed + 8) * 0.05).collect(),
+                            fc2: synth_q(hidden, inter, seed + 9),
+                            fc2_b: (0..hidden).map(|i| det_f32(i + seed + 10) * 0.05).collect(),
+                        }
+                    } else {
+                        MlpW::SwiGlu {
+                            gate: synth_q(inter, hidden, seed + 7),
+                            up: synth_q(inter, hidden, seed + 8),
+                            down: synth_q(hidden, inter, seed + 9),
+                        }
+                    },
+                }
+            })
+            .collect();
+        let embed: Vec<f32> = (0..vocab * hidden)
+            .map(|i| det_f32(i + 555) * 0.2)
+            .collect();
+        // f32 pre-transposed [hidden, vocab] head from the tied embed table.
+        let mut head_t = vec![0.0f32; hidden * vocab];
+        for v in 0..vocab {
+            for h in 0..hidden {
+                head_t[h * vocab + v] = embed[v * hidden + h];
+            }
+        }
+        GotDecodeWeights {
+            layers,
+            final_norm: (0..hidden).map(|i| 1.0 + det_f32(i + 999) * 0.01).collect(),
+            final_norm_bias: opt.then(|| (0..hidden).map(|i| det_f32(i + 998) * 0.02).collect()),
+            embed_positions: opt.then(|| {
+                (
+                    (0..64 * hidden)
+                        .map(|i| det_f32(i + 424_242) * 0.03)
+                        .collect(),
+                    2,
+                )
+            }),
+            embed,
+            untied_head: None,
+            lm_head: LmHead::F32(Mat::from_vec(hidden, vocab, head_t)),
+            cfg: DecoderConfig {
+                family,
+                embed_positions: opt.then_some(("t", 2)),
+                hidden_size: hidden,
+                intermediate_size: inter,
+                num_hidden_layers: layers_n,
+                num_attention_heads: 2,
+                head_dim: 4,
+                vocab_size: vocab,
+                rope_theta: 10_000.0,
+                rms_norm_eps: 1e-6,
+                attn_qkv_bias: true,
+                no_repeat_ngram_size: 0,
+                num_key_value_heads: 2,
+                layers_prefix: "model.layers.",
+                embed_tokens: "model.embed_tokens.weight",
+                final_norm: "model.norm.weight",
+                lm_head: None,
+            },
+        }
+    }
+
+    /// Seed one stream's caches with `n` deterministic prefill rows and return
+    /// them (stream identity comes from `stream_seed`, so streams differ).
+    fn seed_stream(w: &GotDecodeWeights, n: usize, stream_seed: usize) -> Vec<Qwen2KvCache> {
+        let kv_dim = w.cfg.kv_dim();
+        (0..w.cfg.num_hidden_layers)
+            .map(|l| {
+                let mut c = Qwen2KvCache::new(kv_dim, n + 32);
+                let k: Vec<f32> = (0..n * kv_dim)
+                    .map(|i| det_f32(i + stream_seed + l * 991) * 0.4)
+                    .collect();
+                let v: Vec<f32> = (0..n * kv_dim)
+                    .map(|i| det_f32(i + stream_seed + l * 991 + 131) * 0.4)
+                    .collect();
+                c.seed(&k, &v);
+                c
+            })
+            .collect()
+    }
+
+    /// THE lossless contract: for B streams at DIFFERENT lengths, every decode
+    /// step's logits from [`qwen2_batched_decode_step`] are BIT-IDENTICAL
+    /// (`f32::to_bits` equality) to [`qwen2_decode_step`] run per stream alone —
+    /// for BOTH dense families (QwenLlama incl RoPE; Opt incl learned positions,
+    /// LayerNorm biases, biased ReLU MLP).
+    #[test]
+    fn batched_dense_decode_step_is_bit_identical_per_stream() {
+        for family in [DecoderFamily::QwenLlama, DecoderFamily::Opt] {
+            let w = synth_weights(family);
+            let hidden = w.cfg.hidden_size;
+            let prefill_lens = [3usize, 5, 8];
+            let b = prefill_lens.len();
+
+            // Single-stream references: independent caches per stream.
+            let mut solo: Vec<Vec<Qwen2KvCache>> = prefill_lens
+                .iter()
+                .enumerate()
+                .map(|(s, &n)| seed_stream(&w, n, s * 100_003))
+                .collect();
+            // Batched twin: identically-seeded caches.
+            let batched_streams: Vec<Vec<Qwen2KvCache>> = prefill_lens
+                .iter()
+                .enumerate()
+                .map(|(s, &n)| seed_stream(&w, n, s * 100_003))
+                .collect();
+            let mut batched = BatchedQwen2KvCache::from_streams(batched_streams);
+
+            for step in 0..4usize {
+                // Per-stream token embeds differ across streams AND steps.
+                let xs: Vec<Mat> = (0..b)
+                    .map(|s| {
+                        Mat::from_vec(
+                            1,
+                            hidden,
+                            (0..hidden)
+                                .map(|i| det_f32(i + s * 7_919 + step * 613) * 0.3)
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let positions: Vec<usize> = (0..b).map(|s| batched.position(s)).collect();
+
+                let batch_logits =
+                    qwen2_batched_decode_step(&w, &mut batched, &xs, &positions).expect("batched");
+                for s in 0..b {
+                    let solo_logits =
+                        qwen2_decode_step(&w, &mut solo[s], &xs[s], positions[s]).expect("solo");
+                    let identical = solo_logits.len() == batch_logits[s].len()
+                        && solo_logits
+                            .iter()
+                            .zip(&batch_logits[s])
+                            .all(|(a, bb)| a.to_bits() == bb.to_bits());
+                    assert!(
+                        identical,
+                        "family {family:?} stream {s} step {step}: batched logits != solo (LOSSLESS contract broken)"
+                    );
+                }
+            }
+            println!(
+                "{{\"check\":\"batched_dense_decode_bit_identity\",\"family\":\"{family:?}\",\"streams\":{b},\"steps\":4,\"result\":\"pass\"}}"
+            );
+        }
+    }
+
+    /// The batched prequant GEMM helper equals the m=1 kernel per row (with and
+    /// without bias), including mixed per-row scales.
+    #[test]
+    fn gemm_prequant_batched_matches_m1() {
+        let qw = synth_q(24, 16, 42);
+        let bias: Vec<f32> = (0..24).map(|i| det_f32(i + 4_242) * 0.1).collect();
+        let raw: Vec<Vec<f32>> = (0..5)
+            .map(|r| {
+                (0..16)
+                    .map(|i| det_f32(i + r * 331) * (r as f32 + 0.5))
+                    .collect()
+            })
+            .collect();
+        let prequant: Vec<(Vec<i8>, f32)> = raw
+            .iter()
+            .map(|row| decoder::quantize_row_i8_te(row))
+            .collect();
+        let rows: Vec<(&[i8], f32)> = prequant.iter().map(|(q, a)| (q.as_slice(), *a)).collect();
+        for maybe_bias in [None, Some(bias.as_slice())] {
+            let batched = decoder::gemm_i8_bias_prequant_batched(&rows, &qw, maybe_bias);
+            for (r, (q, a)) in prequant.iter().enumerate() {
+                let solo = decoder::gemv_i8_bias_prequant(q, *a, &qw, maybe_bias);
+                assert!(
+                    solo.iter()
+                        .zip(&batched[r])
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "row {r} (bias={}) diverged",
+                    maybe_bias.is_some()
+                );
+            }
+        }
+        println!("{{\"check\":\"gemm_prequant_batched_matches_m1\",\"result\":\"pass\"}}");
     }
 
     /// The int8 lever's refine source: untied arch ⇒ the untied head matrix,
