@@ -286,6 +286,19 @@ pub struct OcrRequestArgs {
     /// Requires `--task describe`.
     #[arg(long)]
     pub question: Option<String>,
+    /// PDF page selection: a comma list of 1-based pages and inclusive
+    /// ranges ("3", "3-7", "1,5-9,218"). PDF inputs only — on an image
+    /// input this is a usage error. Out-of-range pages error naming the
+    /// document's page count; pages run in source order, deduplicated.
+    #[arg(long)]
+    pub pages: Option<String>,
+    /// Split two-page book spreads (PDF inputs only): when a rasterized page
+    /// is much wider than tall AND a near-blank vertical gutter sits near the
+    /// center, OCR the left and right halves as separate logical pages
+    /// (labelled `"half": "left"|"right"` in JSON / robot page events). Off
+    /// by default; a page with no detectable gutter passes through unsplit.
+    #[arg(long)]
+    pub split_spreads: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +314,8 @@ pub struct OcrRequest {
     pub ngram_window: u32,
     pub format: bool,
     pub question: Option<String>,
+    pub pages: Option<String>,
+    pub split_spreads: bool,
 }
 
 impl OcrArgs {
@@ -377,6 +392,8 @@ impl OcrRequestArgs {
             // explicit `--format` wins / is idempotent alongside `--task`.
             format: self.format || self.task.implies_got_format(),
             question: self.question.clone(),
+            pages: self.pages.clone(),
+            split_spreads: self.split_spreads,
         })
     }
 
@@ -688,6 +705,11 @@ pub enum RobotCmd {
     /// on THIS host's silicon (exit 1 on any divergence). `FOCR_FORCE_ARCH`
     /// selects which available tier to verify.
     Selftest,
+    /// One-round-trip agent triage: quick_ref + live health + state-aware
+    /// recommendations + copy-pasteable command templates + the exit-code
+    /// dictionary, in a single JSON object (the mega-command an agent runs
+    /// FIRST).
+    Triage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -777,6 +799,12 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::Robot {
             cmd: RobotCmd::Selftest,
         } => run_robot_selftest(),
+        Command::Robot {
+            cmd: RobotCmd::Triage,
+        } => {
+            emit(&robot_triage_payload());
+            Ok(())
+        }
         Command::Ocr(args) if args.robot => {
             emit(&robot::run_start_event("ocr"));
             run_ocr(args, true)
@@ -828,10 +856,16 @@ impl Recognition {
                     .pages
                     .iter()
                     .map(|p| {
-                        serde_json::json!({
+                        let mut page = serde_json::json!({
                             "page": p.page,
                             "layout": layout_to_json(&p.layout),
-                        })
+                        });
+                        // Split-spread halves carry their side; unsplit pages
+                        // keep the exact pre-bd-av64.11 shape (no key).
+                        if let Some(half) = p.half {
+                            page["half"] = serde_json::json!(half);
+                        }
+                        page
                     })
                     .collect();
                 serde_json::json!({
@@ -1218,6 +1252,20 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // the figure-aware variants additionally crop the `![](images/…)` regions out
     // of the source and rewrite the markdown references to the saved files.
     let is_pdf = pdf::looks_like_pdf(&request.image);
+    if !is_pdf && (request.pages.is_some() || request.split_spreads) {
+        return Err(FocrError::Usage(format!(
+            "--pages/--split-spreads select and split PDF pages, but {} is not a PDF",
+            request.image.display()
+        )));
+    }
+    if request.split_spreads && figure_plan.is_some() {
+        return Err(FocrError::Usage(
+            "--split-spreads does not compose with --extract-figures yet (figure \
+             naming is per source page; splitting would collide the indices) — \
+             run the passes separately"
+                .into(),
+        ));
+    }
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, is_pdf) {
         (Some(plan), true) => {
             let (pdf_rec, figs) = recognize_pdf_with_figures(&engine, &request, robot_mode, plan)?;
@@ -1322,10 +1370,100 @@ where
     }
 }
 
+/// Parse a `--pages` spec ("3", "3-7", "1,5-9,218"; 1-based, inclusive
+/// ranges) against a document's page count into 0-based indices, in source
+/// order, deduplicated (bd-av64.11). `None` ⇒ every page.
+///
+/// # Errors
+/// [`FocrError::Usage`] on an empty/garbled spec, a zero page (pages are
+/// 1-based), a reversed range, or a page past `page_count` (the error names
+/// the document's page count).
+fn parse_page_spec(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usize>> {
+    let Some(spec) = spec else {
+        return Ok((0..page_count).collect());
+    };
+    let usage = |what: &str| {
+        FocrError::Usage(format!(
+            "--pages {spec:?}: {what} (expected 1-based pages/ranges like \"1,5-9\"; \
+             this document has {page_count} page(s))"
+        ))
+    };
+    let parse_one = |tok: &str| -> FocrResult<usize> {
+        let n: usize = tok
+            .trim()
+            .parse()
+            .map_err(|_| usage(&format!("unparseable page {tok:?}")))?;
+        if n == 0 {
+            return Err(usage("page 0 (pages are 1-based)"));
+        }
+        if n > page_count {
+            return Err(usage(&format!("page {n} is out of range")));
+        }
+        Ok(n - 1)
+    };
+    let mut selected = Vec::new();
+    let mut seen = vec![false; page_count];
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(usage("empty element"));
+        }
+        let range = match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (parse_one(a)?, parse_one(b)?);
+                if a > b {
+                    return Err(usage(&format!("reversed range {part:?}")));
+                }
+                a..=b
+            }
+            None => {
+                let n = parse_one(part)?;
+                n..=n
+            }
+        };
+        for idx in range {
+            if !seen[idx] {
+                seen[idx] = true;
+                selected.push(idx);
+            }
+        }
+    }
+    selected.sort_unstable();
+    Ok(selected)
+}
+
+/// The logical pages of one rasterized PDF page: the page itself, or its
+/// (left, right) halves when `--split-spreads` finds a book spread
+/// (bd-av64.11). The split decision is logged under FOCR_TIMING.
+fn logical_pages(
+    image: image::DynamicImage,
+    split_spreads: bool,
+    source_page: usize,
+) -> Vec<(image::DynamicImage, Option<&'static str>)> {
+    if split_spreads {
+        if let Some((left, right, gutter_x)) = pdf::split_spread(&image) {
+            crate::native_engine::timing_log(&format!(
+                "pdf page {source_page}: spread split at x={gutter_x} ({}x{})",
+                image.width(),
+                image.height()
+            ));
+            return vec![(left, Some("left")), (right, Some("right"))];
+        }
+        crate::native_engine::timing_log(&format!(
+            "pdf page {source_page}: no spread detected ({}x{}), unsplit",
+            image.width(),
+            image.height()
+        ));
+    }
+    vec![(image, None)]
+}
+
 /// One successfully-OCR'd PDF page's structured layout (for the JSON output).
 struct PdfPageLayout {
     /// 1-based page number in the source PDF.
     page: usize,
+    /// `Some("left"|"right")` when this entry is one half of a split spread.
+    half: Option<&'static str>,
     /// The page's parsed layout spans (labels + pixel bounding boxes).
     layout: Vec<crate::native_engine::LayoutSpan>,
 }
@@ -1374,39 +1512,11 @@ fn recognize_pdf(
         let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
         let mut ok_pages = 0usize;
         let mut first_error: Option<FocrError> = None;
-        for idx in 0..page_count {
-            let page = pages.render(idx).and_then(|image| match model {
-                Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
-                None => engine.recognize_dynamic_with_layout(image),
-            });
-            match page {
-                Ok(doc) => {
-                    if ok_pages > 0 {
-                        document.push_str("\n\n");
-                    }
-                    document.push_str(doc.markdown.trim_end());
-                    page_layouts.push(PdfPageLayout {
-                        page: idx + 1,
-                        layout: doc.layout,
-                    });
-                    ok_pages += 1;
-                }
-                // Whole-run conditions are never per-page — abort immediately:
-                // a missing model (so the caller can offer the download + retry),
-                // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
-                // (every page would fail it identically). Swallowing any of these
-                // per-page would lose the signal and waste compute on doomed pages.
-                Err(
-                    e @ (FocrError::ModelNotFound(_)
-                    | FocrError::Cancelled
-                    | FocrError::FormatMismatch(_)),
-                ) => return Err(e),
-                // Isolate every other per-page failure: skip it, keeping the rest
-                // of the document, but SURFACE the skip on whichever stream the
-                // caller is reading — a structured `page` NDJSON event in robot
-                // mode (so a machine consumer can tell the document is missing
-                // pages), else a human stderr warning.
+        for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
+            let halves = match pages.render(idx) {
+                Ok(image) => logical_pages(image, request.split_spreads, idx + 1),
                 Err(e) => {
+                    // A raster failure skips the SOURCE page (both halves).
                     if robot_mode {
                         emit(&robot::page_skipped_event(idx + 1, &e));
                     } else {
@@ -1414,6 +1524,52 @@ fn recognize_pdf(
                     }
                     if first_error.is_none() {
                         first_error = Some(e);
+                    }
+                    continue;
+                }
+            };
+            for (image, half) in halves {
+                let page = match model {
+                    Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
+                    None => engine.recognize_dynamic_with_layout(image),
+                };
+                match page {
+                    Ok(doc) => {
+                        if ok_pages > 0 {
+                            document.push_str("\n\n");
+                        }
+                        document.push_str(doc.markdown.trim_end());
+                        page_layouts.push(PdfPageLayout {
+                            page: idx + 1,
+                            half,
+                            layout: doc.layout,
+                        });
+                        ok_pages += 1;
+                    }
+                    // Whole-run conditions are never per-page — abort immediately:
+                    // a missing model (so the caller can offer the download + retry),
+                    // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
+                    // (every page would fail it identically). Swallowing any of these
+                    // per-page would lose the signal and waste compute on doomed pages.
+                    Err(
+                        e @ (FocrError::ModelNotFound(_)
+                        | FocrError::Cancelled
+                        | FocrError::FormatMismatch(_)),
+                    ) => return Err(e),
+                    // Isolate every other per-page failure: skip it, keeping the rest
+                    // of the document, but SURFACE the skip on whichever stream the
+                    // caller is reading — a structured `page` NDJSON event in robot
+                    // mode (so a machine consumer can tell the document is missing
+                    // pages), else a human stderr warning.
+                    Err(e) => {
+                        if robot_mode {
+                            emit(&robot::page_skipped_event(idx + 1, &e));
+                        } else {
+                            eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
             }
@@ -1458,7 +1614,7 @@ fn recognize_pdf_with_figures(
     let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
         let mut out: Vec<OkPage> = Vec::new();
         let mut first_error: Option<FocrError> = None;
-        for idx in 0..page_count {
+        for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
             let page = pages.render(idx).and_then(|image| match model {
                 Some(m) => engine.recognize_dynamic_with_figures_model(m, image),
                 None => engine.recognize_dynamic_with_figures(image),
@@ -1506,6 +1662,7 @@ fn recognize_pdf_with_figures(
         document.push_str(md.trim_end());
         page_layouts.push(PdfPageLayout {
             page: page_no,
+            half: None,
             layout: doc.layout,
         });
     }
@@ -2124,6 +2281,55 @@ fn robot_health_payload() -> serde_json::Value {
     })
 }
 
+/// The `robot triage` mega-command payload (bd-wp8.7 / agent-ergonomics
+/// Axiom 0): everything an agent needs to act after ONE round-trip — what the
+/// tool does (quick_ref), whether it can run right now (health), what to type
+/// NEXT given that state (recommendations, copy-pasteable), the common command
+/// templates, and the frozen exit-code dictionary. Composes the existing
+/// health payload and schema — no duplicated facts.
+fn robot_triage_payload() -> serde_json::Value {
+    let health = robot_health_payload();
+    let model_present = health["model_present"].as_bool().unwrap_or(false);
+    let recommendations: Vec<&str> = if model_present {
+        vec![
+            "focr ocr <image-or-pdf> -o out.md   # primary: OCR to markdown",
+            "focr ocr <image> --json             # structured JSON + bounding boxes",
+            "focr models                         # which zoo models/tasks this build can run",
+            "focr ocr-batch <img1> <img2> ...    # load weights once, many pages",
+        ]
+    } else {
+        vec![
+            "focr pull                           # download the default int8 weights (~3.9 GB)",
+            "focr models                         # see the model zoo + what is already pulled",
+            "focr robot health                   # re-check readiness after the pull",
+        ]
+    };
+    serde_json::json!({
+        "schema_version": robot::ROBOT_SCHEMA_VERSION,
+        "command": "robot.triage",
+        "quick_ref": {
+            "ocr": "parse a document image/PDF into markdown (--json for boxes; -o FILE to write)",
+            "ocr-batch": "many images in one process (weights load once)",
+            "pull": "download model weights into the cache (verified)",
+            "models": "list the model zoo: id, tasks, pulled status",
+            "convert": "offline safetensors -> .focrq quantization",
+            "runs": "query run history (--format json|ndjson; empty history = exit 0)",
+            "sync": "export/import the append-only run audit JSONL (one-way contract)",
+            "doctor": "self-check/repair",
+            "robot": "agent surfaces: run (NDJSON stream), schema, health, backends, selftest, triage",
+        },
+        "health": health,
+        "recommendations": recommendations,
+        "commands": {
+            "first_ocr": "focr ocr page.png -o page.md",
+            "structured": "focr ocr page.png --json",
+            "stream_events": "focr robot run page.png",
+            "contract": "focr robot schema",
+        },
+        "exit_codes": robot::robot_schema()["exit_codes"].clone(),
+    })
+}
+
 fn emit(value: &serde_json::Value) {
     // Robot-facing commands emit exactly one JSON object per line.
     println!(
@@ -2408,6 +2614,8 @@ mod tests {
                     format: false,
                     task: OcrTask::Ocr,
                     question: None,
+                    pages: None,
+                    split_spreads: false,
                 },
                 json: false,
                 output: None,
@@ -2437,6 +2645,8 @@ mod tests {
                         format: false,
                         task: OcrTask::Ocr,
                         question: None,
+                        pages: None,
+                        split_spreads: false,
                     },
                 }),
             },
@@ -2460,6 +2670,8 @@ mod tests {
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
+                pages: None,
+                split_spreads: false,
             },
             json: false,
             output: None,
@@ -2826,6 +3038,48 @@ mod tests {
         assert!(json.get("pages").is_none());
     }
 
+    /// bd-av64.11: the --pages spec parser — 1-based pages/ranges to
+    /// deduplicated source-order 0-based indices, with loud usage errors.
+    #[test]
+    fn page_spec_parses_and_rejects() {
+        // None => every page.
+        assert_eq!(parse_page_spec(None, 3).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_page_spec(Some("3"), 218).unwrap(), vec![2]);
+        assert_eq!(
+            parse_page_spec(Some("3-7"), 10).unwrap(),
+            vec![2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            parse_page_spec(Some("1,5-9,218"), 218).unwrap(),
+            vec![0, 4, 5, 6, 7, 8, 217]
+        );
+        // Overlap/duplicates dedupe; output is source-ordered.
+        assert_eq!(
+            parse_page_spec(Some("5-7,6,1"), 10).unwrap(),
+            vec![0, 4, 5, 6]
+        );
+        // Round-trip property: rendering the indices back as 1-based pages
+        // and reparsing is a fixed point.
+        let idx = parse_page_spec(Some("2,4-6"), 9).unwrap();
+        let rendered = idx
+            .iter()
+            .map(|i| (i + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(parse_page_spec(Some(&rendered), 9).unwrap(), idx);
+        for bad in ["", " ", ",", "0", "abc", "3-2", "1-", "-4", "300"] {
+            let err = parse_page_spec(Some(bad), 218).unwrap_err();
+            assert!(
+                matches!(err, FocrError::Usage(_)),
+                "{bad:?} must be a usage error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("218"),
+                "{bad:?}: error names the page count: {err}"
+            );
+        }
+    }
+
     #[test]
     fn pdf_json_carries_per_page_layout_with_one_based_page_numbers() {
         let rec = Recognition::Pdf(PdfRecognition {
@@ -2833,6 +3087,7 @@ mod tests {
             pages: vec![
                 PdfPageLayout {
                     page: 1,
+                    half: None,
                     layout: vec![native_engine::LayoutSpan {
                         label: "text".to_string(),
                         boxes: vec![[0, 0, 5, 5]],
@@ -2840,6 +3095,7 @@ mod tests {
                 },
                 PdfPageLayout {
                     page: 2,
+                    half: None,
                     layout: vec![],
                 },
             ],
@@ -2903,6 +3159,8 @@ mod tests {
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
+                pages: None,
+                split_spreads: false,
             },
             json: false,
             output: None,

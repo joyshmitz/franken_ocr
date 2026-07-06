@@ -1,7 +1,6 @@
 {
  "artifact": "franken_ocr.release_readiness.v1",
  "blocking_cells": [
-  "agent_ergonomics",
   "doctor",
   "certification_bundle",
   "gauntlet_convergence"
@@ -61,8 +60,9 @@
   },
   {
    "cell": "agent_ergonomics",
-   "evidence": "bd-wp8.7 OPEN: audit + apply pass not yet documented",
-   "status": "red"
+   "detail": "median uplift +550 across 5 dimensions; heatmap debt filed (doctor fixtures, ocr-batch golden)",
+   "evidence": "docs/ergonomics/AUDIT.md + tests/agent_ergonomics_regression.rs (6 pinned changes; 11 landed)",
+   "status": "green"
   },
   {
    "cell": "doctor",
@@ -82,7 +82,7 @@
   }
  ],
  "generated_by": "scripts/gauntlet_cert.py --release-readiness",
- "green": 9,
- "red": 4,
+ "green": 10,
+ "red": 3,
  "ship": false
 }

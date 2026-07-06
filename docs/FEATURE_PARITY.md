@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **56** | **184** |
-| `present` | 115 † | 42 | 157 |
+| Total enumerated rows | **128** | **57** | **185** |
+| `present` | 115 † | 43 | 158 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -264,6 +264,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
 | `focr robot backends` (SIMD tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | reflects IsaTier; goldens |
 | `focr robot selftest` (runtime int8 kernel parity on host silicon) | §7.2 | MUST | present | SURF | bd-223.13 | 24/24 on native Win10; AVX2 ceiling proven on 5995WX |
+| `focr robot triage` (one-round-trip agent mega-command) | §7.2 | SHOULD | present | SURF | bd-wp8.7 | quick_ref + health + state-aware recommendations + exit codes in ONE JSON; pinned by agent_ergonomics_regression |
 | `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |
 | `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
 | `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | partial | SURF | bd-wp8.4 | shipped + goldens; idempotent/reversible/capability audit bead open |
