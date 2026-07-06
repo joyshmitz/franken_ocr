@@ -501,7 +501,9 @@ static TROMR: PlannedArch = PlannedArch {
     // single embed_tokens. The rhythm stream is primary (drives EOS); the
     // untie-verify never fires (no `lm_head.weight` exists).
     embed_tokens_name: "decoder.net.rhythm_emb.emb.weight",
-    implemented: false,
+    // E2-E7+E9 shipped: convert (E2), tokenizer (E6), encoder cos 1.0 (E3),
+    // decoder token-exact (E4), merge+MusicXML (E7), `--task music` routing.
+    implemented: true,
 };
 static TROCR: PlannedArch = PlannedArch {
     id: "trocr",
@@ -593,10 +595,10 @@ mod tests {
         implemented.sort_unstable();
         assert_eq!(
             implemented,
-            ["got-ocr2", "onechart", "smolvlm2", "unlimited-ocr"]
+            ["got-ocr2", "onechart", "smolvlm2", "tromr", "unlimited-ocr"]
         );
         // The remaining zoo models are present but NOT yet implemented (descriptors).
-        for id in ["tromr", "trocr", "pix2tex"] {
+        for id in ["trocr", "pix2tex"] {
             let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
@@ -612,7 +614,7 @@ mod tests {
         // E2 (bd-3jo6.5.2): the descriptor carries the tromr-spec §5/§9/§11/§12
         // census, not placeholders. Convert-critical fields first.
         let a = arch_by_id("tromr").expect("tromr registered");
-        assert!(!a.implemented(), "runtime lands E3-E9");
+        assert!(a.implemented(), "E2-E9 shipped (model #5)");
         assert_eq!(a.decoder(), Decoder::Seq2SeqDense);
         assert_eq!(a.tokenizer(), TokenizerKind::MusicVocab);
         // §12: no lm_head.weight exists — four untied per-stream heads; the

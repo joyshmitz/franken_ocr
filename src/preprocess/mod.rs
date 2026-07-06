@@ -903,6 +903,99 @@ fn view_tensor(img: &DynamicImage) -> ViewTensor {
     }
 }
 
+// ───────────────── TrOMR staff preprocess (E9, tromr-spec §6) ─────────────────
+
+/// The `readimg` normalize constants (albumentations `Normalize(mean=0.7931,
+/// std=0.1738, max_pixel_value=255)` — spec §6).
+const TROMR_MEAN: f32 = 0.7931 * 255.0;
+const TROMR_STD: f32 = 0.1738 * 255.0;
+
+/// Half-pixel-center bilinear resize of one u8 plane (the cv2 `INTER_LINEAR`
+/// sampling geometry: `sx = (dx+0.5)·w/nw − 0.5`, edge-clamped, NO area
+/// averaging on downscale — upstream resizes staves this way, quality
+/// warts and all). Float weights + round; cv2's 11-bit fixed-point
+/// arithmetic can differ by ±1 LSB — a MEASURED envelope, ledgered in the
+/// armed cert (the DISC-001 resample precedent).
+fn bilinear_u8(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; nw * nh];
+    let sx_ratio = w as f32 / nw as f32;
+    let sy_ratio = h as f32 / nh as f32;
+    for dy in 0..nh {
+        let fy = ((dy as f32 + 0.5) * sy_ratio - 0.5).max(0.0);
+        let y0 = (fy as usize).min(h - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let wy = fy - y0 as f32;
+        for dx in 0..nw {
+            let fx = ((dx as f32 + 0.5) * sx_ratio - 0.5).max(0.0);
+            let x0 = (fx as usize).min(w - 1);
+            let x1 = (x0 + 1).min(w - 1);
+            let wx = fx - x0 as f32;
+            let top = f32::from(src[y0 * w + x0]) * (1.0 - wx) + f32::from(src[y0 * w + x1]) * wx;
+            let bot = f32::from(src[y1 * w + x0]) * (1.0 - wx) + f32::from(src[y1 * w + x1]) * wx;
+            out[dy * nw + dx] = (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// TrOMR staff preprocess (`staff2score.py::readimg`, spec §6): the ink gray
+/// plane (RGBA ⇒ `255 − alpha`, the rendered-PNG convention; RGB ⇒ the cv2
+/// fixed-point luma `(4899·R + 9617·G + 1868·B + 8192) >> 14`; gray ⇒ as-is)
+/// → half-pixel-center bilinear resize to `h=128, w = ⌊(128/h)·w⌋` floored to
+/// a multiple of 16 → normalize `(px − 0.7931·255)/(0.1738·255)`. Returns
+/// `(pixels[128·W], W)` ready for [`crate::native_engine::tromr::encode`].
+///
+/// Channel-order note: upstream converts to gray AFTER the resize, but the
+/// RGBA path resizes three REPLICATED gray channels (identical results) and
+/// the RGB path's luma-then-resize vs resize-then-luma differ only through
+/// the same ±1-LSB rounding envelope the armed cert measures.
+///
+/// # Errors
+/// A degenerate image, or a resized width of 0 or past the 1280 position
+/// clamp (the E5 front end guarantees the bound; a raw over-wide crop is a
+/// clean error, never undefined crop-indexing — spec §2b).
+pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: degenerate {w}x{h} input"
+        )));
+    }
+    // The ink gray plane.
+    let gray: Vec<u8> = if img.color().has_alpha() {
+        img.to_rgba8().pixels().map(|p| 255 - p.0[3]).collect()
+    } else {
+        img.to_rgb8()
+            .pixels()
+            .map(|p| {
+                let [r, g, b] = p.0;
+                ((4899 * u32::from(r) + 9617 * u32::from(g) + 1868 * u32::from(b) + 8192) >> 14)
+                    .min(255) as u8
+            })
+            .collect()
+    };
+    let new_h = crate::native_engine::tromr::IMG_H;
+    let new_w = ((new_h as f64 / h as f64 * w as f64) as usize) / 16 * 16;
+    if new_w == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: {w}x{h} resizes to zero width (image too narrow)"
+        )));
+    }
+    if new_w > crate::native_engine::tromr::POS_COLS * crate::native_engine::tromr::PATCH {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: resized width {new_w} exceeds the 1280 position clamp — \
+             pass a single-staff crop (aspect ≤ 10:1 at h=128; the staff-detection \
+             front end enforces this)"
+        )));
+    }
+    let resized = bilinear_u8(&gray, w, h, new_w, new_h);
+    let pixels = resized
+        .iter()
+        .map(|&v| (f32::from(v) - TROMR_MEAN) / TROMR_STD)
+        .collect();
+    Ok((pixels, new_w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

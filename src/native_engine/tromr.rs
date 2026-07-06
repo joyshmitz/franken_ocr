@@ -1210,6 +1210,52 @@ pub fn semantic_to_musicxml(merged: &str) -> FocrResult<String> {
     ))
 }
 
+// ───────────────── E9: the recognize assembly ─────────────────
+
+/// The music-recognition result: the raw model-native semantic string (what
+/// SER scoring consumes; ships in `--json`) and the partwise MusicXML (the
+/// primary interop export — spec §8).
+pub struct MusicResult {
+    /// The merged extended-PrIMuS semantic stream.
+    pub semantic: String,
+    /// Partwise MusicXML 4.0.
+    pub musicxml: String,
+}
+
+/// The full E9 single-staff pipeline: §6 preprocess → the certified encoder →
+/// deterministic argmax generate → §8 merge → MusicXML. The input must be a
+/// single-staff crop (the width guard rejects > 1280 at h=128; full-page
+/// staff detection is the E5 front end).
+///
+/// # Errors
+/// A preprocess/width violation, a missing tensor, or a decode error.
+pub fn recognize(
+    weights: &Weights,
+    tk: &crate::tokenizer::music::MusicTokenizer,
+    img: &image::DynamicImage,
+) -> FocrResult<MusicResult> {
+    let t0 = std::time::Instant::now();
+    let (pixels, width) = crate::preprocess::tromr_staff_tensor(img)?;
+    let enc = TromrEncoderW::build(weights)?;
+    let ctx = encode(&enc, &pixels, width)?;
+    super::timing_log(&format!(
+        "  tromr.encode {:.2}s (w {width}, {} ctx tokens)",
+        t0.elapsed().as_secs_f64(),
+        ctx.rows
+    ));
+    let tg = std::time::Instant::now();
+    let dec = TromrDecoderW::build(weights)?;
+    let streams = generate(&dec, &ctx)?;
+    super::timing_log(&format!(
+        "  tromr.generate {} steps {:.2}s",
+        streams.rhythm.len(),
+        tg.elapsed().as_secs_f64()
+    ));
+    let semantic = merge_semantic(tk, &streams)?;
+    let musicxml = semantic_to_musicxml(&semantic)?;
+    Ok(MusicResult { semantic, musicxml })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1519,76 @@ mod tests {
         );
         assert!(xml.contains("<measure number=\"3\">"), "3 measures");
         eprintln!("[tromr-cert] E7 merge+MusicXML over the certified streams OK");
+    }
+
+    /// The E9 L0b cert: OUR preprocess (image crate decode + float bilinear +
+    /// cv2-luma/ink arithmetic) vs the cv2 reference tensor, envelope
+    /// MEASURED; then the output-level gate — our preprocess through the
+    /// certified encoder + decoder must reproduce the oracle's argmax
+    /// streams EXACTLY (the honest test: does the ±1-LSB resample envelope
+    /// move any token?). Model-gated skip-with-SUCCESS.
+    #[test]
+    fn tromr_preprocess_envelope_and_output_gate() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let fx_path = dir.join("tromr_oracle_fixtures.json");
+        if !fx_path.is_file() {
+            eprintln!("[tromr-test] skip_no_model: oracle fixtures absent");
+            return;
+        }
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fx_path).unwrap()).unwrap();
+        let page = fx["_meta"]["page"].as_str().unwrap();
+        if !std::path::Path::new(page).is_file() {
+            eprintln!("[tromr-test] skip_no_model: upstream example absent ({page})");
+            return;
+        }
+        let img = image::open(page).expect("example decodes");
+        let (pixels, width) = crate::preprocess::tromr_staff_tensor(&img).expect("preprocess runs");
+        let oracle_w = fx["preproc"]["shape"][2].as_u64().unwrap() as usize;
+        assert_eq!(
+            width, oracle_w,
+            "resize geometry must match readimg exactly"
+        );
+
+        // L0b envelope vs the cv2 reference (normalized units; 1 u8 LSB =
+        // 0.02257). MEASURED, not asserted tight: the gate is the
+        // output-level stream identity below (the DISC-001 pattern).
+        let oracle = read_f32(&dir.join("tromr_preproc.bin"));
+        let m = maxabs(&pixels, &oracle);
+        let lsb = 1.0f32 / (0.1738 * 255.0);
+        let n_off = pixels
+            .iter()
+            .zip(oracle.iter())
+            .filter(|(a, b)| (**a - **b).abs() > lsb * 1.5)
+            .count();
+        eprintln!(
+            "[tromr-cert] L0b preprocess maxabs {m:.4} ({:.2} LSB); {n_off}/{} pixels past 1.5 LSB",
+            m / lsb,
+            pixels.len()
+        );
+
+        // Output-level gate: the full OUR-pipeline must reproduce the
+        // certified streams token-exactly.
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let enc = TromrEncoderW::build(&weights).expect("encoder hydrates");
+        let dec = TromrDecoderW::build(&weights).expect("decoder hydrates");
+        let ctx = encode(&enc, &pixels, width).expect("encode runs");
+        let streams = generate(&dec, &ctx).expect("generate runs");
+        let want = |k: &str| -> Vec<u32> {
+            fx["argmax_generate"][k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+                .collect()
+        };
+        assert_eq!(streams.rhythm, want("rhythm"), "rhythm via OUR preprocess");
+        assert_eq!(streams.pitch, want("pitch"), "pitch via OUR preprocess");
+        assert_eq!(streams.lift, want("lift"), "lift via OUR preprocess");
+        eprintln!("[tromr-cert] E9 full-native pipeline streams EXACT via our preprocess");
     }
 
     /// The E3 L1/L2 cert: every oracle seam (stem, stages, patch proj, each

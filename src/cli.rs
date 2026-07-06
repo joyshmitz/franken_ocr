@@ -401,6 +401,22 @@ fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResu
                 .into(),
         ));
     }
+    if task == OcrTask::Music {
+        // Music is served by TWO lanes: tromr (native OMR -> MusicXML, the
+        // specialist) and got-ocr2 (sheet-music format mode). Reject only
+        // when the model is knowably NEITHER.
+        if model_spec_is_knowably_not_got(model_spec)
+            && model_spec_is_knowably_not_tromr(model_spec)
+        {
+            return Err(FocrError::Usage(
+                "--task music needs the tromr (native OMR -> MusicXML) or got-ocr2 \
+                 (sheet-music format mode) model, but this run would use a different \
+                 model. Re-run with `--model tromr.focrq` (see `focr models`)"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
     if task.implies_got_format() && model_spec_is_knowably_not_got(model_spec) {
         return Err(FocrError::Usage(format!(
             "--task {task} needs the got-ocr2 model, but this run would use the plain-text \
@@ -427,6 +443,23 @@ fn model_spec_is_knowably_not_onechart(spec: Option<&Path>) -> bool {
     let name = name.to_string_lossy().to_ascii_lowercase();
     !name.contains("onechart")
         && (name.contains("unlimited") || name.contains("got") || name.contains("smolvlm"))
+}
+
+/// True when the model spec is KNOWABLY not a tromr artifact (mirrors
+/// [`model_spec_is_knowably_not_smolvlm2`]).
+fn model_spec_is_knowably_not_tromr(spec: Option<&Path>) -> bool {
+    let Some(path) = spec else {
+        return true;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    !name.contains("tromr")
+        && (name.contains("unlimited")
+            || name.contains("got")
+            || name.contains("smolvlm")
+            || name.contains("onechart"))
 }
 
 fn model_spec_is_knowably_not_smolvlm2(spec: Option<&Path>) -> bool {

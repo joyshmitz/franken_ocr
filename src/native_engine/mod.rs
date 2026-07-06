@@ -98,6 +98,7 @@ pub struct OcrModel {
     /// the model). Only populated for the `got-ocr2` arch; the Baidu path uses
     /// [`Self::tokenizer`] above.
     got_tokenizer: std::sync::OnceLock<crate::tokenizer::tiktoken::Tiktoken>,
+    tromr_tokenizer: std::sync::OnceLock<crate::tokenizer::music::MusicTokenizer>,
 }
 
 /// Process-global cache of the last-loaded model, keyed by resolved path.
@@ -928,6 +929,7 @@ impl OcrModel {
             decoder_cache_i8: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
+            tromr_tokenizer: std::sync::OnceLock::new(),
         });
 
         let mut guard = model_cache_guard()?;
@@ -995,6 +997,9 @@ impl OcrModel {
         if self.arch().id() == "onechart" {
             return self.forward_onechart(&preprocess::decode_path(image_path)?);
         }
+        if self.arch().id() == "tromr" {
+            return self.forward_tromr(&preprocess::decode_path(image_path)?);
+        }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         // Mode = the certified Base-1024 default unless the CLI overrode it
@@ -1020,6 +1025,9 @@ impl OcrModel {
         }
         if self.arch().id() == "onechart" {
             return self.forward_onechart(&img);
+        }
+        if self.arch().id() == "tromr" {
+            return self.forward_tromr(&img);
         }
         let t = std::time::Instant::now();
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
@@ -1103,6 +1111,42 @@ impl OcrModel {
             res.reliable
         ));
         Ok((res.json_text, w, h))
+    }
+
+    /// The TrOMR music-recognition forward path (E9, bd-3jo6.5.9): §6 staff
+    /// preprocess → the certified hybrid encoder → deterministic argmax
+    /// 4-head generate → §8 semantic merge → partwise MusicXML. The TEXT
+    /// output is the MusicXML (the primary interop export); the model-native
+    /// semantic stream is logged via [`timing_log`] and is the library-level
+    /// [`tromr::MusicResult`] field.
+    fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        use image::GenericImageView;
+        let t = std::time::Instant::now();
+        let (w, h) = img.dimensions();
+        let tk = self.tromr_tokenizer()?;
+        let res = tromr::recognize(&self.weights, tk, img)?;
+        timing_log(&format!(
+            "tromr forward {:.2}s (semantic {} chars)",
+            t.elapsed().as_secs_f64(),
+            res.semantic.len()
+        ));
+        Ok((res.musicxml, w, h))
+    }
+
+    /// The TrOMR 4-table WordLevel music tokenizer, loaded from the
+    /// `tokenizer_{rhythm,pitch,lift,note}.json` files beside the model
+    /// (the zoo files-beside convention) and cached.
+    fn tromr_tokenizer(&self) -> FocrResult<&crate::tokenizer::music::MusicTokenizer> {
+        if let Some(t) = self.tromr_tokenizer.get() {
+            return Ok(t);
+        }
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let loaded = crate::tokenizer::music::MusicTokenizer::from_dir(dir)?;
+        let _ = self.tromr_tokenizer.set(loaded);
+        Ok(self
+            .tromr_tokenizer
+            .get()
+            .expect("tromr tokenizer just set"))
     }
 
     /// The GOT Qwen tiktoken tokenizer, loaded from `qwen.tiktoken` beside the
