@@ -54,7 +54,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
-| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder into a versioned scorecard plus raw NDJSON evidence; the conformal ratchet blocks per-category regressions. |
+| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, and `scripts/gauntlet_cert.py` computes the three-pillar release scorecard and invariant monitors. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited SIMD islands, each with a bit-identical scalar fallback. |
 
 ---
@@ -98,6 +98,9 @@ focr robot selftest
 # 9. Generate the parity-ladder scorecard used by release gates.
 scripts/ladder_scorecard.sh --self-test
 scripts/ladder_scorecard.sh --out scorecard.json
+python3 scripts/gauntlet_cert.py --self-test
+python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
+  --scorecard-out /tmp/focr-release-scorecard.json
 
 # 10. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
@@ -122,7 +125,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 **Correctness before speed (always).** A parity gate comes first and a faster kernel that drifts the OCR output is reverted, no source landed, and recorded in the negative-evidence ledger. Speed is shipped on top of parity, never instead of it. The int8 expert/FFN quantization is validated against the f32 path; the vision tower, projector, embeddings, MoE router, and all norms stay high precision.
 
-**Conformance has receipts.** The L0-L5 parity ladder emits structured NDJSON, and `scripts/ladder_scorecard.sh` folds that stream into one `focr-ladder-scorecard/v1` artifact. An unarmed no-weights run is recorded as `skipped_no_model:true`, never as green. Armed runs keep the raw NDJSON beside the scorecard so reviewers can inspect the evidence behind every gate. The release ratchet in `docs/conformance/RATCHET.md` compares per-category lower bounds, not point estimates, so a change that improves the aggregate while lowering one category is blocked.
+**Conformance has receipts.** The L0-L5 parity ladder emits structured NDJSON, and `scripts/ladder_scorecard.sh` folds that stream into one `focr-ladder-scorecard/v1` artifact. An unarmed no-weights run is recorded as `skipped_no_model:true`, never as green. `docs/FEATURE_PARITY.md` splits the release surface into the numbered FeatureUniverse and the CLI/robot SurfaceMatrix; `tests/surface_matrix.rs` fails if a live subcommand, robot event, exit code, or rollup cell is missing from that ledger. The three-pillar gauntlet in `docs/gauntlet/METHODOLOGY.md` and `scripts/gauntlet_cert.py` turns those rows into a `franken_ocr.gauntlet.scorecard.v1` artifact, while the release ratchet compares lower bounds rather than point estimates. A change that improves the aggregate while lowering one category is blocked.
 
 **Runtime ISA dispatch, one binary per arch.** There is no per-CPU-feature variant to choose. One `x86_64` binary covers AVX2 / AVX-VNNI / AVX-512-VNNI; one `aarch64` binary covers NEON / SDOT / SMMLA. At load, CPU feature detection picks the fastest available int8 kernel tier. Apple Silicon deliberately prefers SDOT over SMMLA because measured M-series i8mm throughput does not beat the dot-product path; non-Apple ARM64 can choose SMMLA when it is actually faster. On a Threadripper 5995WX, a Zen 3 part whose ceiling is AVX2, dispatch correctly selects AVX2.
 
@@ -503,7 +506,11 @@ The conformance harness is built to leave reviewable artifacts, not just a green
 |---|---|---|
 | **Parity scorecard** | `scripts/ladder_scorecard.sh --out scorecard.json` | Runs L0-L5 in order, folds each rung's NDJSON into `focr-ladder-scorecard/v1`, and writes the raw stream beside the summary. |
 | **Skip-honest mode** | `scripts/ladder_scorecard.sh --out scorecard.json` without weights | Produces `all_green:false` and `skipped_no_model:true`, so a missing-model run cannot masquerade as a certified release. |
+| **FeatureUniverse / SurfaceMatrix** | `docs/FEATURE_PARITY.md`, `tests/surface_matrix.rs` | Accounts modeling features, ops, CLI surfaces, robot events, parity gates, and alien-artifact families as `present`, `partial`, `missing`, `n/a`, or `excluded`; partial never rounds up. |
+| **Three-pillar gauntlet cert** | `python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md --scorecard-out /tmp/focr-release-scorecard.json` | Scores the surface pillar from the live parity ledger and emits `franken_ocr.gauntlet.scorecard.v1`; performance and conformance gates stay separate, so one green pillar cannot hide another regression. |
 | **Conformal ratchet** | `docs/conformance/RATCHET.md`, `src/conformance.rs` | Computes per-category lower bounds from Jeffreys posterior and Hoeffding instruments, then rejects any category that drops below its committed floor. |
+| **Ville e-process monitors** | `python3 scripts/gauntlet_cert.py --eprocess-fold test-log.ndjson --eprocess-state /tmp/focr-eprocess-state.json` | Folds live invariant observations for KV capacity, `K=6848` i32 no-overflow, same-input determinism, and SIMD-vs-scalar bit identity into persistent anytime-valid monitors. |
+| **Convergence gate** | `python3 scripts/gauntlet_cert.py --convergence docs/gauntlet/ROUNDS.jsonl` | Requires at least 10 gauntlet rounds and a clean tail before declaring the investigation converged. |
 | **Capacity certificate** | `cargo test --test many_pages_without_deadlock capacity_certificate_bounded_stream_soak -- --nocapture` | Exercises the bounded `stream_pages` channel, records queueing percentiles, proves the channel bound, and checks that the kernel pool width stays stable. |
 | **Fixture provenance** | `tests/fixtures/MANIFEST.toml`, `tests/fixtures/PROVENANCE.md` | Records how committed fixtures were generated, including armed and unarmed scorecard examples. |
 
@@ -516,6 +523,16 @@ scripts/ladder_scorecard.sh --out scorecard.json
 ```
 
 The scorecard is the compact receipt. The adjacent `scorecard.raw.ndjson` file is the audit trail.
+
+The broader gauntlet has its own self-test and scorecard path:
+
+```bash
+python3 scripts/gauntlet_cert.py --self-test
+python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
+  --scorecard-out /tmp/focr-release-scorecard.json
+```
+
+The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservative while no residual history exists: its lower bound is `0.0`, not a pretend release win. That makes the first certified advances visible when real residual history starts accumulating.
 
 ---
 
@@ -695,7 +712,7 @@ What this is and is not:
 
 ## About Contributions
 
-Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
+*About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ## License
 
@@ -709,6 +726,10 @@ The model weights are a separate matter. The Baidu Unlimited-OCR weights, and an
 - [`AGENTS.md`](./AGENTS.md), conventions for human and agent contributors, including the engineering doctrine.
 - [`CHANGELOG.md`](./CHANGELOG.md), the project history.
 - [`docs/PERF_LEDGER.md`](./docs/PERF_LEDGER.md), the honest measured perf-ratio log.
+- [`docs/FEATURE_PARITY.md`](./docs/FEATURE_PARITY.md), the FeatureUniverse and SurfaceMatrix scoreboard read by the release gauntlet.
+- [`docs/gauntlet/METHODOLOGY.md`](./docs/gauntlet/METHODOLOGY.md), the three-pillar release certification design.
+- [`docs/gauntlet/RELEASE_SCORECARD.json`](./docs/gauntlet/RELEASE_SCORECARD.json), the current surface-pillar gauntlet scorecard artifact.
+- [`docs/gauntlet/EPROCESS_STATE.json`](./docs/gauntlet/EPROCESS_STATE.json), the persisted invariant-monitor state.
 - [`docs/NEGATIVE_EVIDENCE.md`](./docs/NEGATIVE_EVIDENCE.md), what did not work, including results inherited from sibling projects.
 - [`docs/DISCREPANCIES.md`](./docs/DISCREPANCIES.md), known measured divergences from the reference model.
 - [`docs/conformance/LADDER_HARNESS.md`](./docs/conformance/LADDER_HARNESS.md), the L0-L5 scorecard runner and parity-receipt contract.
