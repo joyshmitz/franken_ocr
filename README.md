@@ -43,6 +43,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 |---|---|
 | **One static binary** | No Python, no CUDA, no FFI at inference, no GPU. About 5 MB; portable to hosts where `ort`/CUDA cannot build. |
 | **Works offline** | `focr pull` fetches and verifies the weights once into `~/.cache/franken_ocr/models`; inference never touches the network. |
+| **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
 | **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
 | **Model zoo** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. Planned descriptors: TrOCR and pix2tex. |
 | **int8 decode, ~2.5x faster** | Custom `.focrq` int8 expert/FFN weights, byte-identical to the f32 path on typical pages. The vision tower stays high precision, where quantizing it would wreck OCR. |
@@ -217,6 +218,50 @@ cargo build --release
 3. **Verify your CPU kernel** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM is bit-identical to the scalar oracle on this host.
 4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output (markdown + bounding boxes), `-o out.md` / `-o out.json` to write a file, or `--robot` for an NDJSON event stream.
 5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`.
+
+---
+
+## Library API
+
+`franken_ocr` is a library as well as a CLI. The public API is synchronous and
+blocking: `OcrEngine` owns the internal asupersync runtime, loads the model on
+first use, caches that model behind an `Arc`, and returns ordinary
+`FocrResult<T>` values. Callers do not need to build or pass an async runtime.
+
+```rust
+use std::path::Path;
+
+use franken_ocr::{OcrEngine, FocrResult};
+
+fn main() -> FocrResult<()> {
+    let engine = OcrEngine::new()?;
+
+    let markdown = engine.recognize(Path::new("page.png"))?;
+    println!("{markdown}");
+
+    let document = engine.recognize_with_layout(Path::new("page.png"))?;
+    println!("{} layout spans", document.layout.len());
+
+    Ok(())
+}
+```
+
+The same engine exposes the surfaces the CLI uses:
+
+| Method | Use case |
+|---|---|
+| `recognize(path)` | Return Markdown for one image or document page. |
+| `recognize_with_model(model, path)` | Pin a specific `.focrq` artifact without changing environment variables. |
+| `recognize_with_layout(path)` | Return Markdown plus grounded bounding boxes, matching `focr ocr --json`. |
+| `recognize_with_figures(path)` | Return Markdown/layout plus cropped figure regions, matching `--extract-figures`. |
+| `recognize_dynamic(image)` | Run an already-decoded `image::DynamicImage`, the same in-memory path used by PDF rasterization. |
+| `recognize_batch(&[paths])` | Load weights once and return one result per input path, in order. |
+| `request_shutdown()` / `reset_shutdown()` | Drive cooperative cancellation for long-running embedders. |
+
+Model resolution follows the CLI rules: `FOCR_MODEL_PATH` wins, then the default
+cache location is searched. For path-explicit calls, pass the model artifact
+directly. The engine keeps the one-live-forward discipline from the CLI, so a
+single process can reuse weights without fanning out concurrent model forwards.
 
 ---
 
