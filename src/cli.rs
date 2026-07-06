@@ -655,13 +655,18 @@ impl std::fmt::Display for OutputFormat {
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum SyncCmd {
-    /// Export run-state audit records as JSONL (atomic, locked).
+    /// Export run-state audit records as JSONL (atomic, locked, idempotent).
+    /// Export is the CANONICAL one-way direction of the audit contract
+    /// (tests/fixtures/runs_schema.json): identical history re-exports
+    /// byte-identically; a crash never leaves a torn file.
     ExportJsonl {
         /// Output path (default: `<run store>.jsonl`).
         #[arg(long)]
         file: Option<std::path::PathBuf>,
     },
-    /// Import (replay) run-state audit records from JSONL.
+    /// Import (replay) run-state audit records from JSONL — additive and
+    /// restorative, keyed by run_id. NEVER a bidirectional merge: import
+    /// restores an audit trail, it does not sync one.
     ImportJsonl {
         /// Input JSONL path.
         #[arg(long)]

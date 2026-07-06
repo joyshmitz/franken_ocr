@@ -106,6 +106,21 @@ fn run_focr_command(mut command: Command, _args: &[&str]) -> Output {
     command.output().expect("failed to spawn focr binary")
 }
 
+/// A hermetic HOME for every golden invocation: the engine's model resolver
+/// searches the USER CACHE (`$HOME/.cache/franken_ocr/models`) as a default
+/// dir, so a developer box with a pulled artifact would flip `model_present`
+/// and every model-not-found golden. Pointing HOME (and the Windows
+/// equivalents) at an empty per-process temp dir makes "no model" true by
+/// construction instead of by hope.
+fn hermetic_home() -> &'static PathBuf {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("focr_golden_home_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 /// Run `focr <args...>` with a hermetic environment (no `FOCR_*` / golden-update
 /// leakage from the dev shell into the captured output) and return the raw output.
 fn run_focr(args: &[&str]) -> Output {
@@ -115,6 +130,9 @@ fn run_focr(args: &[&str]) -> Output {
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
         .env(RUN_STORE_ENV, fresh_run_store_path())
+        .env("HOME", hermetic_home())
+        .env("LOCALAPPDATA", hermetic_home())
+        .env("USERPROFILE", hermetic_home())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
@@ -2473,4 +2491,181 @@ fn scrub_canonicalizer_unit() {
         "result": "pass",
         "detail": "scrubber + canonicalizer + diff helpers verified",
     );
+}
+
+/// bd-wp8.11: the FROZEN `runs`/`sync` record contract, exercised over a
+/// POPULATED store through the real binary. `tests/fixtures/runs_schema.json`
+/// is the versioned-by-hand contract (the robot_schema discipline): the
+/// wrapper keys, the record keys (shared verbatim by `runs --format json`,
+/// `runs --format ndjson`, and every `sync export-jsonl` line), and the
+/// one-way sync direction. Drift against the fixture fails HERE.
+#[test]
+fn runs_schema_contract_over_populated_store() {
+    let test = "runs_schema_contract_over_populated_store";
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runs_schema.json"),
+        )
+        .expect("frozen runs schema fixture"),
+    )
+    .expect("runs schema parses");
+    let record_keys: Vec<&str> = schema["record"]["required"]
+        .as_array()
+        .expect("record.required")
+        .iter()
+        .map(|v| v.as_str().expect("key"))
+        .collect();
+    let wrapper_keys: Vec<&str> = schema["runs_json_wrapper"]["required"]
+        .as_array()
+        .expect("wrapper.required")
+        .iter()
+        .map(|v| v.as_str().expect("key"))
+        .collect();
+
+    // ONE shared hermetic store across every invocation in this test.
+    let store = fresh_run_store_path();
+    let run = |args: &[&str]| -> Output {
+        let mut command = Command::new(focr_bin());
+        command
+            .args(args)
+            .env_remove("FOCR_MODEL_PATH")
+            .env_remove(MODEL_DIR_ENV)
+            .env(RUN_STORE_ENV, &store)
+            .env_remove("FOCR_FORCE_ARCH")
+            .env_remove(FORCE_TEST_ERROR_ENV);
+        command.output().expect("failed to spawn focr binary")
+    };
+
+    // Seed two records through the public import surface (records shaped
+    // exactly as export writes them — the fixture's `record` contract).
+    let seed = store.with_extension("seed.jsonl");
+    std::fs::write(
+        &seed,
+        concat!(
+            r#"{"schema_version":1,"run_id":"run-alpha","started_at":100,"finished_at":150,"input_path":"a.png","mode":"base","quant":"int8","model_version_tag":"test","exit_code":0,"status":"ok"}"#,
+            "\n",
+            r#"{"schema_version":1,"run_id":"run-beta","started_at":200,"finished_at":260,"input_path":"b.png","mode":"gundam","quant":"f32","model_version_tag":"test","exit_code":4,"status":"error"}"#,
+            "\n",
+        ),
+    )
+    .expect("write seed jsonl");
+    let out = run(&[
+        "sync",
+        "--json",
+        "import-jsonl",
+        "--file",
+        seed.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "seed import failed: {out:?}");
+
+    let assert_record = |v: &serde_json::Value, ctx: &str| {
+        for k in &record_keys {
+            assert!(
+                !v[*k].is_null(),
+                "{ctx}: record missing frozen key {k:?}: {v}"
+            );
+        }
+    };
+
+    // `runs --format json`: wrapper + records match the frozen contract.
+    let out = run(&["runs", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc = parse_json_line(&stdout, "runs --format json (populated)");
+    for k in &wrapper_keys {
+        assert!(
+            !doc[*k].is_null(),
+            "wrapper missing frozen key {k:?}: {doc}"
+        );
+    }
+    let records = doc["runs"].as_array().expect("runs array");
+    let count_ok = doc["count"].as_u64() == Some(2) && records.len() == 2;
+    for r in records {
+        assert_record(r, "runs --format json");
+    }
+
+    // `runs --format ndjson`: one record object per line, same contract.
+    let out = run(&["runs", "--format", "ndjson"]);
+    let ndjson = String::from_utf8_lossy(&out.stdout);
+    let nd_lines: Vec<serde_json::Value> = ndjson
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("ndjson line parses"))
+        .collect();
+    assert_eq!(
+        nd_lines.len(),
+        2,
+        "ndjson emits one object per run:\n{ndjson}"
+    );
+    for r in &nd_lines {
+        assert_record(r, "runs --format ndjson");
+    }
+
+    // `--id` selects exactly one; `--limit 1` returns the most recent.
+    let out = run(&["runs", "--id", "run-alpha", "--format", "json"]);
+    let one = parse_json_line(&String::from_utf8_lossy(&out.stdout), "runs --id");
+    let id_ok =
+        one["count"].as_u64() == Some(1) && one["runs"][0]["run_id"].as_str() == Some("run-alpha");
+    let out = run(&["runs", "--limit", "1", "--format", "json"]);
+    let lim = parse_json_line(&String::from_utf8_lossy(&out.stdout), "runs --limit 1");
+    let limit_ok =
+        lim["count"].as_u64() == Some(1) && lim["runs"][0]["run_id"].as_str() == Some("run-beta");
+
+    // Plain format on a populated store: exit 0, one line per run.
+    let out = run(&["runs"]);
+    let plain_ok = out.status.code() == Some(0)
+        && String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("run-"))
+            .count()
+            == 2;
+
+    // Export lines carry the SAME frozen record contract (one contract,
+    // three carriers) and a re-export is byte-identical (idempotent).
+    let audit = store.with_extension("audit.jsonl");
+    let out = run(&[
+        "sync",
+        "--json",
+        "export-jsonl",
+        "--file",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "export failed: {out:?}");
+    let first = std::fs::read_to_string(&audit).expect("audit written");
+    for line in first.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).expect("export line parses");
+        assert_record(&v, "sync export-jsonl");
+    }
+    let out = run(&[
+        "sync",
+        "--json",
+        "export-jsonl",
+        "--file",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "re-export failed: {out:?}");
+    let second = std::fs::read_to_string(&audit).expect("audit re-written");
+    let idempotent = first == second;
+
+    let pass = count_ok && id_ok && limit_ok && plain_ok && idempotent;
+    tlog!(test,
+        "case": "populated_matrix",
+        "event": "assert",
+        "assertion": "runs json/ndjson/--id/--limit/plain + export match the frozen runs_schema.json contract; re-export byte-identical",
+        "inputs": {"store": "[temp]", "seeded_runs": 2},
+        "count_ok": count_ok,
+        "id_ok": id_ok,
+        "limit_ok": limit_ok,
+        "plain_ok": plain_ok,
+        "export_idempotent": idempotent,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(
+        pass,
+        "runs/sync frozen-contract matrix failed (see NDJSON line above)"
+    );
+
+    let _ = std::fs::remove_file(&seed);
+    let _ = std::fs::remove_file(&audit);
+    let _ = std::fs::remove_file(&store);
 }

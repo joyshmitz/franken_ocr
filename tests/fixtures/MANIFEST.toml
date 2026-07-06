@@ -11,6 +11,7 @@
 [entries]
 "golden" = { kind = "committed", note = "scrubbed CLI/robot goldens; UPDATE_GOLDENS review loop" }
 "robot_schema_v1.json" = { kind = "committed", note = "frozen robot NDJSON contract (bd-zc1o)" }
+"runs_schema.json" = { kind = "committed", note = "frozen runs/sync record contract (bd-wp8.11); versioned by hand" }
 "test_log_schema.json" = { kind = "committed", note = "TestLog line contract (bd-n68o)" }
 "tokenizer" = { kind = "committed", note = "hand-curated OQ-16 conformance corpus" }
 "tokenizer_baidu" = { kind = "regenerated-committed", script = "scripts/gen_token_id_fixtures.py" }

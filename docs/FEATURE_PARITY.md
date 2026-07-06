@@ -31,8 +31,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
 | Total enumerated rows | **128** | **55** | **183** |
-| `present` | 0 † | 39 | 39 |
-| `partial` | 0 † | 13 | 13 |
+| `present` | 0 † | 41 | 41 |
+| `partial` | 0 † | 11 | 11 |
 | `missing` | 124 † | 3 | 127 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
 | `n/a` | 0 | 0 | 0 |
@@ -265,8 +265,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
 | `focr robot backends` (SIMD tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | reflects IsaTier; goldens |
 | `focr robot selftest` (runtime int8 kernel parity on host silicon) | §7.2 | MUST | present | SURF | bd-223.13 | 24/24 on native Win10; AVX2 ceiling proven on 5995WX |
-| `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | partial | SURF | bd-wp8.11 | fsqlite RunStore live (bd-223.4) + cli test; full surface-contract bead open |
-| `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | partial | SURF | bd-wp8.11 | locked atomic audit live; same open contract bead |
+| `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |
+| `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
 | `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | partial | SURF | bd-wp8.4 | shipped + goldens; idempotent/reversible/capability audit bead open |
 | Exit codes 0..7 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |

@@ -19,6 +19,7 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 |------|------|--------|-----------------|
 | `golden/` | [C] | Frozen CLI/robot surfaces (scrubbed, canonicalized) | `UPDATE_GOLDENS=1 cargo test --test cli_robot_golden` (reviewed) |
 | `robot_schema_v1.json` | [C] | The frozen robot NDJSON contract (bd-zc1o) | Never regenerated — versioned by hand with the schema |
+| `runs_schema.json` | [C] | The frozen `focr runs`/`sync` record + one-way-audit contract (bd-wp8.11) | Never regenerated — versioned by hand |
 | `test_log_schema.json` | [C] | The TestLog line contract (bd-n68o) | Never regenerated — versioned by hand |
 | `tokenizer/corpus.txt` | [C] | Hand-curated conformance corpus (OQ-16) | Hand-edited only |
 | `tokenizer_baidu/expected.json` | [R→C] | `scripts/gen_token_id_fixtures.py` (pinned `LlamaTokenizerFast`, truth-pack commit) | Rerun the script; commit is a reviewed change |
