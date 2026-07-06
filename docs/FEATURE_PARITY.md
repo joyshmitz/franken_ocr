@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **55** | **183** |
-| `present` | 115 † | 41 | 156 |
+| Total enumerated rows | **128** | **56** | **184** |
+| `present` | 115 † | 42 | 157 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -306,6 +306,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `many_pages_without_deadlock` watchdog | §6.5 | MUST | present | n/a | bd-2ub2 | green + injected-hang detector + live over-budget trip demo; cancel/panic variants bd-1ryu |
 | asupersync capacity certificate (p95/p99, bounded stream, pool stability) | §6.9 | MUST | present | n/a | bd-re8.18 | armed heavy 2026-07-06: p95 7.41 s/page, 48/48 Ok, width stable; `focr-capacity-certificate/v1` |
 | L0–L5 ladder scorecard runner (per-commit parity receipt) | §8.4 | MUST | present | n/a | bd-re8.19 | `scripts/ladder_scorecard.sh`; armed all-green fixture committed |
+| Input-fault robustness suite (typed errors, frozen exit codes) | §8.5 | MUST | present | SURF | bd-15kd | `tests/fault_suite.rs`: corrupt/truncated/zero-byte→4, corrupt artifact→7 (caught+fixed a real exit-1 misclassification), task-mismatch→2, missing→3; armed 4/5 legs gated; cancellation owned by bd-1ryu |
 | Three-pillar release certification (perf/conformance/surface) | §8.5 | MUST | partial | n/a | bd-re8.13 | math+methodology+self-test shipped (`gauntlet_cert.py`); matrix brought current; converged RUN is bd-wp8.8 |
 | Conformal lower-bound release ratchet | §8.5 | SHOULD | present | n/a | bd-re8.14 | Rust impl (`src/conformance.rs`) + Python reference, cross-checked; RATCHET.md ledger |
 | E-processes for load-bearing invariants (Ville) | §8.5 | SHOULD | partial | n/a | bd-re8.15 | math + self-test in `gauntlet_cert.py`; wiring to live invariant streams open |

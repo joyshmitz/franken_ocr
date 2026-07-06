@@ -448,6 +448,44 @@ fn run_determinism_entry() -> GateResult {
     gate.validate_bytes(b"greedy output", b"greedy output")
 }
 
+fn run_input_fault_entry() -> GateResult {
+    // The fault leg's in-process representative (bd-15kd): a corrupt input
+    // must surface as the TYPED InputDecode error — never a panic, never a
+    // generic failure. The full leg (artifact faults, usage faults, armed
+    // exit-4/5 paths) drives the real binary in tests/fault_suite.rs.
+    let p = std::env::temp_dir().join(format!(
+        "focr_conformance_fault_probe_{}.png",
+        std::process::id()
+    ));
+    let outcome = std::fs::write(&p, b"not an image")
+        .map_err(|e| crate::FocrError::Other(anyhow::anyhow!("probe write: {e}")))
+        .and_then(|()| {
+            match crate::preprocess::preprocess_image(
+                &p,
+                crate::preprocess::PreprocessMode::default(),
+            ) {
+                Err(crate::FocrError::InputDecode(_)) => Ok(()),
+                Err(other) => Err(other),
+                Ok(_) => Err(crate::FocrError::Other(anyhow::anyhow!(
+                    "corrupt probe unexpectedly preprocessed"
+                ))),
+            }
+        });
+    let _ = std::fs::remove_file(&p);
+    GateResult {
+        name: "input_fault_typed_errors",
+        level: None,
+        passed: outcome.is_ok(),
+        measured: None,
+        tolerance: None,
+        message: if outcome.is_ok() {
+            "corrupt input surfaced as typed InputDecode (exit 4)"
+        } else {
+            "corrupt input did NOT surface as typed InputDecode"
+        },
+    }
+}
+
 fn run_tolerance_derivation_entry() -> GateResult {
     // The keystone discipline: tolerances DERIVE from a measured floor
     // (never the imported 0.055) — prove the derivation math end-to-end.
@@ -500,6 +538,13 @@ pub fn conformance_registry() -> Vec<RegisteredConformance> {
             level: RequirementLevel::Must,
             clauses: &[],
             run: run_tolerance_derivation_entry,
+        },
+        RegisteredConformance {
+            name: "input_fault_typed_errors",
+            category: ConformanceCategory::Invariant,
+            level: RequirementLevel::Must,
+            clauses: &[],
+            run: run_input_fault_entry,
         },
     ]
 }

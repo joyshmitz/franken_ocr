@@ -586,7 +586,22 @@ fn model_search_dirs() -> Vec<PathBuf> {
         dirs.extend(std::env::split_paths(&raw));
     }
     if let Some(root) = crate::dist::cache_root() {
-        dirs.push(root.join("models"));
+        let models = root.join("models");
+        // Flat root FIRST (the layout every released binary knows), then one
+        // level of per-model subdirectories, name-sorted for determinism:
+        // `focr pull <model>` installs non-primary models into their own
+        // subdir so same-named sidecars (e.g. two different tokenizer.json)
+        // cannot clobber each other (bd-av64.7).
+        let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&models)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort();
+        dirs.push(models);
+        dirs.extend(subdirs);
     }
     dirs
 }
@@ -816,11 +831,14 @@ fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResu
         if recognized_container {
             e
         } else {
-            FocrError::NotImplemented(format!(
-                "native_engine::OcrModel::load — {} exists but is not a recognized model \
-                 container, and the resolver that turns an arbitrary existing path into a \
-                 validated Unlimited-OCR model (header-sniff bd-223.7 / manifest census \
-                 Phase 2) is not yet implemented; underlying parse: {e}",
+            // An existing file the caller explicitly named that parses as
+            // NEITHER a FOCRQ blob NOR a safetensors shard is a corrupt or
+            // wrong-format ARTIFACT — §7.4 exit 7, never the generic exit 1.
+            // (Was a Phase-0 NotImplemented placeholder until the fault suite,
+            // bd-15kd, caught the misclassification.)
+            FocrError::FormatMismatch(format!(
+                "{} exists but is not a recognized model container (neither FOCRQ \
+                 magic nor a plausible safetensors header); underlying parse: {e}",
                 resolved.display()
             ))
         }
