@@ -288,8 +288,19 @@ pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResul
             image.cols
         )));
     }
+    let th = std::time::Instant::now();
     let w = sam_weights_from(weights, prefix)?;
-    forward_with(&w, image, side, side)
+    super::timing_log(&format!(
+        "    sam.hydrate {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    let tf = std::time::Instant::now();
+    let out = forward_with(&w, image, side, side);
+    super::timing_log(&format!(
+        "    sam.forward {:.2}s",
+        tf.elapsed().as_secs_f64()
+    ));
+    out
 }
 
 /// Build a [`SamWeights`] from the named `{prefix}.*` tensors in `weights`
@@ -509,9 +520,14 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     }
 
     // ── 12 transformer blocks.
+    let tb = std::time::Instant::now();
     for blk in &w.blocks {
         x = block_forward(blk, &x, gh, gw)?;
     }
+    super::timing_log(&format!(
+        "    sam.blocks {:.2}s",
+        tb.elapsed().as_secs_f64()
+    ));
 
     // ── neck: x is [gh*gw, dim] NHWC rows; neck operates NCHW.
     // permute(0,3,1,2): NHWC-rows -> NCHW flat.
@@ -705,11 +721,17 @@ pub fn forward_with_batched(
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     let normed = layer_norm_rows(x, &blk.norm1)?;
 
+    let ta = std::time::Instant::now();
     let attn_out = if blk.window > 0 {
         attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
     } else {
         attention(&blk.attn, &normed, gh, gw)?
     };
+    super::timing_log(&format!(
+        "      sam.block attn({}) {:.3}s",
+        if blk.window > 0 { "win" } else { "GLOBAL" },
+        ta.elapsed().as_secs_f64()
+    ));
     ensure_same_shape("vision_sam block attention residual", &attn_out, x)?;
 
     // residual 1: x = shortcut + attn
@@ -719,10 +741,15 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     }
 
     // residual 2: x = h1 + mlp(norm2(h1))
+    let tm = std::time::Instant::now();
     let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
     let mut mlp = blk.lin1.apply(&normed2)?;
     nn::gelu(&mut mlp);
     let mlp = blk.lin2.apply(&mlp)?;
+    super::timing_log(&format!(
+        "      sam.block mlp {:.3}s",
+        tm.elapsed().as_secs_f64()
+    ));
     ensure_same_shape("vision_sam block mlp residual", &mlp, &h1)?;
     for (a, b) in h1.data.iter_mut().zip(mlp.data.iter()) {
         *a += *b;
