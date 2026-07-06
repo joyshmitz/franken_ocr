@@ -18,6 +18,27 @@ Landed on `main` since `0.3.0`, not yet tagged.
 
 ### Added
 
+- **The whole zoo is now `focr pull`-able** (`bd-av64.7/.8/.9`). Published GH
+  releases `models-smolvlm2-v1` (1.09 GB int8 + tokenizer), `models-onechart-v1`
+  (363 MB int8 + the OPT tokenizer triple), and `models-tromr-v1` (86 MB f32 +
+  the four music tokenizer tables); `models/manifest.json` gained the entries
+  plus a backward-compatible `sidecars` field. Non-primary models install into
+  per-model cache subdirectories (two models can now both ship a
+  `tokenizer.json` without clobbering), the resolver searches those subdirs,
+  and a model publishing a single quant is pulled under the default `--quant`
+  with a visible note (`focr pull tromr` just works despite being f32-only).
+  `focr models` gained a truthful `PULL` column driven by the embedded
+  manifest. Verified end-to-end on a clean cache: byte-exact downloads,
+  idempotent re-pull, and one real inference per model — with the pulled
+  OneChart artifact producing byte-identical output to the certified local one.
+- **`focr ocr --pages` + `--split-spreads`** (`bd-av64.11`). Page selection for
+  PDF inputs ("3", "3-7", "1,5-9,218"; 1-based, deduplicated, source order —
+  a 218-page book no longer means 218 forwards), and opt-in two-page-spread
+  splitting whose gutter detector accepts both a blank inter-page gap and a
+  bound book's dark binding shadow; halves become logical pages
+  (`{"page": N, "half": "left"|"right"}` in JSON). On the motivating scanned
+  book, one spread went from a 10-minute forward-budget timeout to a 46-second
+  correct two-half extraction.
 - **`focr ocr --extract-figures`** (`bd-23s8`). Saves the figure/image regions the
   model grounds but does not transcribe to text (the `![](images/…)` placeholders)
   as real image files in a subfolder — default `<output-stem>_figures/`, or set
@@ -75,6 +96,25 @@ skip event. Still pure, memory-safe Rust — no Python, no CUDA, no FFI at infer
 
 ### Fixed
 
+- **Scanned books were OCR'd sideways** (`bd-av64.11`, critical). Many book
+  scans store each page's raster in portrait orientation and rotate it into
+  place with the page content stream's transformation matrix instead of a
+  `/Rotate` entry; the native PDF fast path honored only `/Rotate`, so these
+  documents reached the model rotated 90° and decoded hallucinated text until
+  the forward budget expired. The renderer now classifies the CTM at the first
+  image draw (axis-aligned rotations only; the direction was verified
+  empirically against a reference render) and composes it with `/Rotate`.
+- **TrOMR MusicXML emitter crashes and illegal output** (`bd-av64.1/.3`).
+  Pitched thirty-second/sixty-fourth notes crashed the duration parser
+  (multi-underscore names mis-split); `rest-256th`/`rest-512th` were missing
+  from the duration table entirely; and mixed chord groups emitted
+  importer-rejecting `<chord/><rest/>`. Every emitted document is now
+  validated at emit time (structural lint — a violation is an engine bug and
+  fails loudly rather than shipping broken XML).
+- **One bad staff no longer aborts a TrOMR page** (`bd-av64.2`, partial). The
+  full-page music path recognizes per staff and reports skipped staves (index,
+  bbox, reason) on stderr while the page succeeds with the staves that worked;
+  the page errors only when every staff fails, naming each reason.
 - **Fresh-install OCR happy path** (`bd-3u6x`, critical). `focr pull` installs the
   model as `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup previously
   searched only the bare `unlimited-ocr.focrq` basename — so a freshly-pulled model
