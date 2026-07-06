@@ -48,6 +48,22 @@ pub const DEFAULT_MANIFEST_URL: &str =
 /// an old binary fails loudly rather than misreading a future layout.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// The committed repo manifest, embedded at build time — the same file
+/// [`DEFAULT_MANIFEST_URL`] serves from `main`. Lets `focr models` report
+/// pull availability fully OFFLINE; `focr pull` still fetches the live
+/// source so a newer committed manifest always wins at pull time.
+pub const BUILTIN_MANIFEST_JSON: &str = include_str!("../models/manifest.json");
+
+/// Parse the embedded repo manifest (see [`BUILTIN_MANIFEST_JSON`]).
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if the committed manifest is malformed or
+/// newer than this binary understands — a build-time file, so a failure here
+/// is a packaging bug, and the schema round-trip test catches it.
+pub fn builtin_manifest() -> FocrResult<Manifest> {
+    parse_manifest(BUILTIN_MANIFEST_JSON.as_bytes())
+}
+
 /// The download manifest: every artifact, its mirrors, and its sha256s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -81,6 +97,14 @@ pub struct ModelEntry {
     pub quants: BTreeMap<String, QuantEntry>,
     /// The tokenizer sidecar (e.g. `qwen.tiktoken`), installed beside the `.focrq`.
     pub tokenizer: RemoteFile,
+    /// Additional runtime-required sidecars beyond [`tokenizer`](Self::tokenizer)
+    /// — e.g. OneChart's `merges.txt` + `added_tokens.json` beside its
+    /// `vocab.json`, or TrOMR's remaining three tokenizer tables. Installed
+    /// beside the `.focrq` like the tokenizer. Additive field: binaries
+    /// predating it ignore it (serde default), so the committed manifest stays
+    /// parseable by every released `focr`.
+    #[serde(default)]
+    pub sidecars: Vec<RemoteFile>,
 }
 
 /// The artifacts for one quant level.
@@ -393,10 +417,44 @@ pub struct PullOutcome {
     pub focrq_path: PathBuf,
     /// The installed `tokenizer.json` path (sibling of the `.focrq`).
     pub tokenizer_path: PathBuf,
-    /// Quant level pulled.
+    /// Additional installed sidecar paths (siblings of the `.focrq`).
+    pub sidecar_paths: Vec<PathBuf>,
+    /// Quant level pulled (the manifest's actual tag — see the sole-quant
+    /// fallback in [`pull`]).
     pub quant: String,
-    /// True iff both artifacts were already cached (nothing downloaded).
+    /// The pulled model's license notice from the manifest (empty when the
+    /// manifest entry carries none; the caller may substitute the primary
+    /// model's built-in notice).
+    pub license_notice: String,
+    /// True iff every artifact was already cached (nothing downloaded).
     pub from_cache: bool,
+}
+
+/// Pick the quant entry for a pull. Exact match wins; otherwise, when the
+/// model publishes EXACTLY ONE quant, fall back to it — the CLI default is
+/// `int8`, TrOMR ships f32-only (int8 gated behind an unrun lossless
+/// proof), and failing `focr pull tromr` over a default flag serves no one.
+/// The returned tag is the ACTUAL quant (callers report it; `pull` prints a
+/// visible note when it differs from the request).
+///
+/// # Errors
+/// [`FocrError::Usage`] when the quant is absent and the fallback is
+/// ambiguous (zero or several published quants).
+fn select_quant<'m>(
+    quants: &'m BTreeMap<String, QuantEntry>,
+    requested: &str,
+) -> FocrResult<(String, &'m QuantEntry)> {
+    match quants.get(requested) {
+        Some(entry) => Ok((requested.to_owned(), entry)),
+        None if quants.len() == 1 => {
+            let (tag, entry) = quants.iter().next().expect("len==1 map has an entry");
+            Ok((tag.clone(), entry))
+        }
+        None => Err(FocrError::Usage(format!(
+            "manifest has no quant '{requested}' (available: {})",
+            quants.keys().cloned().collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 /// Fetch (or confirm-cached) the `quant` weights + tokenizer described by the
@@ -434,9 +492,34 @@ pub fn pull(
 
     // Select the model: the primary top-level model (default, and the only one
     // old binaries know) unless `model` names a distinct entry in `models`.
-    let (quants, tokenizer): (&BTreeMap<String, QuantEntry>, &RemoteFile) = match model {
-        None => (&manifest.quants, &manifest.tokenizer),
-        Some(m) if m == manifest.model => (&manifest.quants, &manifest.tokenizer),
+    // Non-primary models install into their own `<cache>/<model-id>/` subdir:
+    // sidecar filenames are NOT unique across models (smolvlm2 ships a
+    // `tokenizer.json` that would clobber unlimited-ocr's in a flat cache),
+    // and the loaders resolve sidecars beside the artifact, so isolation per
+    // model is both necessary and sufficient. The primary model stays flat —
+    // the layout every released binary already knows.
+    static NO_SIDECARS: Vec<RemoteFile> = Vec::new();
+    let (quants, tokenizer, sidecars, subdir, license_notice): (
+        &BTreeMap<String, QuantEntry>,
+        &RemoteFile,
+        &[RemoteFile],
+        Option<&str>,
+        &str,
+    ) = match model {
+        None => (
+            &manifest.quants,
+            &manifest.tokenizer,
+            &NO_SIDECARS,
+            None,
+            manifest.license_notice.as_str(),
+        ),
+        Some(m) if m == manifest.model => (
+            &manifest.quants,
+            &manifest.tokenizer,
+            &NO_SIDECARS,
+            None,
+            manifest.license_notice.as_str(),
+        ),
         Some(m) => {
             let entry = manifest.models.get(m).ok_or_else(|| {
                 let mut avail = vec![manifest.model.clone()];
@@ -446,18 +529,28 @@ pub fn pull(
                     avail.join(", ")
                 ))
             })?;
-            (&entry.quants, &entry.tokenizer)
+            (
+                &entry.quants,
+                &entry.tokenizer,
+                &entry.sidecars,
+                Some(m),
+                entry.license_notice.as_str(),
+            )
         }
     };
 
-    let quant_entry = quants.get(quant).ok_or_else(|| {
-        FocrError::Usage(format!(
-            "manifest has no quant '{quant}' (available: {})",
-            quants.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
-    })?;
+    let (quant_used, quant_entry) = select_quant(quants, quant)?;
+    if quant_used != quant {
+        progress(&format!(
+            "manifest has no quant '{quant}' for this model; using the sole \
+             published quant '{quant_used}'"
+        ));
+    }
 
-    let dir = cache_models_dir()?;
+    let mut dir = cache_models_dir()?;
+    if let Some(sub) = subdir {
+        dir = dir.join(sub);
+    }
     std::fs::create_dir_all(&dir)
         .map_err(|e| FocrError::Other(anyhow::anyhow!("create cache {}: {e}", dir.display())))?;
     let focrq_path = dir.join(&quant_entry.focrq.filename);
@@ -466,6 +559,7 @@ pub fn pull(
     // 2. Download each artifact unless already byte-perfect in the cache.
     let focrq_cached = already_cached(&focrq_path, &quant_entry.focrq);
     let tok_cached = already_cached(&tokenizer_path, tokenizer);
+    let mut from_cache = focrq_cached && tok_cached;
 
     if !focrq_cached {
         install_file(
@@ -483,12 +577,25 @@ pub fn pull(
     } else {
         progress(&format!("cached: {}", tokenizer_path.display()));
     }
+    let mut sidecar_paths = Vec::with_capacity(sidecars.len());
+    for sidecar in sidecars {
+        let path = dir.join(&sidecar.filename);
+        if already_cached(&path, sidecar) {
+            progress(&format!("cached: {}", path.display()));
+        } else {
+            install_file(&runtime, sidecar, &path, quiet, &mut progress)?;
+            from_cache = false;
+        }
+        sidecar_paths.push(path);
+    }
 
     Ok(PullOutcome {
         focrq_path,
         tokenizer_path,
-        quant: quant.to_string(),
-        from_cache: focrq_cached && tok_cached,
+        sidecar_paths,
+        quant: quant_used,
+        license_notice: license_notice.to_owned(),
+        from_cache,
     })
 }
 
@@ -624,6 +731,7 @@ mod tests {
                             urls: vec!["https://example/qwen".into()],
                         }],
                     },
+                    sidecars: Vec::new(),
                 },
             )]),
         };
@@ -688,5 +796,154 @@ mod tests {
         };
         assert!(!already_cached(&p, &wrong_hash));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-av64.7: the COMMITTED manifest is embedded and must lint clean —
+    /// every sha 64-hex lowercase, every size positive, every URL https,
+    /// part sizes summing to the whole, filenames unique per install dir —
+    /// and it must publish the full runtime-ready zoo.
+    #[test]
+    fn builtin_manifest_publishes_the_zoo_and_lints_clean() {
+        let m = builtin_manifest().expect("embedded manifest parses");
+        assert_eq!(m.model, "unlimited-ocr");
+        for id in ["got-ocr2", "smolvlm2", "onechart", "tromr"] {
+            assert!(m.models.contains_key(id), "manifest missing model {id}");
+        }
+        // Runtime-required sidecar sets (the anti-broken-pull contract; the
+        // loaders resolve these beside the artifact — see native_engine).
+        let tromr = &m.models["tromr"];
+        assert_eq!(
+            tromr.quants.keys().cloned().collect::<Vec<_>>(),
+            vec!["f32".to_string()],
+            "tromr publishes f32 only (int8 gated behind a lossless proof)"
+        );
+        assert_eq!(tromr.tokenizer.filename, "tokenizer_rhythm.json");
+        let mut tromr_sidecars: Vec<&str> =
+            tromr.sidecars.iter().map(|f| f.filename.as_str()).collect();
+        tromr_sidecars.sort_unstable();
+        assert_eq!(
+            tromr_sidecars,
+            vec![
+                "tokenizer_lift.json",
+                "tokenizer_note.json",
+                "tokenizer_pitch.json"
+            ]
+        );
+        let onechart = &m.models["onechart"];
+        assert_eq!(onechart.tokenizer.filename, "vocab.json");
+        let mut oc_sidecars: Vec<&str> = onechart
+            .sidecars
+            .iter()
+            .map(|f| f.filename.as_str())
+            .collect();
+        oc_sidecars.sort_unstable();
+        assert_eq!(oc_sidecars, vec!["added_tokens.json", "merges.txt"]);
+        assert_eq!(m.models["smolvlm2"].tokenizer.filename, "tokenizer.json");
+        assert!(m.models["smolvlm2"].sidecars.is_empty());
+
+        // The lint, over every file of every model.
+        let lint = |file: &RemoteFile, ctx: &str| {
+            assert!(file.size > 0, "{ctx}: zero size");
+            assert_eq!(file.sha256.len(), 64, "{ctx}: sha length");
+            assert!(
+                file.sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{ctx}: sha not lowercase hex"
+            );
+            assert!(!file.parts.is_empty(), "{ctx}: no parts");
+            assert_eq!(
+                file.parts.iter().map(|p| p.size).sum::<u64>(),
+                file.size,
+                "{ctx}: part sizes do not sum to the whole"
+            );
+            for part in &file.parts {
+                assert!(!part.urls.is_empty(), "{ctx}: part without urls");
+                for url in &part.urls {
+                    assert!(url.starts_with("https://"), "{ctx}: non-https url {url}");
+                }
+            }
+        };
+        let mut primary: Vec<&str> = vec![m.tokenizer.filename.as_str()];
+        lint(&m.tokenizer, "primary tokenizer");
+        for (tag, q) in &m.quants {
+            lint(&q.focrq, &format!("primary quant {tag}"));
+            primary.push(q.focrq.filename.as_str());
+        }
+        primary.sort_unstable();
+        primary.dedup();
+        assert_eq!(
+            primary.len(),
+            1 + m.quants.len(),
+            "primary filename collision"
+        );
+        for (id, entry) in &m.models {
+            let mut names: Vec<&str> = vec![entry.tokenizer.filename.as_str()];
+            lint(&entry.tokenizer, &format!("{id} tokenizer"));
+            assert!(
+                !entry.license_notice.is_empty(),
+                "{id}: empty license notice"
+            );
+            for (tag, q) in &entry.quants {
+                lint(&q.focrq, &format!("{id} quant {tag}"));
+                names.push(q.focrq.filename.as_str());
+            }
+            for sc in &entry.sidecars {
+                lint(sc, &format!("{id} sidecar {}", sc.filename));
+                names.push(sc.filename.as_str());
+            }
+            let total = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                total,
+                "{id}: filename collision in its install dir"
+            );
+        }
+    }
+
+    /// bd-av64.7: exact quant wins; a sole published quant is the fallback
+    /// (TrOMR is f32-only while the CLI default is int8); several published
+    /// quants + a miss stays a loud Usage error.
+    #[test]
+    fn select_quant_exact_sole_and_ambiguous() {
+        let file = RemoteFile {
+            filename: "x.focrq".into(),
+            size: 1,
+            sha256: "ab".repeat(32),
+            parts: vec![],
+        };
+        let entry = QuantEntry { focrq: file };
+        let sole = BTreeMap::from([("f32".to_string(), entry.clone())]);
+        let (tag, _) = select_quant(&sole, "int8").expect("sole quant falls back");
+        assert_eq!(tag, "f32");
+        let (tag, _) = select_quant(&sole, "f32").expect("exact match");
+        assert_eq!(tag, "f32");
+        let two = BTreeMap::from([
+            ("int8".to_string(), entry.clone()),
+            ("int4".to_string(), entry.clone()),
+        ]);
+        let (tag, _) = select_quant(&two, "int8").expect("exact among several");
+        assert_eq!(tag, "int8");
+        assert!(
+            select_quant(&two, "f32").is_err(),
+            "ambiguous miss must error"
+        );
+        assert!(select_quant(&BTreeMap::new(), "int8").is_err());
+    }
+
+    /// Back-compat: a ModelEntry WITHOUT the (new) sidecars field parses with
+    /// an empty list — the shape every pre-sidecar manifest entry has.
+    #[test]
+    fn model_entry_without_sidecars_parses_empty() {
+        let json = r#"{
+            "license_notice": "x",
+            "quants": {"int8": {"focrq": {"filename": "a.focrq", "size": 1,
+                "sha256": "00", "parts": []}}},
+            "tokenizer": {"filename": "t.json", "size": 1, "sha256": "00", "parts": []}
+        }"#;
+        let entry: ModelEntry = serde_json::from_str(json).expect("parses");
+        assert!(entry.sidecars.is_empty());
     }
 }

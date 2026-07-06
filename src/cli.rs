@@ -1888,8 +1888,38 @@ fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
 /// descriptors register.
 fn run_models(args: &ModelsArgs) -> FocrResult<()> {
     let archs = crate::model_arch::registry();
+    // Pull availability from the EMBEDDED committed manifest (offline truth;
+    // bd-av64.7): which quant tags `focr pull <id>` can fetch. A model with a
+    // runtime engine but no manifest entry is honestly "local" (convert your
+    // own artifact) instead of the old README-only caveat.
+    let pull_quants = |id: &str| -> Vec<String> {
+        dist::builtin_manifest()
+            .ok()
+            .map(|m| {
+                if m.model == id {
+                    m.quants.keys().cloned().collect()
+                } else {
+                    m.models
+                        .get(id)
+                        .map(|e| e.quants.keys().cloned().collect())
+                        .unwrap_or_default()
+                }
+            })
+            .unwrap_or_default()
+    };
     if args.json {
-        let models: Vec<serde_json::Value> = archs.iter().map(|a| model_arch_json(*a)).collect();
+        let models: Vec<serde_json::Value> = archs
+            .iter()
+            .map(|a| {
+                let mut j = model_arch_json(*a);
+                let quants = pull_quants(a.id());
+                j["pull"] = serde_json::json!({
+                    "in_manifest": !quants.is_empty(),
+                    "quants": quants,
+                });
+                j
+            })
+            .collect();
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "models": models,
@@ -1901,7 +1931,10 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
     } else {
         // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
         // fixed-width column would misalign — keep it trailing.
-        println!("{:<14}  {:<8}  {:<22}  TASKS", "ID", "STATUS", "MODEL");
+        println!(
+            "{:<14}  {:<8}  {:<12}  {:<22}  TASKS",
+            "ID", "STATUS", "PULL", "MODEL"
+        );
         for a in archs {
             let tasks = a
                 .tasks()
@@ -1910,10 +1943,17 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 .collect::<Vec<_>>()
                 .join(",");
             let status = if a.implemented() { "ready" } else { "planned" };
+            let quants = pull_quants(a.id());
+            let pull = if quants.is_empty() {
+                if a.implemented() { "local" } else { "-" }.to_owned()
+            } else {
+                quants.join(",")
+            };
             println!(
-                "{:<14}  {:<8}  {:<22}  {}",
+                "{:<14}  {:<8}  {:<12}  {:<22}  {}",
                 a.id(),
                 status,
+                pull,
                 a.display_name(),
                 tasks
             );
@@ -2150,8 +2190,17 @@ fn run_pull(args: &PullArgs) -> FocrResult<()> {
             "quant": outcome.quant,
             "focrq": outcome.focrq_path.display().to_string(),
             "tokenizer": outcome.tokenizer_path.display().to_string(),
+            "sidecars": outcome
+                .sidecar_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
             "from_cache": outcome.from_cache,
-            "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
+            "model_license_notice": if outcome.license_notice.is_empty() {
+                FOCR_MODEL_LICENSE_NOTICE
+            } else {
+                &outcome.license_notice
+            },
         }));
     } else {
         eprintln!(
@@ -3029,6 +3078,32 @@ mod tests {
         assert_eq!(j["decoder"], "DeepSeekV2MoeRswa");
         assert_eq!(j["vision_encoder"], "SamClip");
         assert!(j["license"].as_str().unwrap_or_default().contains("Baidu"));
+    }
+
+    /// bd-av64.7: every runtime-ready arch is pullable per the COMMITTED
+    /// manifest; planned archs are never published. A sixth engine landing
+    /// without a manifest entry (the old smolvlm2/onechart/tromr gap, where
+    /// README caveats stood in for distribution) trips this immediately.
+    #[test]
+    fn ready_archs_are_pullable_per_the_committed_manifest() {
+        let m = crate::dist::builtin_manifest().expect("embedded manifest parses");
+        for a in crate::model_arch::registry() {
+            let in_manifest = m.model == a.id() || m.models.contains_key(a.id());
+            if a.implemented() {
+                assert!(
+                    in_manifest,
+                    "{} is runtime-ready but has no manifest entry — publish its \
+                     artifacts (bd-av64.7 pattern) or record why not",
+                    a.id()
+                );
+            } else {
+                assert!(
+                    !in_manifest,
+                    "{} is planned-only but published in the manifest",
+                    a.id()
+                );
+            }
+        }
     }
 
     #[test]
