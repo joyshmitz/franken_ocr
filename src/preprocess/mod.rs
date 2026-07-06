@@ -1004,6 +1004,54 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tromr_alpha_ink_path_fires_only_when_alpha_varies() {
+        // DISC-004: the inverted-alpha ink convention applies ONLY to PNGs
+        // whose alpha channel varies (rendered transparent-background
+        // staves); fully-opaque RGBA takes the luma path.
+        use image::{DynamicImage, Rgba, RgbaImage};
+        // Varying alpha: ink strip (alpha 255) on transparent paper (alpha 0),
+        // RGB deliberately garbage — the ink must come from alpha alone.
+        let mut var = RgbaImage::from_pixel(64, 128, Rgba([9, 9, 9, 0]));
+        for y in 60..68 {
+            for x in 0..64 {
+                var.put_pixel(x, y, Rgba([200, 200, 200, 255]));
+            }
+        }
+        let (px, w) = super::tromr_staff_tensor(&DynamicImage::ImageRgba8(var))
+            .expect("varying-alpha preprocess runs");
+        assert_eq!(w, 64);
+        // 255 − alpha: the strip (alpha 255) is INK (dark, 0), the rest paper
+        // (255). Normalized: dark << 0 << light region values.
+        let dark = (0.0f32 - 0.7931 * 255.0) / (0.1738 * 255.0);
+        let light = (255.0f32 - 0.7931 * 255.0) / (0.1738 * 255.0);
+        let mid = px[64 * 64 + 32]; // row 64 (inside the strip), col 32
+        let top = px[10 * 64 + 32];
+        assert!((mid - dark).abs() < 1e-4, "strip is ink: {mid} vs {dark}");
+        assert!(
+            (top - light).abs() < 1e-4,
+            "background is paper: {top} vs {light}"
+        );
+
+        // Fully-opaque RGBA: the luma path (alpha ignored); a dark-RGB strip
+        // must be the ink instead.
+        let mut opaque = RgbaImage::from_pixel(64, 128, Rgba([250, 250, 250, 255]));
+        for y in 60..68 {
+            for x in 0..64 {
+                opaque.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        let (px, _) = super::tromr_staff_tensor(&DynamicImage::ImageRgba8(opaque))
+            .expect("opaque-alpha preprocess runs");
+        let mid = px[64 * 64 + 32];
+        let top = px[10 * 64 + 32];
+        assert!(
+            mid < top,
+            "opaque path reads RGB ink: strip {mid} vs paper {top}"
+        );
+        assert!(mid < -3.0, "the dark strip is strongly negative: {mid}");
+    }
+
     use super::*;
     use image::{Rgb, RgbImage};
 
