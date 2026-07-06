@@ -586,6 +586,338 @@ impl Invariant for PlaceholderInvariant {
     }
 }
 
+// ─────────── bd-re8.14: the conformal lower-bound release ratchet ───────────
+//
+// A point-estimate parity score ("99.2% pass") is overconfident: it ignores
+// sampling uncertainty, so a lucky-noise improvement can masquerade as
+// progress. The ratchet makes the release decision on a statistically
+// defensible LOWER bound instead: per category, a Jeffreys Beta-posterior
+// quantile crossed with a distribution-free (Hoeffding one-sided) band, the
+// decision taken on the MORE CONSERVATIVE of the two, truncated to 6 dp.
+// A change may land only if it lowers NO per-category bound (and the ledger
+// floor only ever moves up — that is the ratchet).
+
+/// The ratchet's one-sided error rate: each per-category lower bound is a
+/// 95 % lower confidence limit (α = 0.05). Chosen to match the conformal
+/// convention; recorded in every transparency card.
+pub const RATCHET_ALPHA: f64 = 0.05;
+
+/// The minimum per-category calibration count for the conformal machinery to
+/// DECIDE (review-r1 addendum: a checked precondition, not advice).
+/// Derivation (asserted by `min_calibration_n_is_the_computed_threshold`):
+/// the smallest n at which a PERFECT record's Jeffreys 95 % lower bound
+/// clears 0.9 — i.e. the prior stops dominating and a flawless small corpus
+/// is no longer reported as near-failing — is n = 18 (bound 0.900124;
+/// n = 17 gives 0.894652). We take 20 (bound 0.909524) for a whole-number
+/// margin above that boundary. Below this n the ratchet REFUSES to decide
+/// conformally and falls back to the deterministic raw point estimate,
+/// ledgered as such.
+pub const MIN_CALIBRATION_N: u64 = 20;
+
+/// Truncate (never round) a score to 6 decimal places — the deterministic,
+/// reproducible decision boundary the ratchet compares on.
+#[must_use]
+pub fn truncate_score(x: f64) -> f64 {
+    (x * 1e6).floor() / 1e6
+}
+
+/// Lanczos log-gamma (g = 7, n = 9 coefficients — the standard double-precision
+/// set; |rel err| < 1e-13 over the ratchet's domain of half-integer args).
+fn ln_gamma(x: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        // Reflection: Γ(x)Γ(1−x) = π / sin(πx).
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut acc = COEFFS[0];
+    for (i, c) in COEFFS.iter().enumerate().skip(1) {
+        acc += c / (x + i as f64);
+    }
+    let t = x + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + acc.ln()
+}
+
+/// The continued fraction for the regularized incomplete beta (Numerical
+/// Recipes `betacf`, Lentz's method).
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const MAX_ITER: usize = 200;
+    const EPS: f64 = 3e-16;
+    const FPMIN: f64 = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=MAX_ITER {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// The regularized incomplete beta `I_x(a, b)` — the Beta(a, b) CDF at `x`.
+fn beta_cdf(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let front = ln_front.exp();
+    // The symmetry pick keeps the continued fraction convergent.
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// The Beta(a, b) lower quantile at probability `p`, by bisection on the CDF
+/// (monotone; 200 halvings ≪ f64 resolution, so the answer is deterministic).
+fn beta_quantile(a: f64, b: f64, p: f64) -> f64 {
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if beta_cdf(a, b, mid) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Per-category pass/fail counts — the ratchet's calibration input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CategoryCounts {
+    /// Stable category name (the per-category no-lowering rule keys on this).
+    pub category: &'static str,
+    /// Calibration items that passed.
+    pub passes: u64,
+    /// Calibration items that failed.
+    pub failures: u64,
+}
+
+/// How a category's bound was decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundMethod {
+    /// Jeffreys Beta-posterior × Hoeffding band; decision on the conservative min.
+    Conformal,
+    /// Calibration count below [`MIN_CALIBRATION_N`]: the deterministic raw
+    /// point estimate (the Alien-Artifact conservative fallback), ledgered.
+    DeterministicFallback,
+}
+
+/// One category's computed bound (all scores truncated to 6 dp).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CategoryBound {
+    /// The category this bound scores.
+    pub category: &'static str,
+    /// Calibration size (passes + failures).
+    pub n: u64,
+    /// Raw pass fraction.
+    pub point: f64,
+    /// Jeffreys Beta(s+½, f+½) posterior α-quantile (0.0 under fallback).
+    pub beta_lower: f64,
+    /// Distribution-free one-sided band: `point − sqrt(ln(1/α) / 2n)` clamped
+    /// at 0 (Hoeffding; 0.0 under fallback).
+    pub dkw_lower: f64,
+    /// THE decision value: `min(beta_lower, dkw_lower)` under
+    /// [`BoundMethod::Conformal`], else the raw point estimate.
+    pub lower: f64,
+    /// Which rule produced `lower`.
+    pub method: BoundMethod,
+}
+
+/// Compute one category's lower bound. Refuses to decide conformally below
+/// [`MIN_CALIBRATION_N`] (the checked precondition) — the deterministic
+/// fallback keeps small-corpus categories from emitting a meaninglessly-low
+/// bound that would block every landing.
+#[must_use]
+pub fn category_bound(counts: CategoryCounts) -> CategoryBound {
+    let n = counts.passes + counts.failures;
+    let point = if n == 0 {
+        0.0
+    } else {
+        counts.passes as f64 / n as f64
+    };
+    if n < MIN_CALIBRATION_N {
+        return CategoryBound {
+            category: counts.category,
+            n,
+            point: truncate_score(point),
+            beta_lower: 0.0,
+            dkw_lower: 0.0,
+            lower: truncate_score(point),
+            method: BoundMethod::DeterministicFallback,
+        };
+    }
+    // Jeffreys posterior: Beta(s + ½, f + ½); one-sided lower limit at α.
+    let beta_lower = beta_quantile(
+        counts.passes as f64 + 0.5,
+        counts.failures as f64 + 0.5,
+        RATCHET_ALPHA,
+    );
+    // Distribution-free one-sided band (Hoeffding): P(p̂ − p > ε) ≤ e^(−2nε²).
+    let eps = ((1.0 / RATCHET_ALPHA).ln() / (2.0 * n as f64)).sqrt();
+    let dkw_lower = (point - eps).max(0.0);
+    let lower = truncate_score(beta_lower.min(dkw_lower));
+    CategoryBound {
+        category: counts.category,
+        n,
+        point: truncate_score(point),
+        beta_lower: truncate_score(beta_lower),
+        dkw_lower: truncate_score(dkw_lower),
+        lower,
+        method: BoundMethod::Conformal,
+    }
+}
+
+/// The ratchet decision over a candidate change vs the committed baseline
+/// floors. The rule: a change may land only if NO per-category lower bound
+/// drops below its baseline floor (categories absent from the baseline are
+/// new coverage and always admissible; categories absent from the CANDIDATE
+/// that exist in the baseline are treated as dropped coverage and REJECTED).
+#[derive(Clone, Debug)]
+pub struct RatchetDecision {
+    /// True iff the change may land.
+    pub allowed: bool,
+    /// True iff at least one per-category bound strictly rose (a genuine
+    /// floor raise, not just a hold).
+    pub raised: bool,
+    /// Human-readable per-category verdicts (structured logging feeds off
+    /// these; each line names the category, baseline floor, candidate bound).
+    pub verdicts: Vec<String>,
+}
+
+/// Decide the ratchet: `baseline` is the committed per-category floor set;
+/// `candidate` the freshly computed bounds.
+#[must_use]
+pub fn ratchet_decide(baseline: &[(&str, f64)], candidate: &[CategoryBound]) -> RatchetDecision {
+    let mut allowed = true;
+    let mut raised = false;
+    let mut verdicts = Vec::new();
+    for &(name, floor) in baseline {
+        match candidate.iter().find(|b| b.category == name) {
+            None => {
+                allowed = false;
+                verdicts.push(format!(
+                    "{name}: DROPPED (baseline floor {floor:.6}, no candidate bound) — rejected"
+                ));
+            }
+            Some(b) => {
+                let floor_t = truncate_score(floor);
+                if b.lower < floor_t {
+                    allowed = false;
+                    verdicts.push(format!(
+                        "{name}: LOWERED {:.6} < floor {floor_t:.6} ({:?}) — rejected",
+                        b.lower, b.method
+                    ));
+                } else {
+                    if b.lower > floor_t {
+                        raised = true;
+                    }
+                    verdicts.push(format!(
+                        "{name}: holds {:.6} >= floor {floor_t:.6} ({:?})",
+                        b.lower, b.method
+                    ));
+                }
+            }
+        }
+    }
+    for b in candidate {
+        if !baseline.iter().any(|(name, _)| *name == b.category) {
+            raised = true;
+            verdicts.push(format!(
+                "{}: NEW coverage at {:.6} ({:?}) — admissible, sets the initial floor",
+                b.category, b.lower, b.method
+            ));
+        }
+    }
+    RatchetDecision {
+        allowed,
+        raised,
+        verdicts,
+    }
+}
+
+/// The galaxy-brain transparency card for one bound: equation, substituted
+/// values, plain-English intuition, validity assumptions, and what would flip
+/// the decision — emitted as one JSON object so the release log carries the
+/// full statistical justification inline.
+#[must_use]
+pub fn transparency_card(b: &CategoryBound) -> serde_json::Value {
+    let (s, f) = (
+        (b.point * b.n as f64).round() as u64,
+        b.n - (b.point * b.n as f64).round() as u64,
+    );
+    serde_json::json!({
+        "card": "conformal-ratchet/v1",
+        "category": b.category,
+        "equation": "lower = min( BetaQuantile(s+1/2, f+1/2; alpha), p_hat - sqrt(ln(1/alpha)/(2n)) ), truncated to 6dp",
+        "substituted": {
+            "s": s, "f": f, "n": b.n, "alpha": RATCHET_ALPHA,
+            "p_hat": b.point, "beta_lower": b.beta_lower, "dkw_lower": b.dkw_lower,
+            "lower": b.lower, "method": format!("{:?}", b.method),
+        },
+        "intuition": "the release floor is what the data still guarantees after paying for sampling luck: the Jeffreys posterior prices the binomial uncertainty, the Hoeffding band prices distribution-freeness, and the decision takes the stingier of the two",
+        "validity_assumptions": [
+            "calibration items are exchangeable (i.i.d.-like) draws from the deployment distribution",
+            "pass/fail is a Bernoulli outcome per item (no partial credit)",
+            format!("n >= MIN_CALIBRATION_N ({MIN_CALIBRATION_N}) for the conformal path; below it the deterministic point-estimate fallback is ledgered instead"),
+        ],
+        "decision_flips_if": [
+            format!("any per-category lower bound falls below its committed floor (alpha = {RATCHET_ALPHA})"),
+            "a category present in the baseline disappears from the candidate (dropped coverage)",
+        ],
+    })
+}
+
 /// Same-input-twice determinism gate seed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeterminismGate;
@@ -701,5 +1033,163 @@ mod tests {
         let ok = same.passed && !different.passed;
         log_result("determinism_gate_checks_byte_identity", ok);
         assert!(ok, "same={same:?} different={different:?}");
+    }
+
+    // ── bd-re8.14: the conformal lower-bound ratchet ──
+
+    /// The Beta CDF against EXACT closed forms: `I_x(1,1) = x` (uniform),
+    /// `I_x(a,1) = x^a`, `I_x(1,b) = 1 − (1−x)^b`, and the symmetric median
+    /// `I_0.5(2,2) = 0.5`. These pin the incomplete-beta translation without
+    /// trusting any external table.
+    #[test]
+    fn beta_cdf_matches_closed_forms() {
+        let mut worst = 0.0_f64;
+        for i in 1..20 {
+            let x = f64::from(i) / 20.0;
+            worst = worst.max((beta_cdf(1.0, 1.0, x) - x).abs());
+            worst = worst.max((beta_cdf(3.0, 1.0, x) - x.powi(3)).abs());
+            worst = worst.max((beta_cdf(1.0, 4.0, x) - (1.0 - (1.0 - x).powi(4))).abs());
+        }
+        worst = worst.max((beta_cdf(2.0, 2.0, 0.5) - 0.5).abs());
+        let ok = worst < 1e-12;
+        log_result("beta_cdf_matches_closed_forms", ok);
+        assert!(ok, "worst closed-form deviation {worst:e}");
+    }
+
+    /// Quantile ↔ CDF self-consistency over a grid of Jeffreys-shaped
+    /// posteriors: `CDF(quantile(p)) == p` to 1e-10, plus exact uniform
+    /// quantiles.
+    #[test]
+    fn beta_quantile_inverts_the_cdf() {
+        let mut worst = 0.0_f64;
+        for &(a, b) in &[(0.5, 0.5), (5.5, 0.5), (95.5, 5.5), (20.5, 0.5), (2.0, 8.0)] {
+            for &p in &[0.01, 0.05, 0.5, 0.95] {
+                let q = beta_quantile(a, b, p);
+                worst = worst.max((beta_cdf(a, b, q) - p).abs());
+            }
+        }
+        let uniform = (beta_quantile(1.0, 1.0, 0.05) - 0.05).abs();
+        let ok = worst < 1e-10 && uniform < 1e-12;
+        log_result("beta_quantile_inverts_the_cdf", ok);
+        assert!(ok, "worst inversion error {worst:e}, uniform {uniform:e}");
+    }
+
+    /// Known Jeffreys posteriors, cross-checked against an independent
+    /// stdlib-Python port of the same continued fraction (2026-07-06):
+    /// perfect n=20 → 0.909523573; n=100 s=95 → beta 0.904229236, Hoeffding
+    /// 0.827612658 (the band binds, being the stingier). Stored values are
+    /// floor-truncated to 6 dp.
+    #[test]
+    fn category_bound_matches_known_posteriors() {
+        let perfect20 = category_bound(CategoryCounts {
+            category: "perfect20",
+            passes: 20,
+            failures: 0,
+        });
+        let mixed100 = category_bound(CategoryCounts {
+            category: "mixed100",
+            passes: 95,
+            failures: 5,
+        });
+        let ok = perfect20.method == BoundMethod::Conformal
+            && (perfect20.beta_lower - 0.909_523).abs() < 1e-9
+            && (mixed100.beta_lower - 0.904_229).abs() < 1e-9
+            && (mixed100.dkw_lower - 0.827_612).abs() < 1e-9
+            && (mixed100.lower - mixed100.dkw_lower).abs() < 1e-12
+            && perfect20.lower <= perfect20.beta_lower;
+        log_result("category_bound_matches_known_posteriors", ok);
+        assert!(ok, "perfect20={perfect20:?} mixed100={mixed100:?}");
+    }
+
+    /// The review-r1 checked precondition: MIN_CALIBRATION_N sits above the
+    /// COMPUTED boundary where a perfect record's Jeffreys lower bound first
+    /// clears 0.9 (n = 18; n = 17 is still below).
+    #[test]
+    fn min_calibration_n_is_the_computed_threshold() {
+        let at17 = beta_quantile(17.5, 0.5, RATCHET_ALPHA);
+        let at18 = beta_quantile(18.5, 0.5, RATCHET_ALPHA);
+        let ok = at17 < 0.9 && at18 >= 0.9 && MIN_CALIBRATION_N >= 18;
+        log_result("min_calibration_n_is_the_computed_threshold", ok);
+        assert!(ok, "at17={at17} at18={at18} MIN={MIN_CALIBRATION_N}");
+    }
+
+    /// Below MIN_CALIBRATION_N the ratchet refuses to decide conformally:
+    /// deterministic point-estimate fallback, and NO spurious red (a perfect
+    /// 10-item category holds a 0.95 floor instead of being blocked by a
+    /// prior-dominated bound).
+    #[test]
+    fn small_corpus_takes_the_deterministic_fallback() {
+        let b = category_bound(CategoryCounts {
+            category: "tiny",
+            passes: 10,
+            failures: 0,
+        });
+        let decision = ratchet_decide(&[("tiny", 0.95)], &[b]);
+        let ok = b.method == BoundMethod::DeterministicFallback
+            && (b.lower - 1.0).abs() < 1e-12
+            && decision.allowed;
+        log_result("small_corpus_takes_the_deterministic_fallback", ok);
+        assert!(ok, "bound={b:?} decision={decision:?}");
+    }
+
+    /// THE ratchet rule: a per-category regression blocks the land even when
+    /// the aggregate improves — and dropped coverage is also a rejection.
+    #[test]
+    fn per_category_regression_blocks_even_when_aggregate_improves() {
+        // Aggregate: baseline 150/200 = 0.75 vs candidate 175/200 = 0.875 —
+        // a big aggregate win, carried entirely by category A while B slips.
+        let a = category_bound(CategoryCounts {
+            category: "a",
+            passes: 100,
+            failures: 0,
+        });
+        let b = category_bound(CategoryCounts {
+            category: "b",
+            passes: 75,
+            failures: 25,
+        });
+        let baseline = [("a", 0.60), ("b", 0.80)];
+        let decision = ratchet_decide(&baseline, &[a, b]);
+        let dropped = ratchet_decide(&baseline, &[a]);
+        let holds = ratchet_decide(&[("a", 0.60), ("b", b.lower)], &[a, b]);
+        let ok = !decision.allowed && !dropped.allowed && holds.allowed && holds.raised;
+        log_result(
+            "per_category_regression_blocks_even_when_aggregate_improves",
+            ok,
+        );
+        assert!(
+            ok,
+            "decision={decision:?}\ndropped={dropped:?}\nholds={holds:?}"
+        );
+    }
+
+    /// The transparency card carries the full justification: equation,
+    /// substituted values, intuition, validity assumptions, flip conditions.
+    #[test]
+    fn transparency_card_is_complete() {
+        let b = category_bound(CategoryCounts {
+            category: "parity",
+            passes: 95,
+            failures: 5,
+        });
+        let card = transparency_card(&b);
+        let ok = card["card"] == "conformal-ratchet/v1"
+            && card["equation"]
+                .as_str()
+                .is_some_and(|e| e.contains("BetaQuantile"))
+            && card["substituted"]["n"] == 100
+            && card["substituted"]["s"] == 95
+            && card["intuition"].as_str().is_some_and(|s| !s.is_empty())
+            && card["validity_assumptions"]
+                .as_array()
+                .is_some_and(|a| a.len() == 3)
+            && card["decision_flips_if"]
+                .as_array()
+                .is_some_and(|a| a.len() == 2);
+        println!(
+            "{{\"check\":\"transparency_card_is_complete\",\"result\":\"{}\",\"card\":{card}}}",
+            if ok { "pass" } else { "fail" }
+        );
+        assert!(ok, "{card}");
     }
 }
