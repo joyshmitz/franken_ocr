@@ -186,59 +186,59 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | # | Op | §4.3 status | Req | Status | Parity | Module | Bead | Notes |
 |---|----|-------------|-----|--------|--------|--------|------|-------|
-| 86 | int8 dynamic-quant linear (SMMLA/SDOT/VNNI) | EXISTS reuse | MUST | missing | L3 | nn.rs | bd-1es.9 | crown asset |
-| 87 | f32 linear | EXISTS reuse | MUST | missing | L1 | nn.rs | bd-1gv.10 | |
-| 88 | Conv2d (im2col+GEMM) | EXISTS reuse | MUST | missing | L1 | nn.rs | bd-1gv.5 | 5 fixed shapes |
-| 89 | SDPA attention (+masked/+gqa) | EXISTS reuse | MUST | missing | L1 | nn.rs | bd-1gv.9 | |
-| 90 | Windowed self-attention (window 14) | BUILD | MUST | missing | L2 | vision_sam.rs | bd-1gv.6 | OQ-15 |
-| 91 | quick_gelu | BUILD | MUST | missing | L1 | nn.rs | bd-1gv.9 | |
-| 92 | GELU / SiLU | EXISTS reuse | MUST | missing | L1 | nn.rs | bd-1gv.28/19.1 | |
-| 93 | RMSNorm | EXISTS reuse | MUST | missing | L1 | nn.rs | bd-1gv.15 | |
-| 94 | LayerNorm / LayerNorm2d | EXISTS + wrap | MUST | missing | L1 | nn.rs | bd-1gv.7 | |
-| 95 | f32 bicubic pos-embed interpolate | GAP BUILD | MUST | missing | L1 | vision_sam.rs | bd-1gv.4 | |
-| 96 | RoPE (theta 10000) | BUILD | MUST | missing | L1 | decoder.rs | bd-1gv.16 | |
-| 97 | R-SWA decode attention (ring + ref block) | BUILD centerpiece | MUST | missing | L2 | rswa.rs | bd-1gv.17 | |
-| 98 | MoE router top-6 greedy + norm_topk_prob | BUILD | MUST | missing | L2 | moe.rs | bd-1gv.18 | |
-| 99 | Grouped expert SiLU-gated MLP | BUILD | MUST | missing | L2 | moe.rs | bd-1gv.19 | int8 linear |
-| 100 | Token embedding lookup (f32-preserving) | BUILD thin | MUST | missing | L1 | decoder.rs | bd-1gv.14 | |
-| 101 | masked-scatter vision fusion | BUILD | MUST | missing | L2 | connector.rs | bd-1gv.11 | |
-| 102 | Image decode/resize/normalize/pad/tile | GAP BUILD | MUST | missing | L0 | preprocess/ | bd-1gv.2/3 | |
-| 103 | BPE tokenizer (tokenizer.json) | GAP BUILD | MUST | missing | L0 | tokenizer/ | bd-1gv.1 | |
-| 104 | Sampler + no_repeat_ngram(35) | BUILD | MUST | missing | L4 | decode.rs | bd-1gv.22 | |
-| 105 | safetensors BF16 load | EXISTS reuse | MUST | missing | SURF | weights.rs | bd-1es.4 | converter |
+| 86 | int8 dynamic-quant linear (SMMLA/SDOT/VNNI) | EXISTS reuse | MUST | present | L3 | nn.rs | bd-1es.9 | linear_int8_dynamic → simd dispatch (nn.rs:151); robot selftest + batched_igemm_parity all tiers |
+| 87 | f32 linear | EXISTS reuse | MUST | present | L1 | nn.rs | bd-1gv.10 | f32 linear (nn.rs:104); L1/L3 |
+| 88 | Conv2d (im2col+GEMM) | EXISTS reuse | MUST | present | L1 | nn.rs | bd-1gv.5 | conv2d im2col+GEMM (nn.rs:185); L1 sam parity |
+| 89 | SDPA attention (+masked/+gqa) | EXISTS reuse | MUST | present | L1 | nn.rs | bd-1gv.9 | SDPA (nn.rs:375); batched_attention_parity + L1 |
+| 90 | Windowed self-attention (window 14) | BUILD | MUST | present | L2 | vision_sam.rs | bd-1gv.6 | windowed self-attention w14 (vision_sam.rs:39,809); L1 |
+| 91 | quick_gelu | BUILD | MUST | present | L1 | nn.rs | bd-1gv.9 | quick_gelu (nn.rs:517); L1 |
+| 92 | GELU / SiLU | EXISTS reuse | MUST | present | L1 | nn.rs | bd-1gv.28/19.1 | gelu/silu (nn.rs:503/488); unit tests + L1/L4 |
+| 93 | RMSNorm | EXISTS reuse | MUST | present | L1 | nn.rs | bd-1gv.15 | rms_norm (nn.rs:400 + hand-computed test) |
+| 94 | LayerNorm / LayerNorm2d | EXISTS + wrap | MUST | present | L1 | nn.rs | bd-1gv.7 | layer_norm/2d (nn.rs:424 + tests) |
+| 95 | f32 bicubic pos-embed interpolate | GAP BUILD | MUST | present | L1 | vision_sam.rs | bd-1gv.4 | f32 bicubic pos-embed interp (vision_sam.rs:506); L1 + PIL goldens script |
+| 96 | RoPE (theta 10000) | BUILD | MUST | present | L1 | decoder.rs | bd-1gv.16 | RoPE table (decoder.rs:89,152); spec_verify_forward_parity + L4 |
+| 97 | R-SWA decode attention (ring + ref block) | BUILD centerpiece | MUST | present | L2 | rswa.rs | bd-1gv.17 | R-SWA decode attention (rswa.rs); batched_attention_parity + spec_ring_rollback |
+| 98 | MoE router top-6 greedy + norm_topk_prob | BUILD | MUST | present | L2 | moe.rs | bd-1gv.18 | MoE router top-6 greedy (moe.rs:414); batched_moe_parity |
+| 99 | Grouped expert SiLU-gated MLP | BUILD | MUST | present | L2 | moe.rs | bd-1gv.19 | grouped expert SwiGLU MLP (moe.rs:396); batched_moe_parity |
+| 100 | Token embedding lookup (f32-preserving) | BUILD thin | MUST | present | L1 | decoder.rs | bd-1gv.14 | embed lookup f32-preserving (decoder.rs:116); L2 fusion rung |
+| 101 | masked-scatter vision fusion | BUILD | MUST | present | L2 | connector.rs | bd-1gv.11 | masked-scatter fusion (connector.rs:346,403); L2 inputs_embeds |
+| 102 | Image decode/resize/normalize/pad/tile | GAP BUILD | MUST | present | L0 | preprocess/ | bd-1gv.2/3 | preprocess pipeline (src/preprocess); L0 rung (default resample within DISC-001 envelope; bit-exact under FOCR_RESAMPLE=pil-bicubic); L5 CER 0.0 |
+| 103 | BPE tokenizer (tokenizer.json) | GAP BUILD | MUST | present | L0 | tokenizer/ | bd-1gv.1 | BPE tokenizer (src/tokenizer); tokenizer_conformance |
+| 104 | Sampler + no_repeat_ngram(35) | BUILD | MUST | present | L4 | decode.rs | bd-1gv.22 | sampler + ngram-35 (sampler.rs:33); batched_sampler_parity + L4 EXACT |
+| 105 | safetensors BF16 load | EXISTS reuse | MUST | present | SURF | weights.rs | bd-1es.4 | safetensors BF16 load (weights.rs:162); convert tests + e2e |
 
 ## 10. Op map — perf kernels (plan §6.6, Phase 3+, behind kill-switches)
 
 | # | Op | §6.6 tier | Req | Status | Parity | Module | Bead | Notes |
 |---|----|-----------|-----|--------|--------|--------|------|-------|
-| 106 | Runtime ISA dispatch (OnceLock<IsaTier>) | all | SHOULD | missing | L3 | nn.rs | bd-2mo.1 | bit-identical paths |
-| 107 | aarch64 SMMLA/i8mm prefill GEMM (the wedge) | A1 | SHOULD | missing | L3 | nn.rs (island) | bd-2mo.4 | register-blocked |
-| 108 | aarch64 SDOT decode GEMV | A2 | SHOULD | missing | L3 | nn.rs (island) | bd-2mo.5 | reuse dot_i8_sdot |
-| 109 | x86 AVX-512-VNNI GEMM/GEMV (U8S8 +128) | X1 | SHOULD | missing | L3 | nn.rs (island) | bd-2mo.6 | |
-| 110 | x86 AVX-VNNI (256-bit) | X2 | SHOULD | missing | L3 | nn.rs (island) | bd-2mo.7 | |
-| 111 | x86 AMX-int8 prefill (_tile_dpbssd, feature) | X3 | MAY | missing | L3 | nn.rs (island) | bd-2mo.8 | behind feature |
-| 112 | x86 AVX2 fallback (maddubs→madd, i16-sat proof) | X4 | SHOULD | missing | L3 | nn.rs (island) | bd-2mo.9 | own overflow proof |
-| 113 | Scalar int8 GEMM/GEMV floor (cross-compile) | S | MUST | missing | L3 | nn.rs | bd-2mo.10 | bit-exact oracle |
-| 114 | i32-overflow proof at worst-case K=6848 | §5.4 | MUST | missing | L3 | tests/ | bd-2mo.11 | not k≤1536 |
-| 115 | Offline arch-specific weight pre-packing (--arch) | §5.4 | SHOULD | missing | SURF | weights.rs | bd-2mo.3 | zero runtime shuffle |
-| 116 | MoE prefill token-grouping (counting-sort → GEMMs) | §6.7 | SHOULD | missing | L2 | moe.rs | bd-2mo.12 | |
-| 117 | int8 attention (Q·Kᵀ, scores·V) + CVaR gate | §6.8 | MAY | missing | L3 | rswa.rs | bd-2mo.15 | FOCR_INT8_ATTN |
-| 118 | int4 group-quant GEMM (unpack→int8 MAC) | §6.3 | SHOULD | missing | L3 | nn.rs (island) | bd-2ela | Phase 4 |
-| 119 | Vectorized poly-exp (softmax/SiLU/quick_gelu) | §6.11 | MAY | missing | L3 | nn.rs | bd-2mo.20 | FOCR_VEC_EXP A/B |
+| 106 | Runtime ISA dispatch (OnceLock<IsaTier>) | all | SHOULD | present | L3 | nn.rs | bd-2mo.1 | OnceLock IsaTier dispatch (dispatch.rs:108,143); selftest + FOCR_FORCE_ARCH sweep |
+| 107 | aarch64 SMMLA/i8mm prefill GEMM (the wedge) | A1 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.4 | aarch64 SMMLA 8×8 prefill GEMM (arm.rs:199); batched_igemm_parity smmla + selftest |
+| 108 | aarch64 SDOT decode GEMV | A2 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.5 | aarch64 SDOT decode GEMV (arm.rs:204); batched_igemm_parity sdot + selftest |
+| 109 | x86 AVX-512-VNNI GEMM/GEMV (U8S8 +128) | X1 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.6 | x86 AVX-512-VNNI (x86.rs:122); vs-scalar gate, arch-gated on x86 hosts |
+| 110 | x86 AVX-VNNI (256-bit) | X2 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.7 | x86 AVX-VNNI 256-bit (x86.rs:129); same gate |
+| 111 | x86 AMX-int8 prefill (_tile_dpbssd, feature) | X3 | MAY | missing | L3 | nn.rs (island) | bd-2mo.8 | no AMX kernel (dispatch.rs:19-21 states x86.rs implements no AMX; MAY tier) |
+| 112 | x86 AVX2 fallback (maddubs→madd, i16-sat proof) | X4 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.9 | AVX2 fallback, non-saturating vpmaddwd (x86.rs:268,285; bd-2mo.9.1); vs-scalar gates |
+| 113 | Scalar int8 GEMM/GEMV floor (cross-compile) | S | MUST | present | L3 | nn.rs | bd-2mo.10 | scalar int8 floor (src/simd/scalar.rs) — IS the bit-exact oracle in every gate |
+| 114 | i32-overflow proof at worst-case K=6848 | §5.4 | MUST | present | L3 | tests/ | bd-2mo.11 | i32 overflow proof K=6848 (tests/int32_overflow_proof.rs:198; rejects the 1536 bound) |
+| 115 | Offline arch-specific weight pre-packing (--arch) | §5.4 | SHOULD | partial | SURF | weights.rs | bd-2mo.3 | --arch flag + arch_target tag shipped and round-tripped (cli.rs:710, convert.rs:542, focrq.rs:523) but NO arch-specific byte reorder — SMMLA still repacks at runtime (arm.rs:23) |
+| 116 | MoE prefill token-grouping (counting-sort → GEMMs) | §6.7 | SHOULD | present | L2 | moe.rs | bd-2mo.12 | MoE prefill gather-by-expert grouped GEMMs (moe.rs:396); batched_moe_parity bit-exact |
+| 117 | int8 attention (Q·Kᵀ, scores·V) + CVaR gate | §6.8 | MAY | partial | L3 | rswa.rs | bd-2mo.15 | int8 QK/PV attention shipped + parity-gated behind FOCR_INT8_KV (rswa.rs:1060,1836 ≤1e-6 + overflow proof) — env name differs from the row note (FOCR_INT8_ATTN) and the CVaR gate is not runtime-wired |
+| 118 | int4 group-quant GEMM (unpack→int8 MAC) | §6.3 | SHOULD | present | L3 | nn.rs (island) | bd-2ela | int4 group-quant GEMM (int4.rs:170); int4_packed_parity unpack-equivalence |
+| 119 | Vectorized poly-exp (softmax/SiLU/quick_gelu) | §6.11 | MAY | missing | L3 | nn.rs | bd-2mo.20 | no FOCR_VEC_EXP / vectorized poly-exp anywhere (MAY tier, not built) |
 
 ## 11. `.focrq` weight transformation & quant recipe (plan §5)
 
 | # | Feature | Plan | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 120 | `.focrq` format spec + version/provenance | §5.2 | MUST | missing | SURF | docs/ | bd-1es.1 | magic, license_notice |
-| 121 | `.focrq` writer + reader (byte-range, manifest census) | §5.2 | MUST | missing | SURF | weights.rs | bd-1es.2/3 | dependency-free |
-| 122 | Tensor remap (HF dotted → internal) | §5.3 | MUST | missing | SURF | weights.rs | bd-1es.4 | |
-| 123 | Per-output-channel int8 quantizer (zp 0) | §5.1 | MUST | missing | L3 | weights.rs | bd-1es.5 | validated set |
-| 124 | Per-row dynamic int8 activation quant (S8S8/U8S8) | §6.3 | MUST | missing | L3 | nn.rs | bd-1es.8 | per arch |
-| 125 | int8 attention q/k/v/o (FOCR_INT8_ATTN kill-switch) | §5/§6 | MAY | missing | L3 | weights.rs | bd-1es.10 | OQ-14 risk |
-| 126 | int8 lm_head (FOCR_INT8_LMHEAD kill-switch) | §5/§6 | MAY | missing | L3 | weights.rs | bd-1es.11 | high-value high-risk |
-| 127 | int4 per-group quantizer (16–32, tier discipline) | §6.3 | SHOULD | missing | L3 | weights.rs | bd-lsu3 | Phase 4 |
-| 128 | High-precision set kept BF16 (vision/proj/embed/router/norms) | §5.1 | MUST | missing | SURF | weights.rs | bd-1es.6 | recipe invariant |
+| 120 | `.focrq` format spec + version/provenance | §5.2 | MUST | present | SURF | docs/ | bd-1es.1 | FOCRQ magic + FORMAT_VERSION=1 + license/sha256 slots (focrq.rs:60,65); check_focrq_format.py lints the doc |
+| 121 | `.focrq` writer + reader (byte-range, manifest census) | §5.2 | MUST | present | SURF | weights.rs | bd-1es.2/3 | writer + reader byte-range manifest (focrq.rs + weights.rs:463); round-trip tests bf16/f32/qint8/qint4 |
+| 122 | Tensor remap (HF dotted → internal) | §5.3 | MUST | present | SURF | weights.rs | bd-1es.4 | HF-dotted key census/classification (convert.rs:655 tests; canonical-key policy) |
+| 123 | Per-output-channel int8 quantizer (zp 0) | §5.1 | MUST | present | L3 | weights.rs | bd-1es.5 | per-out-channel symmetric int8 zp0 clamp±127 (int8.rs:145,47 + tests) |
+| 124 | Per-row dynamic int8 activation quant (S8S8/U8S8) | §6.3 | MUST | present | L3 | nn.rs | bd-1es.8 | per-row dynamic activation quant S8S8/U8S8 (nn.rs:151 + igemm parity + selftest u8s8) |
+| 125 | int8 attention q/k/v/o (FOCR_INT8_ATTN kill-switch) | §5/§6 | MAY | present | L3 | weights.rs | bd-1es.10 | FOCR_INT8_ATTN kill-switch recipe gating (recipe.rs:43,70 + env-gating tests) |
+| 126 | int8 lm_head (FOCR_INT8_LMHEAD kill-switch) | §5/§6 | MAY | present | L3 | weights.rs | bd-1es.11 | FOCR_INT8_LMHEAD kill-switch (recipe.rs:72); lmhead_shard_parity bit-identity |
+| 127 | int4 per-group quantizer (16–32, tier discipline) | §6.3 | SHOULD | present | L3 | weights.rs | bd-lsu3 | int4 group 16/32 tier discipline (int4.rs:49); int4_packed_parity + focrq qint4 roundtrip |
+| 128 | High-precision set kept BF16 (vision/proj/embed/router/norms) | §5.1 | MUST | present | SURF | weights.rs | bd-1es.6 | KeepBf16 high-precision set (recipe.rs:15-20,58 + policy tests) |
 
 ---
 
