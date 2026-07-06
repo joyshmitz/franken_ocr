@@ -229,8 +229,7 @@ fn every_xfail_maps_to_a_disc_entry_or_stated_gap() {
                 stack.push(path);
                 continue;
             }
-            if path.extension().is_none_or(|e| e != "rs")
-                || path.ends_with("conformance_matrix.rs")
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("conformance_matrix.rs")
             {
                 continue;
             }
