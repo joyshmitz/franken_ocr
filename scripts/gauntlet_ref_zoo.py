@@ -256,6 +256,105 @@ def run_onechart(stage: str, page: str, model_dir: str, state) -> dict:
     return _finish(state, t0, time.perf_counter_ns() - t0, text, page)
 
 
+# ── Polyphonic-TrOMR (music) — bd-2sez ──────────────────────────────────────
+#
+# NOT an HF CausalLM: TrOMR is the upstream custom arch (hybrid-CNN/ViT
+# encoder + 4-head transformer decoder with its own generate()), so this lane
+# builds the ledger stages DIRECTLY instead of via stages_from_call_log
+# (there is no text prefill — the decoder seeds from BOS against the encoder
+# memory; the record omits the `prefill` stage and says so).
+
+
+def setup_tromr(stage: str, page: str, model_dir: str):
+    """`model_dir` = the tromr-upstream checkout root (the pinned repo)."""
+    del stage
+    _require(page, model_dir)
+    import torch
+
+    sys.path.insert(0, os.path.join(model_dir, "tromr"))
+    from configs import getconfig  # noqa: PLC0415 — upstream module
+    from model.tromr_arch import TrOMR  # noqa: PLC0415
+
+    conf = getconfig(os.path.join(model_dir, "tromr", "workspace", "config.yaml"))
+    model = TrOMR(conf)
+    ckpt = os.path.join(model_dir, "tromr", "workspace", "checkpoints", "img2score_epoch47.pth")
+    model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
+    model.train(False)
+
+    timers = {"encoder_ns": 0}
+
+    def on_encoder(_t0: int, dur: int, _args, _kwargs) -> None:
+        timers["encoder_ns"] += dur
+
+    _wrap_module_forward(model.encoder, on_encoder)
+    # focr's music lane decodes ARGMAX by default (DISC-004 / E-wave: argmax ==
+    # top-k/T0.2 sampling on real staves); force the same on the reference so
+    # the timed decode path and the output stream are comparable.
+    torch.multinomial = lambda probs, n, **kw: probs.argmax(-1, keepdim=True)
+    return {"torch": torch, "model": model, "timers": timers}
+
+
+def run_tromr(stage: str, page: str, model_dir: str, state) -> dict:
+    del stage, model_dir
+    if state is None:
+        raise ReferenceEntryError("setup state missing — pass --setup gauntlet_ref_zoo:setup_tromr")
+    import cv2
+    import numpy as np
+    from gen_reference_fixtures_tromr import readimg  # the byte-faithful L0 preprocess (DISC-004 rule)
+
+    torch = state["torch"]
+    state["timers"]["encoder_ns"] = 0
+    t0 = time.perf_counter_ns()
+    x = readimg(cv2, np, page)
+    xt = torch.from_numpy(x).unsqueeze(0)  # (1, 1, 128, W)
+    pre_ns = time.perf_counter_ns() - t0
+    g0 = time.perf_counter_ns()
+    with torch.inference_mode():
+        rhythm, pitch, lift = state["model"].generate(xt, temperature=0.2)
+    gen_ns = time.perf_counter_ns() - g0
+    total_ns = time.perf_counter_ns() - t0
+    enc_ns = state["timers"]["encoder_ns"]
+    if enc_ns <= 0:
+        raise ReferenceEntryError("encoder hook recorded 0 ns — generate() never ran the encoder")
+    if enc_ns > gen_ns:
+        raise ReferenceEntryError("encoder span exceeds generate() wall — nesting broken")
+    tokens = int(rhythm.shape[-1])
+    if tokens <= 1:
+        raise ReferenceEntryError("degenerate generate: <= 1 token")
+    ms = 1e-6
+    stages = {
+        "preprocess": {
+            "ms": pre_ns * ms,
+            "note": "upstream readimg (cv2 load + 128-height resize + ToGray + normalize; DISC-004 ink rule)",
+        },
+        "vision_encode": {
+            "ms": enc_ns * ms,
+            "note": "TrOMR hybrid-CNN/ViT encoder forward (hooked; runs inside generate())",
+        },
+        "decode_per_token": {
+            "ms": (gen_ns - enc_ns) * ms,
+            "tokens": tokens,
+            "note": "generate() minus the encoder span; multinomial argmax-forced (matches focr's default per DISC-004); NO prefill stage — the decoder seeds from BOS",
+        },
+        "end_to_end": {
+            "ms": total_ns * ms,
+            "note": "readimg -> generate wall; EXCLUDES model load (done unclocked in setup)",
+        },
+    }
+    # The comparable output = the three token streams (focr's music lane is
+    # token-stream certified vs this oracle, so the stream IS the text).
+    text = json.dumps({
+        "rhythm": [int(v) for v in rhythm[0].tolist()],
+        "pitch": [int(v) for v in pitch[0].tolist()],
+        "lift": [int(v) for v in lift[0].tolist()],
+    })
+    return {
+        "stages": stages,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "chars": tokens,
+    }
+
+
 # ── self-test (wiring only; no torch, no model) ──────────────────────────────
 
 
@@ -271,6 +370,7 @@ def _self_test() -> int:
         "got": (setup_got, run_got),
         "smolvlm2": (setup_smolvlm2, run_smolvlm2),
         "onechart": (setup_onechart, run_onechart),
+        "tromr": (setup_tromr, run_tromr),
     }
     for lane, (setup_fn, run_fn) in lanes.items():
         check(f"{lane}-callables", callable(setup_fn) and callable(run_fn))

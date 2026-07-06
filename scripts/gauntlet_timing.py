@@ -136,6 +136,26 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "onechart_generate",
         re.compile(r"^onechart\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"),
     ),
+    # Polyphonic-TrOMR (bd-2sez): encode folds straight into the canonical
+    # vision_encode stage; generate is the decode TOTAL (per-token derives from
+    # it); the forward line is the lane's info stage. Multi-staff pages emit
+    # one encode+generate pair per staff — summed with occurrences, as for
+    # multi-view vision.
+    (
+        "vision_encode",
+        re.compile(r"^tromr\.encode (?P<s>\d+(?:\.\d+)?)s \(w \d+, \d+ ctx tokens\)$"),
+    ),
+    (
+        "decode_total",
+        re.compile(r"^tromr\.generate (?P<tok>\d+) steps (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "tromr_forward",
+        re.compile(
+            r"^tromr forward (?P<s>\d+(?:\.\d+)?)s "
+            r"\(\d+/\d+ staves recognized, semantic \d+ chars total\)$"
+        ),
+    ),
     (
         "onechart_forward",
         re.compile(r"^onechart forward (?P<s>\d+(?:\.\d+)?)s \(reliable_distance .*\)$"),
@@ -244,7 +264,10 @@ def infer_precision(runs: list[dict]) -> str | None:
     saw_marked = False
     saw_int8 = False
     for run in runs:
-        if any(k in run for k in ("got_forward", "smolvlm2_forward", "onechart_forward")):
+        if any(
+            k in run
+            for k in ("got_forward", "smolvlm2_forward", "onechart_forward", "tromr_forward")
+        ):
             # Zoo-lane timing lines carry no `_i8` marker; their shared-engine
             # `prefill` fan-out would otherwise read as an UNMARKED f32 claim.
             continue
