@@ -16,7 +16,7 @@
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music` when supplied a local or converted artifact. All of it runs through model-specific Rust kernels with no general ML framework, no Python, no CUDA, no FFI at inference, and no GPU. It parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON from a single static binary that fits in about 5 MB.
+**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music`. All five ready models are available through `focr pull`, run through model-specific Rust kernels, and need no general ML framework, Python, CUDA, FFI at inference, or GPU. The single static binary parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON and fits in about 5 MB.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -44,17 +44,17 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **One static binary** | No Python, no CUDA, no FFI at inference, no GPU. About 5 MB; portable to hosts where `ort`/CUDA cannot build. |
 | **Works offline** | `focr pull` fetches and verifies the weights once into `~/.cache/franken_ocr/models`; inference never touches the network. |
 | **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
-| **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
-| **Model zoo** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. Planned descriptors: TrOCR and pix2tex. |
+| **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
+| **Model zoo with pulls** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports both runtime status and pullable quant levels. Planned descriptors: TrOCR and pix2tex. |
 | **int8 decode, ~2.5x faster** | Custom `.focrq` int8 expert/FFN weights, byte-identical to the f32 path on typical pages. The vision tower stays high precision, where quantizing it would wreck OCR. |
 | **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
 | **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
 | **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. |
 | **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
-| **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, stable documented exit codes, deterministic output under fixed sampling. |
+| **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
-| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, and `scripts/gauntlet_cert.py` computes the three-pillar release scorecard and invariant monitors. |
+| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited SIMD islands, each with a bit-identical scalar fallback. |
 
 ---
@@ -82,27 +82,35 @@ focr ocr page.png -o page.md --extract-figures   # -> page.md + page_figures/
 focr pull got-ocr2
 focr ocr --model got-ocr2.int8.focrq --task tables table.png
 
-focr ocr --model /path/to/smolvlm2.int8.focrq --task describe photo.jpg
-focr ocr --model /path/to/smolvlm2.int8.focrq --task describe --question "How many people are visible?" photo.jpg
+focr pull smolvlm2
+focr ocr --model smolvlm2.int8.focrq --task describe photo.jpg
+focr ocr --model smolvlm2.int8.focrq --task describe --question "How many people are visible?" photo.jpg
 
-focr ocr --model /path/to/onechart.int8.focrq --task chart-data chart.png
+focr pull onechart
+focr ocr --model onechart.int8.focrq --task chart-data chart.png
 
-focr ocr --model /path/to/tromr.focrq --task music score-page-or-staff.png -o score.musicxml
+focr pull tromr
+focr ocr --model tromr.focrq --task music score-page-or-staff.png -o score.musicxml
 
-# 7. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
+# 7. OCR only the pages you need from a scanned PDF; optionally split two-page spreads.
+focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
+
+# 8. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
 focr ocr page.png --robot
+focr robot triage
 
-# 8. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
+# 9. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
 focr robot selftest
 
-# 9. Generate the parity-ladder scorecard used by release gates.
+# 10. Generate the parity-ladder and release-readiness scorecards used by release gates.
 scripts/ladder_scorecard.sh --self-test
 scripts/ladder_scorecard.sh --out scorecard.json
 python3 scripts/gauntlet_cert.py --self-test
 python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
   --scorecard-out /tmp/focr-release-scorecard.json
+python3 scripts/gauntlet_cert.py --release-readiness
 
-# 10. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
+# 11. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 
 # TrOMR conversion is available for local sheet-music artifacts.
@@ -117,7 +125,11 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 **A few models, every dimension fixed.** A general ML framework pays a generality tax on every operation: dynamic dtype dispatch, arbitrary shapes, autograd bookkeeping, broadcast machinery, and a device abstraction. `franken_ocr` runs a small set of hand-ported models whose important dimensions are known up front. For the default Unlimited-OCR path that means hidden 1280, 10 heads, head_dim 128, 64 experts, top-6 routing, MoE intermediate 896, R-SWA window 128, and vocab 129280. That buys shape-specialized kernels with no runtime shape branching in the hot loop. The scope is a few hand-tuned, certified models, not any model; there is no generic runtime underneath.
 
-**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. OneChart is runtime-ready for `--task chart-data` when you supply a local or converted `onechart.int8.focrq`; its public `focr pull onechart` manifest entry is still pending. TrOMR is runtime-ready for `--task music` when you supply a local or converted `tromr.focrq`; it accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. Remaining TrOMR work is narrower: public pull-manifest upload, a perf-ledger row, optional `**kern` export, camera-photo dewarp/barline splitting, and broader corpus-quality metrics.
+**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. The table includes a `PULL` column from the embedded manifest, so a ready model is not confused with an unpublished local-only artifact. Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and TrOMR are all pullable today. Non-primary models install into per-model cache subdirectories with their tokenizer sidecars beside the `.focrq` artifact. TrOMR publishes an f32 artifact for now because its int8 path is still gated behind a measured-lossless proof.
+
+**Scanned books are addressable.** PDF input no longer means "the whole document or nothing." `--pages 3,5-9` selects source pages with 1-based ranges, reports out-of-range requests against the document page count, and keeps source page numbers in JSON/robot output. `--split-spreads` is opt-in for common two-page book scans: a wide rasterized page with a near-blank center gutter becomes left and right logical pages, while pages without a qualifying gutter pass through unsplit.
+
+**TrOMR page OMR is resilient.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, barline splitting, and broader corpus-quality metrics.
 
 **Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
 
@@ -294,7 +306,8 @@ focr ocr page.png --crop-mode gundam       # reference dynamic-resolution tiling
 focr ocr page.png --max-length 4096 --temperature 0.0
 focr ocr page.png --model /path/to/unlimited-ocr.focrq
 focr ocr eq.png --task formula --model got-ocr2.int8.focrq   # specialized task routing (see below)
-focr ocr chart.png --task chart-data --model /path/to/onechart.int8.focrq
+focr ocr chart.png --task chart-data --model onechart.int8.focrq
+focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
 ```
 
 **Output (`-o`/`--output FILE`).** Writes the result to a file instead of stdout; the
@@ -302,8 +315,10 @@ format follows the extension: `.json` emits structured JSON, any other extension
 (e.g. `.md`) emits Markdown. `--json` forces JSON regardless of extension. The
 structured JSON carries the rendered `markdown` plus a `layout` array, one
 `{label, boxes}` entry per grounded span, where each box is `[x1, y1, x2, y2]` in
-source-image pixels (a PDF nests these under a per-page `pages` array). This is the
-same shape `--json` prints to stdout.
+source-image pixels. A PDF nests these under a per-page `pages` array; split
+spreads become separate logical page entries with the same source `page` number
+and a `"half": "left"` or `"right"` marker. This is the same shape `--json`
+prints to stdout.
 
 **Figures (`--extract-figures`).** The model sees figures/photos/diagrams it does not
 transcribe to text. With `--extract-figures`, those regions are cropped out of the
@@ -315,20 +330,28 @@ chosen by content: JPG (quality 85) for photographic regions, lossless PNG for
 line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
 PDFs name figures per page (`page{N}_figure_{M}`).
 
+**PDF controls.** `--pages SPEC` is for PDFs only. `SPEC` is a comma-separated
+list of 1-based pages and inclusive ranges, such as `3`, `3-7`, or
+`1,5-9,218`; selected pages run in source order with duplicates removed.
+Out-of-range pages are usage errors that name the document page count. `--split-spreads`
+is also PDF-only and off by default. It looks for wide raster pages with a
+near-blank vertical gutter near the center, then OCRs the left and right halves
+as separate logical pages; no qualifying gutter means the page remains unsplit.
+
 **Tasks (`--task`).** Convenience routing over the model zoo (`focr models`). `--task ocr`
 (the default) is plain document OCR, unchanged. `--task formula`, `tables`, `chart`,
 `molecular`, and `geometry` are served by GOT-OCR2's `OCR with format:` mode, so each
 implies `--format` (an explicit `--format` composes idempotently) and needs the
 got-ocr2 model: `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `--task music`
 has two valid lanes: TrOMR is the native OMR path and returns MusicXML, while GOT-OCR2
-can still run its sheet-music format mode. Use `--model /path/to/tromr.focrq --task music`
+can still run its sheet-music format mode. Use `focr pull tromr`, then `--model tromr.focrq --task music`
 for a full printed/scanned page or a staff crop, or use the GOT lane
 (`--model got-ocr2.int8.focrq --task music`). `--task describe` (photo description / VQA) is served by the smolvlm2
-model: `--model smolvlm2.int8.focrq --task describe`, optionally with `--question "What
+model: `focr pull smolvlm2`, then `--model smolvlm2.int8.focrq --task describe`, optionally with `--question "What
 color is the car?"`. SmolVLM2 has no instruction modes; the task is the question
 (default: the model-card caption prompt). `--task chart-data` is the OneChart path: it
 runs chart-to-dict extraction with the number-head reliability check and needs a
-onechart artifact, for example `--model /path/to/onechart.int8.focrq`. Pointing a
+onechart artifact, for example `focr pull onechart`, then `--model onechart.int8.focrq`. Pointing a
 specialized task at the wrong model family fails with usage guidance before any weights
 load.
 
@@ -351,11 +374,21 @@ Download the int8 weights and tokenizer into the cache, verifying every byte.
 
 ```bash
 focr pull                                   # default int8, built-in manifest
+focr pull got-ocr2                          # structured OCR model
+focr pull smolvlm2                          # image description / VQA model
+focr pull onechart                          # chart-to-data model
+focr pull tromr                             # sheet-music OMR model (f32 today)
 focr pull --quant int8 --json               # explicit quant, machine-readable
 focr pull --manifest ./manifest.json        # override the manifest source
 ```
 
 Downloads run over asupersync's native HTTP stack (rustls + webpki-roots), reassemble GitHub split parts, verify against a committed SHA256 manifest, and cache to `~/.cache/franken_ocr/models`. Verified in production against this repo's `models-v1` GitHub release and a Hugging Face mirror.
+The primary Unlimited-OCR artifact installs directly under the cache root.
+Other models install under `~/.cache/franken_ocr/models/<model-id>/` so their
+tokenizer sidecars cannot collide. The resolver searches those subdirectories,
+so `--model onechart.int8.focrq` and `--model tromr.focrq` work after their
+pulls. TrOMR publishes one f32 quant today; a default `focr pull tromr` request
+reports the actual `f32` artifact instead of failing over the absent int8 quant.
 
 ### `focr models`
 
@@ -372,9 +405,9 @@ focr models --json                          # machine-readable list
 |---|---:|---|---|
 | **`unlimited-ocr`** *(default)* | ready | Plain-text document OCR for general documents and PDFs. This is what `focr ocr` runs by default. | Fast path; R-SWA bounded generated-token KV; int8 decode with f32 fallback. |
 | **`got-ocr2`** | ready | Specialized structured output the default cannot produce: formulas, tables, charts, molecular diagrams, geometry, and sheet music. | Heavier per page; `--task formula|tables|chart|molecular|geometry|music` implies `--format`. |
-| **`smolvlm2`** | ready engine | Photo description and VQA through `--task describe [--question "..."]`. | Use a local or converted `smolvlm2.int8.focrq` artifact until the public manifest publishes it. |
-| **`onechart`** | ready engine | Chart-to-data extraction through `--task chart-data`. | Use a local or converted `onechart.int8.focrq` artifact until the public manifest publishes it. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
-| **`tromr`** | ready engine | Polyphonic sheet-music OMR through `--task music`. | Use a local or converted `tromr.focrq` plus the tokenizer tables beside it. The native path now handles staff crops and full printed/scanned pages: staff detection, global deskew, top-to-bottom crops, ResNetV2 plus ViT encoding, four-head decode, semantic merge, and partwise MusicXML. Public pull manifest, `**kern`, camera-photo dewarp, and barline-splitting are follow-ups. |
+| **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
+| **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
+| **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs the f32 `tromr.focrq` artifact and the rhythm, pitch, lift, and note tokenizer tables. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
@@ -386,31 +419,32 @@ focr ocr --model got-ocr2.int8.focrq --format eq.png  # structured .mmd: LaTeX /
 focr ocr --model got-ocr2.int8.focrq --task tables page.png  # task shorthand (implies --format)
 ```
 
-Run SmolVLM2 (photo description / VQA) with a local or converted artifact:
+Run SmolVLM2 (photo description / VQA):
 
 ```bash
-focr ocr --model /path/to/smolvlm2.int8.focrq --task describe photo.jpg
-focr ocr --model /path/to/smolvlm2.int8.focrq --task describe --question "How many dogs are there?" photo.jpg
+focr pull smolvlm2
+focr ocr --model smolvlm2.int8.focrq --task describe photo.jpg
+focr ocr --model smolvlm2.int8.focrq --task describe --question "How many dogs are there?" photo.jpg
 ```
 
-Run OneChart (chart-to-data extraction) with a local or converted artifact:
+Run OneChart (chart-to-data extraction):
 
 ```bash
-focr ocr --model /path/to/onechart.int8.focrq --task chart-data chart.png
+focr pull onechart
+focr ocr --model onechart.int8.focrq --task chart-data chart.png
 ```
 
-The OneChart runtime path is ready, but the public pull manifest has not published the artifact yet. Use a local or converted `onechart.int8.focrq` until `focr pull onechart` appears in `models/manifest.json`.
-
-Run TrOMR sheet-music OMR with a local or converted artifact:
+Run TrOMR sheet-music OMR:
 
 ```bash
+focr pull tromr
+focr ocr --model tromr.focrq --task music score-page.png -o score.musicxml
 focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
-focr ocr --model /path/to/tromr.focrq --task music score-page.png -o score.musicxml
 scripts/tromr_convert_e2e.sh
 scripts/tromr_music_e2e.sh
 ```
 
-The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. The current `tromr.focrq` is an 82 MB all-f32 artifact with 260 tensors; int8 candidates remain gated until they are measured lossless. Public `focr pull tromr` support is still waiting on artifact publication.
+The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. A multi-staff page succeeds when at least one staff recognizes, logging skipped staves with bbox and reason; an all-fail page errors with every staff reason named. The published `tromr.focrq` is an 82 MB all-f32 artifact with 260 tensors; int8 candidates remain gated until they are measured lossless. Local conversion is still available when you have your own TrOMR checkpoint.
 
 ### `focr convert <input>`
 
@@ -437,9 +471,15 @@ focr robot schema                            # self-describing, versioned event/
 focr robot health                            # model present? arch features? thread budget?
 focr robot backends                          # detected SIMD tiers + core count
 focr robot selftest                          # int8 kernel vs scalar oracle on this host
+focr robot triage                            # quick_ref + health + recommendations + commands
 ```
 
 `focr robot selftest` runs the dispatched int8 GEMM against a bit-identical scalar oracle across a shape battery, including the worst-case `K=6848` i32-accumulation overflow case, and emits a single JSON verdict; it exits 1 if any parity case diverges. It has passed 24/24 on Apple SDOT and on a real x86 AVX2 box. Set `FOCR_FORCE_ARCH` to verify a specific ISA tier.
+
+`focr robot triage` is the first command an agent should run in an unfamiliar
+checkout or host. It returns one JSON object with a compact command reference,
+the live health payload, state-aware next commands, command templates, and the
+exit-code dictionary.
 
 ### `focr runs` and `focr sync`
 
@@ -463,13 +503,24 @@ Exports are canonical and atomic: the writer takes an exclusive lock, writes a
 temporary file beside the target, fsyncs it, then renames it into place. Imports
 are idempotent because records replace by `run_id`.
 
-### Scaffolded subcommand
+### `focr doctor`
 
-`doctor` still emits its planned JSON contract and returns a not-yet-implemented
-status (exit code 1).
+`doctor` is the local self-check and reversible repair surface. Detect-only mode
+is read-only and exits 0 when healthy or 1 when findings are present. `--fix`
+applies only safe repairs through one mutation chokepoint: every touched file is
+backed up first under `.doctor/runs/<run-id>/backups/`, hashes and modes are
+logged to `actions.jsonl`, and `doctor undo <run-id>` restores from that log.
+Irreversible work, such as regenerating model artifacts, is refused with the
+exact command to run manually.
 
 ```bash
-focr doctor --json                          # idempotent self-check / repair
+focr doctor                                 # human-readable detect-only report
+focr doctor --json                          # one JSON object with typed findings
+focr doctor --dry-run                       # planned blast radius, no mutation
+focr doctor --fix                           # safe reversible repairs only
+focr doctor undo <run-id>                   # restore a prior --fix run
+focr doctor capabilities                    # detector/fixer/exit-code contract
+focr doctor robot-docs                      # paste-ready agent handbook
 ```
 
 ---
@@ -508,6 +559,7 @@ The conformance harness is built to leave reviewable artifacts, not just a green
 | **Skip-honest mode** | `scripts/ladder_scorecard.sh --out scorecard.json` without weights | Produces `all_green:false` and `skipped_no_model:true`, so a missing-model run cannot masquerade as a certified release. |
 | **FeatureUniverse / SurfaceMatrix** | `docs/FEATURE_PARITY.md`, `tests/surface_matrix.rs` | Accounts modeling features, ops, CLI surfaces, robot events, parity gates, and alien-artifact families as `present`, `partial`, `missing`, `n/a`, or `excluded`; partial never rounds up. |
 | **Three-pillar gauntlet cert** | `python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md --scorecard-out /tmp/focr-release-scorecard.json` | Scores the surface pillar from the live parity ledger and emits `franken_ocr.gauntlet.scorecard.v1`; performance and conformance gates stay separate, so one green pillar cannot hide another regression. |
+| **Release-readiness gate** | `python3 scripts/gauntlet_cert.py --release-readiness` | Reads the committed evidence artifacts for parity, surface, performance, determinism, deadlock watchdogs, robot schema, build matrix, installer, ledger completeness, doctor, ergonomics, certification bundle, and convergence; any red cell exits nonzero. |
 | **Conformal ratchet** | `docs/conformance/RATCHET.md`, `src/conformance.rs` | Computes per-category lower bounds from Jeffreys posterior and Hoeffding instruments, then rejects any category that drops below its committed floor. |
 | **Ville e-process monitors** | `python3 scripts/gauntlet_cert.py --eprocess-fold test-log.ndjson --eprocess-state /tmp/focr-eprocess-state.json` | Folds live invariant observations for KV capacity, `K=6848` i32 no-overflow, same-input determinism, and SIMD-vs-scalar bit identity into persistent anytime-valid monitors. |
 | **Convergence gate** | `python3 scripts/gauntlet_cert.py --convergence docs/gauntlet/ROUNDS.jsonl` | Requires at least 10 gauntlet rounds and a clean tail before declaring the investigation converged. |
@@ -530,9 +582,10 @@ The broader gauntlet has its own self-test and scorecard path:
 python3 scripts/gauntlet_cert.py --self-test
 python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
   --scorecard-out /tmp/focr-release-scorecard.json
+python3 scripts/gauntlet_cert.py --release-readiness
 ```
 
-The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservative while no residual history exists: its lower bound is `0.0`, not a pretend release win. That makes the first certified advances visible when real residual history starts accumulating.
+The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservative while no residual history exists: its lower bound is `0.0`, not a pretend release win. That makes the first certified advances visible when real residual history starts accumulating. `docs/gauntlet/RELEASE_READINESS.json` is a separate all-green ship-gate artifact; it is allowed to be red while named Phase-5 deliverables remain open, but a release cannot pass it with any red cell.
 
 ---
 
@@ -684,9 +737,9 @@ For the single-page `ocr` command, point `FOCR_MODEL_PATH` at the bf16 safetenso
 What this is and is not:
 
 - **int8 can repeat on hard tables.** int8 decode is roughly 2.5x faster and byte-identical to f32 on typical pages, but some dense tables (for example `page_0590`) can trigger repetition runs. The no-repeat n-gram guard and the f32 fallback are the documented kill-switches. The vision tower stays high precision because quantizing it breaks OCR.
-- **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes each page (pure-Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. The fast path covers common scanned-PDF codecs: JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported. Rasterize that PDF out of band and retry.
+- **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes pages in process (pure Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. `--pages` lets you run only the source pages you need, and `--split-spreads` can split common two-page book scans when the gutter is clear enough. The fast path covers common scanned-PDF codecs: JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported. Rasterize that PDF out of band and retry.
 - **Native Windows (x86_64) is supported and proven end-to-end; ARM64 is not yet.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10: the same 3.9 GB int8 weights, vision tower, and DeepSeek-V2 decoder produce the same markdown a Mac or Linux host does. `focr.exe robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle, including the K=6848 overflow case). `focr pull` works on Windows too; the full 3.9 GB multi-part download, reassembly, and SHA-256 verify complete over the native async HTTP/TLS stack. The earlier send-path bug that surfaced as `WSAENOTCONN` / os error 10057 (`bd-15ow`) is fixed. The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`. The one remaining gap, tracked under epic `bd-3u97`, is that ARM64 Windows is not published.
-- **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, OneChart for chart-to-data extraction, and TrOMR for sheet-music OMR on full printed/scanned pages or staff crops. TrOCR and pix2tex remain descriptor-only roadmap items. Each ready model is transformed offline and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
+- **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, OneChart for chart-to-data extraction, and TrOMR for sheet-music OMR on full printed/scanned pages or staff crops. TrOCR and pix2tex remain descriptor-only roadmap items. Each ready model is transformed offline, distributed through the manifest with required sidecars, and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
 - **Not benchmark SOTA.** Unlimited-OCR is strong but not the OmniDocBench leader. The aim is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
 - **CPU only.** No GPU. CUDA is a deferred stretch goal; CPU stays the product.
 
