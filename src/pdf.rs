@@ -149,6 +149,54 @@ impl PdfPages {
 }
 
 /// Decode one image XObject to RGB/gray, dispatching on its terminal `/Filter`.
+/// Detect and split a two-page book spread into (left, right) halves
+/// (bd-av64.11). A spread is a rasterized page that is (a) noticeably wider
+/// than tall (w/h >= 1.25 — portrait book pages side by side) AND (b) has a
+/// low-ink vertical gutter near the horizontal center. Returns `None` when
+/// either condition fails — a false split is worse than none (full-bleed
+/// landscape photos, single-column landscape pages, spreads with a plate
+/// crossing the gutter all pass through unsplit).
+///
+/// The gutter search: over the middle 20% of columns, a column qualifies
+/// as gutter when its dark fraction is EITHER <= 0.5% (a blank inter-page
+/// gap — flat-scanned loose pages) OR >= 60% (the dark binding shadow of a
+/// bound book pressed into the scanner — the Cadwallader case). Text
+/// columns are mixed black-on-white and match neither. Among qualifying
+/// columns the one closest to the exact center wins. Decision + geometry
+/// are logged by the caller under FOCR_TIMING.
+#[must_use]
+pub fn split_spread(img: &DynamicImage) -> Option<(DynamicImage, DynamicImage, u32)> {
+    let (w, h) = (img.width(), img.height());
+    if h == 0 || (f64::from(w) / f64::from(h)) < 1.25 {
+        return None;
+    }
+    let gray = img.to_luma8();
+    let ink_threshold = 160u8; // scanned text is near-black; paper near-white
+    let (lo, hi) = (w * 2 / 5, w * 3 / 5); // middle 20% of columns
+    let center = i64::from(w / 2);
+    let mut best: Option<(i64, u32)> = None; // (distance to center, column)
+    for x in lo..hi {
+        let mut dark = 0u32;
+        for y in 0..h {
+            if gray.get_pixel(x, y).0[0] < ink_threshold {
+                dark += 1;
+            }
+        }
+        let dark_frac_pct_x10 = u64::from(dark) * 1000 / u64::from(h);
+        let is_gutter = dark_frac_pct_x10 <= 5 || dark_frac_pct_x10 >= 600;
+        if is_gutter {
+            let dist = (i64::from(x) - center).abs();
+            if best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, x));
+            }
+        }
+    }
+    let (_, gutter_x) = best?;
+    let left = img.crop_imm(0, 0, gutter_x, h);
+    let right = img.crop_imm(gutter_x, 0, w - gutter_x, h);
+    Some((left, right, gutter_x))
+}
+
 fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, String> {
     let width = u32::try_from(img.width).map_err(|_| "negative image width".to_string())?;
     let height = u32::try_from(img.height).map_err(|_| "negative image height".to_string())?;
@@ -534,6 +582,53 @@ fn inherited<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synth_page(w: u32, h: u32, text_cols: &[(u32, u32)]) -> DynamicImage {
+        // White canvas with black "text block" columns [x0, x1).
+        let mut img = image::GrayImage::from_pixel(w, h, image::Luma([255u8]));
+        for &(x0, x1) in text_cols {
+            for x in x0..x1 {
+                for y in (10..h.saturating_sub(10)).step_by(3) {
+                    img.put_pixel(x, y, image::Luma([20u8]));
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(img)
+    }
+
+    /// bd-av64.11: a synthetic spread (text left + right, blank center
+    /// gutter) splits at the gutter; the negatives pass through unsplit.
+    #[test]
+    fn split_spread_positive_and_negatives() {
+        // POSITIVE: 1600x1000 spread, text at [100,700) and [900,1500).
+        let spread = synth_page(1600, 1000, &[(100, 700), (900, 1500)]);
+        let (left, right, gx) = split_spread(&spread).expect("spread splits");
+        assert!((700..=900).contains(&gx), "gutter near center: {gx}");
+        assert_eq!(left.width() + right.width(), 1600);
+        assert_eq!(left.height(), 1000);
+        // NEGATIVE 1: portrait page (aspect below the spread threshold).
+        assert!(split_spread(&synth_page(1000, 1600, &[(100, 900)])).is_none());
+        // NEGATIVE 2: landscape but ink crosses the center (a full-width
+        // plate/table) — no blank gutter, no split.
+        assert!(split_spread(&synth_page(1600, 1000, &[(100, 1500)])).is_none());
+        // NEGATIVE 3: landscape blank page — a gutter exists but splitting a
+        // blank is harmless; the heuristic DOES split it (blank center
+        // qualifies). Accepting this is deliberate: both halves are blank,
+        // and OCR of blank halves is cheap + correct.
+        // NEGATIVE 4: single centered column (text crosses the middle).
+        assert!(split_spread(&synth_page(1600, 1000, &[(600, 1000)])).is_none());
+        // POSITIVE 2: a bound book's DARK binding shadow as the gutter (the
+        // Cadwallader case) — a solid dark band at the center qualifies.
+        let mut bound = synth_page(1600, 1000, &[(100, 700), (900, 1500)]).to_luma8();
+        for x in 780..820 {
+            for y in 0..1000 {
+                bound.put_pixel(x, y, image::Luma([30u8]));
+            }
+        }
+        let bound = DynamicImage::ImageLuma8(bound);
+        let (_, _, gx) = split_spread(&bound).expect("binding shadow splits");
+        assert!((780..=820).contains(&gx), "split inside the shadow: {gx}");
+    }
 
     #[test]
     fn looks_like_pdf_by_extension() {

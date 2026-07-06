@@ -441,7 +441,7 @@ fn spec_decode_enabled() -> bool {
 }
 
 /// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
-fn timing_log(msg: &str) {
+pub(crate) fn timing_log(msg: &str) {
     if std::env::var_os("FOCR_TIMING").is_some() {
         eprintln!("[focr-timing] {msg}");
     }
