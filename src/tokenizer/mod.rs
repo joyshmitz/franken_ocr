@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::error::{FocrError, FocrResult};
 
+pub mod music;
 mod ops;
 mod pretok;
 pub mod tiktoken;
