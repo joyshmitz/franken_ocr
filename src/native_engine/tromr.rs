@@ -1079,9 +1079,27 @@ fn duration_info(name: &str) -> Option<(&'static str, u32, bool)> {
         "thirty_second" => ("32nd", 8),
         "sixty_fourth" => ("64th", 4),
         "hundred_twenty_eighth" => ("128th", 2),
+        // The rhythm vocab's two finest rests use numeral names, not the
+        // spelled-out forms. At 64 divisions/quarter a 256th is exactly 1
+        // tick; a 512th would be 0.5, floored to 1 — `<type>` stays exact
+        // and measure sums at that extreme are already model-approximate.
+        "256th" => ("256th", 1),
+        "512th" => ("512th", 1),
         _ => return None,
     };
     Some((xml, if dotted { ticks * 3 / 2 } else { ticks }, dotted))
+}
+
+/// Split a pitched atom `<head>_<duration>` on its separator underscore.
+/// The duration name may itself contain underscores (`thirty_second`,
+/// `sixty_fourth`, `hundred_twenty_eighth`), so a positional
+/// `rsplit_once('_')` mis-splits those (bd-av64.1: `note-B4_thirty_second`
+/// parsed as duration `"second"` and aborted the run). Scan candidate
+/// separators left-to-right and take the first whose suffix is a known
+/// duration — the longest duration candidate wins.
+fn split_pitch_duration(atom: &str) -> Option<(&str, (&'static str, u32, bool))> {
+    atom.match_indices('_')
+        .find_map(|(i, _)| duration_info(&atom[i + 1..]).map(|info| (&atom[..i], info)))
 }
 
 /// `keySignature-XM` → MusicXML circle-of-fifths value (the 15 majors).
@@ -1150,11 +1168,167 @@ pub fn staves_to_musicxml(semantics: &[String]) -> FocrResult<String> {
             part_measures(merged)?
         ));
     }
-    Ok(format!(
+    let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <score-partwise version=\"4.0\">\n\
          \x20 <part-list>{part_list}</part-list>\n{parts}</score-partwise>\n"
-    ))
+    );
+    // Emit-time enforcement (bd-av64.3): a structural violation here is by
+    // definition an emitter bug — never a model-quality artifact — so every
+    // produced document is valid-by-construction or the run fails loud.
+    let violations = validate_musicxml(&xml);
+    if violations.is_empty() {
+        Ok(xml)
+    } else {
+        Err(FocrError::Other(anyhow::anyhow!(
+            "tromr xml: emitter produced invalid MusicXML (emitter bug): {}",
+            violations.join("; ")
+        )))
+    }
+}
+
+/// Structural MusicXML lint over the emitter's output (bd-av64.3). Empty
+/// result = pass. Rules: balanced tags under exactly one `score-partwise`
+/// root; `<chord/>` never co-occurs with `<rest/>` in one note; a
+/// `<chord/>` note directly follows another note in its measure; every
+/// note carries a positive integer `<duration>`; `part-list` score-part
+/// ids match the `<part>` ids in order. Musical bar-sum checks are
+/// deliberately NOT here: model output is legitimately imperfect and
+/// hard-failing on it would reject honest recognitions (the annotate-only
+/// sanity pass, bd-av64.5, owns that concern).
+pub fn validate_musicxml(xml: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut roots = 0usize;
+    let mut score_part_ids: Vec<String> = Vec::new();
+    let mut part_ids: Vec<String> = Vec::new();
+    let mut in_note = false;
+    let mut note_line = 0usize;
+    let (mut note_chord, mut note_rest, mut note_chord_legal) = (false, false, false);
+    let mut note_duration: Option<i64> = None;
+    let mut prev_was_note = false;
+
+    fn id_attr(raw: &str) -> Option<String> {
+        let rest = &raw[raw.find("id=\"")? + 4..];
+        Some(rest[..rest.find('"')?].to_owned())
+    }
+    let line_of = |pos: usize| xml[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
+
+    let mut pos = 0usize;
+    while let Some(lt) = xml[pos..].find('<') {
+        let start = pos + lt;
+        let Some(gt) = xml[start..].find('>') else {
+            violations.push(format!("unterminated tag at line {}", line_of(start)));
+            return violations;
+        };
+        let raw = &xml[start + 1..start + gt];
+        pos = start + gt + 1;
+        if raw.starts_with('?') || raw.starts_with('!') {
+            continue;
+        }
+        let closing = raw.starts_with('/');
+        let self_closing = raw.ends_with('/');
+        let name = raw
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if name.is_empty() {
+            violations.push(format!("empty tag at line {}", line_of(start)));
+            continue;
+        }
+        if closing {
+            match stack.pop() {
+                Some(open) if open == name => {}
+                Some(open) => violations.push(format!(
+                    "mismatched </{name}> closing <{open}> at line {}",
+                    line_of(start)
+                )),
+                None => violations.push(format!(
+                    "</{name}> with nothing open at line {}",
+                    line_of(start)
+                )),
+            }
+            if name == "note" && in_note {
+                if note_chord && note_rest {
+                    violations.push(format!(
+                        "<chord/> co-occurs with <rest/> at line {note_line}"
+                    ));
+                }
+                if note_chord && !note_chord_legal {
+                    violations.push(format!(
+                        "<chord/> note not directly preceded by a note at line {note_line}"
+                    ));
+                }
+                match note_duration {
+                    Some(v) if v > 0 => {}
+                    Some(v) => {
+                        violations.push(format!("non-positive <duration> {v} at line {note_line}"))
+                    }
+                    None => {
+                        violations.push(format!("<note> missing <duration> at line {note_line}"));
+                    }
+                }
+                in_note = false;
+                prev_was_note = true;
+            }
+            continue;
+        }
+        match name {
+            "score-partwise" if stack.is_empty() => roots += 1,
+            "score-part" => match id_attr(raw) {
+                Some(id) => score_part_ids.push(id),
+                None => violations.push(format!(
+                    "<score-part> missing id at line {}",
+                    line_of(start)
+                )),
+            },
+            "part" => match id_attr(raw) {
+                Some(id) => part_ids.push(id),
+                None => violations.push(format!("<part> missing id at line {}", line_of(start))),
+            },
+            "measure" | "attributes" => prev_was_note = false,
+            "note" => {
+                in_note = true;
+                note_line = line_of(start);
+                (note_chord, note_rest, note_chord_legal) = (false, false, prev_was_note);
+                note_duration = None;
+            }
+            "chord" if in_note => note_chord = true,
+            "rest" if in_note => note_rest = true,
+            "duration" if in_note => {
+                let text = &xml[pos..];
+                let end = text.find('<').unwrap_or(0);
+                match text[..end].trim().parse::<i64>() {
+                    Ok(v) => note_duration = Some(v),
+                    Err(_) => violations.push(format!(
+                        "unparseable <duration> {:?} at line {}",
+                        &text[..end],
+                        line_of(start)
+                    )),
+                }
+            }
+            _ => {}
+        }
+        if !self_closing {
+            stack.push(name.to_owned());
+        }
+    }
+    if !stack.is_empty() {
+        violations.push(format!("unclosed tags: {}", stack.join(", ")));
+    }
+    if roots != 1 {
+        violations.push(format!(
+            "expected exactly one <score-partwise> root, found {roots}"
+        ));
+    }
+    if score_part_ids != part_ids {
+        violations.push(format!(
+            "part-list ids {score_part_ids:?} do not match part ids {part_ids:?}"
+        ));
+    }
+    violations
 }
 
 /// The per-part measure builder (the body of one `<part>`).
@@ -1248,12 +1422,14 @@ fn part_measures(merged: &str) -> FocrResult<String> {
                 });
                 continue;
             }
-            let (head, dur) = atom.rsplit_once('_').ok_or_else(|| {
-                FocrError::Other(anyhow::anyhow!("tromr xml: unparseable event {atom:?}"))
-            })?;
-            let (xml_type, ticks, dotted) = duration_info(dur).ok_or_else(|| {
-                FocrError::Other(anyhow::anyhow!("tromr xml: unknown duration {atom:?}"))
-            })?;
+            let (head, (xml_type, ticks, dotted)) =
+                split_pitch_duration(atom).ok_or_else(|| {
+                    if atom.contains('_') {
+                        FocrError::Other(anyhow::anyhow!("tromr xml: unknown duration {atom:?}"))
+                    } else {
+                        FocrError::Other(anyhow::anyhow!("tromr xml: unparseable event {atom:?}"))
+                    }
+                })?;
             if head == "nonote" {
                 notes.push(XmlNote {
                     step: 'C',
@@ -1302,6 +1478,19 @@ fn part_measures(merged: &str) -> FocrResult<String> {
                 ticks,
                 dotted,
             });
+        }
+
+        // A '|'-joined group is a chord: only its pitched members may sound
+        // together. MusicXML 4.0 forbids <chord/> on a rest (a rest cannot
+        // sound simultaneously with a note in one voice), so a mixed group
+        // drops its rests — the pitched notes carry the group's duration —
+        // and an all-rest group collapses to its first rest (bd-av64.3; the
+        // 2026-07-06 Cadwallader run emitted `<chord/><rest/>`, which
+        // importers reject).
+        if notes.iter().any(|n| !n.rest) {
+            notes.retain(|n| !n.rest);
+        } else {
+            notes.truncate(1);
         }
 
         if !attributes.is_empty() {
@@ -1567,6 +1756,195 @@ mod tests {
         assert!(semantic_to_musicxml("timeSignature-C/+note-C4_whole").is_ok());
         assert!(semantic_to_musicxml("garbage-token_xyz").is_err());
         assert!(semantic_to_musicxml("note-C4_gigasecond").is_err());
+    }
+
+    /// bd-av64.1 (vocab-exhaustive gate): EVERY rhythm-vocab token must
+    /// flow through the XML emitter. The 2026-07-06 Cadwallader run
+    /// crashed on a pitched `thirty_second` because `rsplit_once('_')`
+    /// split inside the duration name, and this test's first run also
+    /// caught `rest-256th`/`rest-512th` missing from the duration table —
+    /// goldens never decoded either class.
+    #[test]
+    fn every_rhythm_vocab_token_renders_to_musicxml() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tromr/tokenizer_rhythm.json"),
+        )
+        .expect("vocab fixture reads");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("vocab fixture parses");
+        let vocab = json["model"]["vocab"].as_object().expect("vocab map");
+        assert!(
+            vocab.len() >= 200,
+            "vocab unexpectedly small: {}",
+            vocab.len()
+        );
+        // Every lift form the merge can append to a pitch head.
+        let lifts = ["", "##", "#", "bb", "b", "N"];
+        for token in vocab.keys() {
+            let semantics: Vec<String> = match token.as_str() {
+                // Stream controls never reach the emitter.
+                "[PAD]" | "[BOS]" | "[EOS]" | "+" | "|" => continue,
+                t if t.starts_with("note-") => {
+                    let dur = &t["note-".len()..];
+                    // The merge renders `{pitch}{lift}_{dur}` plus the
+                    // pitch-head-abstained `nonote_{dur}` form.
+                    lifts
+                        .iter()
+                        .map(|l| format!("clef-G2+note-C4{l}_{dur}+barline"))
+                        .chain([format!("clef-G2+nonote_{dur}+barline")])
+                        .collect()
+                }
+                t => vec![format!("clef-G2+{t}+note-C4_quarter+barline")],
+            };
+            for s in semantics {
+                let out = semantic_to_musicxml(&s);
+                assert!(
+                    out.is_ok(),
+                    "vocab token {token:?} failed via {s:?}: {}",
+                    out.err().map(|e| e.to_string()).unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// bd-av64.1 regression: the exact Cadwallader failure atom, and the
+    /// full multi-underscore family with tick values.
+    #[test]
+    fn multi_underscore_durations_parse_exactly() {
+        let xml = semantic_to_musicxml(
+            "clef-G2+note-B4_thirty_second+note-C5_sixty_fourth.+note-D5_hundred_twenty_eighth+barline",
+        )
+        .expect("multi-underscore durations render");
+        assert!(
+            xml.contains("<duration>8</duration><type>32nd</type>"),
+            "32nd: {xml}"
+        );
+        // dotted 64th: 4 * 3/2 = 6 ticks
+        assert!(
+            xml.contains("<duration>6</duration><type>64th</type><dot/>"),
+            "64th.: {xml}"
+        );
+        assert!(
+            xml.contains("<duration>2</duration><type>128th</type>"),
+            "128th: {xml}"
+        );
+        // The numeral-named finest rests (found missing by the vocab gate).
+        let xml = semantic_to_musicxml("clef-G2+rest-256th+rest-512th+barline").expect("renders");
+        assert!(
+            xml.contains("<duration>1</duration><type>256th</type>"),
+            "256th: {xml}"
+        );
+        assert!(
+            xml.contains("<duration>1</duration><type>512th</type>"),
+            "512th: {xml}"
+        );
+        // split_pitch_duration: head is untouched, longest duration wins.
+        let (head, (xml_type, ticks, dotted)) =
+            split_pitch_duration("note-B4_thirty_second").expect("splits");
+        assert_eq!(
+            (head, xml_type, ticks, dotted),
+            ("note-B4", "32nd", 8, false)
+        );
+    }
+
+    /// bd-av64.3: a '|'-joined group mixing pitched notes and rests must
+    /// not emit `<chord/><rest/>` (importer-rejecting); rests drop from
+    /// mixed groups, all-rest groups collapse to one rest.
+    #[test]
+    fn mixed_chord_groups_drop_rests_and_all_rest_groups_collapse() {
+        let xml = semantic_to_musicxml("clef-G2+note-C4_eighth|rest-eighth|note-E4_eighth+barline")
+            .expect("mixed group renders");
+        assert!(
+            !xml.contains("<chord/><rest/>"),
+            "chord-on-rest leaked: {xml}"
+        );
+        assert_eq!(xml.matches("<note>").count(), 2, "rests must drop: {xml}");
+        assert_eq!(
+            xml.matches("<chord/>").count(),
+            1,
+            "one chord follower: {xml}"
+        );
+
+        let xml = semantic_to_musicxml("clef-G2+rest-quarter|rest-quarter+barline")
+            .expect("all-rest group renders");
+        assert_eq!(
+            xml.matches("<note>").count(),
+            1,
+            "all-rest collapses: {xml}"
+        );
+        assert!(!xml.contains("<chord/>"), "no chord on the survivor: {xml}");
+
+        // A rest FIRST in a mixed group: the pitched notes still form a
+        // legal chord (first pitched note carries no <chord/>).
+        let xml = semantic_to_musicxml("clef-G2+rest-eighth|note-C4_eighth|note-E4_eighth+barline")
+            .expect("rest-first mixed group renders");
+        assert!(validate_musicxml(&xml).is_empty(), "must validate: {xml}");
+        assert_eq!(xml.matches("<chord/>").count(), 1);
+    }
+
+    /// bd-av64.3: the structural validator flags each illegal shape (red
+    /// fixtures, incl. the frozen 2026-07-06 chord-on-rest shape) and
+    /// passes real emitted documents (green).
+    #[test]
+    fn musicxml_validator_red_and_green() {
+        let wrap = |notes: &str| {
+            format!(
+                "<?xml version=\"1.0\"?><score-partwise version=\"4.0\">\
+                 <part-list><score-part id=\"P1\"><part-name>S</part-name></score-part></part-list>\
+                 <part id=\"P1\"><measure number=\"1\">{notes}</measure></part></score-partwise>"
+            )
+        };
+        // RED 1: the exact grand.musicxml line-37 shape from the Cadwallader run.
+        let bad = wrap(
+            "<note><pitch><step>C</step><octave>4</octave></pitch><duration>16</duration></note>\
+             <note><chord/><rest/><duration>16</duration></note>",
+        );
+        assert!(
+            validate_musicxml(&bad)
+                .iter()
+                .any(|v| v.contains("co-occurs")),
+            "chord-on-rest must flag: {:?}",
+            validate_musicxml(&bad)
+        );
+        // RED 2: chord note with nothing before it.
+        let bad = wrap(
+            "<note><chord/><pitch><step>C</step><octave>4</octave></pitch><duration>16</duration></note>",
+        );
+        assert!(
+            validate_musicxml(&bad)
+                .iter()
+                .any(|v| v.contains("preceded"))
+        );
+        // RED 3: missing duration.
+        let bad = wrap("<note><pitch><step>C</step><octave>4</octave></pitch></note>");
+        assert!(
+            validate_musicxml(&bad)
+                .iter()
+                .any(|v| v.contains("missing <duration>"))
+        );
+        // RED 4: unbalanced tag.
+        let bad =
+            wrap("<note><pitch><step>C</step><octave>4</octave><duration>16</duration></note>");
+        assert!(
+            validate_musicxml(&bad)
+                .iter()
+                .any(|v| v.contains("mismatched"))
+        );
+        // RED 5: part-list/part id disagreement.
+        let bad = "<?xml version=\"1.0\"?><score-partwise version=\"4.0\">\
+                   <part-list><score-part id=\"P1\"><part-name>S</part-name></score-part></part-list>\
+                   <part id=\"P2\"><measure number=\"1\"></measure></part></score-partwise>";
+        assert!(
+            validate_musicxml(bad)
+                .iter()
+                .any(|v| v.contains("do not match"))
+        );
+        // GREEN: a real emitted document, attributes + chords + multirest.
+        let xml = semantic_to_musicxml(
+            "clef-F4+keySignature-FM+timeSignature-3/4+note-C4_quarter|note-E4_quarter+rest-quarter+barline+multirest-2+barline+note-F3_half.+barline",
+        )
+        .expect("emits");
+        assert_eq!(validate_musicxml(&xml), Vec::<String>::new());
     }
 
     fn zoo_dir() -> Option<std::path::PathBuf> {

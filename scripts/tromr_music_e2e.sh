@@ -2,18 +2,29 @@
 # tromr_music_e2e.sh — the E9 music-task gate (bd-3jo6.5.9).
 #
 # Drives the REAL `focr` binary over the REAL tromr.focrq:
-#   1/4 GATE      zoo dir present (artifact + tokenizer tables + the upstream
+#   1/5 GATE      zoo dir present (artifact + tokenizer tables + the upstream
 #                 example staff) else SKIP-with-SUCCESS
-#   2/4 BIN       build (or take FOCR_BIN) — release profile
-#   3/4 NEGATIVE  /nonexistent model => exit 3; music at an unlimited-named
+#   2/5 BIN       build (or take FOCR_BIN) — release profile
+#   3/5 NEGATIVE  /nonexistent model => exit 3; music at an unlimited-named
 #                 model => exit 2 (Usage — knowably neither tromr nor got;
 #                 ambiguous names pass through to the engine arch tag by design)
-#   4/4 MUSIC     --task music on the example staff => partwise MusicXML
+#   4/5 MUSIC     --task music on the example staff => partwise MusicXML
 #                 carrying the CERTIFIED structure (clef F4, key CM fifths 0,
 #                 3 measures — the token-exact argmax result for this staff,
 #                 matching the committed ground truth's own opening)
+#   5/5 REALSCAN  optional real-scan crop arm (bd-av64.1 regression: the
+#                 2026-07-06 Cadwallader crop crashed the emitter on a
+#                 pitched thirty_second) — set FOCR_TROMR_REALSCAN_CROP to a
+#                 local staff image (copyright material stays LOCAL-ONLY,
+#                 never committed); skipped-with-SUCCESS when unset.
 #
-# Env: FOCR_TROMR_DIR (default the USB zoo); FOCR_BIN (skips the build).
+# MusicXML validity: every document the binary emits is validated at emit
+# time inside the engine (validate_musicxml, bd-av64.3) — a structural
+# violation fails the run itself, so any exit-0 music step here implies a
+# validator-clean document by construction.
+#
+# Env: FOCR_TROMR_DIR (default the USB zoo); FOCR_BIN (skips the build);
+#      FOCR_TROMR_REALSCAN_CROP (optional local staff crop for step 5).
 #
 # Logging contract: stdout DATA-ONLY NDJSON, schema "tromr_music_e2e/v1"
 # (events gate|bin|negative|music|result); human telemetry `TRMU `-prefixed
@@ -52,7 +63,7 @@ ZOO="${FOCR_TROMR_DIR:-/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr}"
 MODEL="$ZOO/tromr.focrq"
 STAFF="$ZOO/../tromr-upstream/examples/1.png"
 
-step "1/4 GATE"
+step "1/5 GATE"
 if [ ! -f "$MODEL" ] || [ ! -f "$ZOO/tokenizer_rhythm.json" ] || [ ! -f "$STAFF" ]; then
   skip "tromr artifact/tokenizers/example staff absent under $ZOO — skipped with SUCCESS"
   ndj event=gate result=skip reason=no_weights zoo="$ZOO"
@@ -62,7 +73,7 @@ fi
 ok "artifact + tokenizer tables + example staff present"
 ndj event=gate result=pass zoo="$ZOO"
 
-step "2/4 BIN"
+step "2/5 BIN"
 if [ -n "${FOCR_BIN:-}" ]; then
   BIN="$FOCR_BIN"
 else
@@ -77,7 +88,7 @@ fi
 ok "binary ready: $BIN"
 ndj event=bin result=pass path="$BIN"
 
-step "3/4 NEGATIVE"
+step "3/5 NEGATIVE"
 rc=0
 "$BIN" ocr "$STAFF" --task music --model /nonexistent/tromr.focrq >/dev/null 2>&1 || rc=$?
 if [ "$rc" -ne 3 ]; then
@@ -98,7 +109,7 @@ fi
 ok "music at an unlimited-named model => exit 2 (knowably neither tromr nor got)"
 ndj event=negative check=wrong_family_guard result=pass exit_code="$rc"
 
-step "4/4 MUSIC"
+step "4/5 MUSIC"
 t0=$(python3 -c 'import time; print(int(time.time()*1000))')
 OUT=$("$BIN" ocr "$STAFF" --task music --model "$MODEL" 2>/dev/null) || {
   rc=$?
@@ -127,6 +138,37 @@ for want in "<clef><sign>F</sign><line>4</line></clef>" "<key><fifths>0</fifths>
 done
 ok "MusicXML carries the certified structure (clef F4, CM, 3 measures)"
 ndj event=music result=pass elapsed_ms=$((t1 - t0))
+
+step "5/5 REALSCAN"
+CROP="${FOCR_TROMR_REALSCAN_CROP:-}"
+if [ -n "$CROP" ] && [ -f "$CROP" ]; then
+  t0=$(python3 -c 'import time; print(int(time.time()*1000))')
+  OUT2=$("$BIN" ocr "$CROP" --task music --model "$MODEL" 2>/dev/null) || {
+    rc=$?
+    fail "real-scan crop failed (exit $rc) — the bd-av64.1 emitter-crash class"
+    ndj event=realscan result=fail exit_code="$rc" crop="$CROP"
+    exit 1
+  }
+  t1=$(python3 -c 'import time; print(int(time.time()*1000))')
+  case "$OUT2" in
+    "<?xml"*) : ;;
+    *)
+      fail "real-scan output is not MusicXML"
+      ndj event=realscan result=fail reason=not_xml crop="$CROP"
+      exit 1
+      ;;
+  esac
+  # Whether the decode contains a 32nd is model-dependent; record, don't gate.
+  case "$OUT2" in
+    *"<type>32nd</type>"*) has32=1 ;;
+    *) has32=0 ;;
+  esac
+  ok "real-scan crop transcribes without an emitter crash (has_32nd=$has32)"
+  ndj event=realscan result=pass has_32nd="$has32" elapsed_ms=$((t1 - t0)) crop="$CROP"
+else
+  skip "FOCR_TROMR_REALSCAN_CROP unset — real-scan arm skipped"
+  ndj event=realscan result=skip
+fi
 
 log "ALL STEPS PASSED"
 ndj event=result result=pass
