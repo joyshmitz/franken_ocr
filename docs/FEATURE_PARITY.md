@@ -4,7 +4,7 @@
 
 **Provenance.** Pinned source @ HF `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5` / GitHub `7e98affeacba24e95562fbaa234ddb89b856874a` ([`truth-pack/PINNED_SOURCES.md`](truth-pack/PINNED_SOURCES.md); SHA-256s in [`truth-pack/SOURCE_HASHES.md`](truth-pack/SOURCE_HASHES.md)). Feature rows trace to THE SPEC's `[SPEC-NNN]` clauses ([`truth-pack/EXISTING_UNLIMITED_OCR_STRUCTURE.md`](truth-pack/EXISTING_UNLIMITED_OCR_STRUCTURE.md)) and to the Rust design ([`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md)). Counts are line-backed in [`truth-pack/CENSUS.md`](truth-pack/CENSUS.md).
 
-**Status (seed @ Phase −1).** **EVERY row is `missing` / not-implemented** — this file is SEEDED now and updated every phase (it is the surface-parity ledger). The `Bead` column names the bead that *delivers* the feature; the `Parity` column is the gate level (L0–L5, §8.2) that proves it; `Status` flips to `present`/`partial` only when that bead lands AND its parity gate is green. **`partial` never rounds up to `present`. `excluded` still counts as coverage debt** (it is enumerated, with a reason).
+**Status (measured, 2026-07-06).** The Phase −1 all-`missing` seed is superseded: every row now carries a MEASURED status with its evidence cited in the Notes cell (FeatureUniverse swept under bd-1630; SurfaceMatrix under bd-re8.13/bd-wp8.11). The `Bead` column names the bead that *delivered* (or still owes) the feature; the `Parity` column is the gate level (L0–L5, §8.2) that proves it; `Status` flips to `present` only when that bead landed AND its parity gate is green. **`partial` never rounds up to `present`. `excluded` still counts as coverage debt** (it is enumerated, with a reason).
 
 ---
 
@@ -44,13 +44,13 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 > (§12–§15) was brought current the same day (bd-re8.13).
 > `tests/surface_matrix.rs` locks enumeration and recomputes this rollup.
 
-| Conformance metric | Value (Phase −1 seed) |
+| Conformance metric | Value (measured 2026-07-06) |
 |--------------------|----------------------|
 | MUST clauses enumerated (across both populations) | 92 |
 | MUST coverage (enumerated / SPEC MUST) | **1.00** (every `[SPEC-NNN]` MUST clause has a row) |
-| MUST `present` | 0 (Phase −1 — no kernels yet) |
+| MUST rows `present` / total MUST rows | **137 / 145** (the 8 non-present MUST rows are enumerated debt: see the `partial`/`missing` rows) |
 
-> Phase −1 is the **all-`missing` seed**: nothing is implemented yet, so `present`/`partial` are 0 by construction. The value of this table now is the *complete enumeration* — the gauntlet can only account what is listed. The 5 `excluded` rows are reasoned coverage debt (§16), not omissions.
+> The 4 `excluded` rows are reasoned coverage debt (§16), not omissions; the gauntlet can only account what is listed.
 
 > **CI doc-lint contract (bd-322.25 TESTS REQUIRED).** This file is parseable into the FeatureUniverse table: every feature row has a valid `Status` ∈ {present, partial, missing, n/a, excluded}, a valid `Parity` ∈ {L0..L5, SURF, n/a}, a `Bead` id (or `—`), and a `Req` ∈ {MUST, SHOULD, MAY, n/a}. The lint emits one NDJSON line `{doc, n_features, n_present, n_partial, n_missing, n_excluded, must_coverage}` and fails if any row is malformed or if a `[SPEC-NNN]` MUST clause has no row. The enumerated MUST set must cover the §4.3 op map + the §7.2 surface.
 

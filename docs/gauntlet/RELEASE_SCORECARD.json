@@ -25,24 +25,24 @@
   "\u00a79 Op map": 0.0
  },
  "per_category_mean": {
-  "\u00a71 Modeling features": 0.339622,
-  "\u00a710 Op map": 0.333333,
-  "\u00a711 `.focrq` weight transformation & quant recipe": 0.333333,
-  "\u00a712 CLI surface": 0.608695,
+  "\u00a71 Modeling features": 0.650943,
+  "\u00a710 Op map": 0.595238,
+  "\u00a711 `.focrq` weight transformation & quant recipe": 0.666666,
+  "\u00a712 CLI surface": 0.623188,
   "\u00a713 Robot / NDJSON event contract": 0.666666,
   "\u00a714 Parity gates & gauntlet machinery": 0.631578,
   "\u00a715 Alien-artifact families": 0.433333,
-  "\u00a72 Modeling features": 0.333333,
-  "\u00a73 Modeling features": 0.333333,
-  "\u00a74 Modeling features": 0.333333,
-  "\u00a75 Modeling features": 0.333333,
-  "\u00a76 Modeling features": 0.333333,
-  "\u00a77 Modeling features": 0.333333,
-  "\u00a78 Modeling features": 0.358974,
-  "\u00a79 Op map": 0.333333
+  "\u00a72 Modeling features": 0.666666,
+  "\u00a73 Modeling features": 0.666666,
+  "\u00a74 Modeling features": 0.648148,
+  "\u00a75 Modeling features": 0.619047,
+  "\u00a76 Modeling features": 0.654761,
+  "\u00a77 Modeling features": 0.666666,
+  "\u00a78 Modeling features": 0.641025,
+  "\u00a79 Op map": 0.666666
  },
  "pillar": "surface",
- "point_estimate": 0.402591,
+ "point_estimate": 0.633151,
  "residual_history_n": 0,
  "source": "docs/FEATURE_PARITY.md"
 }
