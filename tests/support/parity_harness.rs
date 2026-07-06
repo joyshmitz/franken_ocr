@@ -1269,6 +1269,76 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 8b. The shared determinism gate (bd-3kge) — ONE helper, used everywhere.
+//
+// G5/§7.3: our engine MUST be byte-deterministic under greedy (temperature 0).
+// This is DISTINCT from the ORACLE's bf16 nondeterminism (§8.2, measured via
+// `establish_floor`): a divergence here is a REAL BUG in our engine, never
+// test noise — no tolerance may paper over it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `run` `n` times (n ≥ 2) and assert every output is BYTE-IDENTICAL to
+/// the first. The closure receives the attempt index (callers that vary
+/// thread counts do so via subprocess env — `FOCR_THREADS` latches once per
+/// process — and can instead collect outputs themselves and call
+/// [`assert_outputs_deterministic`]).
+///
+/// Emits one structured `parity`/`token_exact` TestLog line per comparison
+/// (`value` = `"identical"` or the first-divergence byte offset).
+///
+/// # Panics
+/// On any byte divergence — with the attempt index, the first-divergence
+/// offset, and both lengths.
+pub fn assert_deterministic<F>(test: &str, case: &str, n: usize, mut run: F)
+where
+    F: FnMut(usize) -> Vec<u8>,
+{
+    assert!(n >= 2, "determinism needs at least two runs");
+    let reference = run(0);
+    for attempt in 1..n {
+        let output = run(attempt);
+        assert_outputs_deterministic(test, case, attempt, &reference, &output);
+    }
+}
+
+/// The comparison half of [`assert_deterministic`], for callers that collect
+/// outputs out-of-process (e.g. the same CLI invocation at two
+/// `FOCR_THREADS` settings): assert `output` is byte-identical to
+/// `reference`, logging the structured parity line.
+///
+/// # Panics
+/// On divergence, with the first-divergence offset and both lengths.
+pub fn assert_outputs_deterministic(
+    test: &str,
+    case: &str,
+    attempt: usize,
+    reference: &[u8],
+    output: &[u8],
+) {
+    let divergence = reference
+        .iter()
+        .zip(output.iter())
+        .position(|(a, b)| a != b)
+        .or_else(|| (reference.len() != output.len()).then(|| reference.len().min(output.len())));
+    let value = divergence.map_or_else(|| "identical".to_owned(), |off| off.to_string());
+    eprintln!(
+        "{{\"schema_version\":1,\"test\":\"{test}\",\"case\":\"{case}\",\"event\":\"parity\",\
+         \"metric\":\"token_exact\",\"attempt\":{attempt},\"value\":\"{value}\",\
+         \"result\":\"{}\"}}",
+        if divergence.is_none() { "pass" } else { "fail" }
+    );
+    if let Some(off) = divergence {
+        panic!(
+            "DETERMINISM VIOLATION ({test}/{case}): attempt {attempt} diverges from the \
+             reference at byte {off} (lens {} vs {}) — a real engine bug under greedy, \
+             never test noise",
+            reference.len(),
+            output.len()
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 9. Inline unit tests — the comparator MATH, on SYNTHETIC vectors only.
 //    These run with no weights and no fixtures (the task contract: "the
 //    comparator MATH is unit-tested inline with synthetic vectors").
@@ -1277,6 +1347,35 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-3kge acceptance: a deterministic closure passes; an INJECTED
+    /// nondeterministic source (RandomState-hashed iteration order leaking
+    /// into the output) FAILS the gate.
+    #[test]
+    fn determinism_gate_passes_stable_and_fails_injected() {
+        assert_deterministic("harness_self", "stable", 3, |attempt| {
+            let _ = attempt; // deliberately attempt-independent output
+            b"page text, attempt-independent (7 inputs)".to_vec()
+        });
+
+        let injected = std::panic::catch_unwind(|| {
+            assert_deterministic("harness_self", "injected", 2, |_| {
+                // HashMap iteration order depends on RandomState per map —
+                // exactly the class of bug the gate exists to catch.
+                let map: std::collections::HashMap<String, u32> =
+                    (0..64).map(|i| (format!("k{i}"), i)).collect();
+                map.keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into_bytes()
+            });
+        });
+        assert!(
+            injected.is_err(),
+            "the gate must FAIL on hash-order nondeterminism"
+        );
+    }
 
     #[test]
     fn cosine_identical_is_one() {

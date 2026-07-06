@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+#[path = "support/parity_harness.rs"]
+mod parity_harness;
+
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
 use franken_ocr::{DEFAULT_MODEL_PATH, FocrError, MODEL_PATH_ENV, OcrEngine};
 
@@ -698,6 +701,20 @@ fn recognize_real_model_when_present_else_skip_with_success() {
 
     match result {
         Ok(markdown) => {
+            // bd-3kge: the SHARED determinism gate over the public entrypoint
+            // — a second recognize() of the same image must be BYTE-IDENTICAL
+            // under greedy (our-engine determinism; a divergence is a real
+            // bug, never noise).
+            let second = engine
+                .recognize(&image)
+                .expect("second recognize for the determinism gate");
+            parity_harness::assert_outputs_deterministic(
+                test,
+                case,
+                1,
+                markdown.as_bytes(),
+                second.as_bytes(),
+            );
             // Real output: assert non-empty + well-formed; log markdown + token
             // count + timing (the §4.3 mandate).
             let token_count = markdown.split_whitespace().count();
