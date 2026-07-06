@@ -33,6 +33,7 @@
 //! pre-DISC-001 pipeline, doctrine #2).
 
 pub mod pil_resample;
+pub mod staff_detect;
 
 use std::path::Path;
 
