@@ -54,6 +54,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
+| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder into a versioned scorecard plus raw NDJSON evidence; the conformal ratchet blocks per-category regressions. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited SIMD islands, each with a bit-identical scalar fallback. |
 
 ---
@@ -94,7 +95,11 @@ focr ocr page.png --robot
 # 8. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
 focr robot selftest
 
-# 9. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
+# 9. Generate the parity-ladder scorecard used by release gates.
+scripts/ladder_scorecard.sh --self-test
+scripts/ladder_scorecard.sh --out scorecard.json
+
+# 10. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 
 # TrOMR conversion is available for local sheet-music artifacts.
@@ -116,6 +121,8 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 **Offline at inference.** The only network step is `focr pull`, which runs ahead of time. There is no Python, no CUDA, no FFI, and no GPU in the inference path. The async runtime that orchestrates I/O and cancellation is an owned internal detail; the library API is synchronous and blocking, so there is no async plumbing to thread through your code.
 
 **Correctness before speed (always).** A parity gate comes first and a faster kernel that drifts the OCR output is reverted, no source landed, and recorded in the negative-evidence ledger. Speed is shipped on top of parity, never instead of it. The int8 expert/FFN quantization is validated against the f32 path; the vision tower, projector, embeddings, MoE router, and all norms stay high precision.
+
+**Conformance has receipts.** The L0-L5 parity ladder emits structured NDJSON, and `scripts/ladder_scorecard.sh` folds that stream into one `focr-ladder-scorecard/v1` artifact. An unarmed no-weights run is recorded as `skipped_no_model:true`, never as green. Armed runs keep the raw NDJSON beside the scorecard so reviewers can inspect the evidence behind every gate. The release ratchet in `docs/conformance/RATCHET.md` compares per-category lower bounds, not point estimates, so a change that improves the aggregate while lowering one category is blocked.
 
 **Runtime ISA dispatch, one binary per arch.** There is no per-CPU-feature variant to choose. One `x86_64` binary covers AVX2 / AVX-VNNI / AVX-512-VNNI; one `aarch64` binary covers NEON / SDOT / SMMLA. At load, CPU feature detection picks the fastest available int8 kernel tier. Apple Silicon deliberately prefers SDOT over SMMLA because measured M-series i8mm throughput does not beat the dot-product path; non-Apple ARM64 can choose SMMLA when it is actually faster. On a Threadripper 5995WX, a Zen 3 part whose ceiling is AVX2, dispatch correctly selects AVX2.
 
@@ -488,6 +495,30 @@ gated until real kernels and parity evidence land.
 
 ---
 
+## Conformance and Release Evidence
+
+The conformance harness is built to leave reviewable artifacts, not just a green test line.
+
+| Artifact | Command or location | What it proves |
+|---|---|---|
+| **Parity scorecard** | `scripts/ladder_scorecard.sh --out scorecard.json` | Runs L0-L5 in order, folds each rung's NDJSON into `focr-ladder-scorecard/v1`, and writes the raw stream beside the summary. |
+| **Skip-honest mode** | `scripts/ladder_scorecard.sh --out scorecard.json` without weights | Produces `all_green:false` and `skipped_no_model:true`, so a missing-model run cannot masquerade as a certified release. |
+| **Conformal ratchet** | `docs/conformance/RATCHET.md`, `src/conformance.rs` | Computes per-category lower bounds from Jeffreys posterior and Hoeffding instruments, then rejects any category that drops below its committed floor. |
+| **Capacity certificate** | `cargo test --test many_pages_without_deadlock capacity_certificate_bounded_stream_soak -- --nocapture` | Exercises the bounded `stream_pages` channel, records queueing percentiles, proves the channel bound, and checks that the kernel pool width stays stable. |
+| **Fixture provenance** | `tests/fixtures/MANIFEST.toml`, `tests/fixtures/PROVENANCE.md` | Records how committed fixtures were generated, including armed and unarmed scorecard examples. |
+
+For an armed release receipt, provide the real model and fixture roots:
+
+```bash
+FOCR_FIXTURES_DIR=/path/to/fixtures/native_f32 \
+FOCR_MODEL_PATH=/path/to/model-00001-of-000001.safetensors \
+scripts/ladder_scorecard.sh --out scorecard.json
+```
+
+The scorecard is the compact receipt. The adjacent `scorecard.raw.ndjson` file is the audit trail.
+
+---
+
 ## Environment Variables
 
 | Variable | Effect |
@@ -680,3 +711,5 @@ The model weights are a separate matter. The Baidu Unlimited-OCR weights, and an
 - [`docs/PERF_LEDGER.md`](./docs/PERF_LEDGER.md), the honest measured perf-ratio log.
 - [`docs/NEGATIVE_EVIDENCE.md`](./docs/NEGATIVE_EVIDENCE.md), what did not work, including results inherited from sibling projects.
 - [`docs/DISCREPANCIES.md`](./docs/DISCREPANCIES.md), known measured divergences from the reference model.
+- [`docs/conformance/LADDER_HARNESS.md`](./docs/conformance/LADDER_HARNESS.md), the L0-L5 scorecard runner and parity-receipt contract.
+- [`docs/conformance/RATCHET.md`](./docs/conformance/RATCHET.md), the conformal lower-bound release ratchet.
