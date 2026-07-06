@@ -846,9 +846,503 @@ pub fn generate(w: &TromrDecoderW, ctx: &Mat) -> FocrResult<MusicStreams> {
     })
 }
 
+// ───────────────── E7: semantic merge + MusicXML assembly ─────────────────
+
+/// Merge the three RAW id streams into the extended-PrIMuS semantic string
+/// (upstream `inference.py`, ported verbatim over index-aligned tokens —
+/// spec §8):
+///
+/// * rhythm `|` replaces the previous joiner with `|` (chord join,
+///   bottom-to-top);
+/// * a rhythm token CONTAINING `"note"` renders
+///   `<pitch><lift?>_<duration>` — the pitch token verbatim (a `nonote`
+///   pitch stays `nonote_<dur>`, exactly what upstream emits), the lift
+///   letter appended only for the five real accidental classes;
+/// * every other rhythm token passes through; all joined by `+`.
+///
+/// Port rules (spec §8, replacing upstream's delete-anywhere loop): the
+/// streams stay INDEX-ALIGNED; the trailing rhythm `[EOS]` (and the aligned
+/// pitch/lift tails) are stripped; any OTHER control id in any stream is a
+/// decode error — fail loud, never skip-and-shift.
+///
+/// # Errors
+/// Length mismatches, an id outside its table, or a mid-stream control id.
+pub fn merge_semantic(
+    tk: &crate::tokenizer::music::MusicTokenizer,
+    streams: &MusicStreams,
+) -> FocrResult<String> {
+    use crate::tokenizer::music::{EOS_ID, Stream};
+    let t = streams.rhythm.len();
+    if t == 0 || streams.pitch.len() != t || streams.lift.len() != t {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr merge: stream lens (r {}, p {}, l {}) must be equal and non-zero",
+            streams.rhythm.len(),
+            streams.pitch.len(),
+            streams.lift.len()
+        )));
+    }
+    // Strip the trailing rhythm [EOS] and the aligned tails.
+    let end = if streams.rhythm[t - 1] == EOS_ID {
+        t - 1
+    } else {
+        t
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(end);
+    for j in 0..end {
+        let r_tok = tk.token(Stream::Rhythm, streams.rhythm[j]).ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "tromr merge: rhythm id {} out of table",
+                streams.rhythm[j]
+            ))
+        })?;
+        if matches!(r_tok, "[BOS]" | "[EOS]" | "[PAD]") {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "tromr merge: mid-stream rhythm control token {r_tok:?} at step {j} — decode error"
+            )));
+        }
+        if r_tok == "|" {
+            // Chord join: fuse with the PREVIOUS event.
+            let Some(prev) = parts.last_mut() else {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "tromr merge: chord '|' with no preceding event"
+                )));
+            };
+            prev.push('|');
+            continue;
+        }
+        if r_tok.contains("note") {
+            let p_tok = tk.token(Stream::Pitch, streams.pitch[j]).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!(
+                    "tromr merge: pitch id {} out of table",
+                    streams.pitch[j]
+                ))
+            })?;
+            let l_tok = tk.token(Stream::Lift, streams.lift[j]).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!(
+                    "tromr merge: lift id {} out of table",
+                    streams.lift[j]
+                ))
+            })?;
+            let lift = match l_tok {
+                "lift_##" | "lift_#" | "lift_bb" | "lift_b" | "lift_N" => {
+                    l_tok.rsplit('_').next().unwrap_or("")
+                }
+                _ => "",
+            };
+            let dur = r_tok.rsplit("note-").next().unwrap_or(r_tok);
+            let rendered = format!("{p_tok}{lift}_{dur}");
+            match parts.last_mut() {
+                Some(prev) if prev.ends_with('|') => prev.push_str(&rendered),
+                _ => parts.push(rendered),
+            }
+        } else {
+            match parts.last_mut() {
+                Some(prev) if prev.ends_with('|') => prev.push_str(r_tok),
+                _ => parts.push(r_tok.to_owned()),
+            }
+        }
+    }
+    Ok(parts.join("+"))
+}
+
+/// The rhythm duration names → (MusicXML `<type>`, ticks at 64
+/// divisions-per-quarter, dotted) — spec §8/§9 duration table.
+fn duration_info(name: &str) -> Option<(&'static str, u32, bool)> {
+    let (base, dotted) = match name.strip_suffix('.') {
+        Some(b) => (b, true),
+        None => (name, false),
+    };
+    let (xml, ticks) = match base {
+        "long" => ("long", 1024),
+        "breve" => ("breve", 512),
+        "whole" => ("whole", 256),
+        "half" => ("half", 128),
+        "quarter" => ("quarter", 64),
+        "eighth" => ("eighth", 32),
+        "sixteenth" => ("16th", 16),
+        "thirty_second" => ("32nd", 8),
+        "sixty_fourth" => ("64th", 4),
+        "hundred_twenty_eighth" => ("128th", 2),
+        _ => return None,
+    };
+    Some((xml, if dotted { ticks * 3 / 2 } else { ticks }, dotted))
+}
+
+/// `keySignature-XM` → MusicXML circle-of-fifths value (the 15 majors).
+fn key_fifths(name: &str) -> Option<i32> {
+    Some(match name {
+        "CM" => 0,
+        "GM" => 1,
+        "DM" => 2,
+        "AM" => 3,
+        "EM" => 4,
+        "BM" => 5,
+        "F#M" => 6,
+        "C#M" => 7,
+        "FM" => -1,
+        "BbM" => -2,
+        "EbM" => -3,
+        "AbM" => -4,
+        "DbM" => -5,
+        "GbM" => -6,
+        "CbM" => -7,
+        _ => return None,
+    })
+}
+
+/// One parsed note within an event (chord group).
+struct XmlNote {
+    step: char,
+    octave: u32,
+    alter: Option<i32>,
+    natural: bool,
+    rest: bool,
+    xml_type: &'static str,
+    ticks: u32,
+    dotted: bool,
+}
+
+/// Serialize the merged semantic string to partwise MusicXML (spec §8: the
+/// primary interop export; the raw semantic string ships beside it in
+/// `--json`). One part; measures split on `barline`; `multirest-N` expands
+/// to N whole-measure rests; a `nonote_<dur>` event (the pitch head
+/// abstained on a note step) renders as a rest of that duration — the
+/// semantic string keeps the model-native `nonote` form for scoring.
+///
+/// # Errors
+/// A token that parses as none of the §9 vocabulary classes.
+pub fn semantic_to_musicxml(merged: &str) -> FocrResult<String> {
+    let mut measures: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut attributes = String::new();
+    let mut divisions_emitted = false;
+
+    fn flush(current: &mut String, measures: &mut Vec<String>) {
+        if !current.is_empty() {
+            let n = measures.len() + 1;
+            measures.push(format!("  <measure number=\"{n}\">\n{current}  </measure>"));
+            current.clear();
+        }
+    }
+
+    for event in merged.split('+') {
+        if event.is_empty() {
+            continue;
+        }
+        if let Some(clef) = event.strip_prefix("clef-") {
+            let (sign, line) = clef.split_at(1);
+            attributes.push_str(&format!(
+                "      <clef><sign>{sign}</sign><line>{line}</line></clef>\n"
+            ));
+            continue;
+        }
+        if let Some(key) = event.strip_prefix("keySignature-") {
+            let fifths = key_fifths(key).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: unknown key {event:?}"))
+            })?;
+            attributes.push_str(&format!("      <key><fifths>{fifths}</fifths></key>\n"));
+            continue;
+        }
+        if let Some(ts) = event.strip_prefix("timeSignature-") {
+            let (beats, beat_type, symbol) = match ts {
+                "C" => (4, 4, " symbol=\"common\""),
+                "C/" => (2, 2, " symbol=\"cut\""),
+                other => {
+                    let (b, t) = other.split_once('/').ok_or_else(|| {
+                        FocrError::Other(anyhow::anyhow!("tromr xml: bad time {event:?}"))
+                    })?;
+                    let b = b.parse::<u32>().map_err(|_| {
+                        FocrError::Other(anyhow::anyhow!("tromr xml: bad beats {event:?}"))
+                    })?;
+                    let t = t.parse::<u32>().map_err(|_| {
+                        FocrError::Other(anyhow::anyhow!("tromr xml: bad beat-type {event:?}"))
+                    })?;
+                    (b, t, "")
+                }
+            };
+            attributes.push_str(&format!(
+                "      <time{symbol}><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>\n"
+            ));
+            continue;
+        }
+        if event == "barline" {
+            flush(&mut current, &mut measures);
+            continue;
+        }
+        if let Some(n) = event.strip_prefix("multirest-") {
+            let n: usize = n.parse().map_err(|_| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: bad multirest {event:?}"))
+            })?;
+            flush(&mut current, &mut measures);
+            for _ in 0..n {
+                current
+                    .push_str("    <note><rest measure=\"yes\"/><duration>256</duration></note>\n");
+                flush(&mut current, &mut measures);
+            }
+            continue;
+        }
+
+        // Note / rest event (possibly a `|`-joined chord group).
+        let mut notes: Vec<XmlNote> = Vec::new();
+        for atom in event.split('|') {
+            if let Some(dur) = atom.strip_prefix("rest-") {
+                let (xml_type, ticks, dotted) = duration_info(dur).ok_or_else(|| {
+                    FocrError::Other(anyhow::anyhow!("tromr xml: unknown duration {atom:?}"))
+                })?;
+                notes.push(XmlNote {
+                    step: 'C',
+                    octave: 4,
+                    alter: None,
+                    natural: false,
+                    rest: true,
+                    xml_type,
+                    ticks,
+                    dotted,
+                });
+                continue;
+            }
+            let (head, dur) = atom.rsplit_once('_').ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: unparseable event {atom:?}"))
+            })?;
+            let (xml_type, ticks, dotted) = duration_info(dur).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: unknown duration {atom:?}"))
+            })?;
+            if head == "nonote" {
+                notes.push(XmlNote {
+                    step: 'C',
+                    octave: 4,
+                    alter: None,
+                    natural: false,
+                    rest: true,
+                    xml_type,
+                    ticks,
+                    dotted,
+                });
+                continue;
+            }
+            let body = head.strip_prefix("note-").ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: unparseable note {atom:?}"))
+            })?;
+            let mut it = body.chars();
+            let step = it.next().ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr xml: empty note {atom:?}"))
+            })?;
+            let octave: String = body[1..].chars().take_while(char::is_ascii_digit).collect();
+            let acc = &body[1 + octave.len()..];
+            let octave: u32 = octave
+                .parse()
+                .map_err(|_| FocrError::Other(anyhow::anyhow!("tromr xml: bad octave {atom:?}")))?;
+            let (alter, natural) = match acc {
+                "" => (None, false),
+                "#" => (Some(1), false),
+                "##" => (Some(2), false),
+                "b" => (Some(-1), false),
+                "bb" => (Some(-2), false),
+                "N" => (Some(0), true),
+                other => {
+                    return Err(FocrError::Other(anyhow::anyhow!(
+                        "tromr xml: unknown accidental {other:?} in {atom:?}"
+                    )));
+                }
+            };
+            notes.push(XmlNote {
+                step,
+                octave,
+                alter,
+                natural,
+                rest: false,
+                xml_type,
+                ticks,
+                dotted,
+            });
+        }
+
+        if !attributes.is_empty() {
+            let divisions = if divisions_emitted {
+                String::new()
+            } else {
+                divisions_emitted = true;
+                "      <divisions>64</divisions>\n".to_owned()
+            };
+            current.push_str(&format!(
+                "    <attributes>\n{divisions}{attributes}    </attributes>\n"
+            ));
+            attributes.clear();
+        }
+        for (i, n) in notes.iter().enumerate() {
+            let mut body = String::new();
+            if i > 0 {
+                body.push_str("<chord/>");
+            }
+            if n.rest {
+                body.push_str("<rest/>");
+            } else {
+                let alter = n
+                    .alter
+                    .map(|a| format!("<alter>{a}</alter>"))
+                    .unwrap_or_default();
+                body.push_str(&format!(
+                    "<pitch><step>{}</step>{alter}<octave>{}</octave></pitch>",
+                    n.step, n.octave
+                ));
+            }
+            body.push_str(&format!(
+                "<duration>{}</duration><type>{}</type>",
+                n.ticks, n.xml_type
+            ));
+            if n.dotted {
+                body.push_str("<dot/>");
+            }
+            if n.natural {
+                body.push_str("<accidental>natural</accidental>");
+            }
+            current.push_str(&format!("    <note>{body}</note>\n"));
+        }
+    }
+    flush(&mut current, &mut measures);
+
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <score-partwise version=\"4.0\">\n\
+         \x20 <part-list><score-part id=\"P1\"><part-name>Music</part-name></score-part></part-list>\n\
+         \x20 <part id=\"P1\">\n{}\n  </part>\n</score-partwise>\n",
+        measures.join("\n")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_tokenizer() -> crate::tokenizer::music::MusicTokenizer {
+        crate::tokenizer::music::MusicTokenizer::from_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tromr"),
+        )
+        .expect("committed tables load")
+    }
+
+    /// merge_semantic vs the UPSTREAM inference.py merge run over the SAME
+    /// oracle argmax streams (golden generated 2026-07-05 in the pinned venv;
+    /// the oracle streams live in tromr_oracle_fixtures.json — 42 ids/stream,
+    /// rhythm trailing [EOS] stripped, upstream len 41/42/42 alignment holds
+    /// because the only special is trailing).
+    #[test]
+    fn merge_semantic_matches_upstream_golden() {
+        let tk = fixture_tokenizer();
+        // The oracle argmax streams for examples/1.png (fixture copy — the
+        // armed cert already proves our generate emits exactly these).
+        let rhythm: Vec<u32> = vec![
+            15, 21, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 5, 131, 131, 131, 131,
+            131, 131, 131, 131, 131, 131, 131, 131, 5, 131, 131, 131, 131, 131, 131, 131, 131, 131,
+            131, 131, 131, 5, 2,
+        ];
+        let pitch: Vec<u32> = vec![
+            0, 0, 0, 0, 38, 39, 40, 41, 42, 43, 0, 38, 39, 40, 41, 40, 40, 41, 42, 43, 40, 38, 40,
+            40, 40, 40, 0, 0, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 0, 0,
+        ];
+        let lift: Vec<u32> = vec![
+            0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
+        ];
+        // NOTE: these literals are the fixture's first 41 ids + the trailing
+        // EOS; if the oracle fixture regenerates differently the ARMED cert
+        // (not this test) is the authority — this test pins the MERGE math
+        // over a real stream shape, with the golden string from upstream.
+        let streams = MusicStreams {
+            rhythm,
+            pitch,
+            lift,
+        };
+        let merged = merge_semantic(&tk, &streams).expect("merge runs");
+        assert!(
+            merged
+                .starts_with("clef-G2+keySignature-CM+nonote_eighth+nonote_eighth+note-E5_eighth"),
+            "{merged}"
+        );
+        assert!(
+            merged.ends_with("barline"),
+            "trailing EOS stripped: {merged}"
+        );
+        assert_eq!(merged.matches("barline").count(), 3, "{merged}");
+        assert!(!merged.contains("[EOS]"), "{merged}");
+    }
+
+    #[test]
+    fn merge_semantic_edges() {
+        let tk = fixture_tokenizer();
+        // Chord: rhythm [note-eighth(131), |(4), note-eighth] pitches C4/E4.
+        let streams = MusicStreams {
+            rhythm: vec![131, 4, 131],
+            pitch: vec![29, 0, 31],
+            lift: vec![1, 0, 3], // lift_null, nonote, lift_#
+        };
+        let merged = merge_semantic(&tk, &streams).expect("chord merges");
+        // One event: first note, '|', second note with '#' attached.
+        let p29 = tk
+            .token(crate::tokenizer::music::Stream::Pitch, 29)
+            .unwrap();
+        let p31 = tk
+            .token(crate::tokenizer::music::Stream::Pitch, 31)
+            .unwrap();
+        assert_eq!(merged, format!("{p29}_eighth|{p31}#_eighth"));
+
+        // Mid-stream EOS is a decode error, not a skip.
+        let bad = MusicStreams {
+            rhythm: vec![131, 2, 131],
+            pitch: vec![29, 0, 31],
+            lift: vec![1, 0, 1],
+        };
+        assert!(
+            merge_semantic(&tk, &bad).is_err(),
+            "mid-stream EOS must fail loud"
+        );
+
+        // Length mismatch fails loud.
+        let bad = MusicStreams {
+            rhythm: vec![131],
+            pitch: vec![29, 30],
+            lift: vec![1],
+        };
+        assert!(merge_semantic(&tk, &bad).is_err());
+
+        // Leading '|' (chord with no head) fails loud.
+        let bad = MusicStreams {
+            rhythm: vec![4, 131],
+            pitch: vec![0, 29],
+            lift: vec![0, 1],
+        };
+        assert!(merge_semantic(&tk, &bad).is_err());
+    }
+
+    #[test]
+    fn musicxml_serializes_the_vocabulary() {
+        let xml = semantic_to_musicxml(
+            "clef-G2+keySignature-EbM+timeSignature-3/4+note-F4#_quarter.+note-C5_eighth|note-E5N_eighth+rest-half+barline+multirest-2+nonote_eighth",
+        )
+        .expect("serializes");
+        for want in [
+            "<divisions>64</divisions>",
+            "<clef><sign>G</sign><line>2</line></clef>",
+            "<key><fifths>-3</fifths></key>",
+            "<time><beats>3</beats><beat-type>4</beat-type></time>",
+            // dotted quarter with sharp: 64*1.5 = 96 ticks
+            "<pitch><step>F</step><alter>1</alter><octave>4</octave></pitch><duration>96</duration><type>quarter</type><dot/>",
+            // chord second note carries <chord/> + natural accidental
+            "<chord/><pitch><step>E</step><alter>0</alter><octave>5</octave></pitch>",
+            "<accidental>natural</accidental>",
+            "<rest/><duration>128</duration><type>half</type>",
+            "<rest measure=\"yes\"/>",
+            "<measure number=\"4\">",
+        ] {
+            assert!(xml.contains(want), "missing {want:?} in:\n{xml}");
+        }
+        // multirest-2 = two of the whole-measure rests.
+        assert_eq!(xml.matches("rest measure=\"yes\"").count(), 2);
+        // The C/ cut-time + unknown-token error paths.
+        assert!(semantic_to_musicxml("timeSignature-C/+note-C4_whole").is_ok());
+        assert!(semantic_to_musicxml("garbage-token_xyz").is_err());
+        assert!(semantic_to_musicxml("note-C4_gigasecond").is_err());
+    }
 
     fn zoo_dir() -> Option<std::path::PathBuf> {
         let dir = std::env::var_os("FOCR_TROMR_DIR").map(std::path::PathBuf::from)?;
@@ -962,6 +1456,23 @@ mod tests {
             "[tromr-cert] L4 argmax generate EXACT: {} steps, rhythm ends [barline, EOS]",
             streams.rhythm.len()
         );
+
+        // E7 tail: the certified streams flow through the merge + MusicXML
+        // assembly (the merge math itself is golden-tested synthetically).
+        let mtk = fixture_tokenizer();
+        let merged = merge_semantic(&mtk, &streams).expect("merge runs");
+        assert!(
+            merged.starts_with("clef-G2+keySignature-CM+"),
+            "merged head: {merged}"
+        );
+        assert!(merged.ends_with("barline"), "trailing EOS stripped");
+        let xml = semantic_to_musicxml(&merged).expect("xml serializes");
+        assert!(
+            xml.contains("<clef><sign>G</sign><line>2</line></clef>"),
+            "clef in xml"
+        );
+        assert!(xml.contains("<measure number=\"3\">"), "3 measures");
+        eprintln!("[tromr-cert] E7 merge+MusicXML over the certified streams OK");
     }
 
     /// The E3 L1/L2 cert: every oracle seam (stem, stages, patch proj, each
