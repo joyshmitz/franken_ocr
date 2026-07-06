@@ -419,19 +419,26 @@ bd-3kix) extends to staves — synthesize via Verovio/MuseScore renders with kno
 
 ## 16. Open questions (doctrine hard rule — no kernel ships against an unresolved OQ)
 
-- **OQ-T1** oracle torch version: prove torch-2.x ≡ torch-1.11 logits for this graph (or
-  pin the delta) before the parity ladder is trusted. §13.
-- **OQ-T2** cv2 `INTER_LINEAR` resize parity: measure our bilinear vs cv2 fixed-point on
-  the fixture set; fold into the L0b tolerance (mirror of GOT's CatmullRom note).
-- **OQ-T3** albumentations 1.2.0 `ToGray` exact arithmetic (cv2 fixed-point luma
-  coefficients + uint8 rounding BEFORE normalize) — pin from the albumentations source at
-  E3 implementation time.
-- **OQ-T4** `stable_softmax` (max-subtract) vs our softmax: confirm bitwise-benign in f32
-  at L1 (expected yes; verify, don't assume).
+- **OQ-T1 RESOLVED (2026-07-06, measured on hetzner1 x86):** torch 1.11.0 vs torch
+  2.7.1, same host, same input (examples/1.png via the corrected readimg): encoder
+  context maxabs **1.49e-6** (cos 0.9999999), argmax generate streams **IDENTICAL**
+  (68 tokens, all three streams). The torch-2.x oracle is version-valid.
+- **OQ-T2 RESOLVED (E9 L0b, measured):** our half-pixel-center float bilinear vs the
+  cv2 reference — BIT-EXACT on the alpha-ink path; exactly ±1 u8 LSB worst-case on
+  the luma path (0/102400 pixels past 1.5 LSB), and the output-level gate stays
+  token-exact. The envelope is reported by the armed cert every run.
+- **OQ-T3 RESOLVED (E3/E9):** ToGray pinned by delegating to cv2's own fixed-point
+  luma (`(4899R+9617G+1868B+8192)>>14`) in both the fixture script and the Rust
+  port (albumentations 1.2.0 itself is not importable on py3.13 — scikit-image
+  0.18.3 has no wheels; its two used transforms are exactly this arithmetic).
+- **OQ-T4 RESOLVED (E3/E4 certs):** encoder cos 1.00000000 / decoder token-exact
+  through our sdpa — the stable-softmax difference is bitwise-benign at f32.
 - **OQ-T5** wide-staff policy: our 10:1 clamp + barline chunking is a documented divergence
   (upstream undefined, §2b) — needs a measured DISCREPANCIES entry once E5 exists.
-- **OQ-T6** sampled-vs-argmax decode divergence rate on real staves (kill-switch
-  `FOCR_TROMR_SAMPLE`) — measure for the DISCREPANCIES entry. §5.
+- **OQ-T6 RESOLVED (DISC-004, measured):** on REAL staves argmax and top-k/T=0.2
+  sampling produce IDENTICAL streams (SER equal on all 4 committed examples);
+  the apparent argmax collapse was the upstream opaque-alpha blank-input bug.
+  Default = argmax; `FOCR_TROMR_SAMPLE=1` + `FOCR_TROMR_SEED` = seeded sampling.
 - **RESOLVED by source this census:** `on_attn` out-proj is bias-free (x_transformers.py:577
   + checkpoint); decoder LN eps 1e-5 vs encoder 1e-6 (§4/§2b); note head inference-dead
   (§5); note_mask train-only; pos-emb scale 1/16 (§4); backbone final norm Identity;

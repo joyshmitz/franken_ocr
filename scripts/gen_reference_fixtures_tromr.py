@@ -58,9 +58,16 @@ def readimg(cv2, np, path: str):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise SystemExit(f"FATAL: cannot read {path}")
-    if img.ndim == 3 and img.shape[2] == 4:
-        img = 255 - img[:, :, 3]  # inverted alpha = ink (rendered-PNG convention)
+    if img.ndim == 3 and img.shape[2] == 4 and img[:, :, 3].min() < 255:
+        # Inverted alpha = ink (rendered-PNG convention) — ONLY when the alpha
+        # channel actually varies. Upstream applies 255−alpha to EVERY
+        # 4-channel input, which BLANKS fully-opaque PNGs (their own
+        # examples/*.png are opaque RGBA: alpha ≡ 255 ⇒ ink ≡ 0 — measured
+        # 2026-07-06, DISC-004). Deliberate, documented divergence.
+        img = 255 - img[:, :, 3]
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
     elif img.ndim == 3 and img.shape[2] == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     elif img.ndim == 2:

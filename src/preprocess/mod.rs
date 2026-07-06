@@ -961,8 +961,13 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
             "tromr preprocess: degenerate {w}x{h} input"
         )));
     }
-    // The ink gray plane.
-    let gray: Vec<u8> = if img.color().has_alpha() {
+    // The ink gray plane. The inverted-alpha convention applies ONLY when
+    // the alpha channel varies: upstream applies 255−alpha to EVERY
+    // 4-channel input, which BLANKS fully-opaque PNGs (their own demo
+    // staves are opaque RGBA — measured 2026-07-06, DISC-004). A deliberate,
+    // documented divergence; opaque-alpha images take the RGB luma path.
+    let alpha_is_ink = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255);
+    let gray: Vec<u8> = if alpha_is_ink {
         img.to_rgba8().pixels().map(|p| 255 - p.0[3]).collect()
     } else {
         img.to_rgb8()

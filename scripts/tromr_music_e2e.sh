@@ -9,8 +9,9 @@
 #                 model => exit 2 (Usage — knowably neither tromr nor got;
 #                 ambiguous names pass through to the engine arch tag by design)
 #   4/4 MUSIC     --task music on the example staff => partwise MusicXML
-#                 carrying the CERTIFIED structure (clef G2, key CM fifths 0,
-#                 3 measures — the token-exact argmax result for this staff)
+#                 carrying the CERTIFIED structure (clef F4, key CM fifths 0,
+#                 3 measures — the token-exact argmax result for this staff,
+#                 matching the committed ground truth's own opening)
 #
 # Env: FOCR_TROMR_DIR (default the USB zoo); FOCR_BIN (skips the build).
 #
@@ -114,7 +115,7 @@ case "$OUT" in
     exit 1
     ;;
 esac
-for want in "<clef><sign>G</sign><line>2</line></clef>" "<key><fifths>0</fifths></key>" "<measure number=\"3\">" "score-partwise"; do
+for want in "<clef><sign>F</sign><line>4</line></clef>" "<key><fifths>0</fifths></key>" "<measure number=\"3\">" "score-partwise"; do
   case "$OUT" in
     *"$want"*) : ;;
     *)
@@ -124,7 +125,7 @@ for want in "<clef><sign>G</sign><line>2</line></clef>" "<key><fifths>0</fifths>
       ;;
   esac
 done
-ok "MusicXML carries the certified structure (clef G2, CM, 3 measures)"
+ok "MusicXML carries the certified structure (clef F4, CM, 3 measures)"
 ndj event=music result=pass elapsed_ms=$((t1 - t0))
 
 log "ALL STEPS PASSED"

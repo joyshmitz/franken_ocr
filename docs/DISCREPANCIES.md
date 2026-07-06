@@ -74,6 +74,59 @@ since exact-token OCR fails in the tail.
 
 ---
 
+## DISC-004: TrOMR upstream `readimg` blanks fully-opaque RGBA inputs; opaque-alpha images take the RGB path here
+
+- claim_id / evidence_id: CLAIM-e8-alpha-ink → the armed E8/E9 cert logs
+    (`tromr::tests::{tromr_preprocess_envelope_and_output_gate,tromr_ser_vs_committed_ground_truth}`,
+    src/native_engine/tromr.rs) + `scripts/gen_reference_fixtures_tromr.py`
+- Provenance (model commit + fixture hash): NetEase/Polyphonic-TrOMR
+    `img2score_epoch47.pth` sha256 02925259ef… (census pin, tromr-spec §Sources);
+    `examples/{1..4}.png` + committed `.txt` ground truths (upstream clone)
+- CPU feature string: aarch64+neon+dotprod (Apple M4)
+- Exact command + env: `FOCR_TROMR_DIR=<zoo>/tromr cargo test --release --lib --
+    --nocapture tromr::tests`
+- Reference behavior: upstream `staff2score.py::readimg` applies `img = 255 −
+    alpha` to EVERY 4-channel input (the rendered-PNG ink convention). The
+    repo's own `examples/*.png` are fully-opaque RGBA (alpha ≡ 255, measured
+    2026-07-06), so upstream's literal code feeds the model an ALL-ZERO image
+    for its own demo staves; the model then hallucinates a stereotyped
+    ~42-token reading that is IDENTICAL across different staves (verified on
+    the oracle itself: examples 1 and 2 produce the same argmax stream on
+    blank input). Argmax SER vs the committed ground truths on blank input:
+    ~1.55 (garbage).
+- Our impl: the inverted-alpha ink path fires ONLY when the alpha channel
+    actually varies (`min(alpha) < 255`); fully-opaque RGBA takes the
+    BGRA→RGB → cv2 fixed-point luma path (`preprocess::tromr_staff_tensor` +
+    the fixture script's `readimg`, both sides identical).
+- Measured impact: with real (non-blank) input the model reads staves
+    correctly — L5 SER vs the four committed ground truths: 0.125 / 0.040 /
+    0.375 / 0.304 (mean 0.211, argmax decode), and the recognized opening
+    (`clef-F4+keySignature-CM`) matches the ground truth's own opening.
+    Decode-mode attribution: per-head ARGMAX and upstream top-k/T=0.2
+    sampling produce IDENTICAL streams on real inputs (SER equal to 3 d.p.)
+    — the earlier apparent "argmax collapse" was entirely the blank-input
+    artifact. L0b preprocess envelope vs the cv2 reference on the luma path:
+    maxabs exactly 1 u8 LSB, 0/102400 pixels past 1.5 LSB, and the
+    output-level gate (our preprocess → certified encoder+decoder) stays
+    TOKEN-EXACT.
+- Fallback / kill-switch state: `FOCR_TROMR_SAMPLE=1` enables the upstream
+    sampling arithmetic from a pinned PCG32 seed (`FOCR_TROMR_SEED`,
+    default 0) — deterministic per seed; the default is per-head argmax.
+- Resolution: ACCEPTED as a deliberate, justified divergence from upstream's
+    literal code — their convention self-evidently blanks their own demo
+    inputs; ours preserves the ink convention exactly where alpha carries ink
+    and is measured-superior everywhere else (SER 1.55 → 0.211 on the
+    committed examples).
+- Tests affected: `tromr::tests::tromr_ser_vs_committed_ground_truth` (pinned
+    gates mean ≤ 0.25, per-example ≤ 0.45),
+    `tromr::tests::tromr_preprocess_envelope_and_output_gate` (envelope
+    reported every run + token-exact output gate); the frozen pre-fix stream
+    literals live on in `merge_semantic_matches_upstream_golden` as a
+    self-consistent synthetic merge case.
+- Review date: when E5 (staff-detection front end) lands — re-measure the
+    envelope + SER over its crop corpus, and extend the alpha-variance rule
+    if real rendered-PNG (transparent-background) staves appear there.
+
 ## DISC-003: SmolVLM2 f32 describe e2e flips near-tied tokens via summation-order drift
 
 - claim_id / evidence_id: CLAIM-c8-neartie → the armed C8 cert logs
