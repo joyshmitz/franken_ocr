@@ -144,7 +144,58 @@ impl PdfPages {
         let decoded = decode_image_xobject(&self.doc, main)
             .map_err(|e| FocrError::InputDecode(format!("PDF page {}: {e}", idx + 1)))?;
 
-        Ok(apply_rotation(decoded, page_rotation(&self.doc, page_id)))
+        let total_rotation = (page_rotation(&self.doc, page_id)
+            + content_rotation(&self.doc, page_id))
+        .rem_euclid(360);
+        Ok(apply_rotation(decoded, total_rotation))
+    }
+}
+
+/// Rotation (0/90/180/270 degrees, clockwise-positive like `/Rotate`) the
+/// page CONTENT STREAM applies to its main image through the current
+/// transformation matrix. Scanned-book PDFs often store the scan portrait
+/// and place it with a rotated `cm` instead of a `/Rotate` entry — the
+/// Cadwallader class: `/Rotate 0`, image 2480x3504, displayed landscape.
+/// Ignoring the CTM fed the OCR model SIDEWAYS pages (bd-av64.11,
+/// 2026-07-06: a spread decoded garbage until the 600s forward budget).
+///
+/// Only the matrix in effect at the FIRST `Do` is classified, and only
+/// axis-aligned rotations are recognized (a skewed/general matrix returns
+/// 0 — leave the raster as stored rather than guess).
+fn content_rotation(doc: &Document, page_id: ObjectId) -> i64 {
+    let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+        return 0;
+    };
+    let mut cm: Option<[f64; 4]> = None;
+    for op in &content.operations {
+        match op.operator.as_ref() {
+            "cm" => {
+                let v: Vec<f64> = op
+                    .operands
+                    .iter()
+                    .filter_map(|o| o.as_float().ok().map(f64::from))
+                    .collect();
+                if v.len() >= 4 {
+                    cm = Some([v[0], v[1], v[2], v[3]]);
+                }
+            }
+            "Do" => break,
+            _ => {}
+        }
+    }
+    let Some([a, b, c, d]) = cm else { return 0 };
+    if b.abs() > a.abs() && c.abs() > d.abs() {
+        // Rotated placement: the image x-axis maps to the page y-axis. For
+        // b > 0 (the Cadwallader matrix [0 595 -841 0]) the stored raster
+        // reads upright after a 90-degree COUNTER-clockwise turn — verified
+        // empirically against a reference render (mean-abs-diff 3.6 CCW vs
+        // 19.6 CW on the title page), because raster row 0 sits at page
+        // LEFT under this matrix. 270 here is the image crate's CCW.
+        if b > 0.0 { 270 } else { 90 }
+    } else if a < 0.0 && d < 0.0 {
+        180
+    } else {
+        0
     }
 }
 
