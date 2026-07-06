@@ -61,93 +61,93 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 1 | Image load + EXIF-transpose + RGB | SPEC-020 | MUST | missing | L0 | preprocess/mod.rs | bd-1gv.2 | |
-| 2 | Normalize ToTensor→(0.5,0.5) ⇒ [-1,1] | SPEC-021 | MUST | missing | L0 | preprocess/normalize.rs | bd-1gv.2 | exact |
-| 3 | Pad-to-square gray (127,127,127) | SPEC-022 | MUST | missing | L0 | preprocess/pad.rs | bd-1gv.2 | ImageOps.pad equivalent |
-| 4 | Crop decision (crop_mode, ≤640 both ⇒ [1,1]) | SPEC-023 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | |
-| 5 | `dynamic_preprocess` tiling (min 2/max 32, row-major) | SPEC-024 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | OQ-7 resolved |
-| 6 | `find_closest_aspect_ratio` (tie-break larger area) | SPEC-025 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | |
-| 7 | crop_ratio (width_crop_num, height_crop_num) | SPEC-026 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | |
-| 8 | Token query counts (base 16, tile 10) | SPEC-027 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | CENSUS (c) |
-| 9 | Image-token id-stream layout (2D, 273/1024-view) | SPEC-028 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | 256+16+1 |
-| 10 | Non-crop branch single global block | SPEC-029 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | |
-| 11 | BOS prepend + images_seq_mask | SPEC-030 | MUST | missing | L0 | preprocess/tile.rs, tokenizer/ | bd-1gv.3 | |
-| 12 | Image tensor packing `images=[(crop,ori)]` | SPEC-031 | MUST | missing | L0 | preprocess/tile.rs | bd-1gv.3 | |
-| 13 | `valid_img_tokens` accounting (metric only) | SPEC-032 | MAY | excluded | n/a | — | — | compression-ratio metric, not in forward |
-| 14 | Multi-image path (infer_multi, no-crop) | SPEC-033 | MUST | missing | L5 | orchestrator.rs, connector.rs | bd-1gv.25 | OQ-13 cross-page |
-| 15 | Prompt `plain` template (empty sep/roles) | SPEC-034 | MUST | missing | L4 | tokenizer/, preprocess/tile.rs | bd-1gv.1 | |
-| 16 | Prompt split on `<image>` (add_special_tokens=False) | SPEC-035 | MUST | missing | L0 | tokenizer/ | bd-1gv.1 | |
-| 17 | Roles `<\|User\|>`/`<\|Assistant\|>` (absent in plain output) | SPEC-036 | SHOULD | missing | L4 | tokenizer/ | bd-1gv.1 | |
-| 18 | Bicubic image resize (aspect-preserving) | SPEC-021/024 | MUST | missing | L0 | preprocess/resize.rs | bd-1gv.2 | frankentorch gap |
+| 1 | Image load + EXIF-transpose + RGB | SPEC-020 | MUST | present | L0 | preprocess/mod.rs | bd-1gv.2 | decode_image + EXIF-transpose (preprocess/mod.rs:379); L0 armed green |
+| 2 | Normalize ToTensor→(0.5,0.5) ⇒ [-1,1] | SPEC-021 | MUST | present | L0 | preprocess/normalize.rs | bd-1gv.2 | [-1,1] normalize (mod.rs:667); L0 anchor NORM_LO/HI |
+| 3 | Pad-to-square gray (127,127,127) | SPEC-022 | MUST | present | L0 | preprocess/pad.rs | bd-1gv.2 | gray-127 pad (mod.rs:73,479); L0 anchor GRAY_PAD==127 |
+| 4 | Crop decision (crop_mode, ≤640 both ⇒ [1,1]) | SPEC-023 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | crop decision ≤640⇒[1,1] (mod.rs:548); L0 + unit tests |
+| 5 | `dynamic_preprocess` tiling (min 2/max 32, row-major) | SPEC-024 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | dynamic_preprocess tiling (mod.rs:546-610); gundam census test |
+| 6 | `find_closest_aspect_ratio` (tie-break larger area) | SPEC-025 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | find_closest_aspect_ratio tie-break (mod.rs:637,1184); L0 |
+| 7 | crop_ratio (width_crop_num, height_crop_num) | SPEC-026 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | CropGrid (mod.rs:173,203,230); L0 |
+| 8 | Token query counts (base 16, tile 10) | SPEC-027 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | num_queries base16/tile10 (mod.rs:138); base_global_placeholder_is_273 |
+| 9 | Image-token id-stream layout (2D, 273/1024-view) | SPEC-028 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | 273/1024-view layout (mod.rs:1106); L0 anchor SLOTS_PER_1024_VIEW |
+| 10 | Non-crop branch single global block | SPEC-029 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | non-crop single global block (mod.rs:83,1251); L0 |
+| 11 | BOS prepend + images_seq_mask | SPEC-030 | MUST | present | L0 | preprocess/tile.rs, tokenizer/ | bd-1gv.3 | BOS prepend + images_seq_mask (build_prompt native_engine/mod.rs:2483); L4 + L2 inputs_embeds |
+| 12 | Image tensor packing `images=[(crop,ori)]` | SPEC-031 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | views() tiles-then-global packing (native_engine/mod.rs:2466); L0 |
+| 13 | `valid_img_tokens` accounting (metric only) | SPEC-032 | MAY | excluded | n/a | — | — | (unchanged; §16 coverage debt — metric-only, not in the forward) |
+| 14 | Multi-image path (infer_multi, no-crop) | SPEC-033 | MUST | partial | L5 | orchestrator.rs, connector.rs | bd-1gv.25 | no-crop multi-image connector assembly implemented + unit-tested (connector.rs:804); L5 cross-page e2e honestly gated (MR-2-live gated, OQ-13) |
+| 15 | Prompt `plain` template (empty sep/roles) | SPEC-034 | MUST | present | L4 | tokenizer/, preprocess/tile.rs | bd-1gv.1 | plain template, empty sep/roles (native_engine/mod.rs:125); L4 |
+| 16 | Prompt split on `<image>` (add_special_tokens=False) | SPEC-035 | MUST | present | L0 | tokenizer/ | bd-1gv.1 | split on <image> add_special=False (tokenizer/mod.rs:532); L0/L4 + tokenizer conformance |
+| 17 | Roles `<\|User\|>`/`<\|Assistant\|>` (absent in plain output) | SPEC-036 | SHOULD | present | L4 | tokenizer/ | bd-1gv.1 | roles absent in plain output (native_engine/mod.rs:126); L4 |
+| 18 | Bicubic image resize (aspect-preserving) | SPEC-021/024 | MUST | present | L0 | preprocess/resize.rs | bd-1gv.2 | Pillow-exact bicubic (preprocess/pil_resample.rs); L0 exact under FOCR_RESAMPLE=pil-bicubic, default within bd-30me envelope |
 
 ## 2. Modeling features — tokenizer (SPEC-019, OQ-16)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 19 | Byte-level BPE encode/decode (tokenizer.json) | UNRESOLVED-1/OQ-16 | MUST | missing | L0 | tokenizer/mod.rs | bd-1gv.1 | token-id-exact vs LlamaTokenizerFast |
-| 20 | Pre-tokenizer `Sequence` + byte-fallback + merges | OQ-16 | MUST | missing | L0 | tokenizer/mod.rs | bd-1gv.1 | base 128000 + 830 added |
-| 21 | Special tokens (bos 0/eos 1/pad/`<image>`128815/ref/det/grounding) | SPEC-014/019 | MUST | missing | L0 | tokenizer/special.rs | bd-1gv.1 | |
-| 22 | Tokenizer conformance corpus (CJK/math/code/glyphs) | OQ-16 | MUST | missing | L4 | tests/ | bd-1gv.1.1 | frozen golden id sequences |
+| 19 | Byte-level BPE encode/decode (tokenizer.json) | UNRESOLVED-1/OQ-16 | MUST | present | L0 | tokenizer/mod.rs | bd-1gv.1 | byte-level BPE encode/decode (tokenizer/mod.rs); tokenizer_conformance round-trip |
+| 20 | Pre-tokenizer `Sequence` + byte-fallback + merges | OQ-16 | MUST | present | L0 | tokenizer/mod.rs | bd-1gv.1 | pretok Sequence + byte-fallback (tokenizer/pretok.rs); conformance gate |
+| 21 | Special tokens (bos 0/eos 1/pad/`<image>`128815/ref/det/grounding) | SPEC-014/019 | MUST | present | L0 | tokenizer/special.rs | bd-1gv.1 | special ids pinned (tokenizer/mod.rs:80-115); special_id_constants tests |
+| 22 | Tokenizer conformance corpus (CJK/math/code/glyphs) | OQ-16 | MUST | present | L4 | tests/ | bd-1gv.1.1 | 14-category corpus + 49KB golden ids; conformance gate (L4) |
 
 ## 3. Modeling features — vision tower SAM (SPEC-040..046, OQ-15)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 23 | SAM build params (768/12/12, global [2,5,8,11]) | SPEC-040 | MUST | missing | L2 | vision_sam.rs | bd-1gv.5 | |
-| 24 | SAM patch-embed Conv2d k16s16 → 64×64×768 | SPEC-041 | MUST | missing | L1 | vision_sam.rs | bd-1gv.5 | im2col→GEMM |
-| 25 | SAM abs pos_embed (1,64,64,768) + bicubic interp | SPEC-042 | MUST | missing | L1 | vision_sam.rs | bd-1gv.4 | f32 bicubic build |
-| 26 | SAM window attention (window=14) | SPEC-043 | MUST | missing | L2 | vision_sam.rs | bd-1gv.6 | OQ-15 |
-| 27 | SAM global attention (blocks 2/5/8/11) | SPEC-043 | MUST | missing | L2 | vision_sam.rs | bd-1gv.6 | sdpa |
-| 28 | SAM decomposed relative-position bias | SPEC-044 | MUST | missing | L1 | vision_sam.rs | bd-1gv.6 | add_decomposed_rel_pos |
-| 29 | SAM window partition/unpartition (pad to mult) | SPEC-045 | MUST | missing | L1 | vision_sam.rs | bd-1gv.6 | |
-| 30 | SAM neck + downsample (1×1/3×3/2×stride-2) → 16×16×1024 | SPEC-046 | MUST | missing | L1 | vision_sam.rs | bd-1gv.7 | 16× compression |
-| 31 | SAM MLPBlock GELU activation | SPEC-043 | MUST | missing | L1 | nn.rs | bd-1gv.28 | distinct from quick_gelu/SiLU |
-| 32 | LayerNorm2d (vision) | SPEC-046 | MUST | missing | L1 | nn.rs | bd-1gv.7 | thin wrapper over layer_norm |
+| 23 | SAM build params (768/12/12, global [2,5,8,11]) | SPEC-040 | MUST | present | L2 | vision_sam.rs | bd-1gv.5 | SAM geometry + GLOBAL_BLOCKS (vision_sam.rs:26); L1 sam_output |
+| 24 | SAM patch-embed Conv2d k16s16 → 64×64×768 | SPEC-041 | MUST | present | L1 | vision_sam.rs | bd-1gv.5 | patch_embed conv k16s16 (vision_sam.rs + nn.rs:179); L1 |
+| 25 | SAM abs pos_embed (1,64,64,768) + bicubic interp | SPEC-042 | MUST | present | L1 | vision_sam.rs | bd-1gv.4 | abs pos_embed bicubic interp (vision_sam.rs:1404); L1 |
+| 26 | SAM window attention (window=14) | SPEC-043 | MUST | present | L2 | vision_sam.rs | bd-1gv.6 | window attention w=14 (vision_sam.rs:553,703); L1/L2 |
+| 27 | SAM global attention (blocks 2/5/8/11) | SPEC-043 | MUST | present | L2 | vision_sam.rs | bd-1gv.6 | global attention blocks 2/5/8/11 (vision_sam.rs:342); L1 |
+| 28 | SAM decomposed relative-position bias | SPEC-044 | MUST | present | L1 | vision_sam.rs | bd-1gv.6 | decomposed rel-pos bias (vision_sam.rs:867); L1 |
+| 29 | SAM window partition/unpartition (pad to mult) | SPEC-045 | MUST | present | L1 | vision_sam.rs | bd-1gv.6 | window partition/unpartition (vision_sam.rs:703); L1 (SPEC-045 via range cite) |
+| 30 | SAM neck + downsample (1×1/3×3/2×stride-2) → 16×16×1024 | SPEC-046 | MUST | present | L1 | vision_sam.rs | bd-1gv.7 | neck + net2/net3 downsample (vision_sam.rs:516-531); L1 |
+| 31 | SAM MLPBlock GELU activation | SPEC-043 | MUST | present | L1 | nn.rs | bd-1gv.28 | MLPBlock GELU (vision_sam.rs:724, nn.rs:503 + hand-computed test); L1 |
+| 32 | LayerNorm2d (vision) | SPEC-046 | MUST | present | L1 | nn.rs | bd-1gv.7 | LayerNorm2d (nn.rs:416, used in neck); L1 |
 
 ## 4. Modeling features — vision tower CLIP + bridge (SPEC-047..052, OQ-6)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 33 | CLIP build params (24/1024/16, patch 14) | SPEC-047 | MUST | missing | L2 | vision_clip.rs | bd-1gv.9 | |
-| 34 | CLIP embeddings take SAM features as patch_embeds (fused) | SPEC-048 | MUST | missing | L1 | vision_clip.rs | bd-1gv.9 | |
-| 35 | CLIP get_abs_pos bicubic interp branch | UNRESOLVED-3 | SHOULD | missing | L1 | vision_clip.rs | bd-1gv.4 | no-op at 1024 |
-| 36 | CLIP 24-layer transformer (SDPA, no causal) | SPEC-049 | MUST | missing | L2 | vision_clip.rs | bd-1gv.9 | |
-| 37 | quick_gelu `x·σ(1.702x)` | SPEC-049 | MUST | missing | L1 | nn.rs | bd-1gv.9 | build |
-| 38 | CLIP call sig `vision_model(image, sam_features)` | SPEC-050 | MUST | missing | L2 | vision_clip.rs | bd-1gv.9 | |
-| 39 | Hybrid concat(CLIP[:,1:], SAM_flat) → 2048 | SPEC-051 | MUST | missing | L2 | vision_bridge.rs | bd-1gv.10 | OQ-6 concat order |
-| 40 | Linear projector 2048→1280 | SPEC-052/016 | MUST | missing | L1 | vision_bridge.rs | bd-1gv.10 | linear_tensor_f32 |
-| 41 | Vision+ingest L0–L2 parity-ladder harness | §8.2 | MUST | missing | L2 | tests/ | bd-1gv.12 | end-to-end vision gate |
+| 33 | CLIP build params (24/1024/16, patch 14) | SPEC-047 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | CLIP 24/1024 patch14 (vision_clip.rs:68,88); L1 clip_output |
+| 34 | CLIP embeddings take SAM features as patch_embeds (fused) | SPEC-048 | MUST | present | L1 | vision_clip.rs | bd-1gv.9 | CLIP embeddings take SAM patch_embeds (vision_clip.rs:296); L1 |
+| 35 | CLIP get_abs_pos bicubic interp branch | UNRESOLVED-3 | SHOULD | partial | L1 | vision_clip.rs | bd-1gv.4 | abs_pos_for_len implemented (vision_clip.rs:834) but the bicubic branch is a no-op at 1024 — L1 exercises only pass-through |
+| 36 | CLIP 24-layer transformer (SDPA, no causal) | SPEC-049 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | 24-layer no-causal transformer (vision_clip.rs:596); L1/L2 |
+| 37 | quick_gelu `x·σ(1.702x)` | SPEC-049 | MUST | present | L1 | nn.rs | bd-1gv.9 | quick_gelu (nn.rs:517 + hand-computed test); L1 |
+| 38 | CLIP call sig `vision_model(image, sam_features)` | SPEC-050 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | vision_model(img, sam_feat) signature (vision_clip.rs:253); L1 (SPEC-050 via range) |
+| 39 | Hybrid concat(CLIP[:,1:], SAM_flat) → 2048 | SPEC-051 | MUST | present | L2 | vision_bridge.rs | bd-1gv.10 | hybrid concat CLIP[:,1:]+SAM→2048 (vision_bridge.rs:95); L1/L2 projector_output |
+| 40 | Linear projector 2048→1280 | SPEC-052/016 | MUST | present | L1 | vision_bridge.rs | bd-1gv.10 | linear projector 2048→1280 (vision_bridge.rs:146); L1/L2 |
+| 41 | Vision+ingest L0–L2 parity-ladder harness | §8.2 | MUST | present | L2 | tests/ | bd-1gv.12 | L0–L2 ladder harness armed green (parity_ladder.rs rungs) |
 
 ## 5. Modeling features — connector (SPEC-060..066)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 42 | Learned image_newline/view_seperator params | SPEC-060 | MUST | missing | L1 | connector.rs | bd-1gv.11 | randn·1/√1280 |
-| 43 | Vision-branch trigger condition | SPEC-061 | MUST | missing | L2 | connector.rs | bd-1gv.11 | prefill-only guard |
-| 44 | CROP branch `[local,global,view_sep]` arrangement | SPEC-062 | MUST | missing | L2 | connector.rs | bd-1gv.11 | per-row newline col |
-| 45 | NO-CROP branch (global + sep per image) | SPEC-063 | MUST | missing | L2 | connector.rs | bd-1gv.11 | |
-| 46 | masked_scatter into text embeds | SPEC-064 | MUST | missing | L2 | connector.rs | bd-1gv.11 | order must align |
-| 47 | inputs_embeds source (embed_tokens) | SPEC-065 | MUST | missing | L2 | decoder.rs, connector.rs | bd-1gv.14 | |
-| 48 | Ordering invariant (token layout = feature concat) | SPEC-066 | MUST | missing | L2 | connector.rs | bd-1gv.11.1 | load-bearing |
+| 42 | Learned image_newline/view_seperator params | SPEC-060 | MUST | present | L1 | connector.rs | bd-1gv.11 | learned image_newline/view_seperator (connector.rs:30); L2 inputs_embeds |
+| 43 | Vision-branch trigger condition | SPEC-061 | MUST | partial | L2 | connector.rs | bd-1gv.11 | prefill-only fusion is structural (build_inputs_embeds one-shot, native_engine/mod.rs:1817) but SPEC-061 uncited and no dedicated trigger-guard test |
+| 44 | CROP branch `[local,global,view_sep]` arrangement | SPEC-062 | MUST | partial | L2 | connector.rs | bd-1gv.11 | assemble_crop_block implemented + unit-tested (connector.rs:208) but the live L0/L2 oracle compare runs NO-CROP only (Gundam numeric parity not wired; parity_ladder.rs:1054) |
+| 45 | NO-CROP branch (global + sep per image) | SPEC-063 | MUST | present | L2 | connector.rs | bd-1gv.11 | assemble_global_block no-crop branch (connector.rs:167); L2 armed green |
+| 46 | masked_scatter into text embeds | SPEC-064 | MUST | present | L2 | connector.rs | bd-1gv.11 | masked_scatter (connector.rs:346 + order test); L2 |
+| 47 | inputs_embeds source (embed_tokens) | SPEC-065 | MUST | present | L2 | decoder.rs, connector.rs | bd-1gv.14 | inputs_embeds from embed_tokens (connector.rs:339); L2 |
+| 48 | Ordering invariant (token layout = feature concat) | SPEC-066 | MUST | present | L2 | connector.rs | bd-1gv.11.1 | ordering invariant checked in code (connector.rs:23,336,370); L2 |
 
 ## 6. Modeling features — decoder & MoE (SPEC-070..081)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 49 | Decoder stack (embed/12 layers/final norm) | SPEC-070 | MUST | missing | L2 | decoder.rs | bd-1gv.24 | |
-| 50 | RMSNorm (f32 variance, eps 1e-6) | SPEC-071 | MUST | missing | L1 | nn.rs | bd-1gv.15 | rms_norm_forward_f32 |
-| 51 | Decoder layer pre-norm residual | SPEC-072 | MUST | missing | L2 | decoder.rs | bd-1gv.24 | |
-| 52 | Attention class = SlidingWindowLlamaAttention (all 12) | SPEC-073 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | OQ-2 uniform |
-| 53 | Dense-vs-MoE per layer (0 dense, 1..11 MoE) | SPEC-074 | MUST | missing | L2 | decoder.rs, moe.rs | bd-1gv.24 | first_k_dense_replace=1 |
-| 54 | Dense MLP SwiGLU (layer 0, intermediate 6848) | SPEC-075 | MUST | missing | L2 | moe.rs | bd-1gv.20 | |
-| 55 | MoE forward (top-6 route + 2 fused shared) | SPEC-076 | MUST | missing | L2 | moe.rs | bd-1gv.19 | shared intermediate 1792 |
-| 56 | MoEGate (softmax top-6 greedy, NO renorm) | SPEC-077 | MUST | missing | L2 | moe.rs | bd-1gv.18 | norm_topk_prob=false |
-| 57 | SiLU activation (LLM/expert) | SPEC-075 | MUST | missing | L1 | nn.rs | bd-1gv.19.1 | |
-| 58 | RoPE Llama variant (theta 10000, head_dim 128) | SPEC-078 | MUST | missing | L1 | decoder.rs | bd-1gv.16 | OQ-5; NOT MLA interleave |
-| 59 | Position IDs (arange / cumsum) | SPEC-079 | MUST | missing | L2 | decoder.rs | bd-1gv.24 | |
-| 60 | 4D causal mask handling (decode=None, prefill=causal) | SPEC-080 | MUST | missing | L2 | decoder.rs, rswa.rs | bd-1gv.17 | |
-| 61 | lm_head GEMV 1280→129280 (f32) + logits.float() | SPEC-081 | MUST | missing | L3 | decoder.rs | bd-1gv.21 | non-tied |
-| 62 | Token embedding lookup (bf16-preserving index_select) | SPEC-070 | MUST | missing | L1 | decoder.rs | bd-1gv.14 | |
+| 49 | Decoder stack (embed/12 layers/final norm) | SPEC-070 | MUST | present | L2 | decoder.rs | bd-1gv.24 | 12-layer decode driver (decoder.rs:669); L4 + layer-count assert (parity_ladder.rs:1368) |
+| 50 | RMSNorm (f32 variance, eps 1e-6) | SPEC-071 | MUST | present | L1 | nn.rs | bd-1gv.15 | RMSNorm f32 var eps 1e-6 (nn.rs:400 + hand-computed test); L1 |
+| 51 | Decoder layer pre-norm residual | SPEC-072 | MUST | present | L2 | decoder.rs | bd-1gv.24 | pre-norm residual layer (decoder.rs:481); L2 |
+| 52 | Attention class = SlidingWindowLlamaAttention (all 12) | SPEC-073 | MUST | present | L2 | rswa.rs | bd-1gv.17 | R-SWA attention all 12 layers (rswa.rs; decoder.rs:8); batched_attention_parity + L2/L4 |
+| 53 | Dense-vs-MoE per layer (0 dense, 1..11 MoE) | SPEC-074 | MUST | present | L2 | decoder.rs, moe.rs | bd-1gv.24 | first_k_dense_replace=1 (moe.rs:637); L2/L4 |
+| 54 | Dense MLP SwiGLU (layer 0, intermediate 6848) | SPEC-075 | MUST | present | L2 | moe.rs | bd-1gv.20 | dense SwiGLU 6848 (moe.rs:68); chunked_prefill_parity |
+| 55 | MoE forward (top-6 route + 2 fused shared) | SPEC-076 | MUST | present | L2 | moe.rs | bd-1gv.19 | MoE top-6 + 2 fused shared experts (moe.rs); batched_moe_parity |
+| 56 | MoEGate (softmax top-6 greedy, NO renorm) | SPEC-077 | MUST | present | L2 | moe.rs | bd-1gv.18 | MoEGate softmax top-6 NO renorm (moe.rs:184 + raw-softmax tests) |
+| 57 | SiLU activation (LLM/expert) | SPEC-075 | MUST | present | L1 | nn.rs | bd-1gv.19.1 | SiLU (nn.rs:485); L1 |
+| 58 | RoPE Llama variant (theta 10000, head_dim 128) | SPEC-078 | MUST | present | L1 | decoder.rs | bd-1gv.16 | RoPE theta 10000 hd128 NEOX (decoder.rs:89); L1 + chunked_prefill qkv_with_rope |
+| 59 | Position IDs (arange / cumsum) | SPEC-079 | MUST | partial | L2 | decoder.rs | bd-1gv.24 | arange position ids implemented (decoder.rs:710), proven transitively by L4 token-exact; the cumsum/masked-position branch is absent (unneeded for unpadded v1, sub-case uncovered) |
+| 60 | 4D causal mask handling (decode=None, prefill=causal) | SPEC-080 | MUST | present | L2 | decoder.rs, rswa.rs | bd-1gv.17 | causal prefill / no-mask decode (decoder.rs + rswa.rs:22); chunked_prefill_parity causal tiling |
+| 61 | lm_head GEMV 1280→129280 (f32) + logits.float() | SPEC-081 | MUST | present | L3 | decoder.rs | bd-1gv.21 | lm_head GEMV 1280→129280 (decoder.rs); L3 rung + lmhead_shard_parity bit-identity |
+| 62 | Token embedding lookup (bf16-preserving index_select) | SPEC-070 | MUST | present | L1 | decoder.rs | bd-1gv.14 | embed_tokens bf16 index_select (decoder.rs:3684); L5 CER 0 end-to-end |
 
 ## 7. Modeling features — R-SWA ring buffer (SPEC-090..096, the centerpiece)
 
