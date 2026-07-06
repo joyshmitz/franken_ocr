@@ -31,19 +31,18 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
 | Total enumerated rows | **128** | **55** | **183** |
-| `present` | 0 † | 41 | 41 |
-| `partial` | 0 † | 11 | 11 |
-| `missing` | 124 † | 3 | 127 |
+| `present` | 115 † | 41 | 156 |
+| `partial` | 7 † | 11 | 18 |
+| `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
 | `n/a` | 0 | 0 | 0 |
 
-> † **§1–§11 statuses are still the Phase −1 seed** and known-stale: the L0–L5
-> ladder is armed all-green (see §14), which proves most modeling rows, but
-> flipping each numbered row demands per-row evidence citation — that sweep is
-> tracked as its own bead and MUST NOT be shortcut by bulk-flipping.
-> The SurfaceMatrix (§12–§15) was brought current 2026-07-06 (bd-re8.13) with
-> per-row evidence; `tests/surface_matrix.rs` locks it against enumeration
-> drift and recomputes this rollup.
+> † §1–§11 statuses were flipped from the Phase −1 seed to MEASURED values on
+> 2026-07-06 (bd-1630): three read-only evidence sweeps scored every numbered
+> row against the shipped tree and the armed-green L0–L5 ladder; each row's
+> Notes cell cites its implementation site and proving gate. The SurfaceMatrix
+> (§12–§15) was brought current the same day (bd-re8.13).
+> `tests/surface_matrix.rs` locks enumeration and recomputes this rollup.
 
 | Conformance metric | Value (Phase −1 seed) |
 |--------------------|----------------------|
