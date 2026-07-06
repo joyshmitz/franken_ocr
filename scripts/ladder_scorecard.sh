@@ -163,4 +163,9 @@ echo "ladder_scorecard: running the L0-L5 rungs (single-threaded, ordered)" >&2
 ( cd "$REPO_ROOT" && cargo test --release --test parity_ladder -- --test-threads=1 --nocapture ) 2> "$RAW" >&2 || {
   echo "ladder_scorecard: a rung FAILED — the scorecard below carries the break" >&2
 }
+# Keep the raw NDJSON beside the scorecard: the fold is a summary, the raw
+# rows are the evidence (and the only diagnostic when a rung dies pre-parity).
+if [ -n "$OUT" ]; then
+  cp "$RAW" "${OUT%.json}.raw.ndjson"
+fi
 fold "$RAW" "${OUT}"

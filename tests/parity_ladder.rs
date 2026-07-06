@@ -148,6 +148,15 @@ fn subject_model_path() -> PathBuf {
             .flatten()
             .map(|e| e.path())
             .filter(|c| c.extension().is_some_and(|x| x == "safetensors"))
+            // exFAT/macOS AppleDouble junk (`._model-*.safetensors`, 4 KB
+            // resource forks) sorts BEFORE the real shard and is a valid
+            // `.safetensors` name — skip every dotfile or the armed ladder
+            // dies on a phantom "header overruns file" (bd-re8.19 catch).
+            .filter(|c| {
+                c.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.starts_with('.'))
+            })
             .collect();
         shards.sort();
         if let Some(shard) = shards.into_iter().next() {

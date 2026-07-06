@@ -21,5 +21,6 @@
 "smolvlm2" = { kind = "regenerated-committed", script = "scripts/gen_reference_fixtures_smolvlm2.py" }
 "onechart" = { kind = "regenerated-committed", script = "scripts/gen_reference_fixtures_onechart.py" }
 "tromr" = { kind = "regenerated-committed", script = "scripts/gen_reference_fixtures_tromr.py", note = "tokenizer tables are upstream-frozen bytes" }
+"ladder_scorecard" = { kind = "regenerated-committed", script = "scripts/ladder_scorecard.sh", note = "the L0-L5 per-commit parity receipt, armed + unarmed shapes (bd-re8.19)" }
 "PROVENANCE.md" = { kind = "committed", note = "this catalogue's prose twin" }
 "MANIFEST.toml" = { kind = "committed", note = "this file" }

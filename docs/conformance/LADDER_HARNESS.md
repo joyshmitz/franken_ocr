@@ -230,6 +230,36 @@ conforms to `tests/fixtures/test_log_schema.json` — the suite's own
 `validate_event` contract test asserts that conformance, so the log contract
 cannot drift unnoticed.
 
+### 7.5 The scorecard runner (bd-re8.19) — the per-commit parity receipt
+
+`scripts/ladder_scorecard.sh` is the single entry the phase exit gates and the
+three-pillar cert call. It runs the whole ladder **in order** in one process
+(`--test-threads=1`; the rungs are named `l0_..l5_` so alphabetical == ladder
+order), captures the rungs' own NDJSON, and folds it into ONE artifact:
+
+```bash
+# Unarmed: skip-honest scorecard (all_green:false, skipped_no_model:true).
+scripts/ladder_scorecard.sh --out scorecard.json
+
+# Armed: the real receipt (env exactly as §7 above).
+FOCR_FIXTURES_DIR=... FOCR_MODEL_PATH=... scripts/ladder_scorecard.sh --out scorecard.json
+
+# Fold self-test (synthetic NDJSON; no cargo, sub-second):
+scripts/ladder_scorecard.sh --self-test
+```
+
+Scorecard schema `focr-ladder-scorecard/v1`: per-gate
+`{gate, outcome, meaningful, parity_rows, worst:{metric,value,tolerance}}` +
+`all_green` + `skipped_no_model` + a one-line `receipt` string (the per-commit
+parity receipt, e.g. `L4 token_exact_fraction=1; L5 cer=0`). Short-circuit
+semantics: every rung still RUNS, but rungs above the first failure are marked
+`not_meaningful:below_LN` so a single lower-gate break reads as ONE failure,
+not six. A skipped ladder is NEVER green: `all_green` requires
+`skipped_no_model:false`. The raw NDJSON is preserved beside `--out` (`.json`
+swapped for `.raw.ndjson`) — the fold is a summary; the rows are the evidence.
+Canonical shapes (armed all-green + unarmed skip) are committed under
+`tests/fixtures/ladder_scorecard/`.
+
 ---
 
 ## 8. Relationship to the rest of the conformance pillar
