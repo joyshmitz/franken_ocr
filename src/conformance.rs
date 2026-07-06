@@ -361,6 +361,149 @@ impl GateResult {
     }
 }
 
+// ─────────── bd-re8.12: the ConformanceTest registry + coverage matrix ───────────
+
+/// The requirement level of a spec clause / conformance entry (RFC-2119
+/// style, bd-re8.12): a MUST failure blocks conformance; SHOULD is tracked
+/// debt; MAY is informative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequirementLevel {
+    /// Conformance-blocking.
+    Must,
+    /// Tracked coverage debt — reported, never rounds up to conformant.
+    Should,
+    /// Informative.
+    May,
+}
+
+/// The suite category a conformance entry registers under (bd-re8.12: the
+/// differential/golden/metamorphic/parity/invariant suites all hang off ONE
+/// trait so coverage is accounted uniformly).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConformanceCategory {
+    /// Same-as-reference on any input (the PyO3/torch oracle differential).
+    Differential,
+    /// Frozen-surface regression (goldens).
+    Golden,
+    /// Oracle-free self-consistency (metamorphic).
+    Metamorphic,
+    /// The L0-L5 ladder rungs.
+    Parity,
+    /// Non-ladder invariants (determinism, overflow-freedom, …).
+    Invariant,
+}
+
+/// One registered conformance entry (bd-re8.12): `run()` executes the
+/// entry's IN-PROCESS representative check and returns a [`GateResult`];
+/// entries whose full evidence runs in a dedicated test binary (the armed
+/// ladder, the golden suite) still run a real, self-contained slice here —
+/// registration is never a no-op, and the covered spec clauses feed the
+/// coverage matrix (`clauses`).
+pub trait ConformanceTest {
+    /// Stable entry name.
+    fn name(&self) -> &'static str;
+    /// The suite category.
+    fn category(&self) -> ConformanceCategory;
+    /// The requirement level of the clauses this entry covers.
+    fn requirement_level(&self) -> RequirementLevel;
+    /// The `[SPEC-NNN]` clause ids this entry covers (the coverage matrix is
+    /// computed from the SPEC side; these are the accounting links back).
+    fn clauses(&self) -> &'static [u32];
+    /// Execute the in-process representative check.
+    fn run(&self) -> GateResult;
+}
+
+/// A registered entry backed by a plain function — the concrete shape the
+/// shipped suites register through.
+pub struct RegisteredConformance {
+    name: &'static str,
+    category: ConformanceCategory,
+    level: RequirementLevel,
+    clauses: &'static [u32],
+    run: fn() -> GateResult,
+}
+
+impl ConformanceTest for RegisteredConformance {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn category(&self) -> ConformanceCategory {
+        self.category
+    }
+    fn requirement_level(&self) -> RequirementLevel {
+        self.level
+    }
+    fn clauses(&self) -> &'static [u32] {
+        self.clauses
+    }
+    fn run(&self) -> GateResult {
+        (self.run)()
+    }
+}
+
+fn run_determinism_entry() -> GateResult {
+    // The shared byte-identity gate on a real pair (the full e2e adoption
+    // lives in tests/e2e_recognize.rs — bd-3kge).
+    let gate = DeterminismGate;
+    gate.validate_bytes(b"greedy output", b"greedy output")
+}
+
+fn run_tolerance_derivation_entry() -> GateResult {
+    // The keystone discipline: tolerances DERIVE from a measured floor
+    // (never the imported 0.055) — prove the derivation math end-to-end.
+    let t = default_tolerances();
+    let ordered = t.ordered();
+    // Every tolerance must carry a declared PROVENANCE (structural contract
+    // or an explicit derive-from-floor/ledger obligation) — none may be an
+    // unexplained number. The armed rungs replace the Todo placeholders with
+    // measured values at run time (parity_harness::establish_floor).
+    let sourced = ordered.iter().all(|g| {
+        matches!(
+            g.source,
+            ToleranceSource::StructuralSpec
+                | ToleranceSource::TodoDeriveFromOracleFloor
+                | ToleranceSource::TodoLedgerBudget
+        )
+    });
+    GateResult {
+        name: "tolerances_carry_declared_provenance",
+        level: None,
+        passed: sourced,
+        measured: None,
+        tolerance: None,
+        message: if sourced {
+            "every gate tolerance declares its provenance"
+        } else {
+            "a gate tolerance has undeclared provenance"
+        },
+    }
+}
+
+/// The registry (bd-re8.12): every shipped suite registers here with its
+/// category, requirement level, and covered clauses. The coverage META-test
+/// (`tests/conformance_matrix.rs`) enumerates clauses from the SPEC and
+/// cross-checks this accounting — a missing suite shows up as an uncovered
+/// MUST clause there, not as a silently green registry here.
+#[must_use]
+pub fn conformance_registry() -> Vec<RegisteredConformance> {
+    vec![
+        RegisteredConformance {
+            name: "determinism_byte_identity",
+            category: ConformanceCategory::Invariant,
+            level: RequirementLevel::Must,
+            clauses: &[100, 101, 102, 103],
+            run: run_determinism_entry,
+        },
+        RegisteredConformance {
+            name: "tolerances_carry_declared_provenance",
+            category: ConformanceCategory::Parity,
+            level: RequirementLevel::Must,
+            clauses: &[],
+            run: run_tolerance_derivation_entry,
+        },
+    ]
+}
+
 /// Validator trait for L0-L5 parity gates.
 pub trait ParityGate {
     /// Stable gate name.

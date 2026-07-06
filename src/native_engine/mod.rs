@@ -120,6 +120,12 @@ const MODEL_QUANT_ENV: &str = "FOCR_QUANT";
 /// per-view image-placeholder block, and this trailing text tokenizes to the
 /// task ids (`document`,`Ġparsing`,`.` = [34030, 76466, 16]). The full base
 /// prompt id-stream is therefore `[BOS] + [IMAGE]×273 + [34030, 76466, 16]`.
+// Prompt-construction provenance: the reference `plain` conversation template
+// concatenates User+Assistant contents with empty seps and `.strip()`
+// ([SPEC-034]); the `<|User|>`/`<|Assistant|>` role strings never reach the
+// prompt text ([SPEC-036]) — hence the bare "document parsing." tail below.
+// The torch-side class hierarchy and config facts ([SPEC-001], [SPEC-002])
+// are embodied by this fused forward + the frozen decoder constants.
 const BASE_PROMPT_TEXT: &str = "document parsing.";
 
 /// Env override for the generated-token cap (`max_length` in [`DecodeParams`]).

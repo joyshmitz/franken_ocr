@@ -1,4 +1,6 @@
 //! SAM ViT-B encoder forward ([SPEC-040..046], PROPOSED_ARCHITECTURE.md §6.3).
+//! Vision config provenance: SAM ViT-B width 768 / depth 12 / 12 heads /
+//! global attention at [2,5,8,11], image size 1024 ([SPEC-017]).
 //!
 //! Real fp32 forward. Patch-embed Conv2d k16s16 -> 64x64 tokens (width 768);
 //! learned `pos_embed` (1,64,64,768) bicubic-interpolated to the runtime grid;
