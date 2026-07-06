@@ -36,6 +36,7 @@ pub mod smolvlm2;
 pub(crate) mod spec;
 pub mod tensor;
 pub mod token_compress;
+pub mod tromr;
 pub mod vision_bridge;
 pub mod vision_clip;
 pub mod vision_sam;

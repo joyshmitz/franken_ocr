@@ -203,6 +203,89 @@ pub fn conv2d(
     )
 }
 
+/// TF-'SAME' padding amounts for ONE dimension (timm `padding.py`, E3/A8 —
+/// tromr-spec §2a): `total = max((ceil(i/s)−1)·s + k − i, 0)`, split
+/// `begin = total/2`, `end = total − begin` (right/bottom gets the extra —
+/// the asymmetry that plain symmetric padding cannot express; stem 7×7 s2 at
+/// H=128 pads 2 top / 3 bottom).
+#[must_use]
+pub fn tf_same_pad_amounts(i: usize, k: usize, s: usize) -> (usize, usize) {
+    let total = (i.div_ceil(s) - 1) * s + k;
+    let total = total.saturating_sub(i);
+    (total / 2, total - total / 2)
+}
+
+/// Pad a flat NCHW tensor per TF-'SAME' for a `(kh, kw, sh, sw)` op, filling
+/// with `fill` (`0.0` before [`conv2d`]; `f32::NEG_INFINITY` before
+/// [`max_pool2d`] — timm `MaxPool2dSame` pads with −∞ so border maxima are
+/// never fabricated from zeros). Returns `(padded, ph, pw)`; the SAME output
+/// dims are `ceil(h/sh) × ceil(w/sw)`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn tf_same_pad(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    h: usize,
+    w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    fill: f32,
+) -> (Vec<f32>, usize, usize) {
+    let (top, bottom) = tf_same_pad_amounts(h, kh, sh);
+    let (left, right) = tf_same_pad_amounts(w, kw, sw);
+    let (ph, pw) = (h + top + bottom, w + left + right);
+    let mut out = vec![fill; batch * ch * ph * pw];
+    for bc in 0..batch * ch {
+        let src = &input[bc * h * w..(bc + 1) * h * w];
+        let dst = &mut out[bc * ph * pw..(bc + 1) * ph * pw];
+        for row in 0..h {
+            let d = (row + top) * pw + left;
+            dst[d..d + w].copy_from_slice(&src[row * w..(row + 1) * w]);
+        }
+    }
+    (out, ph, pw)
+}
+
+/// Max-pool `k×k` stride `s` over a PRE-PADDED flat NCHW tensor (pair with
+/// [`tf_same_pad`] using a `NEG_INFINITY` fill for the timm `MaxPool2dSame`
+/// semantics — tromr-spec §2a stem `MaxPool2dSame(k3, s2)`). `(oh, ow)` are
+/// the output spatial dims. Tight scalar loops (doctrine #3).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool2d(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    k: usize,
+    s: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f32> {
+    let mut out = vec![f32::NEG_INFINITY; batch * ch * oh * ow];
+    for bc in 0..batch * ch {
+        let src = &input[bc * ph * pw..(bc + 1) * ph * pw];
+        let dst = &mut out[bc * oh * ow..(bc + 1) * oh * ow];
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut m = f32::NEG_INFINITY;
+                for ky in 0..k {
+                    let row = oy * s + ky;
+                    for kx in 0..k {
+                        m = m.max(src[row * pw + ox * s + kx]);
+                    }
+                }
+                dst[oy * ow + ox] = m;
+            }
+        }
+    }
+    out
+}
+
 /// In-place GroupNorm (+ optional fused ReLU) over a flat NCHW tensor — the
 /// TrOMR/pix2tex ResNetV2 backbone norm (E3/A8; tromr-spec §2a:
 /// `GroupNormAct(num_groups=32, eps=1e-5)`, groups of 2 even at 64 channels;
@@ -788,6 +871,72 @@ mod tests {
         group_norm(&mut fused, 2, 6, 6, 3, 1e-5, &weight, &bias, true).unwrap();
         let clamped: Vec<f32> = x.iter().map(|v| v.max(0.0)).collect();
         assert_eq!(fused, clamped, "fused ReLU must equal unfused + clamp");
+    }
+
+    /// TF-'SAME' pad arithmetic vs the timm `padding.py` formula — every case
+    /// the TrOMR backbone hits (tromr-spec §2a).
+    #[test]
+    fn tf_same_pad_amounts_match_timm() {
+        // Stem 7×7 s2 at H=128: total 5 → 2 top / 3 bottom (the spec's example).
+        assert_eq!(tf_same_pad_amounts(128, 7, 2), (2, 3));
+        assert_eq!(tf_same_pad_amounts(1280, 7, 2), (2, 3));
+        // 3×3 s1 → symmetric 1/1 at any size; 1×1 anything → 0/0.
+        assert_eq!(tf_same_pad_amounts(37, 3, 1), (1, 1));
+        assert_eq!(tf_same_pad_amounts(64, 1, 1), (0, 0));
+        assert_eq!(tf_same_pad_amounts(64, 1, 2), (0, 0));
+        // k3 s2: even i → total 1 (asymmetric 0/1), odd i → total 2 (1/1).
+        assert_eq!(tf_same_pad_amounts(6, 3, 2), (0, 1));
+        assert_eq!(tf_same_pad_amounts(9, 3, 2), (1, 1));
+    }
+
+    /// tf_same_pad(−∞) + max_pool2d vs a timm-`pad_same` + `F.max_pool2d`
+    /// oracle golden (torch 2.12.1, 2026-07-05): x = cos(0.37·arange) over
+    /// (1,2,6,9), k3 s2 → padded (7,11), out (3,5). H pads 0/1 (asymmetric),
+    /// W pads 1/1 — the dynamic-SAME case a fixed pad cannot express.
+    #[test]
+    fn max_pool2d_same_matches_timm_golden() {
+        let x: Vec<f32> = (0..2 * 6 * 9).map(|i| (i as f32 * 0.37).cos()).collect();
+        const Y: [f32; 30] = [
+            1.0, 0.9323273, 0.4507553, 0.93477, 0.9999768, 0.9298415, 0.7338563, 0.7475899,
+            0.9999071, 0.9999071, 0.7292103, 0.4628793, 0.9395249, 0.999791, 0.9247403, 0.4262586,
+            0.7565722, 0.9996285, 0.9996285, 0.7198165, 0.4749172, 0.9441053, 0.9994195, 0.9194672,
+            0.4138885, 0.7654141, 0.9991641, 0.9991641, 0.7102889, 0.1313064,
+        ];
+        let (padded, ph, pw) = tf_same_pad(&x, 1, 2, 6, 9, 3, 3, 2, 2, f32::NEG_INFINITY);
+        assert_eq!((ph, pw), (7, 11), "padded dims match timm pad_same");
+        let y = max_pool2d(&padded, 1, 2, ph, pw, 3, 2, 3, 5);
+        assert_eq!(y.len(), Y.len());
+        let maxabs = y
+            .iter()
+            .zip(Y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxabs <= 1e-6, "vs timm golden: maxabs {maxabs}");
+        // No output may be −∞ (the pad fill must never win a real window).
+        assert!(
+            y.iter().all(|v| v.is_finite()),
+            "pool output must be finite"
+        );
+    }
+
+    /// The zero-fill pad path composes with `conv2d` at the stem geometry:
+    /// 128×1280 k7 s2 pads to 133×1285 (timm golden shape) and convolves to
+    /// the SAME output 64×640.
+    #[test]
+    fn tf_same_pad_stem_geometry_composes_with_conv2d() {
+        let (h, w) = (128usize, 1280usize);
+        let x = vec![1.0f32; h * w];
+        let (padded, ph, pw) = tf_same_pad(&x, 1, 1, h, w, 7, 7, 2, 2, 0.0);
+        assert_eq!((ph, pw), (133, 1285), "timm pad_same golden shape");
+        // A 7×7 all-ones kernel over an all-ones interior: the CENTER output
+        // (away from every border) must sum to exactly 49.
+        let weight = vec![1.0f32; 7 * 7];
+        let (oh, ow) = (h.div_ceil(2), w.div_ceil(2));
+        let y = conv2d(&padded, &weight, None, 1, 1, ph, pw, 7, 7, oh, ow, 2, 2, 1);
+        assert_eq!(y.len(), oh * ow);
+        assert_eq!(y[(oh / 2) * ow + ow / 2], 49.0, "interior window sums 7×7");
+        // The top-left output sees the 2-top/2-left pad: 5×5 real ones = 25.
+        assert_eq!(y[0], 25.0, "corner window is 5×5 real after 2/3-2/3 pads");
     }
 
     #[test]
