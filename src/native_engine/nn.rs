@@ -203,6 +203,83 @@ pub fn conv2d(
     )
 }
 
+/// In-place GroupNorm (+ optional fused ReLU) over a flat NCHW tensor — the
+/// TrOMR/pix2tex ResNetV2 backbone norm (E3/A8; tromr-spec §2a:
+/// `GroupNormAct(num_groups=32, eps=1e-5)`, groups of 2 even at 64 channels;
+/// the `norm3`/downsample instances skip the activation, hence `fuse_relu`).
+///
+/// Torch `nn.GroupNorm` semantics: per `(batch, group)`, mean and POPULATION
+/// variance over the group's `(channels/groups) × spatial` elements, then the
+/// per-CHANNEL affine `y = (x − μ)/√(σ² + eps) · γ_c + β_c`. First GroupNorm
+/// in the repo (Baidu/GOT/SmolVLM2/OneChart are LayerNorm/RMSNorm only).
+/// Tight scalar loops — LLVM autovectorizes (doctrine #3).
+///
+/// # Errors
+/// Shape violations: `channels % groups != 0`, a length mismatch on `x`
+/// (`batch·channels·spatial`) or on `weight`/`bias` (`channels`).
+#[allow(clippy::too_many_arguments)]
+pub fn group_norm(
+    x: &mut [f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    groups: usize,
+    eps: f32,
+    weight: &[f32],
+    bias: &[f32],
+    fuse_relu: bool,
+) -> FocrResult<()> {
+    if groups == 0 || !channels.is_multiple_of(groups) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: channels {channels} not divisible by groups {groups}"
+        )));
+    }
+    if x.len() != batch * channels * spatial {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: x len {} != batch {batch} * channels {channels} * spatial {spatial}",
+            x.len()
+        )));
+    }
+    if weight.len() != channels || bias.len() != channels {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: weight/bias len {}/{} != channels {channels}",
+            weight.len(),
+            bias.len()
+        )));
+    }
+    let cpg = channels / groups;
+    let group_len = cpg * spatial;
+    for b in 0..batch {
+        for g in 0..groups {
+            let start = (b * channels + g * cpg) * spatial;
+            let slice = &mut x[start..start + group_len];
+            // Population mean/variance in f64 accumulation (spatial × cpg can
+            // reach 64·80·8 = 40960 elements — f32 running sums drift).
+            let mut sum = 0.0f64;
+            for &v in slice.iter() {
+                sum += f64::from(v);
+            }
+            let mean = sum / group_len as f64;
+            let mut var = 0.0f64;
+            for &v in slice.iter() {
+                let d = f64::from(v) - mean;
+                var += d * d;
+            }
+            let var = var / group_len as f64;
+            let inv = 1.0 / (var + f64::from(eps)).sqrt();
+            let (mean, inv) = (mean as f32, inv as f32);
+            for c in 0..cpg {
+                let (gamma, beta) = (weight[g * cpg + c], bias[g * cpg + c]);
+                for v in &mut slice[c * spatial..(c + 1) * spatial] {
+                    let y = (*v - mean) * inv * gamma + beta;
+                    *v = if fuse_relu { y.max(0.0) } else { y };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Scaled dot-product attention forward (`sdpa_forward_f32`).
 ///
 /// `q/k/v` are flat, head-major: `q` is `[num_bh, seq_q, d_k]`, `k` is
@@ -662,5 +739,71 @@ mod tests {
 
         let again = linear_int8_dynamic(&x, &w, None).unwrap();
         assert_eq!(y, again, "dynamic activation quant must be byte-identical");
+    }
+
+    /// group_norm vs a torch `nn.GroupNorm(3, 6, eps=1e-5)` oracle golden —
+    /// B2×C6×H2×W3, groups of 2 (the same family as TrOMR's GN32-over-64ch).
+    /// Generated 2026-07-05 in the pinned zoo venv (torch 2.12.1):
+    /// `x = sin(0.13·arange)`, `γ = linspace(0.5,1.5,6)`, `β = linspace(-0.2,0.2,6)`.
+    #[test]
+    fn group_norm_matches_torch_golden() {
+        const X: [f32; 72] = [
+            0.0, 0.1296341, 0.2570806, 0.3801884, 0.4968801, 0.6051864, 0.7032794, 0.7895037,
+            0.8624042, 0.9207506, 0.9635582, 0.9901046, 0.9999417, 0.9929036, 0.9691092, 0.9289597,
+            0.873133, 0.8025711, 0.7184649, 0.6222337, 0.5155014, 0.4000695, 0.277886, 0.1510129,
+            0.0215911, -0.1081951, -0.2361552, -0.3601299, -0.4780271, -0.5878571, -0.6877661,
+            -0.7760682, -0.8512733, -0.9121122, -0.957558, -0.9868438, -0.9994755, -0.9952398,
+            -0.9742084, -0.9367359, -0.8834547, -0.8152643, -0.7333152, -0.6389909, -0.5338824,
+            -0.4197641, -0.2985622, -0.1723212, -0.0431721, 0.0867056, 0.21512, 0.3399035,
+            0.4589513, 0.5702536, 0.6719319, 0.7622709, 0.8397455, 0.9030485, 0.9511114, 0.983123,
+            0.9985433, 0.997112, 0.9788533, 0.9440752, 0.8933646, 0.8275774, 0.7478238, 0.6554497,
+            0.5520141, 0.4392635, 0.3190989, 0.1935491,
+        ];
+        const Y: [f32; 72] = [
+            -1.1128683, -0.9128186, -0.716145, -0.5261666, -0.3460895, -0.1789526, 0.1213925,
+            0.3076768, 0.4651756, 0.5912306, 0.6837148, 0.7410672, 0.9592738, 0.9367534, 0.8606158,
+            0.7321458, 0.5535116, 0.3277276, 0.1605169, -0.2158298, -0.6332453, -1.084684,
+            -1.5625268, -2.0587103, 2.4798393, 1.9679233, 1.4632101, 0.9742165, 0.509194,
+            0.0759915, -0.305477, -0.7073503, -1.0496179, -1.3265028, -1.5333323, -1.6666154,
+            -0.7448562, -0.7371473, -0.6988704, -0.6306711, -0.5337003, -0.4095948, -0.2046283,
+            0.0357078, 0.3035217, 0.5942926, 0.9031123, 1.2247713, -1.6645347, -1.3156482,
+            -0.9706925, -0.6354902, -0.3156959, -0.0167077, 0.4023003, 0.6989031, 0.9532693,
+            1.1611068, 1.3189077, 1.424009, 1.5083864, 1.5014455, 1.4129068, 1.2442629, 0.9983606,
+            0.6793492, 0.3991693, -0.1176782, -0.6964164, -1.3272738, -1.9996133, -2.7020838,
+        ];
+        let weight: Vec<f32> = (0..6).map(|i| 0.5 + i as f32 * 0.2).collect();
+        let bias: Vec<f32> = (0..6).map(|i| -0.2 + i as f32 * 0.08).collect();
+
+        let mut x = X.to_vec();
+        group_norm(&mut x, 2, 6, 6, 3, 1e-5, &weight, &bias, false).unwrap();
+        let maxabs = x
+            .iter()
+            .zip(Y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxabs <= 2e-6, "vs torch golden: maxabs {maxabs}");
+
+        // Fused ReLU == unfused + clamp (and matches the oracle's relu(y)).
+        let mut fused = X.to_vec();
+        group_norm(&mut fused, 2, 6, 6, 3, 1e-5, &weight, &bias, true).unwrap();
+        let clamped: Vec<f32> = x.iter().map(|v| v.max(0.0)).collect();
+        assert_eq!(fused, clamped, "fused ReLU must equal unfused + clamp");
+    }
+
+    #[test]
+    fn group_norm_rejects_bad_shapes() {
+        let w = vec![1.0f32; 6];
+        let b = vec![0.0f32; 6];
+        // channels not divisible by groups
+        let mut x = vec![0.0f32; 2 * 6 * 6];
+        assert!(group_norm(&mut x, 2, 6, 6, 4, 1e-5, &w, &b, false).is_err());
+        // zero groups
+        assert!(group_norm(&mut x, 2, 6, 6, 0, 1e-5, &w, &b, false).is_err());
+        // x length mismatch
+        let mut short = vec![0.0f32; 5];
+        assert!(group_norm(&mut short, 2, 6, 6, 3, 1e-5, &w, &b, false).is_err());
+        // weight/bias length mismatch
+        let mut x2 = vec![0.0f32; 2 * 6 * 6];
+        assert!(group_norm(&mut x2, 2, 6, 6, 3, 1e-5, &w[..4], &b, false).is_err());
     }
 }
