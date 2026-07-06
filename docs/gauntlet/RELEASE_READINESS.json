@@ -1,0 +1,88 @@
+{
+ "artifact": "franken_ocr.release_readiness.v1",
+ "blocking_cells": [
+  "agent_ergonomics",
+  "doctor",
+  "certification_bundle",
+  "gauntlet_convergence"
+ ],
+ "cells": [
+  {
+   "cell": "parity_l0_l5",
+   "detail": "L0 max_abs_diff=0.0078432; L1 cosine=1; L2 max_abs_diff=8.76188e-05; L3 cosine=1; L4 token_exact_fraction=1; L5 cer=0",
+   "evidence": "tests/fixtures/ladder_scorecard/scorecard_armed.json",
+   "status": "green"
+  },
+  {
+   "cell": "surface_parity",
+   "detail": "missing MUST rows: none; partial MUST rows (enumerated debt): 4",
+   "evidence": "docs/FEATURE_PARITY.md \u00a712-\u00a715 (lock: tests/surface_matrix.rs)",
+   "status": "green"
+  },
+  {
+   "cell": "perf_vs_reference",
+   "detail": "check_ledgers exit 0; gauntlet ratio rows present: True",
+   "evidence": "docs/PERF_LEDGER.md + scripts/check_ledgers.py",
+   "status": "green"
+  },
+  {
+   "cell": "determinism",
+   "detail": "obs=1 e=0.001 rejected=None",
+   "evidence": "docs/gauntlet/EPROCESS_STATE.json (INV-DETERMINISM)",
+   "status": "green"
+  },
+  {
+   "cell": "deadlock_watchdog",
+   "detail": "armed capacity cert p50/p95/p99 = 6.83/7.41/9.58 s/page (bd-re8.18)",
+   "evidence": "tests/many_pages_without_deadlock.rs (+ cancel_and_panic_faults.rs)",
+   "status": "green"
+  },
+  {
+   "cell": "robot_schema",
+   "evidence": "tests/fixtures/robot_schema_v1.json + runs_schema.json (tests: cli_robot_golden, surface_matrix)",
+   "status": "green"
+  },
+  {
+   "cell": "build_matrix",
+   "detail": "release-history cell; re-verified at each release cut",
+   "evidence": "v0.3.0 GH release (tag f4796b3): darwin x2, linux x2, win-msvc + shasum sidecars",
+   "status": "green"
+  },
+  {
+   "cell": "installer",
+   "evidence": "install.sh (+ published checksum sidecars per release)",
+   "status": "green"
+  },
+  {
+   "cell": "ledger_completeness",
+   "detail": "exit 0",
+   "evidence": "scripts/check_ledgers.py over DISCREPANCIES.md + NEGATIVE_EVIDENCE.md + PERF_LEDGER.md",
+   "status": "green"
+  },
+  {
+   "cell": "agent_ergonomics",
+   "evidence": "bd-wp8.7 OPEN: audit + apply pass not yet documented",
+   "status": "red"
+  },
+  {
+   "cell": "doctor",
+   "evidence": "bd-wp8.4/.4.1 OPEN: idempotent/reversible fixture suite not yet shipped",
+   "status": "red"
+  },
+  {
+   "cell": "certification_bundle",
+   "evidence": "bd-wp8.9 OPEN: FINAL_GAUNTLET_REPORT + bundle JSONs not yet produced",
+   "status": "red"
+  },
+  {
+   "cell": "gauntlet_convergence",
+   "detail": "rounds=0/10, tail_clean=False",
+   "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
+   "status": "red"
+  }
+ ],
+ "generated_by": "scripts/gauntlet_cert.py --release-readiness",
+ "green": 9,
+ "red": 4,
+ "ship": false
+}

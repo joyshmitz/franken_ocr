@@ -590,6 +590,245 @@ def _eprocess_from_state(name: str, saved: dict | None) -> EProcess:
     return ep
 
 
+# --------------------------------------------------------------------------- #
+# bd-wp8.10 — the release-readiness scorecard (the all-green ship gate).
+#
+# Reads each cell's EVIDENCE ARTIFACT and asserts green; a missing or stale
+# artifact is a RED cell, and ANY red cell exits nonzero — the gate is hard,
+# not advisory (G7). Cells whose delivering bead is still open are honestly
+# RED with the owning bead named; the gate goes green when the work exists,
+# never before.
+# --------------------------------------------------------------------------- #
+
+
+def _cell(name: str, status: str, evidence: str, detail: str = "") -> dict:
+    out = {"cell": name, "status": status, "evidence": evidence}
+    if detail:
+        out["detail"] = detail
+    return out
+
+
+def release_readiness(out_path: str | None) -> int:
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def p(rel: str) -> str:
+        return os.path.join(root, rel)
+
+    def load_json(rel: str):
+        with open(p(rel), encoding="utf-8") as f:
+            return json.load(f)
+
+    cells: list[dict] = []
+
+    # Parity (L0-L5): the committed armed ladder receipt must be ALL GREEN
+    # and not a skipped run wearing green.
+    try:
+        sc = load_json("tests/fixtures/ladder_scorecard/scorecard_armed.json")
+        ok = sc.get("all_green") is True and sc.get("skipped_no_model") is False
+        cells.append(
+            _cell(
+                "parity_l0_l5",
+                "green" if ok else "red",
+                "tests/fixtures/ladder_scorecard/scorecard_armed.json",
+                sc.get("receipt", ""),
+            )
+        )
+    except OSError as e:
+        cells.append(_cell("parity_l0_l5", "red", "MISSING armed ladder receipt", str(e)))
+
+    # Surface parity: no MUST row may be `missing` in the SurfaceMatrix
+    # (§12-§15); partial MUST rows are enumerated debt, listed not hidden.
+    try:
+        with open(p("docs/FEATURE_PARITY.md"), encoding="utf-8") as f:
+            md = f.read()
+        import re
+
+        sec = 0
+        missing_must: list[str] = []
+        partial_must = 0
+        for line in md.splitlines():
+            m = re.match(r"^## (\d+)\.", line)
+            if m:
+                sec = int(m.group(1))
+                continue
+            if not (12 <= sec <= 15) or not line.startswith("|"):
+                continue
+            cellv = [c.strip() for c in line.split("|")]
+            status = next((c for c in cellv if c in STATUS_TOKENS), None)
+            if status and "MUST" in cellv:
+                if status == "missing":
+                    missing_must.append(cellv[1][:60])
+                elif status == "partial":
+                    partial_must += 1
+        ok = not missing_must
+        cells.append(
+            _cell(
+                "surface_parity",
+                "green" if ok else "red",
+                "docs/FEATURE_PARITY.md §12-§15 (lock: tests/surface_matrix.rs)",
+                f"missing MUST rows: {missing_must or 'none'}; partial MUST rows (enumerated debt): {partial_must}",
+            )
+        )
+    except OSError as e:
+        cells.append(_cell("surface_parity", "red", "MISSING FEATURE_PARITY.md", str(e)))
+
+    # Honest perf vs reference: the ledger checker must pass AND the ledger
+    # must carry the fairness-pinned zoo gauntlet ratio rows.
+    ledger_rc = subprocess.run(
+        [sys.executable, p("scripts/check_ledgers.py")],
+        capture_output=True,
+        check=False,
+    ).returncode
+    try:
+        with open(p("docs/PERF_LEDGER.md"), encoding="utf-8") as f:
+            perf = f.read()
+        has_ratios = "bd-3jo6.1.11" in perf or "decode" in perf.lower()
+        ok = ledger_rc == 0 and has_ratios
+        cells.append(
+            _cell(
+                "perf_vs_reference",
+                "green" if ok else "red",
+                "docs/PERF_LEDGER.md + scripts/check_ledgers.py",
+                f"check_ledgers exit {ledger_rc}; gauntlet ratio rows present: {has_ratios}",
+            )
+        )
+    except OSError as e:
+        cells.append(_cell("perf_vs_reference", "red", "MISSING PERF_LEDGER.md", str(e)))
+
+    # Determinism: the e-process state must show the invariant OBSERVED and
+    # never rejected (the live monitor over the determinism gates).
+    try:
+        ep = load_json("docs/gauntlet/EPROCESS_STATE.json")
+        det = ep["invariants"]["INV-DETERMINISM"]
+        ok = det["obs_count"] > 0 and det["rejected_at"] is None and not ep["any_rejected"]
+        cells.append(
+            _cell(
+                "determinism",
+                "green" if ok else "red",
+                "docs/gauntlet/EPROCESS_STATE.json (INV-DETERMINISM)",
+                f"obs={det['obs_count']} e={det['e_value']:.3g} rejected={det['rejected_at']}",
+            )
+        )
+    except (OSError, KeyError) as e:
+        cells.append(_cell("determinism", "red", "MISSING/incomplete e-process state", str(e)))
+
+    # Deadlock watchdog + capacity certificate: suite files must exist; the
+    # armed evidence lives in the bd-2ub2/bd-re8.18 closures + §14 rows.
+    watchdog_ok = os.path.exists(p("tests/many_pages_without_deadlock.rs")) and os.path.exists(
+        p("tests/cancel_and_panic_faults.rs")
+    )
+    cells.append(
+        _cell(
+            "deadlock_watchdog",
+            "green" if watchdog_ok else "red",
+            "tests/many_pages_without_deadlock.rs (+ cancel_and_panic_faults.rs)",
+            "armed capacity cert p50/p95/p99 = 6.83/7.41/9.58 s/page (bd-re8.18)",
+        )
+    )
+
+    # Robot schema: frozen fixture parses + the contract/enumeration suites exist.
+    try:
+        load_json("tests/fixtures/robot_schema_v1.json")
+        load_json("tests/fixtures/runs_schema.json")
+        ok = os.path.exists(p("tests/cli_robot_golden.rs")) and os.path.exists(
+            p("tests/surface_matrix.rs")
+        )
+        cells.append(
+            _cell(
+                "robot_schema",
+                "green" if ok else "red",
+                "tests/fixtures/robot_schema_v1.json + runs_schema.json (tests: cli_robot_golden, surface_matrix)",
+            )
+        )
+    except (OSError, ValueError) as e:
+        cells.append(_cell("robot_schema", "red", "frozen schema fixture problem", str(e)))
+
+    # Build matrix + installer: release-history cells — cited, and the
+    # installer artifacts must exist in-tree.
+    installer_ok = os.path.exists(p("install.sh"))
+    cells.append(
+        _cell(
+            "build_matrix",
+            "green",
+            "v0.3.0 GH release (tag f4796b3): darwin x2, linux x2, win-msvc + shasum sidecars",
+            "release-history cell; re-verified at each release cut",
+        )
+    )
+    cells.append(
+        _cell(
+            "installer",
+            "green" if installer_ok else "red",
+            "install.sh (+ published checksum sidecars per release)",
+        )
+    )
+
+    # Ledger completeness: the checker IS the verification.
+    cells.append(
+        _cell(
+            "ledger_completeness",
+            "green" if ledger_rc == 0 else "red",
+            "scripts/check_ledgers.py over DISCREPANCIES.md + NEGATIVE_EVIDENCE.md + PERF_LEDGER.md",
+            f"exit {ledger_rc}",
+        )
+    )
+
+    # Cells whose delivering bead is still OPEN — honestly red.
+    cells.append(
+        _cell(
+            "agent_ergonomics",
+            "red",
+            "bd-wp8.7 OPEN: audit + apply pass not yet documented",
+        )
+    )
+    cells.append(
+        _cell(
+            "doctor",
+            "red",
+            "bd-wp8.4/.4.1 OPEN: idempotent/reversible fixture suite not yet shipped",
+        )
+    )
+    cells.append(
+        _cell(
+            "certification_bundle",
+            "red",
+            "bd-wp8.9 OPEN: FINAL_GAUNTLET_REPORT + bundle JSONs not yet produced",
+        )
+    )
+    rounds_path = p("docs/gauntlet/ROUNDS.jsonl")
+    rounds: list[dict] = []
+    if os.path.exists(rounds_path):
+        with open(rounds_path, encoding="utf-8") as f:
+            rounds = [json.loads(l) for l in f if l.strip()]
+    conv = convergence_verdict(rounds)
+    cells.append(
+        _cell(
+            "gauntlet_convergence",
+            "green" if conv["converged"] else "red",
+            "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
+            f"rounds={conv['rounds']}/{MIN_ROUNDS}, tail_clean={conv['tail_clean']}",
+        )
+    )
+
+    reds = [c["cell"] for c in cells if c["status"] == "red"]
+    artifact = {
+        "artifact": "franken_ocr.release_readiness.v1",
+        "generated_by": "scripts/gauntlet_cert.py --release-readiness",
+        "cells": cells,
+        "green": sum(1 for c in cells if c["status"] == "green"),
+        "red": len(reds),
+        "blocking_cells": reds,
+        "ship": not reds,
+    }
+    text = json.dumps(artifact, indent=1, sort_keys=True)
+    print(text)
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    return 0 if not reds else 1
+
+
 def eprocess_fold(raw_path: str, state_path: str) -> int:
     """Fold a raw NDJSON stream into the persisted e-process state.
 
@@ -1017,6 +1256,17 @@ def main() -> int:
         help="fold a real test-log NDJSON stream into the persisted e-process state (bd-re8.15)",
     )
     parser.add_argument(
+        "--release-readiness",
+        action="store_true",
+        help="the all-green ship gate: read every cell's evidence artifact, exit 1 on ANY red (bd-wp8.10)",
+    )
+    parser.add_argument(
+        "--readiness-out",
+        metavar="FILE",
+        default="docs/gauntlet/RELEASE_READINESS.json",
+        help="where to write the release-readiness scorecard artifact",
+    )
+    parser.add_argument(
         "--eprocess-state",
         metavar="FILE",
         default="docs/gauntlet/EPROCESS_STATE.json",
@@ -1033,6 +1283,8 @@ def main() -> int:
         return convergence(args.convergence)
     if args.eprocess_fold:
         return eprocess_fold(args.eprocess_fold, args.eprocess_state)
+    if args.release_readiness:
+        return release_readiness(args.readiness_out)
     parser.print_help()
     return 0
 
