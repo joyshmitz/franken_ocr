@@ -475,13 +475,32 @@ static TROMR: PlannedArch = PlannedArch {
     vision_encoder: VisionEncoder::ResNetVit,
     decoder: Decoder::Seq2SeqDense,
     tokenizer: TokenizerKind::MusicVocab,
-    decode_contract: PLACEHOLDER_CONTRACT,
+    // CENSUSED (docs/zoo/tromr-spec.md §5/§9, E2): greedy argmax-forced (the
+    // E8 oracle plan; upstream's top-k sampling is the OQ-T6 kill-switch),
+    // stop on the RHYTHM stream's `[EOS]` = 2 (pad 0, bos 1, max_seq_len 256).
+    decode_contract: DecodeContract {
+        temperature: 0.0,
+        eos_token_id: 2,
+        no_repeat_ngram_size: 0,
+        ngram_window: 0,
+    },
     tasks: &[Task::Music],
-    tie_word_embeddings: false, // placeholder until censused (sub-epic E)
-    vision_tower_prefix: "model.sam_model", // ResNet stem; placeholder
-    decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic E)
-    lm_head_stored_int8: true,  // placeholder until censused (sub-epic E)
-    embed_tokens_name: "model.embed_tokens.weight",
+    // §12: NO `lm_head.weight` at all — FOUR untied per-stream heads
+    // (`decoder.net.to_logits_{lift,pitch,rhythm,note}`), each Linear+bias.
+    tie_word_embeddings: false,
+    // §12: the whole tower (ResNetV2 stem + hybrid ViT) lives under `encoder.`
+    // (WS is FOLDED into the stored conv weights at export — no runtime WS).
+    vision_tower_prefix: "encoder.",
+    // §12: flat x-transformers layout, `i%3` ⇒ 0=self-attn 1=cross-attn 2=ff.
+    decoder_layers_prefix: "decoder.net.attn_layers.layers.",
+    // §11: heads are tiny ([260/71/7/2]×256 Linear+bias) — always HP; the 40
+    // decoder GEMMs are int8 CANDIDATES behind a measured-lossless gate only
+    // (default f32; see quant::convert::is_decoder_int8_tensor_for).
+    lm_head_stored_int8: false,
+    // §12: THREE input embeddings summed per step (lift/pitch/rhythm) — no
+    // single embed_tokens. The rhythm stream is primary (drives EOS); the
+    // untie-verify never fires (no `lm_head.weight` exists).
+    embed_tokens_name: "decoder.net.rhythm_emb.emb.weight",
     implemented: false,
 };
 static TROCR: PlannedArch = PlannedArch {
@@ -589,6 +608,38 @@ mod tests {
     }
 
     #[test]
+    fn tromr_descriptor_is_the_censused_shape() {
+        // E2 (bd-3jo6.5.2): the descriptor carries the tromr-spec §5/§9/§11/§12
+        // census, not placeholders. Convert-critical fields first.
+        let a = arch_by_id("tromr").expect("tromr registered");
+        assert!(!a.implemented(), "runtime lands E3-E9");
+        assert_eq!(a.decoder(), Decoder::Seq2SeqDense);
+        assert_eq!(a.tokenizer(), TokenizerKind::MusicVocab);
+        // §12: no lm_head.weight exists — four untied per-stream heads; the
+        // artifact stores everything high-precision by default (§11).
+        assert!(
+            !a.tie_word_embeddings(),
+            "4 untied heads, no lm_head at all"
+        );
+        assert!(
+            !a.lm_head_stored_int8(),
+            "heads are tiny Linear+bias — always HP"
+        );
+        assert_eq!(a.vision_tower_prefix(), "encoder.");
+        assert_eq!(a.decoder_layers_prefix(), "decoder.net.attn_layers.layers.");
+        assert_eq!(a.embed_tokens_name(), "decoder.net.rhythm_emb.emb.weight");
+        // §9: greedy argmax-forced, rhythm-stream EOS 2, no ngram guard.
+        let c = a.decode_contract();
+        assert_eq!(c.eos_token_id, 2, "rhythm [EOS]");
+        assert_eq!(c.temperature, 0.0);
+        assert_eq!(c.no_repeat_ngram_size, 0);
+        assert_eq!(
+            a.license_notice(),
+            "Polyphonic-TrOMR (NetEase) - Apache-2.0"
+        );
+    }
+
+    #[test]
     fn lookup_and_default_resolve() {
         assert_eq!(default_arch().id(), "unlimited-ocr");
         assert!(default_arch().implemented());
@@ -662,10 +713,11 @@ mod tests {
 
     /// The new arch-namespace accessors default to the Unlimited-OCR/GOT layout,
     /// so every pre-existing arch is untouched by the SmolVLM2 additions.
-    /// (OneChart left this list at its D1 census — see the dedicated test.)
+    /// (OneChart left this list at its D1 census, TrOMR at its E2 census —
+    /// see their dedicated tests.)
     #[test]
     fn arch_namespace_defaults_are_the_historical_layout() {
-        for id in ["unlimited-ocr", "got-ocr2", "tromr", "trocr", "pix2tex"] {
+        for id in ["unlimited-ocr", "got-ocr2", "trocr", "pix2tex"] {
             let a = arch_by_id(id).expect("registered");
             assert_eq!(a.decoder_layers_prefix(), "model.layers.", "{id}");
             assert!(a.lm_head_stored_int8(), "{id}");
