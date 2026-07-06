@@ -69,12 +69,15 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use franken_ocr::{FocrError, MODEL_PATH_ENV, OcrEngine};
+use franken_ocr::{
+    FocrError, MODEL_PATH_ENV, OcrEngine, kernel_pool_width, stream_pages, thread_budget,
+};
 
 // ───────────────────────────── tunables ─────────────────────────────
 
@@ -1040,6 +1043,305 @@ struct BatchReport {
     ok_results: usize,
     model_not_found: usize,
     other_terminal: usize,
+}
+
+// ─────────────── scenario 5: the capacity certificate (bd-re8.18) ───────────────
+
+/// Nearest-rank percentile: the `ceil(k/100 · n)`-th smallest sample
+/// (1-indexed). The standard definition, so every number in the certificate is
+/// reproducible by hand from the raw samples. Sorts a copy.
+fn percentile_nearest_rank(samples: &[u128], k: usize) -> u128 {
+    assert!(
+        !samples.is_empty() && (1..=100).contains(&k),
+        "percentile needs samples and k in 1..=100"
+    );
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = (k * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
+}
+
+/// Hand-worked nearest-rank check (the classic 5-sample set): p30 of
+/// [15,20,35,40,50] is the ceil(1.5)=2nd smallest = 20; p50 → 3rd = 35;
+/// p100 → 5th = 50; p1 → 1st = 15.
+#[test]
+fn percentile_nearest_rank_hand_worked() {
+    let s = [35u128, 20, 15, 50, 40];
+    assert_eq!(percentile_nearest_rank(&s, 30), 20);
+    assert_eq!(percentile_nearest_rank(&s, 50), 35);
+    assert_eq!(percentile_nearest_rank(&s, 95), 50);
+    assert_eq!(percentile_nearest_rank(&s, 100), 50);
+    assert_eq!(percentile_nearest_rank(&s, 1), 15);
+    log_line(
+        "percentile_hand_worked",
+        "result",
+        "pass",
+        r#""checks":5,"definition":"nearest_rank""#,
+    );
+}
+
+/// How many pages the certificate's consumer deliberately lags on, and how
+/// often, to force the bounded buffer full (the backpressure proof). Only the
+/// first `LAG_PAGES` are lagged so the soak's tail runs at full speed.
+const LAG_PAGES: usize = 64;
+const LAG_EVERY: usize = 16;
+const LAG_SLEEP: Duration = Duration::from_millis(2);
+
+/// The bounded stream capacity under certification. Small on purpose: the
+/// in-flight bound (`capacity + 1`) must be provable with a laggy consumer.
+const STREAM_CAPACITY: usize = 4;
+
+/// bd-re8.18: the asupersync capacity certificate. Drives the many-pages soak
+/// through the BOUNDED `stream_pages` channel with a deliberately laggy
+/// consumer, measures per-page latency at the producer, and emits ONE
+/// structured `capacity_certificate` NDJSON artifact carrying:
+///
+///  - **p50/p95/p99/max queueing evidence** (nearest-rank over every page);
+///  - **the bounded-channel proof**: observed max in-flight
+///    (`produced − consumed`) never exceeds `capacity + 1` — backpressure,
+///    never unbounded growth — AND the buffer provably FILLED at least once
+///    under the injected consumer lag (fast mode), so the bound was exercised,
+///    not just never approached;
+///  - **the no-oversubscription proof**: the kernel rayon pool width measured
+///    before and after the soak is identical (no second pool, no mid-run
+///    growth — the N× multiplication doctrine #5 forbids) and within the
+///    platform's logical width;
+///  - **the no-nested-runtime evidence**: the soak runs under the same
+///    wall-clock watchdog as scenario 1 (a nested runtime or rayon-under-lock
+///    regression hangs exactly there), on a single engine, with a strictly
+///    sequential producer.
+///
+/// Heavy branch (`FOCR_MODEL_PATH` + `FOCR_WATCHDOG_IMAGE`): real forwards
+/// give real queueing numbers. Unarmed: the certificate still proves the
+/// bounded stream + pool stability over the orchestration path, and `mode`
+/// says which one it certified.
+///
+/// Armed sizing (`FOCR_CAPACITY_PAGES`): a real forward is seconds per page
+/// (SAM-B vision encode dominates), so the default 256-page soak cannot fit
+/// ANY real model inside the heavy watchdog budget (measured 2026-07-06:
+/// 256 GOT int8 pages > 1800 s — the watchdog fired, correctly). Armed runs
+/// size the soak with this env var instead; the override is floored at
+/// `2 × pool` so pages > pool always holds, applies ONLY to the armed-heavy
+/// branch, and the artifact records the page count — never a silent cap.
+#[test]
+fn capacity_certificate_bounded_stream_soak() {
+    let case = "capacity_certificate";
+    let pool = detected_pool();
+    let heavy = heavy_model_path();
+    let pages = match std::env::var("FOCR_CAPACITY_PAGES") {
+        Ok(v) if heavy.is_some() => {
+            let requested: usize = v
+                .parse()
+                .expect("FOCR_CAPACITY_PAGES must be a positive integer");
+            requested.max(pool * 2)
+        }
+        _ => pages_for(pool),
+    };
+    let (model_path, budget) = match &heavy {
+        Some(p) => (p.clone(), WATCHDOG_BUDGET_HEAVY),
+        None => (PathBuf::from(ABSENT_MODEL), WATCHDOG_BUDGET),
+    };
+    let heavy_page = std::env::var_os("FOCR_WATCHDOG_IMAGE")
+        .map(PathBuf::from)
+        .filter(|p| heavy.is_some() && p.exists());
+    let real_forwards = heavy_page.is_some();
+    let mode = if real_forwards {
+        "heavy_forward"
+    } else if heavy.is_some() {
+        // Weights present but no decodable page: the soak certifies model-load
+        // + input-decode orchestration only, and says so.
+        "heavy_orchestration_no_image"
+    } else {
+        "no_weights_orchestration"
+    };
+
+    let width_before = kernel_pool_width();
+    let budget_threads = thread_budget();
+    log_line(
+        case,
+        "setup",
+        "pass",
+        &format!(
+            r#""seed":0,"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{bs},"mode":"{mode}","model_path":{mp},"stream_capacity":{STREAM_CAPACITY},"kernel_pool_width_before":{width_before},"thread_budget":{budget_threads}"#,
+            bs = budget.as_secs(),
+            mp = json_str(&model_path.display().to_string()),
+        ),
+    );
+
+    let model_path_for_worker = model_path.clone();
+    let outcome = run_with_watchdog(budget, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        let page_buf = heavy_page.unwrap_or_else(|| PathBuf::from(SYNTHETIC_PAGE));
+
+        // `produced` is bumped by the producer thread right before each send;
+        // the consumer reads it to compute live in-flight. That makes the
+        // observed maximum a true upper-bound witness on channel occupancy.
+        let produced = Arc::new(AtomicUsize::new(0));
+        let produced_probe = Arc::clone(&produced);
+
+        let mut issued = 0usize;
+        let mut samples: Vec<u128> = Vec::with_capacity(pages);
+        let mut consumed = 0usize;
+        let mut max_in_flight = 0usize;
+        // Terminal-outcome tally: [Ok, ModelNotFound, other].
+        let mut tally = [0usize; 3];
+
+        let streamed = stream_pages(
+            STREAM_CAPACITY,
+            move || {
+                if issued == pages {
+                    return Ok(None);
+                }
+                issued += 1;
+                let started = Instant::now();
+                let kind: u8 = match engine.recognize_with_model(&model_path_for_worker, &page_buf)
+                {
+                    Ok(_) => 0,
+                    Err(FocrError::ModelNotFound(_)) => 1,
+                    Err(_) => 2,
+                };
+                let latency_us = started.elapsed().as_micros();
+                produced_probe.fetch_add(1, Ordering::SeqCst);
+                Ok(Some((latency_us, kind)))
+            },
+            |(latency_us, kind): (u128, u8)| {
+                consumed += 1;
+                let in_flight = produced.load(Ordering::SeqCst).saturating_sub(consumed);
+                max_in_flight = max_in_flight.max(in_flight);
+                samples.push(latency_us);
+                tally[kind as usize] += 1;
+                if consumed <= LAG_PAGES && consumed.is_multiple_of(LAG_EVERY) {
+                    thread::sleep(LAG_SLEEP);
+                }
+            },
+        )
+        .expect("bounded page stream completes");
+        (streamed, samples, max_in_flight, tally)
+    });
+
+    let (streamed, samples, max_in_flight, tally, elapsed) = match outcome {
+        Watch::TimedOut => {
+            log_line(
+                case,
+                "error",
+                "fail",
+                &format!(
+                    r#""diag":{{"error_kind":"DEADLOCK_SUSPECTED","focr_exit_code":5,"message":"capacity soak did not complete within watchdog budget"}},"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{}"#,
+                    budget.as_secs(),
+                ),
+            );
+            panic!(
+                "DEADLOCK SUSPECTED: the capacity-certificate soak ({pages} pages through \
+                 the bounded stream) did NOT complete within the {}s watchdog budget — \
+                 a nested runtime, rayon under a held lock, or an unbounded channel \
+                 stall manifests exactly here.",
+                budget.as_secs(),
+            );
+        }
+        Watch::Finished { payload, elapsed } => {
+            let (streamed, samples, max_in_flight, tally) = payload;
+            (streamed, samples, max_in_flight, tally, elapsed)
+        }
+    };
+
+    // Every page streamed, exactly once, in order (the stream returns the count).
+    assert_eq!(
+        streamed, pages,
+        "expected {pages} pages streamed, got {streamed}"
+    );
+    assert_eq!(samples.len(), pages, "one latency sample per page");
+
+    // The bounded-channel proof: occupancy never exceeded capacity + 1 (the
+    // buffered items plus the one in the producer's hand mid-send)…
+    assert!(
+        max_in_flight <= STREAM_CAPACITY + 1,
+        "bounded channel violated: observed {max_in_flight} in flight > capacity {STREAM_CAPACITY} + 1"
+    );
+    // …and, in fast mode, the bound was actually REACHED under the injected
+    // lag — a bound never approached is a bound never tested. (The heavy
+    // branch's real forwards are slower than the consumer, so the buffer
+    // legitimately may never fill there; the artifact records the observed
+    // value either way.)
+    let backpressure_engaged = max_in_flight >= STREAM_CAPACITY;
+    if !real_forwards {
+        assert!(
+            backpressure_engaged,
+            "consumer lag ({LAG_PAGES} pages, {LAG_SLEEP:?} every {LAG_EVERY}) never filled the \
+             {STREAM_CAPACITY}-slot buffer (max in-flight {max_in_flight}) — the backpressure \
+             path went unexercised"
+        );
+    }
+
+    // The no-oversubscription proof: pool width identical before/after, and
+    // never wider than the platform's logical width.
+    let width_after = kernel_pool_width();
+    assert_eq!(
+        width_before, width_after,
+        "kernel rayon pool width CHANGED across the soak ({width_before} → {width_after}): \
+         a second pool or mid-run growth is the doctrine-#5 oversubscription class"
+    );
+    assert!(
+        width_after <= pool,
+        "kernel pool width {width_after} exceeds the platform logical width {pool}"
+    );
+
+    // Outcome-shape honesty per branch (same contract as scenario 1).
+    let [ok_results, model_not_found, other_terminal] = tally;
+    if real_forwards {
+        assert!(
+            ok_results > 0,
+            "heavy branch drove {pages} real pages but produced no Ok result \
+             (model_not_found={model_not_found}, other_terminal={other_terminal})"
+        );
+    } else if heavy.is_none() {
+        assert_eq!(
+            model_not_found, pages,
+            "no-weights branch: every call must return the clean fast ModelNotFound"
+        );
+    } else {
+        // Weights without a real page: progress means post-resolution results,
+        // never a silent ModelNotFound (that would mean the artifact never loaded).
+        assert!(
+            ok_results > 0 || other_terminal > 0,
+            "heavy weights present but every call returned ModelNotFound ({model_not_found}) — \
+             the artifact was not actually loaded"
+        );
+    }
+
+    let p50 = percentile_nearest_rank(&samples, 50);
+    let p95 = percentile_nearest_rank(&samples, 95);
+    let p99 = percentile_nearest_rank(&samples, 99);
+    let max = *samples.iter().max().expect("non-empty samples");
+    assert!(
+        p50 <= p95 && p95 <= p99 && p99 <= max,
+        "percentiles must be monotone"
+    );
+
+    // THE artifact: one line, self-contained, consumed by the three-pillar cert.
+    log_line(
+        case,
+        "artifact",
+        "pass",
+        &format!(
+            r#""artifact":"capacity_certificate","schema":"focr-capacity-certificate/v1","mode":"{mode}","pages":{pages},"pool_logical":{pool},"thread_budget":{budget_threads},"kernel_pool_width":{width_after},"pool_width_stable":true,"latency_us":{{"p50":{p50},"p95":{p95},"p99":{p99},"max":{max},"samples":{n}}},"stream_capacity":{STREAM_CAPACITY},"max_in_flight":{max_in_flight},"bounded_channel_verified":true,"backpressure_engaged":{backpressure_engaged},"ok_results":{ok_results},"model_not_found":{model_not_found},"other_terminal":{other_terminal},"elapsed_us":{elapsed_us},"no_nested_runtime_evidence":"watchdogged completion + single engine + sequential producer (scenario 1b gauge covers one-live-forward)""#,
+            n = samples.len(),
+            elapsed_us = elapsed.as_micros(),
+        ),
+    );
+    log_line(
+        case,
+        "result",
+        if heavy.is_none() {
+            "skip_no_model"
+        } else {
+            "pass"
+        },
+        &format!(
+            r#""elapsed_us":{},"pages_issued":{pages},"certified_mode":"{mode}","native_path_ran":true,"fallback_target":{ft}"#,
+            elapsed.as_micros(),
+            ft = json_str(&model_path.display().to_string()),
+        ),
+    );
 }
 
 /// Minimal JSON string escaper for the handful of values (paths) we embed. We

@@ -148,6 +148,15 @@ pub fn thread_budget() -> usize {
     })
 }
 
+/// The kernel rayon pool's CURRENT width — the diagnostic the capacity
+/// certificate (bd-re8.18) records before/after the many-pages soak to prove
+/// no second pool was spawned and the width never grew mid-run (the N×
+/// oversubscription class doctrine #5 forbids). First call instantiates the
+/// global pool, which is exactly what the kernels themselves use.
+pub fn kernel_pool_width() -> usize {
+    rayon::current_num_threads()
+}
+
 // ── Bounded per-page result streaming (bd-223.2 scaffold) ───────────────────
 
 /// Stream page results from a SEQUENTIAL producer to a consumer through a
