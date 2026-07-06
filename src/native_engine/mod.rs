@@ -2566,14 +2566,15 @@ mod tests {
     }
 
     /// A path that exists on disk but is not a real model resolves (the
-    /// header-sniff resolver is a later bead, so `resolve_model` accepts any
-    /// existing path) and then fails cleanly with `NotImplemented`, never panics.
-    /// `Weights::load` reports a low-level container `FormatMismatch` on the junk
-    /// bytes, but the real gap is that the model package's resolve + manifest
-    /// assembly is Phase-2; `OcrModel::load` maps that case to `NotImplemented`.
-    /// Uses a freshly-created temp file so the test is CWD-independent.
+    /// header-sniff resolver accepts any existing path) and then fails
+    /// cleanly with `FormatMismatch` (§7.4 exit 7), never panics. This was a
+    /// Phase-0 `NotImplemented` placeholder until the input-fault suite
+    /// (bd-15kd) typed the corrupt-artifact class: junk bytes in a `.focrq`
+    /// are a container-format fault, and the fault suite pins the same
+    /// contract end-to-end through the CLI. Uses a freshly-created temp file
+    /// so the test is CWD-independent.
     #[test]
-    fn load_existing_non_model_path_is_not_implemented_not_panic() {
+    fn load_existing_non_model_path_is_format_mismatch_not_panic() {
         let mut tmp = std::env::temp_dir();
         tmp.push(format!(
             "franken_ocr_load_test_{}.focrq",
@@ -2582,8 +2583,17 @@ mod tests {
         std::fs::write(&tmp, b"not a real model blob").expect("write temp file");
         let r = OcrModel::load(&tmp);
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup (not a delete of source)
-        // resolve_model accepts an existing path; Weights::load is the stub.
-        assert!(matches!(r, Err(FocrError::NotImplemented(_))));
+        // resolve_model accepts an existing path; the container reader types
+        // the junk as a format fault (exit 7).
+        let err = match r {
+            Ok(_) => panic!("junk artifact must error, not load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, FocrError::FormatMismatch(_)),
+            "expected FormatMismatch (exit 7) on a junk artifact, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 7, "FormatMismatch maps to exit 7");
     }
 
     fn temp_model_dir(label: &str) -> PathBuf {
