@@ -26,6 +26,10 @@ verification-only artifact (G3's no-FFI runtime claim is preserved).
 Usage:
     python3 scripts/gauntlet_cert.py --self-test     # validate the math (CI gate)
     python3 scripts/gauntlet_cert.py --demo          # print a worked franken_ocr cert
+    # bd-re8.13 real-data modes:
+    python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
+        --scorecard-out docs/gauntlet/RELEASE_SCORECARD.json   # score the REAL scoreboard
+    python3 scripts/gauntlet_cert.py --convergence   # >=10 rounds / >=2 clean gate (exit 1 until met)
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -382,6 +387,149 @@ def global_e_value(processes: Iterable[EProcess]) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# bd-re8.13 — the REAL-data modes: score FEATURE_PARITY.md, track convergence.
+# --------------------------------------------------------------------------- #
+
+STATUS_TOKENS = ("present", "partial", "missing", "n/a", "excluded")
+
+
+def parse_feature_parity(md_text: str) -> dict[str, dict[str, int]]:
+    """Parse FEATURE_PARITY.md into per-section status tallies.
+
+    A row is status-bearing when one of its pipe-cells is EXACTLY a status
+    token — the same rule `tests/surface_matrix.rs` uses, so the two parsers
+    cannot diverge on what counts as a scoreboard row. Returns
+    {section_title: {status: count}} for every `## N.` section with rows.
+    """
+    import re
+
+    sections: dict[str, dict[str, int]] = {}
+    current = None
+    for line in md_text.splitlines():
+        m = re.match(r"^## (\d+)\.\s*(.*)", line)
+        if m:
+            current = f"§{m.group(1)} {m.group(2).split('(')[0].split('—')[0].strip()}"
+            continue
+        if current is None or not line.startswith("|") or line.startswith("|-"):
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 6:
+            continue
+        for c in cells:
+            if c.lower() in STATUS_TOKENS:
+                sections.setdefault(current, {})
+                sections[current][c.lower()] = sections[current].get(c.lower(), 0) + 1
+                break
+    return {k: v for k, v in sections.items() if v}
+
+
+def categories_from_parity(md_text: str) -> list[CategoryEvidence]:
+    """One CategoryEvidence per scoreboard section, equal category weights
+    (normalized to the loader's sum-to-1.0 invariant), equal row weights
+    within a section. `n/a` rows are skipped entirely; `excluded` rows keep
+    their weight in the coverage-debt tally per §2.1.2."""
+    sections = parse_feature_parity(md_text)
+    if not sections:
+        raise ValueError("no scoreboard sections parsed from FEATURE_PARITY.md")
+    cat_w = 1.0 / len(sections)
+    cats: list[CategoryEvidence] = []
+    for title, tallies in sections.items():
+        scored = {s: n for s, n in tallies.items() if s != "n/a"}
+        n_rows = sum(scored.values())
+        row_w = 1.0 / n_rows if n_rows else 0.0
+        ev = CategoryEvidence(title, cat_w)
+        for status, count in scored.items():
+            for _ in range(count):
+                add_outcome(ev, status, row_w)
+        cats.append(ev)
+    return cats
+
+
+def from_parity(md_path: str, residuals_path: str | None, out_path: str | None) -> int:
+    """Emit the surface-pillar scorecard computed from the REAL scoreboard.
+
+    With no residual history the conformal band bootstraps WIDE (halfwidth
+    1.0 -> lower bound 0.0) per the §3.2 pitfall guard — the artifact says so
+    explicitly rather than inventing confidence it does not have. Residual
+    history accrues one entry per gauntlet round (|observed - Beta-mean|).
+    """
+    md_text = open(md_path, encoding="utf-8").read()
+    cats = categories_from_parity(md_text)
+    residuals: list[float] = []
+    if residuals_path and os.path.exists(residuals_path):
+        residuals = json.load(open(residuals_path, encoding="utf-8"))
+    sc = compute_scorecard(cats, residuals, confidence=0.95)
+    debt = {
+        c.category_id: round(c.weighted_excluded, 6)
+        for c in cats
+        if c.weighted_excluded > 0
+    }
+    artifact = {
+        "artifact": "franken_ocr.gauntlet.scorecard.v1",
+        "source": md_path,
+        "pillar": "surface",
+        "point_estimate": sc.point_estimate,
+        "parity_score_lower_bound": sc.lower_bound,
+        "conformal_halfwidth": round(sc.conformal_halfwidth, 6),
+        "residual_history_n": len(residuals),
+        "band_note": (
+            "no residual history yet: bootstrap band 1.0 -> lower bound 0 (maximally conservative, §3.2)"
+            if not residuals
+            else "band from held-out round residuals"
+        ),
+        "per_category_mean": sc.per_category_mean,
+        "per_category_lower": sc.per_category_lower,
+        "excluded_weight_debt": debt,
+    }
+    text = json.dumps(artifact, sort_keys=True, indent=1)
+    print(text)
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    return 0
+
+
+# Convergence (METHODOLOGY §7): >=10 full rounds AND the last >=2 consecutive
+# rounds each produced <3 new genuine findings. Exits nonzero until met — this
+# is the gate bd-wp8.8 runs behind.
+MIN_ROUNDS = 10
+CLEAN_ROUNDS = 2
+CLEAN_FINDING_CEILING = 3
+
+
+def convergence_verdict(rounds: list[dict]) -> dict:
+    n = len(rounds)
+    tail = rounds[-CLEAN_ROUNDS:] if n >= CLEAN_ROUNDS else []
+    tail_clean = len(tail) == CLEAN_ROUNDS and all(
+        int(r.get("new_findings", 10**9)) < CLEAN_FINDING_CEILING for r in tail
+    )
+    converged = n >= MIN_ROUNDS and tail_clean
+    return {
+        "check": "gauntlet-convergence",
+        "rounds": n,
+        "min_rounds": MIN_ROUNDS,
+        "tail_clean": tail_clean,
+        "tail_findings": [int(r.get("new_findings", -1)) for r in tail],
+        "clean_ceiling": CLEAN_FINDING_CEILING,
+        "converged": converged,
+        "result": "pass" if converged else "fail",
+    }
+
+
+def convergence(rounds_path: str) -> int:
+    rounds: list[dict] = []
+    if os.path.exists(rounds_path):
+        for line in open(rounds_path, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                rounds.append(json.loads(line))
+    verdict = convergence_verdict(rounds)
+    verdict["rounds_file"] = rounds_path
+    print(json.dumps(verdict, sort_keys=True))
+    return 0 if verdict["converged"] else 1
+
+
+# --------------------------------------------------------------------------- #
 # A worked franken_ocr scorecard (illustrative; matches METHODOLOGY §3.6).
 # --------------------------------------------------------------------------- #
 
@@ -604,6 +752,64 @@ def self_test() -> int:
         ep_sat.observe(True)
     check("eprocess_no_reset", ep_sat.e_value > 1.0)
 
+    # bd-re8.13 — the real-data modes.
+    fixture_md = "\n".join(
+        [
+            "## 12. CLI surface",
+            "| Surface | §7 | Req | Status | Parity | Bead | Notes |",
+            "|---|---|---|---|---|---|---|",
+            "| `focr a` | §7 | MUST | present | SURF | bd-x | |",
+            "| `focr b` | §7 | MUST | partial | SURF | bd-x | |",
+            "| `focr c` | §7 | MAY | missing | SURF | bd-x | |",
+            "## 13. Events",
+            "| Event | §7 | Req | Status | Parity | Bead | Notes |",
+            "|---|---|---|---|---|---|---|",
+            "| `e1` | §7 | MUST | present | SURF | bd-x | |",
+            "| `e2` | §7 | n/a | n/a | n/a | — | skipped in scoring |",
+        ]
+    )
+    parsed = parse_feature_parity(fixture_md)
+    check(
+        "parity_parse_sections_and_tallies",
+        parsed == {
+            "§12 CLI surface": {"present": 1, "partial": 1, "missing": 1},
+            "§13 Events": {"present": 1, "n/a": 1},
+        },
+        parsed=parsed,
+    )
+    cats_fp = categories_from_parity(fixture_md)
+    check(
+        "parity_categories_weights_and_na_skip",
+        len(cats_fp) == 2
+        and _approx(sum(c.category_weight for c in cats_fp), 1.0)
+        # §13: one scored row (present), the n/a row skipped entirely.
+        and _approx(cats_fp[1].weighted_successes, 1.0)
+        and _approx(cats_fp[1].weighted_failures, 0.0),
+    )
+    sc_fp = compute_scorecard(cats_fp, residuals=[], confidence=0.95)
+    check(
+        "parity_scorecard_bootstrap_band_is_conservative",
+        _approx(sc_fp.conformal_halfwidth, 1.0) and _approx(sc_fp.lower_bound, 0.0),
+        point=sc_fp.point_estimate,
+    )
+
+    rounds_clean = [{"round": i, "new_findings": 5} for i in range(1, 9)] + [
+        {"round": 9, "new_findings": 2},
+        {"round": 10, "new_findings": 0},
+    ]
+    check("convergence_meets_at_10_with_2_clean", convergence_verdict(rounds_clean)["converged"])
+    check(
+        "convergence_refuses_short_history",
+        not convergence_verdict(rounds_clean[:9])["converged"],
+    )
+    check(
+        "convergence_refuses_dirty_tail",
+        not convergence_verdict(
+            rounds_clean[:9] + [{"round": 10, "new_findings": 3}]
+        )["converged"],
+    )
+    check("convergence_refuses_empty", not convergence_verdict([])["converged"])
+
     if failures:
         emit("gauntlet-cert-self-test", False, failed=failures)
         return 1
@@ -615,11 +821,33 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--self-test", action="store_true", help="validate the gauntlet math (CI gate)")
     parser.add_argument("--demo", action="store_true", help="print a worked franken_ocr scorecard + ratchet verdict")
+    parser.add_argument(
+        "--from-parity",
+        metavar="MD",
+        help="compute the surface-pillar scorecard from the REAL FEATURE_PARITY.md (bd-re8.13)",
+    )
+    parser.add_argument(
+        "--residuals",
+        metavar="JSON",
+        help="held-out round residuals (JSON array file); absent -> bootstrap wide band",
+    )
+    parser.add_argument("--scorecard-out", metavar="FILE", help="also write the scorecard artifact here")
+    parser.add_argument(
+        "--convergence",
+        metavar="ROUNDS_JSONL",
+        nargs="?",
+        const="docs/gauntlet/ROUNDS.jsonl",
+        help="check the >=10-rounds / >=2-clean convergence gate; exit 1 until met (bd-wp8.8)",
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if args.demo:
         return _demo()
+    if args.from_parity:
+        return from_parity(args.from_parity, args.residuals, args.scorecard_out)
+    if args.convergence:
+        return convergence(args.convergence)
     parser.print_help()
     return 0
 

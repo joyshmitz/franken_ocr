@@ -30,12 +30,20 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **45** | **173** |
-| `present` | 0 | 0 | 0 |
-| `partial` | 0 | 0 | 0 |
-| `missing` | 124 | 44 | 168 |
-| `excluded` (coverage debt, reasoned) | 4 | 1 (`pdf`) | 5 |
+| Total enumerated rows | **128** | **55** | **183** |
+| `present` | 0 † | 39 | 39 |
+| `partial` | 0 † | 13 | 13 |
+| `missing` | 124 † | 3 | 127 |
+| `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
 | `n/a` | 0 | 0 | 0 |
+
+> † **§1–§11 statuses are still the Phase −1 seed** and known-stale: the L0–L5
+> ladder is armed all-green (see §14), which proves most modeling rows, but
+> flipping each numbered row demands per-row evidence citation — that sweep is
+> tracked as its own bead and MUST NOT be shortcut by bulk-flipping.
+> The SurfaceMatrix (§12–§15) was brought current 2026-07-06 (bd-re8.13) with
+> per-row evidence; `tests/surface_matrix.rs` locks it against enumeration
+> drift and recomputes this rollup.
 
 | Conformance metric | Value (Phase −1 seed) |
 |--------------------|----------------------|
@@ -236,68 +244,84 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 ## 12. CLI surface (plan §7.2) — the SurfaceMatrix
 
+> Statuses brought current 2026-07-06 (bd-re8.13): the Phase −1 all-`missing`
+> seed is superseded by shipped, contract-tested surfaces (v0.1.0–v0.3.0 +
+> the model-zoo waves). Notes cite the proving test/release. The enumeration
+> test (`tests/surface_matrix.rs`) asserts every live subcommand and every
+> frozen-schema robot event/exit-code has a row here.
+
 | Subcommand / surface | §7 | Req | Status | Parity | Bead | Notes |
 |----------------------|-----|-----|--------|--------|------|-------|
-| `focr ocr <image>` → markdown / `--json` | §7.2 | MUST | missing | SURF | bd-1gv.27 | primary, IMAGE-ONLY v1 |
-| `focr ocr --robot` / `focr robot run` (NDJSON stream) | §7.2 | MUST | missing | SURF | bd-223.3, bd-wp8.3 | streaming |
-| `focr convert <st> -o <.focrq> [--arch][--quant]` | §7.2 | MUST | missing | SURF | bd-1es.6 | stub bd-223.6 → full |
-| `focr robot schema` (self-describing contract) | §7.2 | MUST | missing | SURF | bd-wp8.2 | versioned |
-| `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | missing | SURF | bd-223.3 | |
-| `focr robot backends` (SIMD tiers + USL pool sizing) | §7.2 | MUST | missing | SURF | bd-2mo.2 | reflects IsaTier |
-| `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | missing | SURF | bd-wp8.11 | fsqlite history |
-| `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | missing | SURF | bd-wp8.11 | locked atomic audit |
-| `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | missing | SURF | bd-wp8.4 | reversible |
-| Exit codes 0..7 (stable, documented) | §7.4 | MUST | missing | SURF | bd-223.5 | error.rs mapping |
-| Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | missing | SURF | bd-223.7 | OnceLock, documented |
-| Model resolution (no network at runtime) + header sniff | §7.5 | MUST | missing | SURF | bd-223.7 | actionable errors |
-| `--version` carries Baidu MIT attribution | §11 | MUST | missing | SURF | bd-223.14 | license compliance |
-| `pdf` input | §7.7 | n/a | excluded | n/a | — | **OUT of v1** — MuPDF-parity unscoped; rasterize out-of-band |
-| 5-target single-binary cross-platform build | §7.6 | MUST | missing | SURF | bd-wp8.5 | linux/darwin x2 + win-msvc |
+| `focr ocr <image>` → markdown / `--json` | §7.2 | MUST | present | SURF | bd-1gv.27 | v0.1.0; goldens (`cli_robot_golden`) + armed e2e (L5 CER 0.0) |
+| `focr ocr -o/--output FILE` (.md / .json-with-boxes) | §7.2 | MUST | present | SURF | bd-sreb | v0.3.0; goldens |
+| `focr ocr --extract-figures [--figures-dir]` | §7.2 | SHOULD | present | SURF | bd-sreb | v0.3.0; figure PNG/JPG chosen by content |
+| `focr ocr --task format\|music\|describe\|vqa\|chart-data` (zoo lanes) | §7.2 | MUST | partial | SURF | bd-av64 | GOT/SmolVLM2/OneChart/TrOMR lanes shipped w/ armed certs; `music` partial on real-input hardening (bd-av64: duration crash, wide-staff abort) |
+| `focr ocr --robot` / `focr robot run` (NDJSON stream) | §7.2 | MUST | present | SURF | bd-223.3 | contract tests green (bd-zc1o); internals polish tracked bd-wp8.3 |
+| `focr ocr-batch` (load-once multi-image throughput) | §7.2 | SHOULD | partial | SURF | bd-1azu | spine + batched-parity tests green; NO CLI golden yet (an untested surface never rounds up) |
+| `focr convert <st> -o <.focrq> [--arch][--quant]` | §7.2 | MUST | present | SURF | bd-1es.6 | byte-parity vs published artifact re-proven 2026-07-06 (sha d8c5fcf2…) |
+| `focr pull [model] [--quant]` (manifest + verify) | §7.2 | MUST | present | SURF | bd-3u6x | verified vs HF; native Windows proven (bd-15ow); zoo artifact publication user-gated (bd-av64.8) |
+| `focr models` (zoo discovery: id, tasks, status) | §7.2 | MUST | present | SURF | bd-3jo6.1.13 | CLI shipped + goldens; A13 docs/runbook half still open |
+| `focr robot schema` (self-describing contract) | §7.2 | MUST | present | SURF | bd-wp8.2 | versioned; frozen fixture |
+| `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
+| `focr robot backends` (SIMD tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | reflects IsaTier; goldens |
+| `focr robot selftest` (runtime int8 kernel parity on host silicon) | §7.2 | MUST | present | SURF | bd-223.13 | 24/24 on native Win10; AVX2 ceiling proven on 5995WX |
+| `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | partial | SURF | bd-wp8.11 | fsqlite RunStore live (bd-223.4) + cli test; full surface-contract bead open |
+| `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | partial | SURF | bd-wp8.11 | locked atomic audit live; same open contract bead |
+| `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | partial | SURF | bd-wp8.4 | shipped + goldens; idempotent/reversible/capability audit bead open |
+| Exit codes 0..7 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests |
+| Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
+| Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |
+| `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |
+| `pdf` input (native scanned fast path) | §7.7 | SHOULD | partial | SURF | bd-0a7.4 | **moved from `excluded`**: scanned-PDF native path shipped v0.2.0 (lopdf, decompress-bomb bounded bd-2zpu); vector-page rasterization deferred |
+| 5-target single-binary cross-platform build | §7.6 | MUST | present | SURF | bd-wp8.5 | v0.1.0–v0.3.0 released: darwin×2, linux×2, win-msvc; local cross-build runbook |
+| aarch64-windows target | §7.6 | MAY | missing | SURF | bd-3u97 | open; win-msvc x86_64 ships today |
 
 ## 13. Robot / NDJSON event contract (plan §7.3)
 
 | Event / contract | §7.3 | Req | Status | Parity | Bead | Notes |
 |------------------|------|-----|--------|--------|------|-------|
-| `run_start` event | §7.3 | MUST | missing | SURF | bd-223.3 | carries schema_version |
-| `stage` event (name, seq, elapsed, budget) | §7.3 | MUST | missing | SURF | bd-223.3 | |
-| `page` event (per-page text/bbox, streaming) | §7.3 | MUST | missing | SURF | bd-wp8.3 | bounded mpsc |
-| `run_complete` event | §7.3 | MUST | missing | SURF | bd-223.3 | |
-| `run_error` event (carries exit code) | §7.3 | MUST | missing | SURF | bd-223.5 | |
-| `ROBOT_SCHEMA_VERSION` on every line | §7.3 | MUST | missing | SURF | bd-223.3 | stable versioned |
-| Frozen JSON-schema fixture + contract test | §7.3 | MUST | missing | SURF | bd-wp8.2.1, bd-zc1o | scrubbed goldens |
-| Deterministic under fixed sampling (byte-identical) | §7.3 | MUST | missing | SURF | bd-3kge | determinism gate |
+| `run_start` event | §7.3 | MUST | present | SURF | bd-223.3 | carries schema_version; contract test |
+| `stage` event (name, seq, elapsed, budget) | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
+| `page` event (per-page text/bbox, streaming) | §7.3 | MUST | present | SURF | bd-wp8.3 | incl per-page skip signal (bd-fck1, v0.3.0); bounded-stream scaffold bd-223.2 |
+| `run_complete` event | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
+| `run_error` event (carries exit code) | §7.3 | MUST | present | SURF | bd-223.5 | contract test |
+| `ROBOT_SCHEMA_VERSION` on every line | §7.3 | MUST | present | SURF | bd-223.3 | stable versioned |
+| Frozen JSON-schema fixture + contract test | §7.3 | MUST | present | SURF | bd-zc1o | `tests/fixtures/robot_schema_v1.json` + scrubbed goldens |
+| Deterministic under fixed sampling (byte-identical) | §7.3 | MUST | present | SURF | bd-3kge | shared determinism gate + metamorphic FOCR_THREADS axis |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 
 | Gate / machinery | §8 | Req | Status | Parity | Bead | Notes |
 |------------------|-----|-----|--------|--------|------|-------|
-| Oracle nondeterminism-floor characterization | §8.2 | MUST | missing | n/a | bd-re8.2 | sets all tolerances FIRST |
-| L0 preprocessing parity gate (exact) | §8.2 | MUST | missing | L0 | bd-re8.4 | |
-| L1 per-op + L2 per-layer parity gates | §8.2 | MUST | missing | L1/L2 | bd-re8.5 | cosine ≈ 1.0 |
-| L3 logits + L4 token parity gates | §8.2 | MUST | missing | L3/L4 | bd-re8.6 | argmax + exact token |
-| L5 end-to-end OCR parity (CER/TEDS/Formula-CDM) | §8.2 | MUST | missing | L5 | bd-re8.7 | documented budget |
-| PyO3/subprocess oracle bridge (ULP tolerance, deterministic) | §8.5 | MUST | missing | n/a | bd-re8.3 | test-only, never shipped |
-| Differential test suite (per-op + e2e) | §8.3 | MUST | missing | L5 | bd-re8.9 | vs oracle + community quant |
-| Metamorphic suite (resize/rotation/whitespace; OQ-13 cross-page) | §8.3 | SHOULD | missing | L5 | bd-re8.10 | NOT page-sum |
-| Golden-artifact suite (insta/fuzzy/scrubbed/canonicalized) | §8.3 | MUST | missing | SURF | bd-re8.11 | |
-| ConformanceTest trait + coverage matrix (≥0.95 MUST) | §8.6 | MUST | missing | n/a | bd-re8.12 | XFAIL/DISCREPANCIES |
-| Model-gated e2e (skip-green w/o weights, prove native ran) | §8.3 | MUST | missing | L5 | bd-29wv | |
-| `many_pages_without_deadlock` watchdog | §6.5 | MUST | missing | n/a | bd-2ub2 | hangs on regression |
-| Three-pillar release certification (perf/conformance/surface) | §8.5 | MUST | missing | n/a | bd-re8.13 | reads THIS file |
-| Conformal lower-bound release ratchet | §8.5 | SHOULD | missing | n/a | bd-re8.14 | release uses lower bound |
-| E-processes for load-bearing invariants (Ville) | §8.5 | SHOULD | missing | n/a | bd-re8.15 | KV-bound/overflow/determinism/SIMD==scalar |
-| Head-to-head gauntlet bench vs CPU reference (per-stage, fair) | §9.3 | MUST | missing | n/a | bd-re8.17, bd-2mo.26 | thread/alloc/precision fairness |
-| Release-readiness scorecard (all-green ship gate) | §8.4 | MUST | missing | n/a | bd-wp8.10 | reads THIS file |
+| Oracle nondeterminism-floor characterization | §8.2 | MUST | present | n/a | bd-re8.2 | floors measured + recorded in fixture `_meta`; sets all tolerances |
+| L0 preprocessing parity gate (exact) | §8.2 | MUST | present | L0 | bd-re8.4 | armed green (scorecard 2026-07-06: max_abs 0.0078 ≤ envelope) |
+| L1 per-op + L2 per-layer parity gates | §8.2 | MUST | present | L1/L2 | bd-re8.5 | armed green (cosine 1−4e-13; L2 max-abs 8.8e-5 ledgered) |
+| L3 logits + L4 token parity gates | §8.2 | MUST | present | L3/L4 | bd-re8.6 | armed green (L4 token_exact 1.0 on reproducible prefix) |
+| L5 end-to-end OCR parity (CER/TEDS/Formula-CDM) | §8.2 | MUST | present | L5 | bd-re8.7 | armed green (CER 0.0 both fixture pages) |
+| PyO3/subprocess oracle bridge (ULP tolerance, deterministic) | §8.5 | MUST | present | n/a | bd-re8.3 | test-only; `check_release_linkage.py` guards no-FFI ship |
+| Differential test suite (per-op + e2e) | §8.3 | MUST | present | L5 | bd-re8.9 | in `parity_ladder.rs` (oracle differential guard) |
+| Metamorphic suite (resize/rotation/whitespace; OQ-13 cross-page) | §8.3 | SHOULD | present | L5 | bd-re8.10 | `tests/metamorphic.rs`; armed relations byte-identical; MR-2-live/MR-5 honestly gated |
+| Golden-artifact suite (insta/fuzzy/scrubbed/canonicalized) | §8.3 | MUST | present | SURF | bd-re8.11 | `cli_robot_golden` + UPDATE_GOLDENS review loop |
+| ConformanceTest trait + coverage matrix (≥0.95 MUST) | §8.6 | MUST | present | n/a | bd-re8.12 | registry + SPEC-side matrix ≥0.95 green; XFAIL discipline over emission sites |
+| Model-gated e2e (skip-green w/o weights, prove native ran) | §8.3 | MUST | present | L5 | bd-29wv | `/nonexistent` fallback proof pattern suite-wide |
+| `many_pages_without_deadlock` watchdog | §6.5 | MUST | present | n/a | bd-2ub2 | green + injected-hang detector + live over-budget trip demo; cancel/panic variants bd-1ryu |
+| asupersync capacity certificate (p95/p99, bounded stream, pool stability) | §6.9 | MUST | present | n/a | bd-re8.18 | armed heavy 2026-07-06: p95 7.41 s/page, 48/48 Ok, width stable; `focr-capacity-certificate/v1` |
+| L0–L5 ladder scorecard runner (per-commit parity receipt) | §8.4 | MUST | present | n/a | bd-re8.19 | `scripts/ladder_scorecard.sh`; armed all-green fixture committed |
+| Three-pillar release certification (perf/conformance/surface) | §8.5 | MUST | partial | n/a | bd-re8.13 | math+methodology+self-test shipped (`gauntlet_cert.py`); matrix brought current; converged RUN is bd-wp8.8 |
+| Conformal lower-bound release ratchet | §8.5 | SHOULD | present | n/a | bd-re8.14 | Rust impl (`src/conformance.rs`) + Python reference, cross-checked; RATCHET.md ledger |
+| E-processes for load-bearing invariants (Ville) | §8.5 | SHOULD | partial | n/a | bd-re8.15 | math + self-test in `gauntlet_cert.py`; wiring to live invariant streams open |
+| Head-to-head gauntlet bench vs CPU reference (per-stage, fair) | §9.3 | MUST | partial | n/a | bd-re8.17, bd-2mo.26 | zoo ratios measured (A11, fairness-pinned); unlimited-ocr Phase −1 baseline half open |
+| Release-readiness scorecard (all-green ship gate) | §8.4 | MUST | partial | n/a | bd-wp8.10 | components exist (ladder receipt, capacity cert, ratchet); the tying gate open |
 
 ## 15. Alien-artifact families (plan §9.7) — upside levers behind guarantees
 
 | Family | §9.7 | Req | Status | Parity | Bead | Notes |
 |--------|------|-----|--------|--------|------|-------|
-| AF-1 rate-distortion water-filling bit allocation | §9.7 | SHOULD | missing | L5 | bd-ksps, bd-1xfa.1 | offline bit_allocation_table |
-| AF-2 tail-risk CVaR + EVT worst-case CER gate | §9.7 | SHOULD | missing | L5 | bd-3upw, bd-1xfa.2 | release-gate metric |
-| AF-3 conformal/SPRT early-exit + speculative decode | §9.7 | MAY | missing | L4 | bd-1xfa.3 | token-flip bound |
-| AF-4 submodular high-precision tensor selection | §9.7 | MAY | missing | L5 | bd-1xfa.4 | greedy (1-1/e) |
-| AF-5 USL many-core pool sizing | §9.7 | SHOULD | missing | n/a | bd-2mo.21, bd-1xfa.5 | cap at USL peak |
+| AF-1 rate-distortion water-filling bit allocation | §9.7 | SHOULD | partial | L5 | bd-ksps, bd-1xfa.1 | `scripts/af1_bit_allocator.py` + `src/quant/bit_allocator.rs` shipped; full table integration open |
+| AF-2 tail-risk CVaR + EVT worst-case CER gate | §9.7 | SHOULD | partial | L5 | bd-3upw, bd-1xfa.2 | `scripts/af2_tail_risk.py` math shipped; not yet wired as a release gate |
+| AF-3 conformal/SPRT early-exit + speculative decode | §9.7 | MAY | missing | L4 | bd-1xfa.3 | SPIKE open (spec-decode ring exists; safe-exit bound not) |
+| AF-4 submodular high-precision tensor selection | §9.7 | MAY | missing | L5 | bd-1xfa.4 | SPIKE open |
+| AF-5 USL many-core pool sizing | §9.7 | SHOULD | partial | n/a | bd-2mo.21, bd-1xfa.5 | `scripts/af5_usl_fit.py` + `src/adaptive/usl.rs` shipped; NUMA pool caps open |
 
 ---
 
