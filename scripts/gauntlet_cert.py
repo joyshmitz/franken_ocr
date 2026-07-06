@@ -786,11 +786,14 @@ def release_readiness(out_path: str | None) -> int:
             "median uplift +550 across 5 dimensions; heatmap debt filed (doctor fixtures, ocr-batch golden)",
         )
     )
+    doctor_ok = os.path.exists(p("src/doctor.rs")) and os.path.exists(
+        p("tests/doctor_fixtures.rs")
+    )
     cells.append(
         _cell(
             "doctor",
-            "red",
-            "bd-wp8.4/.4.1 OPEN: idempotent/reversible fixture suite not yet shipped",
+            "green" if doctor_ok else "red",
+            "src/doctor.rs + tests/doctor_fixtures.rs (8 fixture roundtrips: fix/undo byte-identical, dry-run zero-blast, lock, chokepoint code-search)",
         )
     )
     cells.append(

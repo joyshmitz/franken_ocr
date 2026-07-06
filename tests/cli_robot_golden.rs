@@ -1857,49 +1857,54 @@ fn convert_arch_json_surface_accepts_targets() {
 /// [C5] `focr doctor` -> NotImplemented golden (message points at Phase 5).
 #[test]
 fn doctor_not_implemented_golden() {
-    assert_not_implemented_golden(
-        "doctor_not_implemented_golden",
-        "doctor_not_implemented",
-        &["doctor"],
-    );
-}
-
-/// Phase 0 exposes the future doctor contract shape under `--json` while the
-/// actual repair/check body remains a Phase-5 NotImplemented.
-#[test]
-fn doctor_json_emits_scaffold_contract() {
-    let test = "doctor_json_emits_scaffold_contract";
-    let out = run_focr(&["doctor", "--json"]);
+    // LIVE since bd-wp8.4: detect-only doctor. Hermetic env has no model, so
+    // the run reports the model_not_resolvable finding and exits 1 (the
+    // doctor exit contract, declared in `doctor capabilities`).
+    let out = run_focr(&["doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let line = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .expect("doctor --json scaffold line");
-    let v = parse_json_line(line, "doctor --json");
-    let capabilities = v["capabilities"].as_array().map(Vec::len).unwrap_or(0);
-    let checks = v["checks"].as_array().map(Vec::len).unwrap_or(0);
-    let pass = out.status.code() == Some(1)
-        && v["status"].as_str() == Some("scaffold")
-        && capabilities >= 3
-        && checks >= 3
-        && stderr.contains("Phase 5");
-    tlog!(test,
-        "case": "doctor_json",
+    let pass = out.status.code() == Some(1) && stdout.contains("model_not_resolvable");
+    tlog!("doctor_not_implemented_golden",
+        "case": "doctor_detect_only",
         "event": "assert",
-        "assertion": "doctor --json emits scaffold capabilities/checks and exits NotImplemented",
-        "inputs": {"argv": ["doctor", "--json"]},
+        "assertion": "detect-only doctor reports findings and exits 1 (live contract)",
+        "inputs": {"argv": ["doctor"]},
         "exit_code": out.status.code(),
-        "capabilities": capabilities,
-        "checks": checks,
-        "stderr": stderr.trim(),
         "pass": pass,
         "result": if pass { "pass" } else { "fail" },
     );
     assert!(
         pass,
-        "unexpected doctor --json result; stdout:\n{stdout}\nstderr:\n{stderr}"
+        "doctor detect-only: {:?}
+{stdout}",
+        out.status.code()
     );
+}
+
+/// The live doctor `--json` contract: ONE JSON object, versioned, findings
+/// carried with their fixability; hermetic no-model env exits 1.
+#[test]
+fn doctor_json_emits_scaffold_contract() {
+    let test = "doctor_json_emits_scaffold_contract";
+    let out = run_focr(&["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v = parse_json_line(stdout.trim(), "doctor --json");
+    let findings = v["findings"].as_array().map(Vec::len).unwrap_or(0);
+    let pass = out.status.code() == Some(1)
+        && v["schema_version"].as_i64() == Some(1)
+        && v["healthy"].as_bool() == Some(false)
+        && findings >= 1
+        && v["findings"][0]["fixability"]["kind"].as_str().is_some();
+    tlog!(test,
+        "case": "doctor_json_live",
+        "event": "assert",
+        "assertion": "doctor --json emits one versioned JSON object with typed findings (live contract)",
+        "inputs": {"argv": ["doctor", "--json"]},
+        "exit_code": out.status.code(),
+        "findings": findings,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "doctor --json live contract failed:\n{stdout}");
 }
 
 /// `focr robot run <image>` is the agent-facing alias for `focr ocr <image>

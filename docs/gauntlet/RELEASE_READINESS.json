@@ -1,7 +1,6 @@
 {
  "artifact": "franken_ocr.release_readiness.v1",
  "blocking_cells": [
-  "doctor",
   "certification_bundle",
   "gauntlet_convergence"
  ],
@@ -66,8 +65,8 @@
   },
   {
    "cell": "doctor",
-   "evidence": "bd-wp8.4/.4.1 OPEN: idempotent/reversible fixture suite not yet shipped",
-   "status": "red"
+   "evidence": "src/doctor.rs + tests/doctor_fixtures.rs (8 fixture roundtrips: fix/undo byte-identical, dry-run zero-blast, lock, chokepoint code-search)",
+   "status": "green"
   },
   {
    "cell": "certification_bundle",
@@ -82,7 +81,7 @@
   }
  ],
  "generated_by": "scripts/gauntlet_cert.py --release-readiness",
- "green": 10,
- "red": 3,
+ "green": 11,
+ "red": 2,
  "ship": false
 }

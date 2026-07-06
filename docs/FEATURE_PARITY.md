@@ -31,8 +31,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
 | Total enumerated rows | **128** | **57** | **185** |
-| `present` | 115 † | 43 | 158 |
-| `partial` | 7 † | 11 | 18 |
+| `present` | 115 † | 44 | 159 |
+| `partial` | 7 † | 10 | 17 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
 | `n/a` | 0 | 0 | 0 |
@@ -267,7 +267,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr robot triage` (one-round-trip agent mega-command) | §7.2 | SHOULD | present | SURF | bd-wp8.7 | quick_ref + health + state-aware recommendations + exit codes in ONE JSON; pinned by agent_ergonomics_regression |
 | `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |
 | `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
-| `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | partial | SURF | bd-wp8.4 | shipped + goldens; idempotent/reversible/capability audit bead open |
+| `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | present | SURF | bd-wp8.4 | LIVE: detect-then-fix, single-chokepoint mutation (backup-first, hash-logged), undo byte-identical, dry-run zero-blast, capabilities/robot-docs/robot-triage; 8/8 fixture roundtrips (`tests/doctor_fixtures.rs`) |
 | Exit codes 0..7 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
 | Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |

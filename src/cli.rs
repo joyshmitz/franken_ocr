@@ -648,9 +648,38 @@ pub struct SyncArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct DoctorArgs {
-    /// Emit the scaffold capability/check contract as JSON.
+    /// Emit the findings/report as one JSON object on stdout.
     #[arg(long)]
     pub json: bool,
+    /// Apply the SAFE repairs (backup-first, hash-logged, reversible).
+    /// Exit: 0 all fixed, 2 partial, 3 failed+rolled-back, 4 refused, 5 lock held.
+    #[arg(long)]
+    pub fix: bool,
+    /// Disclose the worst-case blast radius without mutating anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// One-round-trip triage: {summary, findings, actions_planned,
+    /// recommended_command} in one JSON object.
+    #[arg(long)]
+    pub robot_triage: bool,
+    #[command(subcommand)]
+    pub cmd: Option<DoctorCmd>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum DoctorCmd {
+    /// Restore a past --fix run byte-for-byte from its backups (hash-verified,
+    /// fails closed on any missing backup).
+    Undo {
+        /// The run id printed by `doctor --fix` (also the dir name under
+        /// `.doctor/runs/`).
+        run_id: String,
+    },
+    /// The full doctor contract (detectors, fixers, exit codes, env), from
+    /// the tool itself.
+    Capabilities,
+    /// Paste-ready agent handbook on stdout.
+    RobotDocs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2145,12 +2174,146 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
 }
 
 fn run_doctor(args: &DoctorArgs) -> FocrResult<()> {
-    if args.json {
-        emit(&doctor_scaffold_payload());
+    use crate::doctor;
+
+    // Contract sub-surfaces first: they never touch disk.
+    match &args.cmd {
+        Some(DoctorCmd::Capabilities) => {
+            emit(&doctor::capabilities());
+            return Ok(());
+        }
+        Some(DoctorCmd::RobotDocs) => {
+            print!("{}", doctor::robot_docs());
+            return Ok(());
+        }
+        Some(DoctorCmd::Undo { run_id }) => {
+            let root = doctor::DoctorRoot::resolve()?;
+            let restored = doctor::undo(&root, run_id)?;
+            emit(&serde_json::json!({
+                "schema_version": doctor::DOCTOR_SCHEMA_VERSION,
+                "command": "doctor.undo",
+                "run_id": run_id,
+                "actions_restored": restored,
+                "verified": "every restored file hash-matched its recorded before_hash",
+            }));
+            return Ok(());
+        }
+        None => {}
     }
-    Err(FocrError::NotImplemented(
-        "focr doctor — lands in Phase 5 (see plan §7)".into(),
-    ))
+
+    let root = doctor::DoctorRoot::resolve()?;
+    let findings = doctor::detect(&root);
+
+    // Deterministic run id: findings-count + wall-clock seconds (unique enough
+    // for a human-auditable dir name; collision just appends actions).
+    let run_id = format!(
+        "run-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+
+    let planned: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "detector": f.detector,
+                "severity": f.severity,
+                "path": f.path,
+                "message": f.message,
+                "fixability": f.fixability,
+            })
+        })
+        .collect();
+
+    if args.robot_triage {
+        let recommended = if findings.is_empty() {
+            "focr ocr <image> -o out.md".to_string()
+        } else if args.fix {
+            "focr doctor --fix".to_string()
+        } else {
+            "focr doctor --fix   # safe repairs only; see `focr doctor capabilities --json`"
+                .to_string()
+        };
+        emit(&serde_json::json!({
+            "schema_version": doctor::DOCTOR_SCHEMA_VERSION,
+            "command": "doctor.robot-triage",
+            "summary": {"findings": findings.len(), "healthy": findings.is_empty()},
+            "findings": planned,
+            "actions_planned": findings.iter().filter(|f| matches!(f.fixability, doctor::Fixability::Auto{..})).count(),
+            "recommended_command": recommended,
+            "capabilities_hint": "focr doctor capabilities --json",
+        }));
+        std::process::exit(if findings.is_empty() {
+            doctor::EXIT_HEALTHY
+        } else {
+            doctor::EXIT_FINDINGS
+        });
+    }
+
+    if args.dry_run {
+        emit(&serde_json::json!({
+            "schema_version": doctor::DOCTOR_SCHEMA_VERSION,
+            "command": "doctor.dry-run",
+            "would_mutate": findings.iter().filter(|f| matches!(f.fixability, doctor::Fixability::Auto{..})).count(),
+            "blast_radius": root.cache_root.display().to_string(),
+            "findings": planned,
+            "note": "NO mutation performed; --fix applies the auto items backup-first",
+        }));
+        std::process::exit(if findings.is_empty() {
+            doctor::EXIT_HEALTHY
+        } else {
+            doctor::EXIT_FINDINGS
+        });
+    }
+
+    if args.fix {
+        let report = match doctor::fix(&root, &findings, &run_id) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("doctor lock held") {
+                    eprintln!("focr doctor: {msg}");
+                    std::process::exit(doctor::EXIT_CONCURRENCY_LOST);
+                }
+                return Err(e);
+            }
+        };
+        emit(&serde_json::json!({
+            "schema_version": doctor::DOCTOR_SCHEMA_VERSION,
+            "command": "doctor.fix",
+            "run_id": report.run_id,
+            "fixed": report.fixed,
+            "refused_unsafe": report.refused,
+            "advice_only": report.advice_only,
+            "failed_rolled_back": report.failed_rolled_back,
+            "undo": format!("focr doctor undo {}", report.run_id),
+            "findings": planned,
+        }));
+        std::process::exit(report.exit_code);
+    }
+
+    // Detect-only.
+    if args.json {
+        emit(&serde_json::json!({
+            "schema_version": doctor::DOCTOR_SCHEMA_VERSION,
+            "command": "doctor",
+            "healthy": findings.is_empty(),
+            "findings": planned,
+        }));
+    } else if findings.is_empty() {
+        println!("focr doctor: healthy ({} checks green)", 4);
+    } else {
+        for f in &findings {
+            println!("[{}] {}: {}", f.severity, f.detector, f.message);
+        }
+    }
+    std::process::exit(if findings.is_empty() {
+        doctor::EXIT_HEALTHY
+    } else {
+        doctor::EXIT_FINDINGS
+    });
 }
 
 fn forced_test_error() -> FocrResult<Option<FocrError>> {
@@ -2210,54 +2373,6 @@ fn non_negative_finite_f32(name: &str, value: f32) -> FocrResult<f32> {
         )));
     }
     Ok(value)
-}
-
-fn doctor_scaffold_payload() -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": robot::ROBOT_SCHEMA_VERSION,
-        "command": "doctor",
-        "status": "scaffold",
-        "capabilities": [
-            {
-                "name": "model_resolution",
-                "phase": "Phase 5",
-                "idempotent": true,
-                "reversible": true,
-                "implemented": false
-            },
-            {
-                "name": "format_version",
-                "phase": "Phase 5",
-                "idempotent": true,
-                "reversible": true,
-                "implemented": false
-            },
-            {
-                "name": "permissions",
-                "phase": "Phase 5",
-                "idempotent": true,
-                "reversible": true,
-                "implemented": false
-            }
-        ],
-        "checks": [
-            {
-                "name": "model_available",
-                "status": "not_run",
-                "landing_phase": "Phase 5"
-            },
-            {
-                "name": "format_supported",
-                "status": "not_run",
-                "landing_phase": "Phase 5"
-            },
-            {
-                "name": "paths_writable",
-                "status": "not_run",
-                "landing_phase": "Phase 5"
-            }
-        ]
-    })
 }
 
 fn robot_health_payload() -> serde_json::Value {
