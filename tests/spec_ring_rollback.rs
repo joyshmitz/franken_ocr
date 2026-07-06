@@ -389,3 +389,34 @@ fn rollback_panics_when_speculation_evicted_a_live_slot() {
     drive_steps(&mut c, 0, 0, SPEC, 0, 1);
     c.rollback_to(&cp);
 }
+
+// ── (5) the KV-cap invariant verdict (bd-re8.15 e-process observation) ─────────
+
+/// INV-KV-CAP: the generated tail NEVER occupies more than the fixed
+/// `RING_WINDOW` slots, however long the decode runs — driving 5× the window
+/// must leave `ring_len == RING_WINDOW` and `effective_len == prefill + W`.
+/// The verdict is computed BEFORE the asserts and emitted as one structured
+/// line so the e-process monitor (`gauntlet_cert.py --eprocess-fold`) observes
+/// a genuine `fail` alarm on violation, not just a CI panic.
+#[test]
+fn kv_cap_ring_bound_holds_under_overfill() {
+    let prefill_rows = 16usize;
+    let mut c = RingCache::new(4096);
+    let (pk, pv) = prefill_kv(prefill_rows, PREFILL_SEED);
+    c.record_prefill(&pk, &pv, prefill_rows).unwrap();
+    drive_steps(&mut c, 0, 0, ACCEPT, 0, RING_WINDOW * 5);
+
+    let bound_ok = c.ring_len() == RING_WINDOW && c.effective_len() == prefill_rows + RING_WINDOW;
+    eprintln!(
+        r#"{{"schema_version":1,"test":"spec_ring_rollback","case":"kv_cap_ring_bound","event":"result","result":"{}"}}"#,
+        if bound_ok { "pass" } else { "fail" }
+    );
+    assert!(
+        bound_ok,
+        "KV cap violated after 5x window overfill: ring_len={} (want {RING_WINDOW}), \
+         effective_len={} (want {})",
+        c.ring_len(),
+        c.effective_len(),
+        prefill_rows + RING_WINDOW,
+    );
+}

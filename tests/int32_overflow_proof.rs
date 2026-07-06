@@ -207,6 +207,18 @@ fn worst_case_accumulators_fit_i32_closed_form() {
     // The two headline numbers at the global worst-case K = 6848.
     let s8s8_6848 = 6848i64 * S8S8_TERM;
     let u8s8_6848 = 6848i64 * U8S8_TERM;
+    // One structured verdict line for the e-process monitor (bd-re8.15),
+    // computed BEFORE the asserts so a genuine violation emits a `fail`
+    // alarm observation before the panic hard-fails CI.
+    let headroom_ok = s8s8_6848 < I32_MAX_I64
+        && u8s8_6848 < I32_MAX_I64
+        && MODEL_KS.iter().all(|case| {
+            case.k as i64 * S8S8_TERM < I32_MAX_I64 && case.k as i64 * U8S8_TERM < I32_MAX_I64
+        });
+    eprintln!(
+        r#"{{"schema_version":1,"test":"int32_overflow_proof","case":"i32_overflow_headroom_k6848","event":"result","result":"{}"}}"#,
+        if headroom_ok { "pass" } else { "fail" }
+    );
     assert_eq!(
         s8s8_6848, 110_451_392,
         "S8S8 worst at K=6848 must be exactly 6848*16129"

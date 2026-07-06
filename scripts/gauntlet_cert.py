@@ -453,11 +453,13 @@ def from_parity(md_path: str, residuals_path: str | None, out_path: str | None) 
     explicitly rather than inventing confidence it does not have. Residual
     history accrues one entry per gauntlet round (|observed - Beta-mean|).
     """
-    md_text = open(md_path, encoding="utf-8").read()
+    with open(md_path, encoding="utf-8") as f:
+        md_text = f.read()
     cats = categories_from_parity(md_text)
     residuals: list[float] = []
     if residuals_path and os.path.exists(residuals_path):
-        residuals = json.load(open(residuals_path, encoding="utf-8"))
+        with open(residuals_path, encoding="utf-8") as f:
+            residuals = json.load(f)
     sc = compute_scorecard(cats, residuals, confidence=0.95)
     debt = {
         c.category_id: round(c.weighted_excluded, 6)
@@ -519,14 +521,124 @@ def convergence_verdict(rounds: list[dict]) -> dict:
 def convergence(rounds_path: str) -> int:
     rounds: list[dict] = []
     if os.path.exists(rounds_path):
-        for line in open(rounds_path, encoding="utf-8"):
-            line = line.strip()
-            if line:
-                rounds.append(json.loads(line))
+        with open(rounds_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rounds.append(json.loads(line))
     verdict = convergence_verdict(rounds)
     verdict["rounds_file"] = rounds_path
     print(json.dumps(verdict, sort_keys=True))
     return 0 if verdict["converged"] else 1
+
+
+# --------------------------------------------------------------------------- #
+# bd-re8.15 — wiring the e-processes to the LIVE invariant streams.
+#
+# The four load-bearing invariants already EMIT structured NDJSON wherever
+# they are exercised (the determinism gates, `robot selftest`, the i32
+# overflow proofs, the R-SWA/KV bound gates). The fold below maps those
+# real lines onto e-process observations and persists the per-invariant
+# state ACROSS runs — the e-value only ever multiplies (Ville's inequality
+# holds over the whole history; resetting would forge the guarantee).
+# --------------------------------------------------------------------------- #
+
+# invariant -> lowercase substrings matched against the line's identifying
+# fields. The mapping is deliberately explicit and versioned here: adding an
+# invariant means adding its emission-site vocabulary alongside.
+EPROCESS_MATCHERS: list[tuple[str, tuple[str, ...]]] = [
+    ("INV-DETERMINISM", ("determin",)),
+    ("INV-SIMD-SCALAR", ("selftest", "simd")),
+    ("INV-I32-NOOVERFLOW", ("overflow",)),
+    ("INV-KV-CAP", ("kv_cap", "kv_bound", "kvcache_bound", "rswa_bound")),
+]
+
+_EPROCESS_ID_FIELDS = (
+    "test",
+    "case",
+    "check",
+    "gate",
+    "suite",
+    "relation",
+    "assertion",
+    "invariant",
+    "command",
+)
+
+
+def classify_invariant_line(obj: dict) -> tuple[str, bool] | None:
+    """Map one structured log line to (invariant, alarm) or None.
+
+    Only lines carrying an explicit pass/fail verdict count as observations —
+    skips (`skip_no_model`) are NOT evidence in either direction."""
+    result = str(obj.get("result", obj.get("verdict", "")))
+    if result not in ("pass", "fail"):
+        return None
+    hay = " ".join(str(obj.get(f, "")) for f in _EPROCESS_ID_FIELDS).lower()
+    for invariant, needles in EPROCESS_MATCHERS:
+        if any(n in hay for n in needles):
+            return (invariant, result == "fail")
+    return None
+
+
+def _eprocess_from_state(name: str, saved: dict | None) -> EProcess:
+    ep = EProcess.for_invariant(name)
+    if saved:
+        ep.e_value = float(saved["e_value"])
+        ep.obs_count = int(saved["obs_count"])
+        ep.rejected_at = saved.get("rejected_at")
+    return ep
+
+
+def eprocess_fold(raw_path: str, state_path: str) -> int:
+    """Fold a raw NDJSON stream into the persisted e-process state.
+
+    Exit 1 iff any invariant's e-value has EVER crossed its Ville threshold
+    (anytime-valid: the rejection is permanent by construction)."""
+    state: dict = {}
+    if os.path.exists(state_path):
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    procs = {
+        name: _eprocess_from_state(name, state.get("invariants", {}).get(name))
+        for name, _ in EPROCESS_MATCHERS
+    }
+    folded = 0
+    with open(raw_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            hit = classify_invariant_line(obj)
+            if hit is None:
+                continue
+            name, alarm = hit
+            procs[name].observe(alarm)
+            folded += 1
+    out = {
+        "artifact": "franken_ocr.gauntlet.eprocess.v1",
+        "source": raw_path,
+        "observations_folded": folded,
+        "invariants": {
+            name: {
+                "e_value": ep.e_value,
+                "obs_count": ep.obs_count,
+                "rejected_at": ep.rejected_at,
+                "threshold": ep.threshold,
+            }
+            for name, ep in procs.items()
+        },
+        "global_e_value": global_e_value(procs.values()),
+        "any_rejected": any(ep.rejected_at is not None for ep in procs.values()),
+    }
+    with open(state_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(out, sort_keys=True, indent=1) + "\n")
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["any_rejected"] else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -810,6 +922,66 @@ def self_test() -> int:
     )
     check("convergence_refuses_empty", not convergence_verdict([])["converged"])
 
+    # bd-re8.15 — the live-stream fold.
+    check(
+        "eprocess_classify_maps_real_shapes",
+        classify_invariant_line(
+            {"test": "e2e", "case": "determinism_gate", "result": "pass"}
+        )
+        == ("INV-DETERMINISM", False)
+        and classify_invariant_line({"check": "int32_overflow_proof", "result": "fail"})
+        == ("INV-I32-NOOVERFLOW", True)
+        and classify_invariant_line({"case": "kv_cap_bound", "result": "pass"})
+        == ("INV-KV-CAP", False)
+        and classify_invariant_line({"test": "robot_selftest", "result": "pass"})
+        == ("INV-SIMD-SCALAR", False)
+        # skips are NOT observations; unmatched lines are None.
+        and classify_invariant_line({"case": "determinism_gate", "result": "skip_no_model"})
+        is None
+        and classify_invariant_line({"case": "l4_tokens", "result": "pass"}) is None,
+    )
+    ep_clean = _eprocess_from_state("INV-DETERMINISM", None)
+    for _ in range(5):
+        ep_clean.observe(False)
+    check(
+        "eprocess_clean_stream_shrinks",
+        ep_clean.e_value < 1.0 and ep_clean.rejected_at is None,
+        e=ep_clean.e_value,
+    )
+    ep_trip = _eprocess_from_state("INV-DETERMINISM", None)
+    tripped = ep_trip.observe(True)
+    check(
+        "eprocess_single_hardware_violation_trips",
+        tripped and ep_trip.rejected_at == 1,
+        e=ep_trip.e_value,
+    )
+    saved = {"e_value": ep_clean.e_value, "obs_count": ep_clean.obs_count, "rejected_at": None}
+    ep_resumed = _eprocess_from_state("INV-DETERMINISM", saved)
+    ep_resumed.observe(False)
+    check(
+        "eprocess_state_roundtrip_never_resets",
+        ep_resumed.obs_count == 6 and ep_resumed.e_value < ep_clean.e_value,
+    )
+    # Injected violation end-to-end, ALL FOUR invariants: the emission-shaped
+    # fail line classifies to the right invariant and a single genuine alarm
+    # crosses the Ville threshold (acceptance: alarms on injected violation,
+    # silent on the clean stream — the clean side is the checks above).
+    injected = {
+        "INV-DETERMINISM": {"case": "determinism_gate", "result": "fail"},
+        "INV-SIMD-SCALAR": {"command": "robot.selftest", "verdict": "fail"},
+        "INV-I32-NOOVERFLOW": {
+            "test": "int32_overflow_proof",
+            "case": "i32_overflow_headroom_k6848",
+            "result": "fail",
+        },
+        "INV-KV-CAP": {"test": "spec_ring_rollback", "case": "kv_cap_ring_bound", "result": "fail"},
+    }
+    for name, line in injected.items():
+        got = classify_invariant_line(line)
+        ep_inj = _eprocess_from_state(name, None)
+        tripped_inj = got == (name, True) and ep_inj.observe(True) and ep_inj.rejected_at == 1
+        check(f"eprocess_injected_violation_trips_{name}", tripped_inj, classified=str(got))
+
     if failures:
         emit("gauntlet-cert-self-test", False, failed=failures)
         return 1
@@ -839,6 +1011,17 @@ def main() -> int:
         const="docs/gauntlet/ROUNDS.jsonl",
         help="check the >=10-rounds / >=2-clean convergence gate; exit 1 until met (bd-wp8.8)",
     )
+    parser.add_argument(
+        "--eprocess-fold",
+        metavar="RAW_NDJSON",
+        help="fold a real test-log NDJSON stream into the persisted e-process state (bd-re8.15)",
+    )
+    parser.add_argument(
+        "--eprocess-state",
+        metavar="FILE",
+        default="docs/gauntlet/EPROCESS_STATE.json",
+        help="the persisted (never-reset) per-invariant e-process state",
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
@@ -848,6 +1031,8 @@ def main() -> int:
         return from_parity(args.from_parity, args.residuals, args.scorecard_out)
     if args.convergence:
         return convergence(args.convergence)
+    if args.eprocess_fold:
+        return eprocess_fold(args.eprocess_fold, args.eprocess_state)
     parser.print_help()
     return 0
 
