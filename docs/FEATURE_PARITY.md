@@ -153,34 +153,34 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 63 | R-SWA heads/dims (10/10, head_dim 128, scale 1/√128) | SPEC-090 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | no QKV bias |
-| 64 | Regime 1: true prefill (full causal, record prefill_len) | SPEC-091 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | OQ-1 |
-| 65 | Regime 2: warmup decode (cat-append until prefill+W) | SPEC-091 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | OQ-3 |
-| 66 | Regime 3: steady-state ring (in-place overwrite, no grow) | SPEC-091 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | slot=prefill+ring_pos |
-| 67 | Effective attention window (prefill_len + 128) | SPEC-094 | MUST | missing | L2 | rswa.rs | bd-1gv.17 | reference never evicted |
-| 68 | PORT INVARIANT: RoPE uses true position, not ring slot | SPEC-095 | MUST | missing | L2 | rswa.rs | bd-1gv.17.2 | decouple slot/logical |
-| 69 | Preallocated fixed ring + reference buffer (m_max 32896) | CENSUS (d) | MUST | missing | L2 | rswa.rs | bd-1gv.17 | KV cap invariant |
-| 70 | Online (FlashAttention-style) softmax over ref block | §6.8 | SHOULD | missing | L2 | rswa.rs | bd-1gv.17.1 | perf-equiv to naive |
-| 71 | KV-cap invariant (never exceeds L·(m+128)) | §8.5 | MUST | missing | L2 | rswa.rs, conformance.rs | bd-1gv.24.1 | e-process monitored |
+| 63 | R-SWA heads/dims (10/10, head_dim 128, scale 1/√128) | SPEC-090 | MUST | present | L2 | rswa.rs | bd-1gv.17 | 10 heads hd128 scale 1/√128 no-bias (rswa.rs:42 + constants_match_spec test) |
+| 64 | Regime 1: true prefill (full causal, record prefill_len) | SPEC-091 | MUST | present | L2 | rswa.rs | bd-1gv.17 | regime 1 true prefill (rswa.rs record_prefill + boundary test) |
+| 65 | Regime 2: warmup decode (cat-append until prefill+W) | SPEC-091 | MUST | present | L2 | rswa.rs | bd-1gv.17 | regime 2 warmup append (rswa.rs + warmup_appends_without_eviction) |
+| 66 | Regime 3: steady-state ring (in-place overwrite, no grow) | SPEC-091 | MUST | present | L2 | rswa.rs | bd-1gv.17 | regime 3 steady-state ring overwrite (rswa.rs + modulo-W tests) |
+| 67 | Effective attention window (prefill_len + 128) | SPEC-094 | MUST | present | L2 | rswa.rs | bd-1gv.17 | effective window prefill+128, ref never evicted (rswa.rs:2197 large_batch_invariants) |
+| 68 | PORT INVARIANT: RoPE uses true position, not ring slot | SPEC-095 | MUST | present | L2 | rswa.rs | bd-1gv.17.2 | PORT INVARIANT RoPE true position not ring slot (rswa.rs:28; spec_ring_rollback slot-decoupling) |
+| 69 | Preallocated fixed ring + reference buffer (m_max 32896) | CENSUS (d) | MUST | present | L2 | rswa.rs | bd-1gv.17 | preallocated worst-case ring+reference (rswa.rs:184 + budget-arithmetic test) |
+| 70 | Online (FlashAttention-style) softmax over ref block | §6.8 | SHOULD | present | L2 | rswa.rs | bd-1gv.17.1 | online FlashAttention-style softmax (rswa.rs:891 + online_matches_naive test) |
+| 71 | KV-cap invariant (never exceeds L·(m+128)) | §8.5 | MUST | present | L2 | rswa.rs, conformance.rs | bd-1gv.24.1 | KV-cap invariant (rswa.rs:2226 + NEW kv_cap_ring_bound_holds_under_overfill 5×W overfill verdict in spec_ring_rollback.rs, wired to the e-process monitor bd-re8.15) |
 
 ## 8. Modeling features — sampler & postprocess (SPEC-100..119)
 
 | # | Feature | SPEC | Req | Status | Parity | Module | Bead | Notes |
 |---|---------|------|-----|--------|--------|--------|------|-------|
-| 72 | Greedy default (temp 0 ⇒ argmax; temp>0 sample) | SPEC-100 | MUST | missing | L4 | decode.rs | bd-1gv.22 | |
-| 73 | EOS=1 / max_length 32768 / use_cache | SPEC-101 | MUST | missing | L4 | decode.rs | bd-1gv.22 | |
-| 74 | no_repeat_ngram options dispatch | SPEC-102 | MUST | missing | L4 | decode.rs | bd-1gv.22 | |
-| 75 | SlidingWindowNoRepeatNgramProcessor (35, win 128/1024) | SPEC-103 | MUST | missing | L4 | decode.rs | bd-1gv.22 | OQ-18 first-class semantics |
-| 76 | Decode + strip EOS string | SPEC-110 | MUST | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 77 | re_match ref/det regex extraction | SPEC-111 | MUST | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 78 | Coordinate parse (extract_coordinates_and_label) | SPEC-112 | MUST | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 79 | bbox /999 → pixel rescale | SPEC-113 | MUST | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 80 | image-label crops → markdown `![](images/..)` | SPEC-114 | SHOULD | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 81 | other-label cleanup + `\coloneqq`/`\eqqcolon` | SPEC-115 | MUST | missing | L5 | postprocess.rs | bd-1gv.23 | |
-| 82 | bbox overlay drawing (result_with_boxes.jpg) | SPEC-116 | MAY | excluded | n/a | — | — | visualization-only, out of v1 |
-| 83 | geometry/line_type special case (geo.jpg) | SPEC-117 | MAY | excluded | n/a | — | — | rare viz path, out of v1 |
-| 84 | Multi-page `<PAGE>` split/rejoin | SPEC-118 | MUST | missing | L5 | postprocess.rs | bd-1gv.25 | per-page prefix |
-| 85 | test_compress metric (output/valid_img tokens) | SPEC-119 | MAY | excluded | n/a | — | — | diagnostic metric, out of v1 |
+| 72 | Greedy default (temp 0 ⇒ argmax; temp>0 sample) | SPEC-100 | MUST | present | L4 | decode.rs | bd-1gv.22 | greedy default / temp>0 sample (sampler.rs:325); L4 token_exact 1.0 + batched_sampler_parity |
+| 73 | EOS=1 / max_length 32768 / use_cache | SPEC-101 | MUST | present | L4 | decode.rs | bd-1gv.22 | EOS=1 max_length 32768 (sampler.rs); spec_decode_gate + L4 EOS stop |
+| 74 | no_repeat_ngram options dispatch | SPEC-102 | MUST | present | L4 | decode.rs | bd-1gv.22 | no_repeat_ngram options dispatch (sampler.rs); spec_decode_gate non-frozen params test |
+| 75 | SlidingWindowNoRepeatNgramProcessor (35, win 128/1024) | SPEC-103 | MUST | present | L4 | decode.rs | bd-1gv.22 | SlidingWindowNoRepeatNgram size 35 win 128/1024 (sampler.rs:33); pinned-constants test |
+| 76 | Decode + strip EOS string | SPEC-110 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | strip EOS (postprocess.rs:113 + test) |
+| 77 | re_match ref/det regex extraction | SPEC-111 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | ref/det regex extraction (postprocess.rs:130 + span tests) |
+| 78 | Coordinate parse (extract_coordinates_and_label) | SPEC-112 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | coordinate parse (postprocess.rs:265 + tests) |
+| 79 | bbox /999 → pixel rescale | SPEC-113 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | bbox /999 rescale w/ python int truncation parity (postprocess.rs:100 + test); metamorphic pad_coord |
+| 80 | image-label crops → markdown `![](images/..)` | SPEC-114 | SHOULD | present | L5 | postprocess.rs | bd-1gv.23 | image-label crops → markdown refs (postprocess.rs:401 + tests) |
+| 81 | other-label cleanup + `\coloneqq`/`\eqqcolon` | SPEC-115 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | other-label cleanup + coloneqq normalize (postprocess.rs:373 + tests) |
+| 82 | bbox overlay drawing (result_with_boxes.jpg) | SPEC-116 | MAY | excluded | n/a | — | — | (unchanged; §16) |
+| 83 | geometry/line_type special case (geo.jpg) | SPEC-117 | MAY | excluded | n/a | — | — | (unchanged; §16) |
+| 84 | Multi-page `<PAGE>` split/rejoin | SPEC-118 | MUST | present | L5 | postprocess.rs | bd-1gv.25 | <PAGE> split/rejoin multi-page (postprocess.rs:38,489 + tests) |
+| 85 | test_compress metric (output/valid_img tokens) | SPEC-119 | MAY | excluded | n/a | — | — | (unchanged; §16) |
 
 ## 9. Op map — frankentorch facade (plan §4.3)
 
