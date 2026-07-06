@@ -124,10 +124,15 @@ fn searched_dirs() -> Vec<String> {
 /// the 6.67 GB blob just to decide whether to skip, per §4.1). `None` ⇒
 /// skip-with-SUCCESS.
 fn resolve_present_model() -> Option<PathBuf> {
-    // `OcrEngine::model_path()` is the single source of truth for resolution
-    // (the `FOCR_MODEL_PATH` override, else `DEFAULT_MODEL_PATH`).
-    let p = OcrEngine::model_path();
-    if p.exists() { Some(p) } else { None }
+    // `recognize()` resolves through the FULL model-resolution policy — the
+    // `FOCR_MODEL_PATH` override, then the search dirs including the
+    // quant-suffixed names a `focr pull` installs (`unlimited-ocr.int8.focrq`,
+    // bd-3u6x) — so this guard must use the same surface. A bare
+    // `model_path().exists()` check misses a pulled artifact and lets the
+    // without-weights branch run against a resolvable model (surfaced
+    // 2026-07-06 when a dev cache was repopulated: recognize() found the int8
+    // artifact and failed with InputDecode instead of ModelNotFound).
+    franken_ocr::native_engine::OcrModel::resolve_model(&OcrEngine::model_path()).ok()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
