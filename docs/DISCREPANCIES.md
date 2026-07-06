@@ -93,7 +93,7 @@ since exact-token OCR fails in the tail.
     matches the oracle for a 22-token exact prefix, then flips one near-tied token
     ("multiple windows…" → "a uniform color scheme…" — both coherent, faithful
     captions of the fixture image) and re-converges structurally.
-- MEASURED impact (fully attributed, 2026-07-03): divergence is
+- Measured impact: (fully attributed, 2026-07-03) divergence is
     decode-trajectory-only and belongs to the **KV-cache fast path**, not the
     decoder math. Three probes isolated it, all with the ORACLE's own
     `connector_out.bin` vision rows:
@@ -114,9 +114,17 @@ since exact-token OCR fails in the tail.
     lands on the oracle's rank-2 token at a gap ≤ 0.5 (median ledger gap ~1.0),
     plus an opt-in `FOCR_SMOLVLM2_CERT_FULL=1` leg re-proving the greedy path
     id-exact — a real defect (wrong math, not reordered math) fails both.
-- Kill-switch: none needed (f32-vs-f32 numerics, not a quant tier); for a
-    trajectory bit-faithful to the sdpa math, `generate_greedy` is the O(n²)
-    reference path.
+- Fallback / kill-switch state: none needed (f32-vs-f32 numerics, not a quant
+    tier); for a trajectory bit-faithful to the sdpa math, `generate_greedy` is
+    the O(n²) reference path.
+- Resolution: ACCEPTED as reordered-math (not wrong-math), attribution-gated —
+    every first divergence must land on the oracle's rank-2 token within the
+    ledgered top-2 gap; the greedy path stays id-exact under
+    `FOCR_SMOLVLM2_CERT_FULL=1`.
+- Tests affected: `smolvlm2::tests::describe_e2e_matches_oracle_l4` +
+    `decoder_qwen2::tests::smolvlm2_kvcache_greedy_matches_oracle_l4`
+    (ledger-gated acceptance, NOT XFAIL — the attribution gate IS the assert);
+    `onechart::tests::opt_kvcache_matches_greedy_and_oracle` (prefix ≥ 12 gate).
 - ALSO OBSERVED at OPT geometry (OneChart D4, 2026-07-05): on the SAME int8
     artifact, the kvcache and re-prefill greedy paths agree for a measured
     13-step prefix at ~320 positions, then flip a whitespace/quote-class JSON
@@ -145,11 +153,18 @@ since exact-token OCR fails in the tail.
 - Our impl: the int8 decode (both `generate_greedy` on the `.focrq` and the kvcache
     path — MUTUALLY bit-identical, the B9 contract) flips the near-tied token at
     step 7 ("It" → "Paris", both coherent continuations) and re-converges structurally.
-- MEASURED impact: int8 last-pos logit cosine 0.998301 vs oracle, argmax EXACT at the
+- Measured impact: int8 last-pos logit cosine 0.998301 vs oracle, argmax EXACT at the
     seam; the f32 path (`model.safetensors`) is token-exact for all 24 ids (cos
     1.000000). Divergence is decode-trajectory-only, first flip at generated index 7.
-- Kill-switch: run the f32 reference weights (`FOCR_MODEL_PATH=<dir with safetensors>`)
-    — the f32 decode is oracle-exact; the int8 artifact is the speed path.
+- Fallback / kill-switch state: run the f32 reference weights
+    (`FOCR_MODEL_PATH=<dir with safetensors>`) — the f32 decode is oracle-exact;
+    the int8 artifact is the speed path.
+- Resolution: ACCEPTED — decode-trajectory-only near-tie flip with argmax exact
+    at the seam and cosine 0.998301; the C10 VQA gate later measured int8 == f32
+    (7/7 BOTH precisions), so the flips move no quality metric.
+- Tests affected: `decoder_qwen2::tests::smolvlm2_decoder_matches_torch_oracle` +
+    `decoder_qwen2::tests::smolvlm2_kvcache_greedy_matches_oracle_l4`
+    (ledger-gated near-tie acceptance, NOT XFAIL).
 - Review date: when C8 (SmolVLM2 e2e quality gate) lands a caption/VQA quality budget —
     re-measure whether near-tie flips move any quality metric.
 

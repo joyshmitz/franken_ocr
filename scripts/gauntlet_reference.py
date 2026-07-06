@@ -130,15 +130,30 @@ def verify_torch_pinned(budget: int, torch_threads: int) -> None:
         )
 
 
-def verify_stack_pins(torch_version: str, transformers_version: str) -> None:
+def verify_stack_pins(
+    torch_version: str,
+    transformers_version: str,
+    pin_torch: str = PINNED_TORCH,
+    pin_transformers: str = PINNED_TRANSFORMERS,
+) -> None:
+    """Refuse a stack that drifts from the EXPLICIT pins.
+
+    The defaults are the Unlimited-OCR truth-pack stack. A zoo lane whose
+    oracle certs were generated against a different stack passes ITS certified
+    pins via `--pin-torch/--pin-transformers` (A11: GOT/OneChart certs are
+    torch 2.12.1 + transformers 4.45.2 — 4.57's cache API breaks the pinned
+    GOT modeling code). The pins remain fail-closed either way and land in
+    the output records; there is no unpinned mode.
+    """
+
     def base(v: str) -> str:
         return v.split("+", 1)[0]
 
-    if base(torch_version) != PINNED_TORCH or base(transformers_version) != PINNED_TRANSFORMERS:
+    if base(torch_version) != pin_torch or base(transformers_version) != pin_transformers:
         raise FairnessError(
             f"unpinned reference stack: torch=={torch_version}, "
-            f"transformers=={transformers_version} (truth pack pins "
-            f"torch=={PINNED_TORCH}, transformers=={PINNED_TRANSFORMERS}); "
+            f"transformers=={transformers_version} (this run pins "
+            f"torch=={pin_torch}, transformers=={pin_transformers}); "
             "a ratio against a drifted stack is not comparable"
         )
 
@@ -303,7 +318,9 @@ def run_stage(args: argparse.Namespace, stage_req: str, budget: int) -> int:
     import torch  # noqa: PLC0415 — deliberate post-gate import
     import transformers  # noqa: PLC0415
 
-    verify_stack_pins(torch.__version__, transformers.__version__)
+    verify_stack_pins(
+        torch.__version__, transformers.__version__, args.pin_torch, args.pin_transformers
+    )
     torch.set_num_threads(budget)
     try:
         torch.set_num_interop_threads(1)
@@ -547,6 +564,16 @@ def main() -> int:
     parser.add_argument("--entry", default=None, help="module:function timed per stage")
     parser.add_argument("--setup", default=None, help="module:function run once, unclocked")
     parser.add_argument("--out", default=None, help="stage-record JSON (merged per stage)")
+    parser.add_argument(
+        "--pin-torch",
+        default=PINNED_TORCH,
+        help="the torch version this lane's oracle certs pinned (default: the truth pack)",
+    )
+    parser.add_argument(
+        "--pin-transformers",
+        default=PINNED_TRANSFORMERS,
+        help="the transformers version this lane's oracle certs pinned (default: the truth pack)",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",

@@ -1407,7 +1407,7 @@ pub fn generate_greedy_kvcache(
             DECODE_LMHEAD_NS.load(Ordering::Relaxed) as f64 * ns,
         );
         eprintln!(
-            "[focr-timing]   decode {} tok in {:.2}s ({:.1} tok/s) | seed(prefill) {:.2}s | \
+            "[focr-timing]   decode {} tok in {:.2}s ({:.1} tok/s) | seed(prefill {n} tok) {:.2}s | \
              layers {:.2}s (attn {:.2}s, gemv+misc {:.2}s) | lm_head {:.2}s",
             ids.len(),
             dec_s,

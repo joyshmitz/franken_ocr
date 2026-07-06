@@ -89,7 +89,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "got_decode",
         re.compile(
             r"^decode (?P<tok>\d+) tok in (?P<s>\d+(?:\.\d+)?)s \(\d+(?:\.\d+)? tok/s\)"
-            r" \| seed\(prefill\) (?P<seed>\d+(?:\.\d+)?)s"
+            r" \| seed\(prefill(?: (?P<seedtok>\d+) tok)?\) (?P<seed>\d+(?:\.\d+)?)s"
             r" \| layers (?P<layers>\d+(?:\.\d+)?)s"
             r" \(attn (?P<attn>\d+(?:\.\d+)?)s, gemv\+misc (?P<gemv>\d+(?:\.\d+)?)s\)"
             r" \| lm_head (?P<head>\d+(?:\.\d+)?)s$"
@@ -194,10 +194,12 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
         entry["occurrences"] += 1
         return
     if name == "got_decode":
-        # The GOT decoder's one-line breakdown carries BOTH the decode total and
-        # the seeding prefill; fan it out to the shared stage names.
+        # The shared-engine decode breakdown (all dense lanes) carries BOTH the
+        # decode total and the seeding prefill; fan it out to the shared stage
+        # names. The seed token count (newer binaries) feeds the prefill floor.
+        seedtok = int(groups["seedtok"]) if groups.get("seedtok") else None
         _add(stages, "decode_total", float(groups["s"]), int(groups["tok"]))
-        _add(stages, "prefill", float(groups["seed"]), None)
+        _add(stages, "prefill", float(groups["seed"]), seedtok)
         _add(stages, "decode_layers", float(groups["layers"]), None)
         _add(stages, "decode_attn", float(groups["attn"]), None)
         _add(stages, "decode_lm_head", float(groups["head"]), None)
@@ -211,6 +213,12 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
         entry = stages[base]
         entry["batched"] = True
         entry["views"] = entry.get("views", 0) + int(groups["views"])
+        return
+    if name == "smolvlm2_vision_splice":
+        # The frame count is the SigLIP "view" count (A11 roofline input).
+        _add(stages, name, float(groups["s"]), None)
+        entry = stages[name]
+        entry["views"] = entry.get("views", 0) + int(groups["frames"])
         return
     tokens = int(groups["tok"]) if groups.get("tok") is not None else None
     _add(stages, name, float(groups["s"]), tokens)
@@ -324,6 +332,10 @@ def aggregate_runs(
             "occurrences": present[0].get("occurrences", 1),
             "synthetic": synthetic,
         }
+        views = [entry.get("views") for entry in present]
+        if any(v is not None for v in views):
+            record["views"] = views[0]
+            record["views_consistent"] = len(set(views)) == 1
         if any(t is not None for t in tokens):
             record["tokens"] = tokens[0]
             record["tokens_consistent"] = len(set(tokens)) == 1

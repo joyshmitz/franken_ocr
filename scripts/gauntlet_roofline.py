@@ -70,6 +70,46 @@ GOT = {
     "kv_window": None,  # full causal: the window is the whole context
 }
 
+SMOLVLM2 = {
+    # src/native_engine/decoder_qwen2.rs::DecoderConfig::smolvlm2 (dense, GQA 15/5)
+    "hidden": 960,
+    "layers": 32,
+    "heads": 15,
+    "head_dim": 64,
+    "kv_dim": 5 * 64,  # num_key_value_heads 5 × head_dim
+    "vocab": 49_280,
+    "dense_inter": 2560,  # SwiGLU: gate/up/down = 3 GEMMs
+    # UNTIED f32 lm_head (model_arch.rs: lm_head_stored_int8: false)
+    "head_f32": True,
+    "kv_window": None,  # full causal
+}
+
+ONECHART = {
+    # src/native_engine/decoder_qwen2.rs::DecoderConfig::onechart (OPT-125M)
+    "hidden": 768,
+    "layers": 12,
+    "heads": 12,
+    "head_dim": 64,
+    "kv_dim": 768,  # MHA
+    "vocab": 50_269,
+    "relu_inter": 3072,  # OPT ReLU MLP: fc1/fc2 = 2 GEMMs (no gate)
+    # TIED head runs against the f32 embed matrix (lm_head omitted from .focrq)
+    "head_f32": True,
+    "kv_window": None,  # full causal
+}
+
+VISION_SIGLIP = {
+    # src/native_engine/vision_siglip.rs — SigLIP-B/16 per 512² frame
+    "dim": 768,
+    "depth": 12,
+    "mlp": 3072,
+    "tokens": 1024,  # (512/16)² patches, full (non-windowed) attention
+    # token_compress.rs — pixel_shuffle is a free gather; the connector GEMM is
+    # modality_projection Linear(12288→960) over 64 shuffled tokens per frame.
+    "connector_macs": 64 * 12_288 * 960,
+    "params": 12 * (4 * 768 * 768 + 2 * 768 * 3072) + 768 * 3 * 16 * 16 + 12_288 * 960,
+}
+
 VISION_SAM = {
     # src/native_engine/vision_sam.rs — SAM-ViT-B at 1024px / patch 16
     "dim": 768,
@@ -203,6 +243,39 @@ def decode_per_token_cost(arch: str, precision: str, kv_len: int | None) -> dict
                 "norms/embeds/biases/activations excluded (lower bound)",
             ],
         }
+    if arch in ("smolvlm2", "onechart"):
+        m = SMOLVLM2 if arch == "smolvlm2" else ONECHART
+        h, kvd = m["hidden"], m["kv_dim"]
+        if arch == "smolvlm2":
+            # GQA: q/o are h×h, k/v are h×kv_dim; SwiGLU = 3 GEMMs.
+            gemm_per_layer = 2 * h * h + 2 * h * kvd + 3 * m["dense_inter"] * h
+            scale_rows = m["layers"] * (2 * h + 2 * kvd + 2 * m["dense_inter"] + h)
+            mlp_note = "SwiGLU gate/up/down"
+        else:
+            # OPT MHA qkvo + ReLU fc1/fc2 (2 GEMMs).
+            gemm_per_layer = 4 * h * h + 2 * m["relu_inter"] * h
+            scale_rows = m["layers"] * (4 * h + m["relu_inter"] + h)
+            mlp_note = "ReLU fc1/fc2"
+        int8_macs = m["layers"] * gemm_per_layer
+        head_macs = m["vocab"] * h  # f32 head (untied-f32 / tied-embed)
+        if kv_len is None:
+            raise RooflineError(
+                f"{arch} decode attention is full-causal: kv_len must come from the "
+                "measurement file (prefill + decoded tokens), not a guess"
+            )
+        kv_bytes = m["layers"] * 2 * kv_len * kvd * 4
+        kv_f32_macs = m["layers"] * 2 * kv_len * h  # scores + context over all q heads
+        return {
+            "int8_macs": int8_macs,
+            "f32_flops": 2 * (head_macs + kv_f32_macs),
+            "bytes": int8_macs + scale_rows * 4 + head_macs * 4 + kv_bytes,
+            "assumptions": [
+                f"dense {arch}: attn qkvo + {mlp_note} int8; the head is an f32 GEMM "
+                "(model_arch.rs: lm_head_stored_int8 false / tied f32 embed)",
+                f"full-causal K+V read at mean context {kv_len} in f32 (kv_dim {kvd})",
+                "norms/embeds/biases/activations excluded (lower bound)",
+            ],
+        }
     raise RooflineError(f"unknown arch {arch!r}")
 
 
@@ -255,6 +328,23 @@ def prefill_cost(arch: str, precision: str, prefill_tokens: int) -> dict:
                 "memory floor = weights streamed once",
             ],
         }
+    if arch in ("smolvlm2", "onechart"):
+        m = SMOLVLM2 if arch == "smolvlm2" else ONECHART
+        h, kvd = m["hidden"], m["kv_dim"]
+        if arch == "smolvlm2":
+            per_tok = m["layers"] * (2 * h * h + 2 * h * kvd + 3 * m["dense_inter"] * h)
+        else:
+            per_tok = m["layers"] * (4 * h * h + 2 * m["relu_inter"] * h)
+        attn_f32 = m["layers"] * 2 * n * n * h
+        return {
+            "int8_macs": n * per_tok,
+            "f32_flops": 2 * attn_f32,
+            "bytes": per_tok,
+            "assumptions": [
+                f"{n} prefill tokens × dense per-token GEMM MACs (head excluded)",
+                "memory floor = int8 weights streamed once",
+            ],
+        }
     raise RooflineError(f"unknown arch {arch!r}")
 
 
@@ -262,6 +352,25 @@ def vision_cost(arch: str, views: int) -> dict:
     """The f32 vision tower(s), per page = `views` × per-view GEMM terms."""
     if views <= 0:
         raise RooflineError("vision floor needs the measured view count (vision_sam occurrences)")
+    if arch == "smolvlm2":
+        # SigLIP-B/16 per 512² frame (views = frames), full attention, then the
+        # pixel-shuffle connector GEMM (token_compress.rs).
+        g = VISION_SIGLIP
+        per_frame = (
+            g["depth"] * g["tokens"] * (4 * g["dim"] * g["dim"] + 2 * g["dim"] * g["mlp"])
+            + g["depth"] * 2 * g["tokens"] * g["tokens"] * g["dim"]
+            + g["connector_macs"]
+        )
+        return {
+            "int8_macs": 0,
+            "f32_flops": views * 2 * per_frame,
+            "bytes": g["params"] * 4,
+            "assumptions": [
+                f"SigLIP-B/16 blocks + full attention over 1024 tokens × {views} frames "
+                "+ the 12288→960 modality_projection",
+                "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)",
+            ],
+        }
     s = VISION_SAM
     sam_gemm = s["depth"] * s["tokens"] * (4 * s["dim"] * s["dim"] + 2 * s["dim"] * s["mlp"])
     sam_attn = s["tokens"] * s["dim"] * 2 * (
@@ -283,6 +392,10 @@ def vision_cost(arch: str, views: int) -> dict:
         macs += BRIDGE["tokens_per_view"] * 1024 * 1024  # mm_projector_vary
         bytes_ += 1024 * 1024 * 4
         assumptions.append("GOT mm_projector_vary 1024→1024 over 256 tokens")
+    elif arch == "onechart":
+        macs += BRIDGE["tokens_per_view"] * 1024 * 768  # mm_projector 1024→768
+        bytes_ += 1024 * 768 * 4
+        assumptions.append("OneChart mm_projector 1024→768 over 256 tokens (same SAM tower)")
     else:
         raise RooflineError(f"unknown arch {arch!r}")
     assumptions.append("f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)")
@@ -353,7 +466,14 @@ def measured_tokens(doc: dict, stage: str) -> int:
 
 
 def measured_views(doc: dict) -> int:
-    for name in ("vision_sam", "got_vision_splice", "vision_encode"):
+    # SmolVLM2: the frame count rides the vision+splice record as `views`.
+    record = stage_record(doc, "smolvlm2_vision_splice")
+    if record is not None:
+        views = record.get("views")
+        if not views:
+            raise RooflineError("smolvlm2_vision_splice record carries no frame count")
+        return int(views)
+    for name in ("vision_sam", "got_vision_splice", "onechart_vision_splice", "vision_encode"):
         record = stage_record(doc, name)
         if record is not None:
             return int(record.get("occurrences", 1))
@@ -363,14 +483,14 @@ def measured_views(doc: dict) -> int:
 def compute_stage_floor(stage: str, arch: str, precision: str, doc: dict, profile: dict) -> dict:
     if stage == "decode_per_token":
         kv_len = None
-        if arch == "got-ocr2":
-            # Mean decode context = prefill + half the emitted stream.
+        if arch in ("got-ocr2", "smolvlm2", "onechart"):
+            # Full-causal lanes: mean decode context = prefill + half the stream.
             prefill = measured_tokens(doc, "prefill") if _has_tokens(doc, "prefill") else 0
             decoded = measured_tokens(doc, "decode_total")
             kv_len = prefill + decoded // 2
             if prefill == 0:
                 raise RooflineError(
-                    "got-ocr2 decode floor needs the measured prefill token count"
+                    f"{arch} decode floor needs the measured prefill token count"
                 )
         cost = decode_per_token_cost(arch, precision, kv_len)
     elif stage == "prefill":
@@ -382,8 +502,12 @@ def compute_stage_floor(stage: str, arch: str, precision: str, doc: dict, profil
     elif stage == "end_to_end":
         parts = {}
         for sub in ("preprocess", "vision_encode", "prefill", "decode_per_token"):
-            if sub in ("preprocess",) and arch == "got-ocr2" and stage_record(doc, sub) is None:
-                continue  # the GOT path emits no separate preprocess timing line
+            if (
+                sub in ("preprocess",)
+                and arch in ("got-ocr2", "smolvlm2", "onechart")
+                and stage_record(doc, sub) is None
+            ):
+                continue  # zoo paths emit no separate preprocess line (vision+splice includes it)
             parts[sub] = compute_stage_floor(sub, arch, precision, doc, profile)
         decoded = measured_tokens(doc, "decode_total")
         floor_ms = sum(
@@ -551,7 +675,11 @@ def _self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--arch", choices=("unlimited-ocr", "got-ocr2"), default="unlimited-ocr")
+    parser.add_argument(
+        "--arch",
+        choices=("unlimited-ocr", "got-ocr2", "smolvlm2", "onechart"),
+        default="unlimited-ocr",
+    )
     parser.add_argument("--precision", choices=("int8",), default="int8")
     parser.add_argument("--stages-json", default=None, help="focr_stages.json (required)")
     parser.add_argument("--stage", action="append", choices=STAGES, default=None)
