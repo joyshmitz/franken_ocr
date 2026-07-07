@@ -37,7 +37,7 @@ use super::batch_scheduler;
 use super::decoder;
 use super::nn;
 use super::sampler;
-use super::tensor::{Mat, QInt8};
+use super::tensor::{Mat, QInt8, WeightLayout};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 use rayon::prelude::*;
@@ -894,6 +894,24 @@ fn concat_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     scales.extend_from_slice(&q.scales);
     scales.extend_from_slice(&k.scales);
     scales.extend_from_slice(&v.scales);
+    // Offline SMMLA panels (bd-2mo.3) concatenate exactly like rows when each
+    // segment's row count is even (true for every registered q_dim/kv_dim, GQA
+    // included: 960/320/320, 1024/1024/1024, 768/768/768), so the concatenated
+    // stream IS the panel pack of the fused matrix.
+    if q.layout == WeightLayout::SmmlaPanels
+        && k.layout == WeightLayout::SmmlaPanels
+        && v.layout == WeightLayout::SmmlaPanels
+        && q.n.is_multiple_of(2)
+        && k.n.is_multiple_of(2)
+    {
+        return QInt8::new_smmla_panels(w, scales, n, q.k);
+    }
+    debug_assert!(
+        q.layout == WeightLayout::RowMajor
+            && k.layout == WeightLayout::RowMajor
+            && v.layout == WeightLayout::RowMajor,
+        "concat_qkv: mixed or odd-row packed layouts are unreachable from the loader"
+    );
     QInt8::new(w, scales, n, q.k)
 }
 

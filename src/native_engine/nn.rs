@@ -764,6 +764,7 @@ mod tests {
             scales: vec![1.0],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &w, None),
@@ -776,6 +777,7 @@ mod tests {
             scales: vec![1.0],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &short_weight, None),
@@ -787,6 +789,7 @@ mod tests {
             scales: vec![],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &missing_scale, None),

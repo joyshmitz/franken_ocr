@@ -850,12 +850,34 @@ impl Weights {
         // one byte per element).
         //
         // An `--arch aarch64-smmla` artifact (arch_target 1, bd-2mo.3) stores
-        // SMMLA panels; un-permute back to the canonical row-major `[n, k]`
-        // here — a one-time load-cost, lossless by construction, so EVERY
-        // consumer keeps its row-major contract on every host (degrade to
-        // generic, never UB). The zero-shuffle packed fast path hands panels
-        // to the i8mm kernel directly when that tier is dispatched.
+        // SMMLA panels. When the host actually dispatches the SMMLA tier the
+        // panels are kept AS-IS — the decode GEMV hands them to `vmmlaq_s32`
+        // with zero runtime shuffle (the whole point of the offline packing).
+        // Any other tier un-permutes back to canonical row-major here — a
+        // one-time load cost, lossless by construction, so every consumer
+        // keeps its row-major contract (degrade to generic, never UB).
+        if self.arch_target == 1 && crate::simd::detected_tier() == crate::simd::IsaTier::Smmla {
+            let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+            let scales = decode_f32_le(view.scales)?;
+            if scales.len() != n {
+                return Err(FocrError::FormatMismatch(format!(
+                    "QInt8 tensor {name:?}: {} scales != n {}",
+                    scales.len(),
+                    n
+                )));
+            }
+            return Ok(QInt8::new_smmla_panels(packed, scales, n, k));
+        }
         let w: Vec<i8> = if self.arch_target == 1 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[focr] arch mismatch: .focrq is packed for aarch64-smmla but this \
+                     host dispatches {}; un-permuting to the generic layout at load \
+                     (correct, but the offline packing buys nothing here)",
+                    crate::simd::tier_string()
+                );
+            });
             let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
             crate::simd::pack::smmla_unpack_panels(&packed, n, k)
                 .map_err(|e| FocrError::FormatMismatch(format!("QInt8 tensor {name:?}: {e}")))?
@@ -1850,6 +1872,79 @@ mod tests {
         // mat() refuses quantized; qint8() succeeds.
         assert!(w.mat("q").is_err());
         assert!(w.qint8("q").is_ok());
+    }
+
+    /// bd-2mo.3: an `--arch aarch64-smmla` artifact (arch_target 1, panel
+    /// payload) loads per the DISPATCHED tier — panels kept verbatim
+    /// (zero-shuffle) when SMMLA is selected, un-permuted to canonical
+    /// row-major otherwise. Tier-portable: this pins whichever branch this
+    /// host takes, and the OTHER branch's correctness is gated by the
+    /// packed-B kernel parity + decoder layout-parity tests.
+    #[test]
+    fn packed_focrq_loads_per_dispatched_tier() {
+        let (n, k) = (3usize, 5usize); // odd n + k off the 8-boundary (padding)
+        let w_rm: Vec<i8> = (0..n * k).map(|i| (i as i8) - 7).collect();
+        let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&w_rm, 0, n, k, k);
+        let panel_bytes: Vec<u8> = panels.iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = panel_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            panel_bytes.len(),
+            panel_bytes.len()
+        );
+        let blob = build_focrq(1, 1, [0u8; 32], &dir, &payload);
+        let w =
+            Weights::from_bytes(blob).expect("packed artifact loads (census accepts panel len)");
+        assert_eq!(w.arch_target(), 1);
+        let q = w.qint8("q").expect("qint8 readback");
+        assert_eq!((q.n, q.k), (n, k));
+        assert_eq!(q.scales, vec![0.1, 0.2, 0.3]);
+        if crate::simd::detected_tier() == crate::simd::IsaTier::Smmla {
+            assert_eq!(
+                q.layout,
+                crate::native_engine::tensor::WeightLayout::SmmlaPanels,
+                "SMMLA host must keep the offline panels (zero-shuffle)"
+            );
+            assert_eq!(q.w, panels, "panel bytes verbatim");
+        } else {
+            assert_eq!(
+                q.layout,
+                crate::native_engine::tensor::WeightLayout::RowMajor,
+                "non-SMMLA host must un-permute to canonical row-major"
+            );
+            assert_eq!(q.w, w_rm, "un-permute is lossless");
+        }
+        println!(
+            r#"{{"check":"packed_focrq_load","tier":"{}","layout":"{:?}","result":"pass"}}"#,
+            crate::simd::tier_string(),
+            q.layout
+        );
+    }
+
+    /// A corrupt panel payload (length disagreeing with the packed rule)
+    /// fails the census loudly instead of mis-slicing.
+    #[test]
+    fn packed_focrq_rejects_wrong_panel_length() {
+        let (n, k) = (3usize, 5usize);
+        // Deliberately store the ROW-MAJOR length (15) under arch_target 1;
+        // the packed rule wants ceil(3/2)*ceil(5/8)*16 = 32.
+        let w_bytes: Vec<u8> = (0..n * k).map(|i| i as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = w_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            w_bytes.len(),
+            w_bytes.len()
+        );
+        let blob = build_focrq(1, 1, [0u8; 32], &dir, &payload);
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(
+            matches!(err, FocrError::FormatMismatch(_)),
+            "wrong panel length must FormatMismatch, got {err:?}"
+        );
     }
 
     #[test]

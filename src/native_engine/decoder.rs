@@ -40,7 +40,7 @@
 use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
-use super::tensor::{Mat, QInt8};
+use super::tensor::{Mat, QInt8, WeightLayout};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 use crate::simd;
@@ -1618,11 +1618,38 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
 /// channels is an independent i32 SDOT dequantized by `a_scale · scale[o]`, so the
 /// rayon row-chunking never changes a per-channel value (the same N-independence
 /// the 64-row blocking and `fuse_qkv` already rely on).
+/// Layout-aware channel-block int8 GEMM: contract `xq [m, k]` against weight
+/// rows `[base, base + cnt)` of `qw` into `acc [m, cnt]` (zeroed here).
+///
+/// `RowMajor` slices the canonical `[n, k]` buffer exactly as before;
+/// `SmmlaPanels` (an `--arch aarch64-smmla` artifact kept packed by the
+/// loader, bd-2mo.3) slices the offline panel stream — pair-aligned because
+/// every caller blocks by the even `I8_GEMV_BLOCK` (or passes base 0) — and
+/// feeds the i8mm kernel with ZERO runtime shuffle. Bit-identical either way:
+/// the packing is a pure zero-padded permutation and integer accumulation is
+/// exact, so each output channel's i32 is the same in both layouts.
+fn igemm_i8_block(qw: &QInt8, xq: &[i8], m: usize, base: usize, cnt: usize, acc: &mut [i32]) {
+    let k = qw.k;
+    match qw.layout {
+        WeightLayout::RowMajor => {
+            acc.fill(0);
+            simd::igemm_s8s8(xq, &qw.w[base * k..(base + cnt) * k], m, k, cnt, acc);
+        }
+        WeightLayout::SmmlaPanels => {
+            debug_assert_eq!(base % 2, 0, "channel blocks must be pair-aligned");
+            let kb = k.div_ceil(8);
+            let start = (base / 2) * kb * 16;
+            let len = cnt.div_ceil(2) * kb * 16;
+            simd::igemm_s8s8_packed_b(xq, &qw.w[start..start + len], m, k, cnt, acc);
+        }
+    }
+}
+
 fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let k = qw.k;
     let n = qw.n;
     debug_assert_eq!(xq.len(), k);
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     let mut y = vec![0.0f32; n];
     y.par_chunks_mut(I8_GEMV_BLOCK)
@@ -1631,7 +1658,7 @@ fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len();
             let mut acc = vec![0i32; cnt];
-            simd::igemm_s8s8(xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+            igemm_i8_block(qw, xq, 1, base, cnt, &mut acc);
             for (j, slot) in ys.iter_mut().enumerate() {
                 *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
             }
@@ -1658,7 +1685,7 @@ pub(crate) fn gemm_i8_bias_prequant_batched(
     let b = rows.len();
     let k = qw.k;
     let n = qw.n;
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     if b == 0 {
         return Vec::new();
@@ -1679,7 +1706,7 @@ pub(crate) fn gemm_i8_bias_prequant_batched(
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len() / b;
             let mut acc = vec![0i32; b * cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], b, k, cnt, &mut acc);
+            igemm_i8_block(qw, &xq, b, base, cnt, &mut acc);
             for j in 0..cnt {
                 let scale_o = qw.scales[base + j];
                 let bias_o = bias.map_or(0.0, |bb| bb[base + j]);
@@ -1793,7 +1820,7 @@ fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let n = qw.n;
     debug_assert_eq!(xq.len(), k);
     let mut acc = vec![0i32; n];
-    simd::igemm_s8s8(xq, &qw.w, 1, k, n, &mut acc);
+    igemm_i8_block(qw, xq, 1, 0, n, &mut acc);
     let mut y = vec![0.0f32; n];
     for (o, slot) in y.iter_mut().enumerate() {
         *slot = acc[o] as f32 * a_scale * qw.scales[o];
@@ -1965,7 +1992,7 @@ fn gemv_i8_sharded(x: &[f32], qw: &QInt8, tiles: usize) -> Vec<f32> {
     let k = qw.k;
     let n = qw.n;
     debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     let (xq, a_scale) = quantize_row_i8(x);
     let mut y = vec![0.0f32; n];
@@ -1979,7 +2006,7 @@ fn gemv_i8_sharded(x: &[f32], qw: &QInt8, tiles: usize) -> Vec<f32> {
                 let base = start + blk * I8_GEMV_BLOCK;
                 let cnt = ys.len();
                 let mut acc = vec![0i32; cnt];
-                simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+                igemm_i8_block(qw, &xq, 1, base, cnt, &mut acc);
                 for (j, slot) in ys.iter_mut().enumerate() {
                     *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
                 }
@@ -2029,7 +2056,7 @@ fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     debug_assert_eq!(q.n, k.n, "fuse_qkv: q/k output dim mismatch");
     debug_assert_eq!(q.n, v.n, "fuse_qkv: q/v output dim mismatch");
     let (n, kk) = (q.n, q.k);
-    let mut w = Vec::with_capacity(n * kk * 3);
+    let mut w = Vec::with_capacity(q.w.len() + k.w.len() + v.w.len());
     w.extend_from_slice(&q.w);
     w.extend_from_slice(&k.w);
     w.extend_from_slice(&v.w);
@@ -2037,6 +2064,24 @@ fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     scales.extend_from_slice(&q.scales);
     scales.extend_from_slice(&k.scales);
     scales.extend_from_slice(&v.scales);
+    // Offline SMMLA panels concatenate exactly like rows: each segment's row
+    // count is even (every registered attention dim), so segment boundaries
+    // land on pair boundaries and the concatenated stream IS the panel pack
+    // of the concatenated matrix.
+    if q.layout == WeightLayout::SmmlaPanels
+        && k.layout == WeightLayout::SmmlaPanels
+        && v.layout == WeightLayout::SmmlaPanels
+        && q.n.is_multiple_of(2)
+        && k.n.is_multiple_of(2)
+    {
+        return QInt8::new_smmla_panels(w, scales, 3 * n, kk);
+    }
+    debug_assert!(
+        q.layout == WeightLayout::RowMajor
+            && k.layout == WeightLayout::RowMajor
+            && v.layout == WeightLayout::RowMajor,
+        "fuse_qkv: mixed or odd-row packed layouts are unreachable from the loader"
+    );
     QInt8::new(w, scales, 3 * n, kk)
 }
 
@@ -2420,7 +2465,7 @@ fn gemv_i8_ngram_masked(x: &[f32], qw: &QInt8, banned: &[u32]) -> Vec<f32> {
     }
     let k = qw.k;
     debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     let (xq, a_scale) = quantize_row_i8(x);
     let mut y = vec![0.0f32; n];
@@ -2430,7 +2475,7 @@ fn gemv_i8_ngram_masked(x: &[f32], qw: &QInt8, banned: &[u32]) -> Vec<f32> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len();
             let mut acc = vec![0i32; cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+            igemm_i8_block(qw, &xq, 1, base, cnt, &mut acc);
             for (j, slot) in ys.iter_mut().enumerate() {
                 *slot = if ban_mask[base + j] {
                     f32::NEG_INFINITY
@@ -2792,7 +2837,7 @@ fn gemv_i8_batched(rows: &[&[f32]], qw: &QInt8) -> Vec<Vec<f32>> {
     let b = rows.len();
     let k = qw.k;
     let n = qw.n;
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     if b == 0 {
         return Vec::new();
@@ -2815,7 +2860,7 @@ fn gemv_i8_batched(rows: &[&[f32]], qw: &QInt8) -> Vec<Vec<f32>> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len() / b;
             let mut acc = vec![0i32; b * cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], b, k, cnt, &mut acc);
+            igemm_i8_block(qw, &xq, b, base, cnt, &mut acc);
             for j in 0..cnt {
                 let scale_o = qw.scales[base + j];
                 for r in 0..b {
@@ -3311,6 +3356,100 @@ mod tests {
     use super::*;
 
     // ── Fused q/k/v GEMV bit-identity (FOCR_QKV_FUSED, bd-241s) ──────────────────
+
+    /// bd-2mo.3: a [`WeightLayout::SmmlaPanels`] weight (the offline `--arch
+    /// aarch64-smmla` packing kept by the loader on an SMMLA host) produces
+    /// BYTE-IDENTICAL f32 output to the same weight in row-major layout,
+    /// through the REAL decode entry points: [`gemv_i8`] (fresh quantize),
+    /// [`gemv_i8_prequant`], and the batched prequant GEMM. `n` deliberately
+    /// exceeds `I8_GEMV_BLOCK` so the even-base panel slicing at block
+    /// boundaries is exercised, and includes an odd tail block (n = 130).
+    #[test]
+    fn smmla_panel_layout_is_byte_identical_through_the_gemv_paths() {
+        let (n, k) = (130usize, 96usize);
+        let mut w = vec![0i8; n * k];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = (((i as i64 * 37 + 5) % 255) - 127) as i8;
+        }
+        let scales: Vec<f32> = (0..n).map(|o| 1.0e-3 + o as f32 * 3.0e-5).collect();
+        let row_major = QInt8::new(w.clone(), scales.clone(), n, k);
+        let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&w, 0, n, k, k);
+        let packed = QInt8::new_smmla_panels(panels, scales, n, k);
+
+        // gemv_i8: fresh activation quantize inside.
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.11 - 4.0).collect();
+        let a = gemv_i8(&x, &row_major);
+        let b = gemv_i8(&x, &packed);
+        assert_eq!(a, b, "gemv_i8 must be layout-invariant (bit-exact)");
+
+        // gemv_i8_prequant: caller-provided int8 row.
+        let xq: Vec<i8> = (0..k)
+            .map(|i| (((i * 91) % 255) as i32 - 127) as i8)
+            .collect();
+        let a = gemv_i8_prequant(&xq, 0.017, &row_major);
+        let b = gemv_i8_prequant(&xq, 0.017, &packed);
+        assert_eq!(
+            a, b,
+            "gemv_i8_prequant must be layout-invariant (bit-exact)"
+        );
+        println!(r#"{{"check":"smmla_panel_gemv_parity","n":{n},"k":{k},"result":"pass"}}"#);
+    }
+
+    /// bd-2mo.3: [`fuse_qkv`] over three panel-layout weights produces the
+    /// panel pack of the fused matrix — i.e. fusing THEN packing equals
+    /// packing THEN fusing — and the fused panel weight GEMVs bit-identically
+    /// to the fused row-major weight.
+    #[test]
+    fn fuse_qkv_concatenates_smmla_panels_losslessly() {
+        let (qkv_dim, hidden) = (64usize, 48usize);
+        let mk = |salt: i64| -> (Vec<i8>, Vec<f32>) {
+            let mut w = vec![0i8; qkv_dim * hidden];
+            for (i, v) in w.iter_mut().enumerate() {
+                *v = (((i as i64 * 31 + salt * 101) % 255) - 127) as i8;
+            }
+            let scales: Vec<f32> = (0..qkv_dim)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            (w, scales)
+        };
+        let (qw, qs) = mk(1);
+        let (kw, ks) = mk(2);
+        let (vw, vs) = mk(3);
+        let pack = |w: &[i8]| crate::simd::pack::smmla_pack_panels(w, 0, qkv_dim, hidden, hidden).0;
+
+        let fused_rm = fuse_qkv(
+            &QInt8::new(qw.clone(), qs.clone(), qkv_dim, hidden),
+            &QInt8::new(kw.clone(), ks.clone(), qkv_dim, hidden),
+            &QInt8::new(vw.clone(), vs.clone(), qkv_dim, hidden),
+        );
+        let fused_pk = fuse_qkv(
+            &QInt8::new_smmla_panels(pack(&qw), qs, qkv_dim, hidden),
+            &QInt8::new_smmla_panels(pack(&kw), ks, qkv_dim, hidden),
+            &QInt8::new_smmla_panels(pack(&vw), vs, qkv_dim, hidden),
+        );
+        assert_eq!(fused_pk.layout, WeightLayout::SmmlaPanels);
+        // fuse-then-pack == pack-then-fuse (byte equality of the panel stream)
+        let repacked = crate::simd::pack::smmla_pack_panels(
+            &fused_rm.w,
+            0,
+            fused_rm.n,
+            fused_rm.k,
+            fused_rm.k,
+        )
+        .0;
+        assert_eq!(
+            fused_pk.w, repacked,
+            "panel concat must equal pack of the fused matrix"
+        );
+        // and the GEMV agrees bitwise
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.07 - 1.5).collect();
+        assert_eq!(
+            gemv_i8(&x, &fused_rm),
+            gemv_i8(&x, &fused_pk),
+            "fused panel GEMV must be bit-exact"
+        );
+        println!(r#"{{"check":"smmla_panel_fuse_qkv","result":"pass"}}"#);
+    }
 
     /// The fused `[3*qkv_dim, hidden]` GEMV must reproduce, BYTE-FOR-BYTE, the q/k/v
     /// that three separate [`gemv_i8`] calls produce. `qkv_dim` is deliberately NOT

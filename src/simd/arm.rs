@@ -211,6 +211,66 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     scalar::igemm_s8s8(a, b, m, k, n, out);
 }
 
+/// S8S8 GEMM whose B is an OFFLINE SMMLA panel stream (`focr convert --arch
+/// aarch64-smmla`, bd-2mo.3): consumed with zero runtime shuffle on the SMMLA
+/// tier; any other tier un-permutes and runs the ordinary row-major path
+/// (bit-identical — the packing is a pure zero-padded permutation).
+///
+/// Unlike [`igemm_s8s8`], `out` is ZEROED here (the accumulate-vs-overwrite
+/// contract is owned by this wrapper, not the caller).
+///
+/// # Panics
+/// On length mismatches (`a != m*k`, `b_panels != ceil(n/2)*ceil(k/8)*16`,
+/// `out != m*n`).
+pub fn igemm_s8s8_packed_b(
+    a: &[i8],
+    b_panels: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) {
+    let a_len = scalar::checked_len("igemm_s8s8_packed_b", m, k, "m*k");
+    let panels_len = crate::simd::pack::smmla_packed_len(n, k);
+    let out_len = scalar::checked_len("igemm_s8s8_packed_b", m, n, "m*n");
+    assert_eq!(
+        a.len(),
+        a_len,
+        "igemm_s8s8_packed_b: a.len {} != m*k {}",
+        a.len(),
+        a_len
+    );
+    assert_eq!(
+        b_panels.len(),
+        panels_len,
+        "igemm_s8s8_packed_b: b_panels.len {} != ceil(n/2)*ceil(k/8)*16 {}",
+        b_panels.len(),
+        panels_len
+    );
+    assert_eq!(
+        out.len(),
+        out_len,
+        "igemm_s8s8_packed_b: out.len {} != m*n {}",
+        out.len(),
+        out_len
+    );
+    out.fill(0);
+
+    #[cfg(target_arch = "aarch64")]
+    if detect_tier() == ArmTier::Smmla {
+        // SAFETY: reached only when `is_aarch64_feature_detected!("i8mm")`
+        // returned true in `detect_tier`; slice lengths asserted above.
+        unsafe { aarch64_impl::igemm_s8s8_smmla_packed_b(a, b_panels, m, k, n, out) };
+        return;
+    }
+
+    // Degrade path (non-SMMLA tier handed a packed artifact): un-permute and
+    // run the ordinary dispatch — never the hot path (the loader only keeps
+    // panels when SMMLA is dispatched), always correct.
+    let b = crate::simd::pack::smmla_unpack_panels(b_panels, n, k).expect("length asserted above");
+    igemm_s8s8(a, &b, m, k, n, out);
+}
+
 /// U8S8 variant: `A` is `u8` (asymmetric activations), `B` is `i8` weights.
 /// Output bit-identical to [`scalar::igemm_u8s8`].
 ///
@@ -570,6 +630,89 @@ mod aarch64_impl {
                         }
                         // Scatter the 2×2 i32 tile into `out`, skipping padded
                         // rows/cols (row-pair p covers output rows r+2p, r+2p+1).
+                        let tile = [
+                            vgetq_lane0(acc),
+                            vgetq_lane1(acc),
+                            vgetq_lane2(acc),
+                            vgetq_lane3(acc),
+                        ];
+                        let ar0 = 2 * p;
+                        let ar1 = 2 * p + 1;
+                        let bc0 = 2 * q;
+                        let bc1 = 2 * q + 1;
+                        if ar0 < mr && bc0 < nr {
+                            out[(r + ar0) * n + (c + bc0)] += tile[0];
+                        }
+                        if ar0 < mr && bc1 < nr {
+                            out[(r + ar0) * n + (c + bc1)] += tile[1];
+                        }
+                        if ar1 < mr && bc0 < nr {
+                            out[(r + ar1) * n + (c + bc0)] += tile[2];
+                        }
+                        if ar1 < mr && bc1 < nr {
+                            out[(r + ar1) * n + (c + bc1)] += tile[3];
+                        }
+                    }
+                }
+                c += nr;
+            }
+            r += mr;
+        }
+    }
+
+    /// SMMLA int8 GEMM whose **B operand is already in offline panel layout**
+    /// (`focr convert --arch aarch64-smmla`, bd-2mo.3): `b_panels` is the
+    /// full-matrix `[ceil(n/2)][ceil(k/8)][16]` stream from
+    /// [`crate::simd::pack::smmla_pack_panels`]. Identical arithmetic to
+    /// [`igemm_s8s8_smmla`] — the ONLY difference is that the per-call
+    /// `pack_panels(b, ..)` is replaced by direct panel loads (zero runtime
+    /// shuffle), so the i32 output is bit-identical by construction.
+    ///
+    /// # Safety
+    /// Caller MUST ensure `i8mm` is available, `b_panels.len() ==
+    /// smmla_packed_len(n, k)`, and the remaining slices satisfy the GEMM
+    /// shape.
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn igemm_s8s8_smmla_packed_b(
+        a: &[i8],
+        b_panels: &[i8],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [i32],
+    ) {
+        let kb = k.div_ceil(8);
+        let mut r = 0;
+        while r < m {
+            let mr = (m - r).min(8);
+            // Pack A rows [r, r+mr) -> ceil(mr/2) row-pairs, kb K-blocks
+            // (activations change per call; only B's pack is offline).
+            let (apack, a_pairs, _kb) = pack_panels(a, r, mr, k, k);
+
+            let mut c = 0;
+            while c < n {
+                let nr = (n - c).min(8);
+                // B panels for output rows [c, c+nr): pair-aligned because c
+                // steps by 8 — the region IS a slice of the offline stream.
+                let b_base = (c / 2) * kb;
+                let b_pairs = nr.div_ceil(2);
+
+                for p in 0..a_pairs {
+                    for q in 0..b_pairs {
+                        // SAFETY: constant splat, no memory.
+                        let mut acc = vdupq_n_s32(0);
+                        for block in 0..kb {
+                            let aoff = (p * kb + block) * 16;
+                            let boff = ((b_base + q * kb) + block) * 16;
+                            // SAFETY: apack len is a_pairs*kb*16 by
+                            // construction; b_panels len is
+                            // ceil(n/2)*kb*16 (caller contract) and
+                            // b_base + q*kb + block < ceil(n/2)*kb.
+                            let av = load16(&apack, aoff);
+                            let bv = load16(b_panels, boff);
+                            // SAFETY: vmmlaq_s32 is register-only; i8mm enabled.
+                            acc = vmmlaq_s32(acc, av, bv);
+                        }
                         let tile = [
                             vgetq_lane0(acc),
                             vgetq_lane1(acc),
@@ -972,6 +1115,92 @@ mod tests {
         // SAFETY: feature just checked.
         unsafe { aarch64_impl::igemm_s8s8_smmla(a, b, m, k, n, &mut out) };
         Some(out)
+    }
+
+    /// bd-2mo.3: the OFFLINE-packed-B SMMLA kernel is bit-identical to the
+    /// row-major SMMLA kernel and the scalar oracle over randomized +
+    /// constant-extreme operands, including odd n, k off the 8-boundary, and
+    /// the doctrine-#6 worst-case K=6848 overflow shape. The only difference
+    /// between the two kernels is WHERE B's pack happens — offline vs per
+    /// call — so equality here proves the zero-shuffle path exact.
+    #[test]
+    fn smmla_packed_b_matches_row_major_and_oracle() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            eprintln!(r#"{{"check":"smmla_packed_b_parity","result":"skip","reason":"no i8mm"}}"#);
+            return;
+        }
+        let mut rng = Rng(0x0dd0_beef_cafe_f00d);
+        let shapes = [
+            (1usize, 16usize, 8usize),
+            (1, 17, 5),
+            (3, 5, 7),
+            (4, 64, 8),
+            (8, 96, 96),
+            (1, 1280, 64),
+            (1, 6848, 4),
+        ];
+        for &(m, k, n) in &shapes {
+            let mut a = vec![0i8; m * k];
+            let mut b = vec![0i8; n * k];
+            if (m, k, n) == (1, 6848, 4) {
+                // constant-extreme worst-case-K overflow stress
+                a.fill(i8::MAX);
+                b.fill(i8::MIN);
+            } else {
+                for v in a.iter_mut() {
+                    *v = rng.i8();
+                }
+                for v in b.iter_mut() {
+                    *v = rng.i8();
+                }
+            }
+            let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&b, 0, n, k, k);
+
+            let mut packed_out = vec![0i32; m * n];
+            // SAFETY: i8mm checked at test entry; panel len by construction.
+            unsafe {
+                aarch64_impl::igemm_s8s8_smmla_packed_b(&a, &panels, m, k, n, &mut packed_out);
+            };
+            let row_major = run_smmla_s8s8(&a, &b, m, k, n).expect("i8mm present");
+            let mut oracle = vec![0i32; m * n];
+            scalar::igemm_s8s8(&a, &b, m, k, n, &mut oracle);
+            assert_eq!(
+                packed_out, row_major,
+                "packed-B vs row-major SMMLA [{m},{k},{n}]"
+            );
+            assert_eq!(
+                packed_out, oracle,
+                "packed-B vs scalar oracle [{m},{k},{n}]"
+            );
+            eprintln!(
+                r#"{{"check":"smmla_packed_b_parity","m":{m},"k":{k},"n":{n},"result":"pass"}}"#
+            );
+        }
+    }
+
+    /// The SAFE public packed-B wrapper degrades correctly on this host's
+    /// natural tier (un-permute + ordinary dispatch when SMMLA is not the
+    /// selected tier) and owns the zeroing contract (a dirty `out` must not
+    /// leak into the result).
+    #[test]
+    fn packed_b_public_wrapper_matches_dispatch_and_zeroes_out() {
+        let mut rng = Rng(0x5eed_5eed_5eed_5eed);
+        for &(m, k, n) in &[(1usize, 48usize, 96usize), (4, 33, 7), (1, 6848, 4)] {
+            let mut a = vec![0i8; m * k];
+            let mut b = vec![0i8; n * k];
+            for v in a.iter_mut() {
+                *v = rng.i8();
+            }
+            for v in b.iter_mut() {
+                *v = rng.i8();
+            }
+            let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&b, 0, n, k, k);
+            let mut want = vec![0i32; m * n];
+            igemm_s8s8(&a, &b, m, k, n, &mut want);
+            let mut got = vec![0x5a5a_5a5ai32; m * n]; // deliberately dirty
+            igemm_s8s8_packed_b(&a, &panels, m, k, n, &mut got);
+            assert_eq!(got, want, "public packed-B wrapper [{m},{k},{n}]");
+        }
     }
 
     #[test]

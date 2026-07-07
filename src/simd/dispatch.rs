@@ -261,6 +261,41 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     }
 }
 
+/// Public **int8 GEMM** entrypoint whose B operand is an OFFLINE SMMLA panel
+/// stream (`focr convert --arch aarch64-smmla`, bd-2mo.3). On the SMMLA tier
+/// the panels feed `vmmlaq_s32` with ZERO runtime shuffle; every other tier
+/// un-permutes and runs the ordinary row-major dispatch — bit-identical
+/// either way (the packing is a pure zero-padded permutation).
+///
+/// Unlike [`igemm_s8s8`], `out` is zeroed by this entrypoint.
+///
+/// # Panics
+/// On length-contract violations (`a != m*k`,
+/// `b_panels != ceil(n/2)*ceil(k/8)*16`, `out != m*n`).
+pub fn igemm_s8s8_packed_b(
+    a: &[i8],
+    b_panels: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::arm::igemm_s8s8_packed_b(a, b_panels, m, k, n, out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Portable degrade: un-permute once and run the ordinary dispatch.
+        // Never the hot path — the loader only keeps panels when the SMMLA
+        // tier is dispatched (aarch64-only by construction).
+        let b = super::pack::smmla_unpack_panels(b_panels, n, k)
+            .expect("igemm_s8s8_packed_b: panel length contract violated");
+        out.fill(0);
+        igemm_s8s8(a, &b, m, k, n, out);
+    }
+}
+
 /// Public **int8 GEMM** entrypoint, U8S8 (unsigned activations · signed
 /// weights) — the asymmetric `DynamicQuantizeLinear` activation path and the
 /// native VNNI operand domain.

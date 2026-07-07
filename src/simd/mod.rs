@@ -70,7 +70,7 @@ pub mod x86;
 
 pub use dispatch::{
     Caps, IsaTier, SelftestCase, SelftestReport, available_tiers, caps, detected_tier, igemm_s8s8,
-    igemm_u8s8, selftest, tier_string,
+    igemm_s8s8_packed_b, igemm_u8s8, selftest, tier_string,
 };
 
 #[cfg(test)]
