@@ -184,10 +184,40 @@ pub fn recognize_batch(
 ) -> FocrResult<Vec<String>> {
     let prompt_ids = ocr_prompt_ids(tk, format)?;
     let tv = std::time::Instant::now();
+    // Hydrate ONCE per batch (bd-av64.10 profiling: the sequential loop
+    // re-hydrated SAM + projector + the widened embed table EVERY page):
+    // the same amortization the MoE spine's vision stage performs.
+    let th = std::time::Instant::now();
+    let sam = vision_sam::sam_weights_from(weights, prefix)?;
+    let proj = vision_sam::Linear {
+        w: weights.vec("model.mm_projector_vary.weight")?,
+        b: weights.vec("model.mm_projector_vary.bias")?,
+        out: 1024,
+        in_: 1024,
+    };
+    let embed = weights.mat("model.embed_tokens.weight")?;
+    let (vocab, hidden) = (embed.rows, embed.cols);
+    super::timing_log(&format!(
+        "  got.hydrate(batch) {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    let mask_of = |ids: &[u32]| -> Vec<bool> { ids.iter().map(|&id| id == IMG_PAD_ID).collect() };
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
     for img in imgs {
         let image = preprocess::got_view_tensor(img);
-        embeds_list.push(build_inputs_embeds(weights, &image, &prompt_ids, prefix)?);
+        let side = (image.cols as f64).sqrt() as usize;
+        if side * side != image.cols || image.rows != 3 {
+            return Err(crate::FocrError::Other(anyhow::anyhow!(
+                "got batch vision: expected [3, side*side] input, got [{}, {}]",
+                image.rows,
+                image.cols
+            )));
+        }
+        let sam_out = vision_sam::forward_with(&sam, &image, side, side)?; // [1024, 256]
+        let tokens = proj.apply(&transpose(&sam_out))?; // [256, 1024]
+        let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, &prompt_ids)?;
+        connector::masked_scatter(&mut inputs_embeds, &tokens, &mask_of(&prompt_ids))?;
+        embeds_list.push(inputs_embeds);
     }
     super::timing_log(&format!(
         "  got.vision+splice(batch of {}) {:.2}s",
