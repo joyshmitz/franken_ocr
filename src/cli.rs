@@ -2666,6 +2666,12 @@ fn run_robot_selftest() -> FocrResult<()> {
         "cases_passed": passed,
         "all_ok": report.all_ok,
         "verdict": if report.all_ok { "pass" } else { "fail" },
+        // A12 (bd-3jo6.1.12): the machine-readable PER-MODEL verdict — every
+        // registered int8 decoder's real kernel shapes proven bit-identical
+        // to the scalar oracle on THIS host, incl its own worst-case-K row.
+        "models": report.models.iter().map(|(id, ok)| serde_json::json!({
+            "id": id, "verdict": if *ok { "pass" } else { "fail" },
+        })).collect::<Vec<_>>(),
         "cases": cases,
     }));
     if report.all_ok {

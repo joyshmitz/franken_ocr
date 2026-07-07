@@ -333,6 +333,11 @@ pub struct SelftestReport {
     pub cases: Vec<SelftestCase>,
     /// True iff EVERY case matched the oracle (the headline pass/fail).
     pub all_ok: bool,
+    /// A12 per-model rollup: `(model_id, ok)` grouped on the case-label
+    /// prefix (`edge:`/`ktail:`/`model:`/`overflow:` = the shared +
+    /// unlimited-ocr battery, reported as "unlimited-ocr"). The
+    /// machine-readable per-model verdict `focr robot selftest` renders.
+    pub models: Vec<(String, bool)>,
 }
 
 /// Deterministic xorshift32 — reproducible per-case fills with no `Math::random`
@@ -365,6 +370,24 @@ const SELFTEST_SHAPES: &[(&str, usize, usize, usize, u32)] = &[
     ("model:prefill_tile", 4, 1280, 64, 0x0f0f_0f0f),
     // ── worst-case-K overflow stress (constant extremes; seed 0 sentinel) ──
     ("overflow:max_mag_k6848", 1, 6848, 4, 0),
+    // ── A12 (bd-3jo6.1.12): EVERY registered int8 decoder's real shapes,
+    //    each with its own worst-case-K overflow row (doctrine #6 per model).
+    //    Labels are `<model-id>:<shape>` — the per-model rollup groups on the
+    //    prefix. TrOMR is deliberately absent: its decode is f32-only until
+    //    the gated int8 experiment (bd-av64.12) lands.
+    // GOT-OCR2 (Qwen2-0.5B: hidden 1024, fused qkv 3072, MLP 2816).
+    ("got-ocr2:qkv_fused_gemv", 1, 1024, 3072, 0x6072_0001),
+    ("got-ocr2:o_proj_gemv", 1, 1024, 1024, 0x6072_0002),
+    ("got-ocr2:mlp_down_gemv", 1, 2816, 1024, 0x6072_0003),
+    ("got-ocr2:overflow_k2816", 1, 2816, 4, 0),
+    // SmolVLM2 (SmolLM2-360M: hidden 960, GQA 15q/5kv ⇒ fused qkv 1600, MLP 2560).
+    ("smolvlm2:qkv_fused_gemv", 1, 960, 1600, 0x5601_0001),
+    ("smolvlm2:mlp_down_gemv", 1, 2560, 960, 0x5601_0002),
+    ("smolvlm2:overflow_k2560", 1, 2560, 4, 0),
+    // OneChart (OPT-125M: hidden 768, fc1/fc2 3072).
+    ("onechart:fc1_gemv", 1, 768, 3072, 0x0c4a_0001),
+    ("onechart:fc2_gemv", 1, 3072, 768, 0x0c4a_0002),
+    ("onechart:overflow_k3072", 1, 3072, 4, 0),
 ];
 
 /// Run the int8-GEMM runtime self-test (the engine behind `focr robot
@@ -419,12 +442,32 @@ pub fn selftest() -> SelftestReport {
     }
 
     let all_ok = cases.iter().all(|c| c.ok);
+    // A12 per-model rollup: zoo cases group on their `<model-id>:` label
+    // prefix; the shared battery + the unlimited shapes roll up under
+    // "unlimited-ocr" (they ARE its kernel set — every other model reuses it).
+    let mut models: Vec<(String, bool)> = Vec::new();
+    for id in ["unlimited-ocr", "got-ocr2", "smolvlm2", "onechart"] {
+        let ok = cases
+            .iter()
+            .filter(|c| match id {
+                "unlimited-ocr" => {
+                    !c.label.contains(':') || {
+                        let p = c.label.split(':').next().unwrap_or("");
+                        matches!(p, "edge" | "ktail" | "model" | "overflow")
+                    }
+                }
+                _ => c.label.starts_with(&format!("{id}:")),
+            })
+            .all(|c| c.ok);
+        models.push((id.to_string(), ok));
+    }
     let snapshot = caps();
     SelftestReport {
         selected: snapshot.selected,
         available: snapshot.available.clone(),
         cases,
         all_ok,
+        models,
     }
 }
 
@@ -595,6 +638,43 @@ mod tests {
             );
         }
         assert!(report.all_ok, "headline verdict must reflect all-ok cases");
+    }
+
+    /// A12: every registered int8 decoder appears in the per-model rollup,
+    /// its real-shape + worst-case-K rows exist, and each rollup verdict is
+    /// consistent with its own cases.
+    #[test]
+    fn selftest_reports_a_per_model_verdict_for_every_registered_decoder() {
+        let report = selftest();
+        let ids: Vec<&str> = report.models.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["unlimited-ocr", "got-ocr2", "smolvlm2", "onechart"],
+            "the per-model rollup must enumerate every registered int8 decoder"
+        );
+        for id in ["got-ocr2", "smolvlm2", "onechart"] {
+            assert!(
+                report
+                    .cases
+                    .iter()
+                    .any(|c| c.label.starts_with(&format!("{id}:overflow_k"))),
+                "{id} must carry its own worst-case-K overflow row (doctrine #6 per model)"
+            );
+            let model_ok = report.models.iter().find(|(m, _)| m == id).unwrap().1;
+            let cases_ok = report
+                .cases
+                .iter()
+                .filter(|c| c.label.starts_with(&format!("{id}:")))
+                .all(|c| c.ok);
+            assert_eq!(
+                model_ok, cases_ok,
+                "{id}: rollup verdict must equal its cases"
+            );
+        }
+        println!(
+            r#"{{"check":"selftest_per_model_verdicts","models":{},"result":"pass"}}"#,
+            report.models.len()
+        );
     }
 
     /// The worst-case-magnitude K=6848 case actually exercises the documented
