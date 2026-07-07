@@ -206,7 +206,7 @@ and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
 claims.
 
 2026-07-07 | NEGATIVE(reverted) | TrOMR 1-crop-page routing through the refined staff band (bd-av64.13 item b, `recognize_page` single-staff branch)
-  claim_id: CLAIM-bd-av64.13-onecrop-route   evidence_id: bd-av64.13 close note + this entry
+  claim_id: CLAIM-bd-av64.13-onecrop-route   evidence_id: artifacts/perf/bd-av64.13/ (pointers; measured tables inline below + the bead close note)
   model source commit + fixture hash: same TrOMR export/artifact as the TTA entry below; fixtures = committed realscan_music corpus v1
   CPU feature string: arm64 Apple M4 (f32 forward)
   exact command + env: FOCR_BIN=<release focr> bash scripts/realscan_music_gate.sh  (routing active unconditionally in the build under test; whole-image fallback retained on crop failure)
@@ -229,7 +229,7 @@ claims.
   evidence dir: none (reproduces from the committed corpus at the pre-revert commit)
 
 2026-07-07 | NEGATIVE(reverted) | TrOMR micro-rotation self-consistency vote (bd-av64.13 lever 2, `FOCR_TROMR_TTA=3` in `src/native_engine/tromr.rs::recognize_voted`)
-  claim_id: CLAIM-bd-av64.13-tta-vote   evidence_id: bd-av64.13 close note + this entry (per-candidate logs inline below)
+  claim_id: CLAIM-bd-av64.13-tta-vote   evidence_id: artifacts/perf/bd-av64.13/ (pointers; per-candidate logs inline below + the bead close note)
   model source commit + fixture hash:
     Polyphonic-TrOMR export model.safetensors sha256 41c88802… (TROMR_EXPORT_MANIFEST.json); tromr.focrq sha256 a9d41485… (all-f32)
     fixtures: tests/fixtures/realscan_music (corpus v1, committed) — the measuring instrument, not a synthetic bench

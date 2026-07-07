@@ -1875,26 +1875,72 @@ fn l4_token_exact_prefix() {
 /// (the budget is calibrated on the f32 subject).
 #[test]
 fn l5_multi_page_matches_infer_multi_oracle() {
+    // MEASURED 2026-07-07 armed: CER 0.1791 (the plate region byte-exact; the
+    // budget absorbs the post-plate bf16-vs-f32 greedy fork — DISC-004).
+    run_l5_multi(
+        "p9_p14",
+        "tests/fixtures/multi_page/p9_p14_raw.md",
+        "tests/fixtures/multi_page/p9_p14_meta.json",
+        &["page_0009.png", "page_0014.png"],
+        0.25,
+        None,
+    );
+}
+
+/// The 10-page LONG-HORIZON leg (bd-1465): the oracle decodes 7117 tokens /
+/// 9 `<PAGE>` markers of real dense-page prose; the subject is CAPPED just
+/// past the oracle's token count (a capped run's tokens are a true prefix of
+/// the full run's — the uncapped subject runs to the 32K position cap where
+/// the oracle EOSes, the same DISC-004 trajectory class stretched over ten
+/// pages; §2.5 expects graceful degradation, not equality).
+#[test]
+fn l5_multi_page_10p_long_horizon() {
+    run_l5_multi(
+        "p10",
+        "tests/fixtures/multi_page/p10_raw.md",
+        "tests/fixtures/multi_page/p10_meta.json",
+        &[
+            "page_0009.png",
+            "page_0014.png",
+            "page_0019.png",
+            "page_0023.png",
+            "page_0086.png",
+            "page_0091.png",
+            "page_0105.png",
+            "page_0107.png",
+            "page_0108.png",
+            "page_0126.png",
+        ],
+        L5_MULTI_10P_BUDGET,
+        Some(7600),
+    );
+}
+
+/// 10-page CER budget — see [`l5_multi_page_10p_long_horizon`]. MEASURED
+/// 2026-07-07 armed: 0.4045 (plate exact; markers 8-vs-9; the DISC-004
+/// trajectory fork compounds across pages — §2.5 graceful degradation:
+/// 2-page 0.179 → 10-page 0.405). Budget = measured + headroom.
+const L5_MULTI_10P_BUDGET: f64 = 0.50;
+
+fn run_l5_multi(
+    case: &str,
+    raw_fixture: &str,
+    meta_fixture: &str,
+    page_names: &[&str],
+    cer_budget: f64,
+    subject_token_cap: Option<usize>,
+) {
     use franken_ocr::native_engine::OcrModel;
 
-    const RAW_FIXTURE: &str = "tests/fixtures/multi_page/p9_p14_raw.md";
-    const META_FIXTURE: &str = "tests/fixtures/multi_page/p9_p14_meta.json";
-    /// Documented budget for CER(finalize_multi(oracle_raw), ours[..len(ref)]):
-    /// the plate region is byte-exact; the budget absorbs ONLY the post-plate
-    /// greedy fork (bf16 oracle vs f32 subject on the fuzzy 640-squash footer
-    /// region — DISC-004). MEASURED 2026-07-07 on the armed pair: 0.1791;
-    /// budget = measured + LSB-drift headroom.
-    const MULTI_PAGE_CER_BUDGET: f64 = 0.25;
-
-    let mut log = Logger::new("L5_multi_page", "p9_p14");
+    let mut log = Logger::new("L5_multi_page", case);
     log.setup(0);
     let t0 = Instant::now();
 
     // Always-on: the fixture parses and the oracle raw carries the reference
     // invariants (a <PAGE> marker; the deterministic plate text).
-    let raw = std::fs::read_to_string(RAW_FIXTURE).expect("committed oracle raw fixture");
+    let raw = std::fs::read_to_string(raw_fixture).expect("committed oracle raw fixture");
     let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(META_FIXTURE).expect("committed oracle meta fixture"),
+        &std::fs::read_to_string(meta_fixture).expect("committed oracle meta fixture"),
     )
     .expect("oracle meta parses");
     log.assertion(
@@ -1905,8 +1951,8 @@ fn l5_multi_page_matches_infer_multi_oracle() {
         "oracle meta pins ngram_window 1024 (OQ-18 multi)",
         meta["ngram_window"] == json!(1024),
     );
-    let finalized_ref =
-        postprocess::finalize_multi(&raw, 2).expect("finalize_multi over the oracle raw");
+    let finalized_ref = postprocess::finalize_multi(&raw, page_names.len())
+        .expect("finalize_multi over the oracle raw");
     // The deterministic plate anchor = the finalized reference's first three
     // content lines (LONDON / PRINTED BY … / STAMFORD …).
     let plate: Vec<&str> = finalized_ref
@@ -1918,8 +1964,8 @@ fn l5_multi_page_matches_infer_multi_oracle() {
 
     let corpus = std::env::var_os("FOCR_CORPUS_DIR").map(PathBuf::from);
     let pages: Option<Vec<PathBuf>> = corpus.as_ref().and_then(|dir| {
-        let pair = [dir.join("page_0009.png"), dir.join("page_0014.png")];
-        pair.iter().all(|p| p.is_file()).then(|| pair.to_vec())
+        let all: Vec<PathBuf> = page_names.iter().map(|n| dir.join(n)).collect();
+        all.iter().all(|p| p.is_file()).then_some(all)
     });
     let model_dir = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from);
     let (Some(pages), Some(model_dir)) = (pages, model_dir.filter(|p| p.exists())) else {
@@ -1933,11 +1979,26 @@ fn l5_multi_page_matches_infer_multi_oracle() {
     };
 
     let _heavy = heavy_rung_guard();
+    // Long-horizon legs cap the subject at the oracle's token count + margin
+    // (a capped run's tokens are a true PREFIX of the full run's, and the
+    // compare below only reads the oracle-length prefix anyway) so an armed
+    // rung costs minutes, not the uncapped 32K-cap hour.
+    if let Some(cap) = subject_token_cap {
+        franken_ocr::native_engine::set_decode_overrides(
+            franken_ocr::native_engine::DecodeOverrides {
+                max_length: Some(cap),
+                ..Default::default()
+            },
+        );
+    }
     let model = OcrModel::load(&model_dir).expect("subject model loads");
     let refs: Vec<&Path> = pages.iter().map(PathBuf::as_path).collect();
-    let ours = model
-        .recognize_multi_page(&refs)
-        .expect("subject cross-page pass");
+    let ours = model.recognize_multi_page(&refs);
+    if subject_token_cap.is_some() {
+        // Never leak the cap into other rungs in this process.
+        franken_ocr::native_engine::set_decode_overrides(Default::default());
+    }
+    let ours = ours.expect("subject cross-page pass");
 
     for line in &plate {
         log.assertion(
@@ -1953,23 +2014,27 @@ fn l5_multi_page_matches_infer_multi_oracle() {
     let ref_chars: Vec<char> = finalized_ref.chars().collect();
     let ours_prefix: String = ours.chars().take(ref_chars.len()).collect();
     let cer = char_error_rate(&finalized_ref, &ours_prefix);
+    let ours_markers = ours.matches(postprocess::PAGE_MARKER).count();
+    let ref_markers = finalized_ref.matches(postprocess::PAGE_MARKER).count();
     log.parity(
         "L5_multi_page",
         "cer_vs_infer_multi_oracle_prefix",
         cer,
-        MULTI_PAGE_CER_BUDGET,
-        RAW_FIXTURE,
+        cer_budget,
+        raw_fixture,
         meta["sha256"].as_str().unwrap_or(""),
         json!({"oracle": "bf16-cpu greedy (deterministic)", "subject": "f32 greedy",
-               "note": "post-plate greedy fork budgeted; plate exact-matched above"}),
-        cer <= MULTI_PAGE_CER_BUDGET,
+               "subject_token_cap": subject_token_cap,
+               "page_markers": {"ours": ours_markers, "oracle": ref_markers},
+               "note": "post-plate greedy fork budgeted (DISC-004); plate exact-matched above"}),
+        cer <= cer_budget,
     );
     assert!(
-        cer <= MULTI_PAGE_CER_BUDGET,
-        "L5-multi CER {cer:.4} > budget {MULTI_PAGE_CER_BUDGET}; ours:\n{ours}\n--- ref:\n{finalized_ref}"
+        cer <= cer_budget,
+        "L5-multi[{case}] CER {cer:.4} > budget {cer_budget}"
     );
     println!(
-        r#"{{"suite":"parity_ladder","rung":"L5_multi_page","cer":{cer:.4},"budget":{MULTI_PAGE_CER_BUDGET},"result":"pass"}}"#
+        r#"{{"suite":"parity_ladder","rung":"L5_multi_page","case":{case:?},"cer":{cer:.4},"budget":{cer_budget},"markers_ours":{ours_markers},"markers_oracle":{ref_markers},"result":"pass"}}"#
     );
     log.result("pass", t0.elapsed().as_micros());
 }

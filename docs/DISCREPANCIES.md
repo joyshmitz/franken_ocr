@@ -78,7 +78,7 @@ since exact-token OCR fails in the tail.
 
 - claim_id / evidence_id: CLAIM-tromr-int8-p100 → bd-av64.12 (measurement log in
     the bead close note; comparison tree preserved in the session scratchpad)
-- Provenance: TrOMR export `model.safetensors` sha256 `41c88802…`
+- Provenance (model commit + fixture hash): TrOMR export `model.safetensors` sha256 `41c88802…`
     (`TROMR_EXPORT_MANIFEST.json`); f32 artifact `tromr.focrq` sha256
     `a9d41485…` (models-tromr-v1); int8 artifact `tromr.int8.focrq` sha256
     `cced11c0…` (models-tromr-v1, 40/260 tensors QInt8PerChan = exactly the
@@ -197,7 +197,12 @@ since exact-token OCR fails in the tail.
     short "page N" run until the 35-gram window ban terminates it (266 tokens).
 - Measured impact: CER over the oracle-length prefix (both sides through the
     same `finalize_multi`) = **0.1791** (2026-07-07, armed); the plate region
-    is exact. Budget pinned at 0.25 in the rung. The fork is the same
+    is exact. Budget pinned at 0.25 in the rung. LONG-HORIZON (bd-1465): the
+    10-page leg measures **0.4045** (subject capped at 7600 tokens — a true
+    prefix; markers 8-vs-9; plate still exact) — the fork compounds across
+    pages exactly as §2.5's graceful-degradation curve expects; the UNCAPPED
+    10-page subject runs to the 32768 position cap and terminates cleanly
+    (31653 + 1115 prefill = 32768) where the bf16 oracle EOSes at 7117. The fork is the same
     precision-trajectory class as DISC-003 (greedy path divergence at a
     near-tie under a different summation/precision), amplified here by the
     lossy 640 squash making footer glyphs genuinely ambiguous.
