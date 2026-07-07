@@ -74,16 +74,23 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
 
-          function Rewrite-AsupersyncPath([string] $cargoToml) {
+          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
             $text = Get-Content -Raw -Path $cargoToml
             $needle = 'path = "/dp/asupersync"'
             if (-not $text.Contains($needle)) {
-              throw "expected $cargoToml to contain $needle before CI path rewrite"
+              if ($required) {
+                throw "expected $cargoToml to contain $needle before CI path rewrite"
+              }
+              # frankensqlite migrated to a crates.io asupersync dep
+              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
+              # root [patch.crates-io] (rewritten above) unifies its graph.
+              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
+              return
             }
             [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
           }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
@@ -189,16 +196,23 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
 
-          function Rewrite-AsupersyncPath([string] $cargoToml) {
+          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
             $text = Get-Content -Raw -Path $cargoToml
             $needle = 'path = "/dp/asupersync"'
             if (-not $text.Contains($needle)) {
-              throw "expected $cargoToml to contain $needle before CI path rewrite"
+              if ($required) {
+                throw "expected $cargoToml to contain $needle before CI path rewrite"
+              }
+              # frankensqlite migrated to a crates.io asupersync dep
+              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
+              # root [patch.crates-io] (rewritten above) unifies its graph.
+              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
+              return
             }
             [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
           }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       - name: Install nightly toolchain
         if: ${{ !matrix.skip }}
