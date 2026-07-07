@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **57** | **185** |
-| `present` | 115 † | 44 | 159 |
+| Total enumerated rows | **128** | **58** | **186** |
+| `present` | 115 † | 45 | 160 |
 | `partial` | 7 † | 10 | 17 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -48,7 +48,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 |--------------------|----------------------|
 | MUST clauses enumerated (across both populations) | 92 |
 | MUST coverage (enumerated / SPEC MUST) | **1.00** (every `[SPEC-NNN]` MUST clause has a row) |
-| MUST rows `present` / total MUST rows | **137 / 145** (the 8 non-present MUST rows are enumerated debt: see the `partial`/`missing` rows) |
+| MUST rows `present` / total MUST rows | **138 / 146** (the 8 non-present MUST rows are enumerated debt: see the `partial`/`missing` rows) |
 
 > The 4 `excluded` rows are reasoned coverage debt (§16), not omissions; the gauntlet can only account what is listed.
 
@@ -283,6 +283,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `run_start` event | §7.3 | MUST | present | SURF | bd-223.3 | carries schema_version; contract test |
 | `stage` event (name, seq, elapsed, budget) | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
 | `page` event (per-page text/bbox, streaming) | §7.3 | MUST | present | SURF | bd-wp8.3 | incl per-page skip signal (bd-fck1, v0.3.0); bounded-stream scaffold bd-223.2 |
+| `staff` event (TrOMR staff result) | §7.3 | MUST | present | SURF | bd-av64.2 | additive v1 music event; carries 1-based staff index, total, bbox, status, and optional skip reason |
 | `run_complete` event | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
 | `run_error` event (carries exit code) | §7.3 | MUST | present | SURF | bd-223.5 | contract test |
 | `ROBOT_SCHEMA_VERSION` on every line | §7.3 | MUST | present | SURF | bd-223.3 | stable versioned |
