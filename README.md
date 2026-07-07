@@ -7,7 +7,7 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![version: v0.3.0](https://img.shields.io/badge/version-v0.3.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.3.0)
+[![version: v0.4.0](https://img.shields.io/badge/version-v0.4.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.4.0)
 [![status: working](https://img.shields.io/badge/status-working-success.svg)](#quick-example)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![toolchain: nightly](https://img.shields.io/badge/toolchain-nightly-purple.svg)](./rust-toolchain.toml)
@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/
 
 </div>
 
-The installer detects your platform, downloads the right prebuilt binary from the `v0.3.0` release, verifies it by SHA256, and puts `focr` on your PATH. Then `focr pull` fetches the weights once and you run offline forever after.
+The installer detects your platform, downloads the right prebuilt binary from the `v0.4.0` release, verifies it by SHA256, and puts `focr` on your PATH. Then `focr pull` fetches the weights once and you run offline forever after.
 
 ---
 
@@ -150,7 +150,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 `franken_ocr` is the only one of these built for a fixed, hand-tuned set of models on CPU.
 
-| | `franken_ocr` v0.3.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
+| | `franken_ocr` v0.4.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
 |---|---|---|---|---|
 | Language / runtime | Pure Rust, one binary | Python + HF transformers | C++ | C++ |
 | Primary target | CPU | CUDA GPU | CPU/GPU | CPU/GPU |
@@ -181,7 +181,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
-The script detects your OS and CPU architecture, downloads the matching binary from the `v0.3.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
+The script detects your OS and CPU architecture, downloads the matching binary from the `v0.4.0` release, verifies the SHA256 sidecar, and installs `focr`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
 
 On native Windows, install from PowerShell:
 
@@ -206,7 +206,7 @@ Release binaries are raw executables, not tar.gz archives. Each one is a single 
 Each asset has a `<asset>.sha256` sidecar in the standard `"<hex>  <asset>"` format. Download the binary and its sidecar from the release base URL, verify, then install. Example for Apple Silicon:
 
 ```bash
-base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.3.0
+base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.4.0
 asset=focr-aarch64-apple-darwin-neon-sdot-i8mm
 
 curl -fsSLO "$base/$asset"
@@ -712,7 +712,7 @@ To force a specific tier for verification, set `FOCR_FORCE_ARCH` (for example `F
 
 ### Checksum mismatch on a manual download
 
-`focr pull` verifies every byte automatically, so prefer it. If you downloaded an asset by hand and `shasum -a 256 -c` (or `sha256sum -c`) fails, the download is corrupt or truncated; re-download the binary and its `.sha256` sidecar from the `v0.3.0` release. A format or version mismatch on a model artifact surfaces as exit code 7.
+`focr pull` verifies every byte automatically, so prefer it. If you downloaded an asset by hand and `shasum -a 256 -c` (or `sha256sum -c`) fails, the download is corrupt or truncated; re-download the binary and its `.sha256` sidecar from the `v0.4.0` release. A format or version mismatch on a model artifact surfaces as exit code 7.
 
 ### Running fully offline
 

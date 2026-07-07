@@ -14,10 +14,27 @@ sections as they land.
 
 ## [Unreleased]
 
-Landed on `main` since `0.3.0`, not yet tagged.
+(nothing yet)
+
+## [0.4.0] - 2026-07-07
+
+The model-zoo release. Four new runtime engines join Baidu Unlimited-OCR — all
+pure-Rust, all CPU-only, all pullable with one command — plus real scanned-book
+support (page selection, spread splitting, a critical sideways-scan fix) and a
+bit-identical 30% speedup of the shared SAM vision tower.
 
 ### Added
 
+- **Four new model engines.** `got-ocr2` (structured OCR: LaTeX formulas,
+  tables, charts, molecular, geometry, sheet music via `--task`/`--format`),
+  `smolvlm2` (photo description / VQA via `--task describe [--question]`),
+  `onechart` (chart→data with the number-head reliability check via
+  `--task chart-data`), and `tromr` (polyphonic sheet-music OMR to MusicXML via
+  `--task music`, staff crops or full printed pages with native staff
+  detection). Each was hand-ported and certified against its pinned reference
+  (token-exact / cosine~1.0 oracle gates), runs through the shared int8 kernel
+  layer with runtime ISA dispatch, and decodes 1.7-3.4x faster per token than
+  the Hugging Face CPU reference at matched threads (`docs/PERF_LEDGER.md`).
 - **The whole zoo is now `focr pull`-able** (`bd-av64.7/.8/.9`). Published GH
   releases `models-smolvlm2-v1` (1.09 GB int8 + tokenizer), `models-onechart-v1`
   (363 MB int8 + the OPT tokenizer triple), and `models-tromr-v1` (86 MB f32 +
@@ -51,6 +68,41 @@ Landed on `main` since `0.3.0`, not yet tagged.
   points `OcrEngine::recognize_with_figures` / `recognize_dynamic_with_figures`
   (and `_model` variants) return the document plus the cropped `ExtractedFigure`s.
 
+### Performance
+
+- **SAM vision tower: bit-identical 36% speedup** (`bd-av64.10`). Five exact
+  transformations (parallel attention windows, parallel heads, hoisted rel-pos
+  tables, a division-free bias add, memcpy QKV splits) took the shared SAM
+  tower from 5.55s to 3.4s per 1024px view on an M4 — GOT-OCR2 full forward
+  6.7s → 4.7s, a real unlimited-ocr book page 19.3s → 13.5s — with the CLI
+  output proven byte-identical and every armed oracle cert green. Stage-level
+  timing instrumentation now ships behind `FOCR_TIMING` for the whole tower.
+- **Continuous-batch spine for the dense decoders** (`bd-3jo6.1.7.5`).
+  `focr ocr-batch` can prefill and decode multiple pages together on the
+  GOT-class dense engine, byte-identical per page to the sequential path.
+
+### Fixed
+
+- **Scanned books were OCR'd sideways** (`bd-av64.11`, critical). Many book
+  scans store each page's raster in portrait orientation and rotate it into
+  place with the page content stream's transformation matrix instead of a
+  `/Rotate` entry; the native PDF fast path honored only `/Rotate`, so these
+  documents reached the model rotated 90° and decoded hallucinated text until
+  the forward budget expired. The renderer now classifies the CTM at the first
+  image draw (axis-aligned rotations only; the direction was verified
+  empirically against a reference render) and composes it with `/Rotate`.
+- **TrOMR MusicXML emitter crashes and illegal output** (`bd-av64.1/.3`).
+  Pitched thirty-second/sixty-fourth notes crashed the duration parser
+  (multi-underscore names mis-split); `rest-256th`/`rest-512th` were missing
+  from the duration table entirely; and mixed chord groups emitted
+  importer-rejecting `<chord/><rest/>`. Every emitted document is now
+  validated at emit time (structural lint — a violation is an engine bug and
+  fails loudly rather than shipping broken XML).
+- **One bad staff no longer aborts a TrOMR page** (`bd-av64.2`, partial). The
+  full-page music path recognizes per staff and reports skipped staves (index,
+  bbox, reason) on stderr while the page succeeds with the staves that worked;
+  the page errors only when every staff fails, naming each reason.
+
 ### Direction (not yet shipped)
 
 - **int4 expert quantization.** Group-quantized int4 expert weights at a
@@ -58,9 +110,6 @@ Landed on `main` since `0.3.0`, not yet tagged.
   int4 s4s8 micro-kernel and exploratory `FOCR_EXPERTS_INT4` / `FOCR_LMHEAD_INT4`
   experiments already exist behind kill switches, but int4 is not validated and
   `focr convert` accepts only int8 as of `0.3.0`.
-- **The full conformance ladder.** Extend the seeded parity ladder into the complete
-  three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
-  gates across the whole forward path.
 - **ARM64 Windows** (`bd-3u97`). `x86_64` Windows ships today; the aarch64-windows
   target is not yet published.
 
@@ -96,25 +145,6 @@ skip event. Still pure, memory-safe Rust — no Python, no CUDA, no FFI at infer
 
 ### Fixed
 
-- **Scanned books were OCR'd sideways** (`bd-av64.11`, critical). Many book
-  scans store each page's raster in portrait orientation and rotate it into
-  place with the page content stream's transformation matrix instead of a
-  `/Rotate` entry; the native PDF fast path honored only `/Rotate`, so these
-  documents reached the model rotated 90° and decoded hallucinated text until
-  the forward budget expired. The renderer now classifies the CTM at the first
-  image draw (axis-aligned rotations only; the direction was verified
-  empirically against a reference render) and composes it with `/Rotate`.
-- **TrOMR MusicXML emitter crashes and illegal output** (`bd-av64.1/.3`).
-  Pitched thirty-second/sixty-fourth notes crashed the duration parser
-  (multi-underscore names mis-split); `rest-256th`/`rest-512th` were missing
-  from the duration table entirely; and mixed chord groups emitted
-  importer-rejecting `<chord/><rest/>`. Every emitted document is now
-  validated at emit time (structural lint — a violation is an engine bug and
-  fails loudly rather than shipping broken XML).
-- **One bad staff no longer aborts a TrOMR page** (`bd-av64.2`, partial). The
-  full-page music path recognizes per staff and reports skipped staves (index,
-  bbox, reason) on stderr while the page succeeds with the staves that worked;
-  the page errors only when every staff fails, naming each reason.
 - **Fresh-install OCR happy path** (`bd-3u6x`, critical). `focr pull` installs the
   model as `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup previously
   searched only the bare `unlimited-ocr.focrq` basename — so a freshly-pulled model

@@ -13,7 +13,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 #
 # Options:
-#   --version vX.Y.Z   Install a specific version (default: latest, falls back to v0.2.0)
+#   --version vX.Y.Z   Install a specific version (default: latest, falls back to v0.4.0)
 #   --dir DIR          Install the binary into DIR (default: ~/.local/bin)
 #   --easy-mode        Add the install directory to PATH in your shell rc files
 #   --verify           Run "focr robot selftest" after install
@@ -35,7 +35,7 @@
 #                          .sha256 sidecar are fetched from directly under it.
 #
 # WINDOWS
-#   v0.2.0 ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
+#   v0.2.0+ ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
 #   proven end-to-end on Windows 10. This POSIX installer cannot install it from a
 #   Git-Bash/MSYS/Cygwin shell, so there it points you at the PowerShell installer:
 #     irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
@@ -60,7 +60,7 @@ shopt -s lastpipe 2>/dev/null || true
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-franken_ocr}"
 BINARY_NAME="focr"
-FALLBACK_VERSION="v0.2.0"
+FALLBACK_VERSION="v0.4.0"
 VERSION="${VERSION:-}"
 
 # Install directory: --dir wins, then PREFIX/bin, then ~/.local/bin.

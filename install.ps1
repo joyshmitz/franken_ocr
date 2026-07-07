@@ -21,7 +21,7 @@
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1))) -Verify
 
   Options:
-    -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.2.0)
+    -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.4.0)
     -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
     -Verify            Run "focr robot selftest" after install and report the verdict
     -NoPull            Do not offer to download the model after install (focr pull)
@@ -33,7 +33,7 @@
     HTTPS_PROXY        HTTPS proxy for downloads (preferred)
     HTTP_PROXY         HTTP proxy for downloads
 
-  Platform: only x86-64 Windows (AMD64) has a published binary in v0.2.0.
+  Platform: only x86-64 Windows (AMD64) has a published binary since v0.2.0.
   Windows on ARM64 is not published yet; this installer says so and stops.
 #>
 [CmdletBinding()]
@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 $script:Owner           = 'Dicklesworthstone'
 $script:Repo            = 'franken_ocr'
 $script:Asset           = 'focr-x86_64-pc-windows-msvc.exe'
-$script:FallbackVersion = 'v0.2.0'
+$script:FallbackVersion = 'v0.4.0'
 
 $script:Quiet               = [bool]$Quiet
 $script:Esc                 = [char]27
