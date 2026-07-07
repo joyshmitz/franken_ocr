@@ -1168,10 +1168,22 @@ pub fn staves_to_musicxml(semantics: &[String]) -> FocrResult<String> {
             part_measures(merged)?
         ));
     }
+    // Annotate-only musical-sanity observations (bd-av64.5): XML comments
+    // never change the musical content, and importers ignore them.
+    let mut annotations = String::new();
+    for w in sanity_warnings(semantics) {
+        annotations.push_str(&format!(
+            "  <!--focr-sanity: {} part {} measure {}: {}-->\n",
+            w.kind,
+            w.part,
+            w.measure,
+            w.detail.replace("--", "-")
+        ));
+    }
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <score-partwise version=\"4.0\">\n\
-         \x20 <part-list>{part_list}</part-list>\n{parts}</score-partwise>\n"
+         \x20 <part-list>{part_list}</part-list>\n{parts}{annotations}</score-partwise>\n"
     );
     // Emit-time enforcement (bd-av64.3): a structural violation here is by
     // definition an emitter bug — never a model-quality artifact — so every
@@ -1185,6 +1197,177 @@ pub fn staves_to_musicxml(semantics: &[String]) -> FocrResult<String> {
             violations.join("; ")
         )))
     }
+}
+
+/// One musical-sanity warning from [`sanity_warnings`] (bd-av64.5):
+/// annotate-only observations about the RECOGNIZED content — never a
+/// rejection (model output is legitimately imperfect; hard structural
+/// legality is [`validate_musicxml`]'s job).
+#[derive(Debug, Clone)]
+pub struct MusicWarning {
+    /// Stable machine kind: `overfull_bar` | `underfull_bar` |
+    /// `impossible_duration` | `key_mismatch`.
+    pub kind: &'static str,
+    /// 1-based part (staff) number.
+    pub part: usize,
+    /// 1-based measure number (0 = the warning is staff-level).
+    pub measure: usize,
+    /// Human detail with the numbers that triggered the flag.
+    pub detail: String,
+}
+
+/// Musical-sanity analysis over per-staff semantic streams (bd-av64.5),
+/// annotate-only per the alien-artifact contract (the deterministic
+/// fallback IS annotation; auto-correction would need a measured-win
+/// ledger):
+///
+/// * **bar sums** vs the active time signature — overfull always flags;
+///   underfull flags EXCEPT for the classical exemptions: a pickup
+///   (anacrusis) first measure, and a final measure (which may complement
+///   the pickup or be cut by the line end). A mid-stream time-signature
+///   change resets the expectation.
+/// * **impossible durations** — a single note longer than the whole bar
+///   (the real Cadwallader read contained a whole note in 3/4).
+/// * **cross-staff key consistency** — staves of one system share a key
+///   signature by engraving convention; disagreement flags every minority
+///   staff with the majority as the suggestion (never rewritten).
+#[must_use]
+pub fn sanity_warnings(semantics: &[String]) -> Vec<MusicWarning> {
+    let mut out = Vec::new();
+    let mut keys: Vec<Option<String>> = Vec::new();
+    for (pi, sem) in semantics.iter().enumerate() {
+        let part = pi + 1;
+        let mut bar_ticks_expected: Option<u32> = None;
+        let mut measure = 1usize;
+        let mut sum = 0u32;
+        let mut key: Option<String> = None;
+        let mut measure_flagged = false;
+        let mut had_pickup_deficit = false;
+        let mut pending: Vec<(usize, u32)> = Vec::new(); // underfull candidates
+        for event in sem.split('+') {
+            if event.is_empty() {
+                continue;
+            }
+            if let Some(k) = event.strip_prefix("keySignature-") {
+                key.get_or_insert_with(|| k.to_owned());
+                continue;
+            }
+            if let Some(ts) = event.strip_prefix("timeSignature-") {
+                bar_ticks_expected = match ts {
+                    "C" => Some(256),
+                    "C/" => Some(128),
+                    other => other.split_once('/').and_then(|(b, t)| {
+                        let b: u32 = b.parse().ok()?;
+                        let t: u32 = t.parse().ok()?;
+                        Some(b * 256 / t)
+                    }),
+                };
+                continue;
+            }
+            if event == "barline" {
+                if let Some(expected) = bar_ticks_expected {
+                    if sum > expected && !measure_flagged {
+                        out.push(MusicWarning {
+                            kind: "overfull_bar",
+                            part,
+                            measure,
+                            detail: format!("{sum} ticks in a {expected}-tick measure"),
+                        });
+                    } else if sum > 0 && sum < expected {
+                        if measure == 1 {
+                            // Anacrusis: classical and unflagged.
+                            had_pickup_deficit = true;
+                        } else {
+                            // Defer: a FINAL underfull measure is exempt
+                            // (complements the pickup / line-end cut).
+                            pending.push((measure, sum));
+                        }
+                    }
+                }
+                measure += 1;
+                sum = 0;
+                measure_flagged = false;
+                continue;
+            }
+            if event.starts_with("clef-") || event.starts_with("multirest-") {
+                continue;
+            }
+            for atom in event.split('|') {
+                let dur = if let Some(d) = atom.strip_prefix("rest-") {
+                    duration_info(d)
+                } else {
+                    split_pitch_duration(atom).map(|(_, info)| info)
+                };
+                let Some((_, ticks, _)) = dur else { continue };
+                if let Some(expected) = bar_ticks_expected
+                    && ticks > expected
+                    && !measure_flagged
+                {
+                    out.push(MusicWarning {
+                        kind: "impossible_duration",
+                        part,
+                        measure,
+                        detail: format!("{ticks}-tick note in a {expected}-tick measure"),
+                    });
+                    measure_flagged = true;
+                }
+                // Chord members sound together: count the group ONCE (the
+                // longest member governs; approximating with the first).
+                sum += ticks;
+                break;
+            }
+        }
+        // Trailing content without a final barline is a line-end cut: exempt.
+        // Deferred underfull measures: the LAST one is exempt (may pair with
+        // the pickup); earlier ones flag.
+        let exempt_last = pending.len().saturating_sub(1);
+        let _ = had_pickup_deficit;
+        for &(m, got) in &pending[..exempt_last] {
+            out.push(MusicWarning {
+                kind: "underfull_bar",
+                part,
+                measure: m,
+                detail: format!(
+                    "{got} ticks in a {}-tick measure",
+                    bar_ticks_expected.unwrap_or(0)
+                ),
+            });
+        }
+        keys.push(key);
+    }
+    // Cross-staff key consistency (only meaningful with >= 2 keyed staves).
+    let known: Vec<(usize, &String)> = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| k.as_ref().map(|k| (i, k)))
+        .collect();
+    if known.len() >= 2 {
+        let mut counts: std::collections::BTreeMap<&String, usize> = Default::default();
+        for (_, k) in &known {
+            *counts.entry(k).or_default() += 1;
+        }
+        if counts.len() > 1 {
+            let majority = counts
+                .iter()
+                .max_by_key(|entry| *entry.1)
+                .map(|(k, _)| (*k).clone())
+                .unwrap_or_default();
+            for (i, k) in &known {
+                if **k != majority {
+                    out.push(MusicWarning {
+                        kind: "key_mismatch",
+                        part: i + 1,
+                        measure: 0,
+                        detail: format!(
+                            "staff reads keySignature-{k} while the system majority is \
+                             keySignature-{majority}"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Structural MusicXML lint over the emitter's output (bd-av64.3). Empty
@@ -2058,6 +2241,97 @@ mod tests {
             .expect("rest-first mixed group renders");
         assert!(validate_musicxml(&xml).is_empty(), "must validate: {xml}");
         assert_eq!(xml.matches("<chord/>").count(), 1);
+    }
+
+    /// bd-av64.5: each sanity rule on synthetic streams, including the
+    /// classical exemptions (pickup first measure, final measure) and the
+    /// mid-stream time-signature reset.
+    #[test]
+    fn sanity_rules_flag_and_exempt_correctly() {
+        let w = |sems: &[&str]| {
+            sanity_warnings(&sems.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        // Overfull: 4 quarters in 3/4.
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_quarter+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+        ]);
+        assert!(
+            ws.iter()
+                .any(|x| x.kind == "overfull_bar" && x.measure == 1),
+            "{ws:?}"
+        );
+        // Anacrasis exemption: underfull FIRST measure never flags; a full
+        // middle; underfull FINAL exempt.
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_quarter+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline+note-C4_half+barline",
+        ]);
+        assert!(ws.is_empty(), "pickup + final exemptions: {ws:?}");
+        // Underfull MIDDLE measure flags.
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline+note-C4_quarter+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline+note-C4_quarter+barline",
+        ]);
+        assert!(
+            ws.iter()
+                .any(|x| x.kind == "underfull_bar" && x.measure == 2),
+            "{ws:?}"
+        );
+        // Impossible duration: whole note in 3/4 (the real Cadwallader read).
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_whole+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+        ]);
+        assert!(ws.iter().any(|x| x.kind == "impossible_duration"), "{ws:?}");
+        // Time-signature change resets the expectation: 2/4 bar after a
+        // mid-stream change must NOT flag.
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline+timeSignature-2/4+note-C4_quarter+note-C4_quarter+barline+note-C4_quarter+note-C4_quarter+barline",
+        ]);
+        assert!(ws.is_empty(), "time change resets: {ws:?}");
+        // Key mismatch across a system: minority staff flags with majority
+        // suggestion (the real grand-staff read: -3 vs -1).
+        let ws = w(&[
+            "clef-G2+keySignature-FM+timeSignature-3/4+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+            "clef-F4+keySignature-EbM+timeSignature-3/4+note-C3_quarter+note-C3_quarter+note-C3_quarter+barline",
+            "clef-G2+keySignature-FM+timeSignature-3/4+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+        ]);
+        let km: Vec<_> = ws.iter().filter(|x| x.kind == "key_mismatch").collect();
+        assert_eq!(km.len(), 1, "{ws:?}");
+        assert_eq!(km[0].part, 2);
+        assert!(
+            km[0].detail.contains("FM"),
+            "majority named: {}",
+            km[0].detail
+        );
+        // Chord groups count once (three-note chord of quarters = ONE beat).
+        let ws = w(&[
+            "clef-G2+timeSignature-3/4+note-C4_quarter|note-E4_quarter|note-G4_quarter+note-C4_quarter+note-C4_quarter+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+        ]);
+        assert!(ws.is_empty(), "chords count once: {ws:?}");
+    }
+
+    /// bd-av64.5: annotations are comments only — stripping them yields the
+    /// exact document emitted before the sanity pass existed (annotate-only
+    /// invariant), and annotated documents still validate.
+    #[test]
+    fn sanity_annotations_are_pure_comments() {
+        let xml = semantic_to_musicxml(
+            "clef-G2+timeSignature-3/4+note-C4_whole+barline+note-C4_quarter+note-C4_quarter+note-C4_quarter+barline",
+        )
+        .expect("emits");
+        assert!(
+            xml.contains("<!--focr-sanity: impossible_duration"),
+            "{xml}"
+        );
+        assert!(
+            validate_musicxml(&xml).is_empty(),
+            "annotated doc validates"
+        );
+        let stripped: String = xml
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("<!--focr-sanity:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!stripped.contains("focr-sanity"), "comments strip cleanly");
+        assert!(stripped.contains("<note>"), "content intact");
     }
 
     /// bd-av64.3: the structural validator flags each illegal shape (red

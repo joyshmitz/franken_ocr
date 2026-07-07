@@ -980,6 +980,7 @@ fn write_ocr_output(
         let mut value = rec.to_json(figures);
         if let Some(meta) = music_meta {
             value["staves"] = music_meta_to_json(meta);
+            value["warnings"] = music_warnings_to_json(meta);
         }
         let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
@@ -1378,6 +1379,21 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 Some(&skip.reason),
             ));
         }
+        for w in &meta.warnings {
+            emit(&robot::music_warning_event(
+                w.kind, w.part, w.measure, &w.detail,
+            ));
+        }
+    }
+    if !robot_mode
+        && let Some(meta) = &music_meta
+        && !meta.warnings.is_empty()
+    {
+        eprintln!(
+            "[focr] {} musical-sanity warning(s) — annotated in the MusicXML; \
+             re-run with --robot for machine-readable detail",
+            meta.warnings.len()
+        );
     }
 
     let markdown = recognition.markdown();
@@ -1415,6 +1431,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         let mut value = recognition.to_json(&figures);
         if let Some(meta) = &music_meta {
             value["staves"] = music_meta_to_json(meta);
+            value["warnings"] = music_warnings_to_json(meta);
         }
         emit(&value);
     } else {
@@ -1427,6 +1444,25 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
 /// DETECTED staff in detection order — recognized staves as `status: "ok"`,
 /// failed ones as `status: "skipped"` with the reason. Absent entirely for
 /// non-music runs, so every existing consumer's shape is unchanged.
+/// The `--json` `warnings` array for a music run (bd-av64.5): annotate-only
+/// musical-sanity observations, machine-stable kinds. Absent for non-music
+/// runs.
+fn music_warnings_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value {
+    serde_json::Value::Array(
+        meta.warnings
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "kind": w.kind,
+                    "part": w.part,
+                    "measure": w.measure,
+                    "detail": w.detail,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value {
     let mut entries: Vec<(usize, serde_json::Value)> = meta
         .staves
@@ -3361,6 +3397,7 @@ mod tests {
                 bbox: (0, 150, 800, 90),
                 reason: "resized width 1296 exceeds the 1280 position clamp".into(),
             }],
+            warnings: Vec::new(),
         };
         let v = music_meta_to_json(&meta);
         let arr = v.as_array().expect("array");

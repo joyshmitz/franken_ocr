@@ -651,6 +651,8 @@ pub struct MusicPageMeta {
     pub staves: Vec<(usize, tromr::StaffBBox)>,
     /// Staves that failed per-staff recognition (index, bbox, reason).
     pub skips: Vec<tromr::StaffSkip>,
+    /// Annotate-only musical-sanity observations (bd-av64.5).
+    pub warnings: Vec<tromr::MusicWarning>,
 }
 
 /// One parsed layout span from the model's grounding output: a ref/det label
@@ -1222,10 +1224,23 @@ impl OcrModel {
                 .map(|(_, r, _)| r.semantic.len())
                 .sum::<usize>()
         ));
+        let semantics: Vec<String> = page
+            .staves
+            .iter()
+            .map(|(_, r, _)| r.semantic.clone())
+            .collect();
+        let warnings = tromr::sanity_warnings(&semantics);
+        for w in &warnings {
+            timing_log(&format!(
+                "  tromr.sanity {} part {} measure {}: {}",
+                w.kind, w.part, w.measure, w.detail
+            ));
+        }
         if let Ok(mut slot) = self.music_meta.lock() {
             *slot = Some(MusicPageMeta {
                 staves: page.staves.iter().map(|(i, _, b)| (*i, *b)).collect(),
                 skips: page.skips.clone(),
+                warnings,
             });
         }
         let xml = if page.staves.len() == 1 {

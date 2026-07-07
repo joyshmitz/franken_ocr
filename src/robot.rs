@@ -20,6 +20,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "stage",
     "page",
     "staff",
+    "music_warning",
     "run_complete",
     "run_error",
 ];
@@ -144,6 +145,21 @@ pub fn staff_event(
         event["reason"] = serde_json::json!(reason);
     }
     event
+}
+
+/// One annotate-only musical-sanity observation from a TrOMR music run
+/// (bd-av64.5): `kind` is machine-stable (`overfull_bar` | `underfull_bar`
+/// | `impossible_duration` | `key_mismatch`), `measure` 0 means the
+/// warning is staff-level. Additive to the v1 event set like `staff`.
+pub fn music_warning_event(kind: &str, part: usize, measure: usize, detail: &str) -> Value {
+    serde_json::json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "music_warning",
+        "kind": kind,
+        "part": part,
+        "measure": measure,
+        "detail": detail,
+    })
 }
 
 #[cfg(test)]
