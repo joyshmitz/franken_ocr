@@ -2678,7 +2678,7 @@ mod tests {
     /// contract end-to-end through the CLI. Uses a freshly-created temp file
     /// so the test is CWD-independent.
     #[test]
-    fn load_existing_non_model_path_is_format_mismatch_not_panic() {
+    fn load_existing_non_model_path_is_format_mismatch_not_panic() -> FocrResult<()> {
         let mut tmp = std::env::temp_dir();
         tmp.push(format!(
             "franken_ocr_load_test_{}.focrq",
@@ -2689,12 +2689,20 @@ mod tests {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup (not a delete of source)
         // resolve_model accepts an existing path; the container reader types
         // the junk as a format fault (exit 7).
-        let err = r.expect_err("junk artifact must error, not load");
+        let err = match r {
+            Ok(_) => {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "junk artifact must error, not load"
+                )));
+            }
+            Err(e) => e,
+        };
         assert!(
             matches!(err, FocrError::FormatMismatch(_)),
             "expected FormatMismatch (exit 7) on a junk artifact, got {err:?}"
         );
         assert_eq!(err.exit_code(), 7, "FormatMismatch maps to exit 7");
+        Ok(())
     }
 
     fn temp_model_dir(label: &str) -> PathBuf {

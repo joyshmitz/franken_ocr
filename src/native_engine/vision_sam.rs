@@ -18,6 +18,8 @@
 //! adapts a loaded [`Weights`] into a [`SamWeights`] through the `.focrq`
 //! reader's named-tensor accessors (bd-1es.3) and runs the real SAM forward.
 
+use rayon::prelude::*;
+
 use super::nn;
 use super::tensor::Mat;
 use super::weights::Weights;
@@ -725,7 +727,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     let attn_out = if blk.window > 0 {
         attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
     } else {
-        attention(&blk.attn, &normed, gh, gw)?
+        attention(&blk.attn, &normed, gh, gw, None)?
     };
     super::timing_log(&format!(
         "      sam.block attn({}) {:.3}s",
@@ -793,7 +795,7 @@ fn block_forward_batched(blk: &BlockP, x: &Mat, gh: usize, gw: usize, v: usize) 
         let av = if blk.window > 0 {
             attention_windowed(&blk.attn, &normed_view, gh, gw, blk.window)?
         } else {
-            attention(&blk.attn, &normed_view, gh, gw)?
+            attention(&blk.attn, &normed_view, gh, gw, None)?
         };
         ensure_mat_shape(
             &av,
@@ -861,14 +863,30 @@ fn attention_windowed(p: &AttnP, normed: &Mat, gh: usize, gw: usize, ws: usize) 
         }
     }
 
-    // Attention per window (each window: ws x ws grid).
+    // Attention per window (each window: ws x ws grid). The rel-pos tables
+    // depend only on the window size — compute them ONCE for all 25 windows
+    // instead of per window (bd-av64.10).
+    let nh = NUM_HEADS;
+    let hd = dim / nh;
+    let rh = get_rel_pos(ws, ws, &p.rel_pos_h, p.size_h, hd);
+    let rw = get_rel_pos(ws, ws, &p.rel_pos_w, p.size_w, hd);
+    // Windows are independent — run them across the pool (bd-av64.10: the
+    // serial loop left ~90% of cores idle because each 196-token window sits
+    // below the inner kernels' own parallel thresholds). Per-window
+    // arithmetic is unchanged and outputs land in disjoint spans, so the
+    // result is bit-identical to the serial loop.
+    let win_span = ws * ws * dim;
     let mut out_windows = vec![0.0f32; windows.len()];
-    for widx in 0..nwin {
-        let base = widx * ws * ws * dim;
-        let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + ws * ws * dim].to_vec());
-        let win_out = attention(p, &win_in, ws, ws)?;
-        out_windows[base..base + ws * ws * dim].copy_from_slice(&win_out.data);
-    }
+    out_windows
+        .par_chunks_mut(win_span)
+        .enumerate()
+        .try_for_each(|(widx, out_chunk)| -> FocrResult<()> {
+            let base = widx * win_span;
+            let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + win_span].to_vec());
+            let win_out = attention(p, &win_in, ws, ws, Some((&rh, &rw)))?;
+            out_chunk.copy_from_slice(&win_out.data);
+            Ok(())
+        })?;
 
     // window_unpartition: scatter back, strip padding.
     let mut merged = vec![0.0f32; gh * gw * dim];
@@ -896,7 +914,13 @@ fn attention_windowed(p: &AttnP, normed: &Mat, gh: usize, gw: usize, ws: usize) 
 /// Multi-head attention over a `gh x gw` token grid `[gh*gw, dim]`, adding the
 /// decomposed rel-pos bias to the logits before softmax. Returns `proj(out)`
 /// shaped `[gh*gw, dim]`.
-fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
+fn attention(
+    p: &AttnP,
+    x: &Mat,
+    gh: usize,
+    gw: usize,
+    relpos: Option<(&[f32], &[f32])>,
+) -> FocrResult<Mat> {
     let n = gh * gw;
     if x.rows != n {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -948,14 +972,12 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     for r in 0..n {
         let row = qkv.row(r);
         for head in 0..nh {
-            for d in 0..hd {
-                let qv = row[head * hd + d];
-                let kv = row[(nh + head) * hd + d];
-                let vv = row[(2 * nh + head) * hd + d];
-                q[(head * n + r) * hd + d] = qv;
-                k[(head * n + r) * hd + d] = kv;
-                v[(head * n + r) * hd + d] = vv;
-            }
+            // Each (row, head) segment is hd contiguous floats in both the
+            // source row and the per-head destination — copy, don't loop.
+            let dst = (head * n + r) * hd;
+            q[dst..dst + hd].copy_from_slice(&row[head * hd..(head + 1) * hd]);
+            k[dst..dst + hd].copy_from_slice(&row[(nh + head) * hd..(nh + head + 1) * hd]);
+            v[dst..dst + hd].copy_from_slice(&row[(2 * nh + head) * hd..(2 * nh + head + 1) * hd]);
         }
     }
 
@@ -964,35 +986,68 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     // Rw = get_rel_pos(gw, gw, rel_pos_w) -> [gw, gw, hd]
     // rel_h[head, q, ky] = sum_c q[head,q,c] * Rh[qy, ky, c]
     // rel_w[head, q, kx] = sum_c q[head,q,c] * Rw[qx, kx, c]
-    let rh = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
-    let rw = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+    //
+    // The tables depend only on (gh, gw) — the windowed path passes them in,
+    // computed once per block instead of once per window (bd-av64.10).
+    let (rh_owned, rw_owned);
+    let (rh, rw): (&[f32], &[f32]) = match relpos {
+        Some((rh, rw)) => (rh, rw),
+        None => {
+            rh_owned = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
+            rw_owned = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+            (&rh_owned, &rw_owned)
+        }
+    };
 
     // Compute attention head-by-head with explicit logits so we can add bias.
     let mut out = vec![0.0f32; nh * n * hd]; // [nh][n, hd]
+    let (mut t_bias, mut t_qk, mut t_add, mut t_sm, mut t_av) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for head in 0..nh {
         let qh = &q[head * n * hd..(head + 1) * n * hd];
         let kh = &k[head * n * hd..(head + 1) * n * hd];
         let vh = &v[head * n * hd..(head + 1) * n * hd];
-        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
+        let t0 = std::time::Instant::now();
+        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, rh, rw, gh, gw, hd);
+        t_bias += t0.elapsed().as_secs_f64();
 
         // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
+        let t0 = std::time::Instant::now();
         let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
         let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
         let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
+        t_qk += t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx) directly
+        // instead of dividing per element — bit-identical arithmetic in the
+        // same order, but branch/div-free and autovectorizable (bd-av64.10:
+        // the naive j/gw + j%gw form burned ~200M integer divisions per
+        // global block).
         for i in 0..n {
-            for j in 0..n {
-                let ky = j / gw;
-                let kx = j % gw;
+            let lrow = &mut lm.data[i * n..(i + 1) * n];
+            let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
+            for ky in 0..gh {
                 let bh = rel_h_bias[i * gh + ky];
-                let bw = rel_w_bias[i * gw + kx];
-                lm.data[i * n + j] = scale * lm.data[i * n + j] + bh + bw;
+                let seg = &mut lrow[ky * gw..(ky + 1) * gw];
+                for (l, &bw) in seg.iter_mut().zip(brow_w) {
+                    *l = scale * *l + bh + bw;
+                }
             }
         }
+        t_add += t0.elapsed().as_secs_f64();
         // softmax rows then weighted sum of v.
+        let t0 = std::time::Instant::now();
         nn::softmax_rows(&mut lm)?;
+        t_sm += t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
         let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
         let head_out = nn::matmul(&lm, &vh_mat)?;
         out[head * n * hd..(head + 1) * n * hd].copy_from_slice(&head_out.data);
+        t_av += t0.elapsed().as_secs_f64();
+    }
+    if n > 1000 {
+        super::timing_log(&format!(
+            "        attn.stages bias {t_bias:.3}s qk {t_qk:.3}s add {t_add:.3}s sm {t_sm:.3}s av {t_av:.3}s"
+        ));
     }
 
     // Reassemble [n, dim] from [nh][n, hd] (head-major -> token rows).
@@ -2187,7 +2242,7 @@ mod tests {
                 .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
                 .collect(),
         );
-        let got = attention(&attn, &x, grid, grid)?;
+        let got = attention(&attn, &x, grid, grid, None)?;
         let expected = attention_scalar_reference(&attn, &x, grid, grid)?;
         let max_abs = got
             .data
@@ -2208,13 +2263,13 @@ mod tests {
         bad_qkv.qkv.out = 3 * dim - 1;
         bad_qkv.qkv.w = vec![0.0; bad_qkv.qkv.out * bad_qkv.qkv.in_];
         bad_qkv.qkv.b = vec![0.0; bad_qkv.qkv.out];
-        assert_err_contains(attention(&bad_qkv, &x, 2, 2), "qkv shape");
+        assert_err_contains(attention(&bad_qkv, &x, 2, 2, None), "qkv shape");
 
         let mut bad_proj = tiny_block(0).attn;
         bad_proj.proj.out = dim - 1;
         bad_proj.proj.w = vec![0.0; bad_proj.proj.out * bad_proj.proj.in_];
         bad_proj.proj.b = vec![0.0; bad_proj.proj.out];
-        assert_err_contains(attention(&bad_proj, &x, 2, 2), "proj shape");
+        assert_err_contains(attention(&bad_proj, &x, 2, 2, None), "proj shape");
     }
 
     #[test]
@@ -2294,7 +2349,7 @@ mod tests {
         };
         // all 4 tokens identical = ones
         let x = Mat::from_vec(4, dim, vec![1.0; 4 * dim]);
-        let out = attention(&attn, &x, 2, 2)?;
+        let out = attention(&attn, &x, 2, 2, None)?;
         assert_eq!(out.shape(), (4, dim));
         // uniform average of identical value vectors -> 1.0 everywhere
         for &v in &out.data {
@@ -2346,12 +2401,12 @@ mod tests {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(3)
             .max(1);
-        let warm = attention(&attn, &x, grid, grid)?;
+        let warm = attention(&attn, &x, grid, grid, None)?;
         let warm_checksum: f32 = warm.data.iter().step_by(97).copied().sum();
         let start = Instant::now();
         let mut checksum = 0.0f32;
         for _ in 0..runs {
-            let out = attention(&attn, &x, grid, grid)?;
+            let out = attention(&attn, &x, grid, grid, None)?;
             checksum += out.data.iter().step_by(97).copied().sum::<f32>();
         }
         let elapsed = start.elapsed();
