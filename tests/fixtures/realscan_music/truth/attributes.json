@@ -55,8 +55,8 @@
     "staff_count": 12,
     "staff_count_note": "5 two-staff systems of No.16 + first system of No.17; verified by eye",
     "clefs_all": "G2",
-    "min_recognized": 7,
-    "xfail_note": "HARDENED 2026-07-07 at 7 = every detected staff: bd-av64.14 fit-first geometry rescued 5, bd-av64.4 barline splitting rescued the final 2 clamp-bound duet bands (0 recognized before the pair)"
+    "min_recognized": 5,
+    "xfail_note": "floor 5 = bd-av64.14 fit-first geometry (was 0). The 2 remaining clamp-bound duet bands CAN be rescued to 7/7 by FOCR_TROMR_SPLIT=1 (bd-av64.4), but splitting is experimental/off-by-default: isolated segments are OOD for the model (continuation octave registration lost, rhythm agreement 0.2 measured 2026-07-07) \u2014 recognition-count rescue only"
   },
   "pages/spohr_p100.png": {
     "kind": "full_page_mixed_prose",

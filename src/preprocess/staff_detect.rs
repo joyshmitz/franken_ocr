@@ -363,10 +363,27 @@ pub fn barline_columns(crop: &StaffCrop) -> Vec<usize> {
     let max_run = (spacing / 2).max(2);
     let ink_at = |x: usize, y: usize| crop.gray[y * crop.w + x] <= thr;
     let coverage = |x: usize| (a..=b).filter(|&y| ink_at(x, y)).count();
-    let near = |x: usize, l: usize| {
-        (l.saturating_sub(2)..=(l + 2).min(crop.h - 1)).any(|y| ink_at(x, y))
+    let near =
+        |x: usize, l: usize| (l.saturating_sub(2)..=(l + 2).min(crop.h - 1)).any(|y| ink_at(x, y));
+    // The stem/clef discriminator: a BARLINE's ink is confined to the staff
+    // (nothing significant beyond either outer line), while stems run past
+    // one outer line toward their beam and clef glyphs overshoot both. A
+    // column with >30% ink in the spacing-tall zone outside either outer
+    // line is engraving, not a barline.
+    let outside_clear = |x: usize| {
+        let zone_above = l0.saturating_sub(spacing)..l0.saturating_sub(2);
+        let zone_below = (l4 + 3).min(crop.h)..(l4 + 1 + spacing).min(crop.h);
+        let frac = |zone: std::ops::Range<usize>| {
+            let len = zone.len();
+            if len == 0 {
+                return false;
+            }
+            zone.filter(|&y| ink_at(x, y)).count() * 10 > len * 3
+        };
+        !frac(zone_above) && !frac(zone_below)
     };
-    let qualifies = |x: usize| coverage(x) >= need && near(x, l0) && near(x, l4);
+    let qualifies =
+        |x: usize| coverage(x) >= need && near(x, l0) && near(x, l4) && outside_clear(x);
     let mut out = Vec::new();
     let mut run_start: Option<usize> = None;
     for x in 0..=crop.w {
@@ -377,8 +394,23 @@ pub fn barline_columns(crop: &StaffCrop) -> Vec<usize> {
                 run_start = None;
                 let e = x;
                 if e - s <= max_run {
-                    let left_clear = s == 0 || coverage(s - 1) < span / 2;
-                    let right_clear = e >= crop.w || coverage(e) < span / 2;
+                    // GAP QUALITY: a true barline sits in an inter-measure
+                    // gap — a spacing/2-wide zone on EACH side (skipping 2
+                    // anti-aliased edge columns, which measured 80-90%
+                    // coverage on the 1843 fixture) where every column is
+                    // near-empty apart from the staff lines themselves
+                    // (5 lines x 2px ~= 12%; floor at 30%). Stems inside
+                    // beamed runs always have neighbor ink and fail this.
+                    let gap = (spacing / 2).max(3);
+                    let all_clear = |range: std::ops::Range<usize>| {
+                        range
+                            .filter(|&x| x < crop.w)
+                            .all(|x| coverage(x) * 10 < span * 3)
+                    };
+                    let left_clear =
+                        s < 3 || all_clear(s.saturating_sub(2 + gap)..s.saturating_sub(2));
+                    let right_clear = e + 3 >= crop.w
+                        || all_clear((e + 2).min(crop.w)..(e + 2 + gap).min(crop.w));
                     if left_clear && right_clear {
                         out.push((s + e - 1) / 2);
                     }
