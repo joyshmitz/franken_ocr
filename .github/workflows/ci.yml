@@ -123,8 +123,43 @@ jobs:
 
       # The one and only test step: the same gate humans run locally. We do NOT
       # duplicate its commands here — the script is the single source of truth.
+      # The full stdout/stderr is captured and uploaded as a CI artifact (the
+      # evidence-graph capture, bd-4yks item 10) even when the gate fails.
       - name: Run the gate (scripts/check.sh)
-        run: ./scripts/check.sh
+        run: ./scripts/check.sh 2>&1 | tee gate-log-${{ matrix.os }}.txt
+
+      - name: Upload gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-log-${{ matrix.os }}
+          path: gate-log-${{ matrix.os }}.txt
+          retention-days: 14
+
+  # Advisory bench-guardrail (bd-4yks item 5, non-blocking by design): compares
+  # stage records against the frozen benches/.bench-history/baseline.json when
+  # bench fixtures exist, and SKIPS-GREEN on a runner without them (no weights,
+  # no timed stages in CI — the guardrail's own posture/receipt refusals are the
+  # honest behavior). continue-on-error keeps it flag-only until a quiet
+  # dedicated runner exists.
+  bench-guardrail:
+    name: bench guardrail (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Guardrail self-test + skip-green check
+        run: |
+          python3 scripts/bench_guardrail.py --self-test
+          python3 scripts/bench_guardrail.py || echo "guardrail reported (advisory; non-blocking)"
 
   advisory-targets:
     name: advisory target (${{ matrix.name }})
