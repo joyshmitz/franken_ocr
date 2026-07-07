@@ -89,6 +89,13 @@ pub struct OcrModel {
     /// ([`OcrEngine`] already amortizes the 6.2 GB weight load via its `Arc`
     /// cache, so a batch loop pays load + quant ONCE, not per page).
     decoder_cache_i8: std::sync::OnceLock<decoder::DecoderWeightCacheI8>,
+    /// Lazily-hydrated, then reused CLIP tower weights (bd-av64.10). Hydration
+    /// widens ~300 M bf16 params to f32 and pre-transposes every linear into
+    /// GEMM layout (~0.6 s, ~1.2 GB resident — the same residency the batched
+    /// spine already held per batch); caching it on the model pays that ONCE
+    /// per process instead of per view/page. Only populated for archs whose
+    /// pipeline runs the CLIP tower (the Baidu path).
+    clip_cache: std::sync::OnceLock<vision_clip::ClipWeights>,
     /// Lazily-loaded, then reused BPE tokenizer. The `tokenizer.json` is ~9.9 MB;
     /// parsing it once and caching it on the model amortizes that across every
     /// page of a multi-page document (e.g. a PDF) instead of re-reading and
@@ -992,6 +999,7 @@ impl OcrModel {
             weights,
             decode_params: decode_params_from_env(),
             decoder_cache_i8: std::sync::OnceLock::new(),
+            clip_cache: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
             tromr_tokenizer: std::sync::OnceLock::new(),
@@ -2053,6 +2061,27 @@ impl OcrModel {
             .expect("decoder int8 cache just set"))
     }
 
+    /// The lazily-hydrated CLIP tower weights (bd-av64.10), built once per
+    /// model and reused by every view/page forward — same idiom as
+    /// [`Self::decoder_cache_i8`]. One-live-forward discipline (doctrine #5)
+    /// means no init race matters; the `OnceLock` just makes the reuse safe.
+    ///
+    /// # Errors
+    /// A missing or mis-shaped `model.vision_model.*` tensor.
+    fn clip_weights(&self) -> FocrResult<&vision_clip::ClipWeights> {
+        if let Some(c) = self.clip_cache.get() {
+            return Ok(c);
+        }
+        let th = std::time::Instant::now();
+        let built = vision_clip::clip_weights_from(&self.weights)?;
+        timing_log(&format!(
+            "    clip.hydrate(cached) {:.2}s",
+            th.elapsed().as_secs_f64()
+        ));
+        let _ = self.clip_cache.set(built);
+        Ok(self.clip_cache.get().expect("clip cache just set"))
+    }
+
     /// Connector + int8 prefill for ONE page whose vision features are ALREADY
     /// computed (stage 3 of the spine; stages 1–2 preprocess and run the tower,
     /// batched across pages by default per bd-1azu.10). Followed by the int8
@@ -2138,7 +2167,11 @@ impl OcrModel {
             timing_log(&format!("  vision.sam {:.2}s", ts.elapsed().as_secs_f64()));
             // CLIP tower fed SAM's x3 as patch_embeds -> [N+1, 1024] (CLS at 0).
             let tc = std::time::Instant::now();
-            let clip = vision_clip::forward(&self.weights, &view, &sam)?;
+            let clip = vision_clip::forward_from_sam(
+                &vision_clip::ClipConfig::default(),
+                self.clip_weights()?,
+                &sam,
+            )?;
             timing_log(&format!("  vision.clip {:.2}s", tc.elapsed().as_secs_f64()));
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
             let tb = std::time::Instant::now();
@@ -2171,7 +2204,9 @@ impl OcrModel {
         let th = std::time::Instant::now();
         let sam_w = vision_sam::sam_weights_from(&self.weights, "model.sam_model")?;
         let clip_cfg = vision_clip::ClipConfig::default();
-        let clip_w = vision_clip::clip_weights_from(&self.weights)?;
+        // The CLIP tower comes from the model-level cache (bd-av64.10): the
+        // first batch hydrates it, every later batch reuses it.
+        let clip_w = self.clip_weights()?;
         timing_log(&format!(
             "  vision.hydrate(batch) {:.2}s",
             th.elapsed().as_secs_f64()
@@ -2211,7 +2246,7 @@ impl OcrModel {
             ));
             let tc = std::time::Instant::now();
             let sam_refs: Vec<&Mat> = sams.iter().collect();
-            let clips = vision_clip::forward_batched_from_sam(&clip_cfg, &clip_w, &sam_refs)?;
+            let clips = vision_clip::forward_batched_from_sam(&clip_cfg, clip_w, &sam_refs)?;
             timing_log(&format!(
                 "  vision.clip(batch of {}) {:.2}s",
                 slots.len(),
