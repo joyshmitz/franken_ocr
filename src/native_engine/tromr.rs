@@ -2368,14 +2368,14 @@ mod tests {
         assert!(s11 <= 0.15, "staff1 SER {s11} regressed (measured 0.040)");
     }
 
-    /// bd-av64.2: ONE over-wide staff band must not abort the page — the
-    /// real failure class from Cadwallader p169 (2026-07-06: a detected
-    /// band whose resized width exceeded the 1280 position clamp killed the
-    /// whole run via `?`-propagation). Self-calibrating geometry: the
-    /// resized width of a full-page-width band is 128*page_w/band_h, so a
-    /// page 7.5 band-heights wide keeps the natural staff under the clamp
-    /// (128*7.5 = 960) while a half-scale staff violates it (128*15 =
-    /// 1920). Model-gated skip-with-SUCCESS.
+    /// bd-av64.2: ONE unfittable staff band must not abort the page — the
+    /// real failure class from Cadwallader p169 (2026-07-06). Post
+    /// bd-av64.14 geometry (ink-extent trim + extend-to-fit), a staff only
+    /// skips when it genuinely CANNOT fit the 1280 positional budget: ink
+    /// spanning a canvas 30x wider than tall, where even a band grown to
+    /// the whole page height resizes past the budget. The good staff is
+    /// the upstream example pasted at natural width — its ink trims narrow
+    /// and fits comfortably on the same canvas. Model-gated.
     #[test]
     fn tromr_page_skips_overwide_staff_and_keeps_the_rest() {
         let Some(dir) = zoo_dir() else {
@@ -2388,23 +2388,18 @@ mod tests {
             return;
         }
         let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
-        let bands = crate::preprocess::staff_detect::detect_staves(
-            &image::DynamicImage::ImageRgb8(a.clone()),
-        )
-        .expect("detect runs on ex1");
-        let band_h = bands.first().map_or(a.height() as usize, |c| c.h);
-        let page_w = (band_h * 15 / 2) as u32; // 7.5 x band_h
-        let b = image::imageops::resize(
-            &a,
-            a.width() / 2,
-            a.height() / 2,
-            image::imageops::FilterType::Triangle,
-        );
-        let gap = 160u32;
-        let h = a.height() + b.height() + 3 * gap;
+        let (page_w, h) = (12_000u32, a.height() + 260);
         let mut page = image::RgbImage::from_pixel(page_w, h, image::Rgb([255, 255, 255]));
-        image::imageops::overlay(&mut page, &a, 0, i64::from(gap));
-        image::imageops::overlay(&mut page, &b, 0, i64::from(2 * gap + a.height()));
+        image::imageops::overlay(&mut page, &a, 40, 20);
+        let bad_top = a.height() + 120;
+        for line in 0..5u32 {
+            let y = bad_top + line * 10;
+            for dy in 0..2 {
+                for x in 0..page_w {
+                    page.put_pixel(x, y + dy, image::Rgb([10, 10, 10]));
+                }
+            }
+        }
         let page = image::DynamicImage::ImageRgb8(page);
 
         let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
@@ -2431,31 +2426,28 @@ mod tests {
     }
 
     /// bd-av64.2: when EVERY detected staff fails, the page error names each
-    /// staff's reason (never a silent empty success). Same geometry trick at
-    /// 20 band-heights wide — both staves blow the clamp. Model-gated.
+    /// staff's reason (never a silent empty success). Post bd-av64.14, both
+    /// staves must be genuinely unfittable: full-page-width ink on a 30:1
+    /// canvas, where trimming cannot narrow them and no vertical extension
+    /// reaches the budget. Model-gated.
     #[test]
     fn tromr_page_all_staves_failing_is_a_named_error() {
         let Some(dir) = zoo_dir() else {
             eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
             return;
         };
-        let examples = dir.join("../tromr-upstream/examples");
-        if !examples.join("1.png").is_file() {
-            eprintln!("[tromr-test] skip_no_model: upstream examples absent");
-            return;
-        }
-        let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
-        let bands = crate::preprocess::staff_detect::detect_staves(
-            &image::DynamicImage::ImageRgb8(a.clone()),
-        )
-        .expect("detect runs on ex1");
-        let band_h = bands.first().map_or(a.height() as usize, |c| c.h);
-        let page_w = (band_h * 20) as u32;
-        let gap = 160u32;
-        let h = 2 * a.height() + 3 * gap;
+        let (page_w, h) = (12_000u32, 420u32);
         let mut page = image::RgbImage::from_pixel(page_w, h, image::Rgb([255, 255, 255]));
-        image::imageops::overlay(&mut page, &a, 0, i64::from(gap));
-        image::imageops::overlay(&mut page, &a, 0, i64::from(2 * gap + a.height()));
+        for &top in &[80u32, 280] {
+            for line in 0..5u32 {
+                let y = top + line * 10;
+                for dy in 0..2 {
+                    for x in 0..page_w {
+                        page.put_pixel(x, y + dy, image::Rgb([10, 10, 10]));
+                    }
+                }
+            }
+        }
         let page = image::DynamicImage::ImageRgb8(page);
 
         let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");

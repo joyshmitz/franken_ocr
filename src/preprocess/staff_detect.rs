@@ -238,20 +238,84 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
     let centers = line_band_centers(&profile, peak / 2);
     let staves = group_staves(&centers);
 
+    // The model's positional budget: a crop resized to h=128 may span at
+    // most 1280 columns (tromr POS_COLS * PATCH). Band geometry below is
+    // shaped so real full-width systems FIT instead of hard-failing the
+    // clamp (bd-av64.14; measured 2026-07-06: full-page-width bands with
+    // page margins included blew the budget on every dense real scan, while
+    // recognition quality is insensitive to GENEROUS bands and catastrophic
+    // only for over-TIGHT ones).
+    let budget = crate::native_engine::tromr::POS_COLS * crate::native_engine::tromr::PATCH;
+    let img_h = crate::native_engine::tromr::IMG_H;
+
     let mut crops = Vec::with_capacity(staves.len());
-    for five in staves {
+    for (i, five) in staves.iter().enumerate() {
         let spacing = (five[4] - five[0]) as f64 / 4.0;
         let margin = (2.0 * spacing).round() as usize * 2;
-        let y0 = five[0].saturating_sub(margin);
-        let y1 = (five[4] + margin + 1).min(h);
-        let ch = y1 - y0;
-        let mut crop = vec![0u8; ch * w];
-        crop.copy_from_slice(&gray[y0 * w..y1 * w]);
+        // Neighbor-aware vertical bounds: a band may extend to the midline
+        // toward the adjacent staff (page edge otherwise), so bands never
+        // swallow a neighbor's lines no matter how far they extend.
+        let lo_bound = if i > 0 {
+            (staves[i - 1][4] + five[0]) / 2
+        } else {
+            0
+        };
+        let hi_bound = if i + 1 < staves.len() {
+            (five[4] + staves[i + 1][0]).div_ceil(2)
+        } else {
+            h
+        };
+        let mut y0 = five[0].saturating_sub(margin).max(lo_bound);
+        let mut y1 = (five[4] + margin + 1).min(h).min(hi_bound);
+
+        // (1) Horizontal ink-extent trim: the staff lines span the system,
+        // so any column inside it holds >= 5 ink pixels; a >= 2 floor keeps
+        // isolated specks from stretching the band to the page margins.
+        // Pad the ink extent by ~2 line-spacings each side (never tighter
+        // than the ink itself).
+        let col_ink = |x: usize, a: usize, b: usize| -> usize {
+            (a..b).filter(|&y| gray[y * w + x] <= thr).count()
+        };
+        let mut x0 = 0;
+        while x0 < w && col_ink(x0, y0, y1) < 2 {
+            x0 += 1;
+        }
+        let mut x1 = w;
+        while x1 > x0 && col_ink(x1 - 1, y0, y1) < 2 {
+            x1 -= 1;
+        }
+        if x1 <= x0 {
+            // No ink columns at all (cannot happen for a grouped staff, but
+            // stay defensive): keep the full width.
+            x0 = 0;
+            x1 = w;
+        }
+        let pad = (2.0 * spacing).round() as usize;
+        x0 = x0.saturating_sub(pad);
+        x1 = (x1 + pad).min(w);
+
+        // (2) Extend-to-fit: if the trimmed band still resizes past the
+        // positional budget, grow it vertically toward the neighbor bounds
+        // (measured: a staff occupying as little as ~30% of the frame still
+        // reads correctly, while width overflow is a hard failure). A band
+        // that cannot reach the budget within its bounds is emitted as-is —
+        // the per-staff recovery (bd-av64.2) skips it with a named reason.
+        let step = spacing.max(1.0).round() as usize;
+        while img_h * (x1 - x0) > budget * (y1 - y0) && (y0 > lo_bound || y1 < hi_bound) {
+            y0 = y0.saturating_sub(step).max(lo_bound);
+            y1 = (y1 + step).min(hi_bound).min(h);
+        }
+
+        let (ch, cw) = (y1 - y0, x1 - x0);
+        let mut crop = vec![0u8; ch * cw];
+        for (row, y) in (y0..y1).enumerate() {
+            crop[row * cw..(row + 1) * cw].copy_from_slice(&gray[y * w + x0..y * w + x1]);
+        }
         crops.push(StaffCrop {
             gray: crop,
-            w,
+            w: cw,
             h: ch,
-            bbox: (0, y0, w, ch),
+            bbox: (x0, y0, cw, ch),
         });
     }
     Ok(crops)
@@ -338,6 +402,77 @@ mod tests {
             detect_staves(&four).expect("runs").is_empty(),
             "4 lines != a staff"
         );
+    }
+
+    /// bd-av64.14: horizontal ink-extent trim — page margins (columns with
+    /// no ink) leave the band; the ink span plus ~2-spacing pads stays.
+    #[test]
+    fn trim_cuts_page_margins_but_keeps_ink() {
+        // Hand-drawn staff with WIDE page margins: lines span x 200..600 on
+        // an 800-wide page (spacing 10 => trim pad 20).
+        let mut gray = vec![250u8; 800 * 260];
+        for line in 0..5 {
+            let y = 80 + line * 10;
+            for dy in 0..2 {
+                for x in 200..600 {
+                    gray[(y + dy) * 800 + x] = 10;
+                }
+            }
+        }
+        let img =
+            DynamicImage::ImageLuma8(image::GrayImage::from_raw(800, 260, gray).expect("synth"));
+        let crops = detect_staves(&img).expect("detects");
+        assert_eq!(crops.len(), 1);
+        let (x0, _y0, cw, _ch) = crops[0].bbox;
+        assert!(
+            (150..=200).contains(&x0),
+            "left margin trimmed to pad (x0 {x0})"
+        );
+        assert!(
+            x0 + cw <= 650 && x0 + cw >= 600,
+            "right margin trimmed (x0+cw {})",
+            x0 + cw
+        );
+    }
+
+    /// bd-av64.14: extend-to-fit — a wide staff with vertical room grows its
+    /// band until the resized width fits the 1280 positional budget.
+    #[test]
+    fn wide_staff_with_room_fits_the_positional_budget() {
+        let img = synth_page(2000, 700, &[320]);
+        let crops = detect_staves(&img).expect("detects");
+        assert_eq!(crops.len(), 1);
+        let (_x0, _y0, cw, ch) = crops[0].bbox;
+        assert!(
+            128 * cw <= 1280 * ch,
+            "resized width {} exceeds 1280 (cw {cw}, ch {ch})",
+            128 * cw / ch
+        );
+    }
+
+    /// bd-av64.14: neighbor bounds — two packed wide staves may extend only
+    /// to their shared midline; bands never overlap even under budget
+    /// pressure, and every band keeps the whole 5-line span.
+    #[test]
+    fn packed_staves_stop_at_the_midline() {
+        let img = synth_page(2000, 400, &[100, 240]);
+        let crops = detect_staves(&img).expect("detects");
+        assert_eq!(crops.len(), 2);
+        let (_, ay, _, ah) = crops[0].bbox;
+        let (_, by, _, _bh) = crops[1].bbox;
+        assert!(ay + ah <= by, "bands must not overlap ({ay}+{ah} vs {by})");
+        assert!(ay <= 100 && ay + ah >= 140 + 2, "staff A span kept");
+    }
+
+    /// bd-av64.14: monotonic safety — with no budget pressure and no close
+    /// neighbor, the band is never TIGHTER than the classic 12-spacing form.
+    #[test]
+    fn unpressured_band_keeps_the_generous_margins() {
+        let img = synth_page(800, 400, &[180]);
+        let crops = detect_staves(&img).expect("detects");
+        let (_, _, _, ch) = crops[0].bbox;
+        // spacing 10 => staff span 40 + 2 x 40 margins = 120.
+        assert!(ch >= 120, "band height {ch} tighter than the classic form");
     }
 
     #[test]
