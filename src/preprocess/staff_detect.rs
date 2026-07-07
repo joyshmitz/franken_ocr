@@ -333,7 +333,59 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
             lines: five.map(|l| l - y0),
         });
     }
+    for crop in &mut crops {
+        refine_band_skew(crop);
+    }
     Ok(crops)
+}
+
+/// Refine one band's residual skew (bd-av64.13 lever 1). The GLOBAL deskew
+/// leaves per-staff residuals on real book pages (paper bow, per-plate
+/// tilt), and recognition sits on a measured knife-edge: a -0.7 degree
+/// rotation flipped a key signature read. Fine grid: +-1.5 degrees, step
+/// 0.1, maximizing row-profile variance over THIS band only. Applied only
+/// when the winner is >= 0.2 degrees away from flat — straight bands stay
+/// BIT-IDENTICAL (the fit-first lesson: geometry changes only where they
+/// pay). Lines are re-derived from the sheared profile; if the 5-line
+/// group cannot be re-found the refinement is abandoned.
+fn refine_band_skew(crop: &mut StaffCrop) {
+    let thr = otsu_threshold(&crop.gray);
+    let ink: Vec<bool> = crop.gray.iter().map(|&v| v <= thr).collect();
+    let score = |deg: f64| -> f64 {
+        profile_variance(&sheared_row_profile(
+            &ink,
+            crop.w,
+            crop.h,
+            deg.to_radians().tan(),
+        ))
+    };
+    let flat = score(0.0);
+    let mut best = (0.0f64, flat);
+    for i in -15..=15i32 {
+        let deg = f64::from(i) * 0.1;
+        if deg == 0.0 {
+            continue;
+        }
+        let sc = score(deg);
+        if sc > best.1 {
+            best = (deg, sc);
+        }
+    }
+    if best.0.abs() < 0.2 {
+        return;
+    }
+    let sheared = shear_gray(&crop.gray, crop.w, crop.h, best.0);
+    let sheared_ink: Vec<bool> = sheared.iter().map(|&v| v <= thr).collect();
+    let profile = sheared_row_profile(&sheared_ink, crop.w, crop.h, 0.0);
+    let peak = profile.iter().copied().max().unwrap_or(0);
+    if peak == 0 {
+        return;
+    }
+    let centers = line_band_centers(&profile, peak / 2);
+    let staves = group_staves(&centers);
+    let Some(five) = staves.first() else { return };
+    crop.gray = sheared;
+    crop.lines = *five;
 }
 
 /// Candidate barline columns within a staff band (bd-av64.4): the centers
