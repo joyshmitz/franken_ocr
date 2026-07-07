@@ -330,6 +330,28 @@ claims.
   agent: opus-4.8 (int4/int8 blend sweep)
   evidence dir: artifacts/perf/bd-attn-serial/
 
+2026-07-07 | NEGATIVE(reverted) | ngram-ban folded into the int8 lm_head dequant epilogue (`decoder::fuse_ngram_lmhead` + `FOCR_FUSE_NGRAM_LMHEAD`, bd-2mo.24 / bd-1azu.54 Lever 3)
+  claim_id: CLAIM-bd-2mo24-fuse-ngram-lmhead   evidence_id: artifacts/perf/bd-2mo.24/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    page_0023.png sha256 a74adb4f437d7955f5f75d3e4f053562c9b7e20cd54840d4488ac2f61ef3f761 (the 821-token ngram-heavy page); weights unlimited-ocr.int8.focrq (the pulled artifact, convert byte-parity vs published d8c5fcf2)
+  CPU feature string: arm64 Apple M4, aarch64+neon+dotprod (SDOT tier)
+  exact command + env:
+    3+3 A/B, same load regime, back-to-back:
+    env [FOCR_FUSE_NGRAM_LMHEAD=1] FOCR_TIMING=1 FOCR_THREADS=8 FOCR_DECODE_INT8=1 focr ocr page_0023.png --model ~/.cache/franken_ocr/models/unlimited-ocr.int8.focrq
+    (baseline rows: flag unset -> sampler copy-then-mask after lm_head_cached_i8)
+  fallback / kill-switch state: FOCR_FUSE_NGRAM_LMHEAD unset (the default, unchanged by this verdict) -> the separate mask pass; FOCR_QKV_FUSED default-ON (its independent WIN); FOCR_DECODE_INT8=1; no FOCR_FORCE_ARCH (native SDOT)
+  measured before -> after vs reference:
+    PERF (M4, within-regime 3x3): decode_i8 best 16.43 s / 0.020 s-tok (off) -> 16.40 s / 0.020 s-tok (on) = 0.2%, inside run-to-run noise (off spread 16.43-17.07 s). The eliminated copy-then-mask pass over the 129,280-logit row is sub-millisecond against a ~20 ms decode step; there is nothing material to save on this axis.
+    ACCURACY: outputs byte-identical across all runs (on_1/2/3 == off_1) - the fusion is exact by construction, as its unit gate proves.
+  bit-exact correctness proof:
+    `fused_ngram_lmhead_is_byte_identical_to_separate_mask` (decoder.rs unit gate) + all six A/B outputs byte-identical on the ngram-heavy page.
+  disposition: REVERT
+  do-not-retry: "the lever is CORRECT but does not pay: the masked-id set is tiny and the mask pass is sub-ms vs a ~20 ms step. Leave the code in place behind the flag (harmless, tested); do not flip the default unless a workload materially changes the arithmetic - e.g. a much larger ban set (multi-image ngram_window=1024 with long repetitive histories) or a decode step an order of magnitude faster, in which case re-run THIS A/B on that workload first."
+  per-lever tally: W 0 / L 0 / N 1
+  agent: fable-5 (bd-2mo.24 verdict run)
+  evidence dir: artifacts/perf/bd-2mo.24/
+
 2026-06-27 | WIN | fused [3*1280,1280] q/k/v decode GEMV (`decoder::fuse_qkv` + `FOCR_QKV_FUSED`; one `simd::igemm_s8s8` over a stacked [3840,1280] weight instead of three [1280,1280] calls)
   claim_id: CLAIM-bd-1waa-qkv-fused-decode-gemv   evidence_id: artifacts/perf/bd-1waa/
   model source commit + fixture hash:
