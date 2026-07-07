@@ -158,8 +158,10 @@ print('1' if x else '0')")
 # ── Tier 3: full pages — staff-count floors via robot staff events ─────────
 check_page() {
   rel="$1"
-  min="$2"
   img="$FIX/$rel"
+  min=$(python3 -c "
+import json
+print(json.load(open('$FIX/truth/attributes.json'))['$1']['min_recognized'])")
   count=$("$BIN" robot run --model "$MODEL" --task music "$img" 2>/dev/null \
     | python3 -c '
 import json, sys
@@ -199,8 +201,8 @@ check_staff "staves/spohr_no17_top.png"
 check_staff "staves/spohr_no17_sys.png"
 check_staff "staves/spohr_no21_sys.png"
 check_staff "staves/spohr_p116_sys29.png"
-check_page "pages/spohr_p055.png" 6
-check_page "pages/spohr_p100.png" 1
+check_page "pages/spohr_p055.png"
+check_page "pages/spohr_p100.png"
 
 if [ "$FAILURES" -eq 0 ]; then
   log "ALL CASES PASSED"
