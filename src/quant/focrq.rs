@@ -364,7 +364,15 @@ impl FocrqBuilder {
             )));
         }
         let numel = checked_numel(&name, &shape)?;
-        let expected = dtype.expected_byte_len(&name, &shape, numel)?;
+        // `--arch aarch64-smmla` (arch_target 1, bd-2mo.3): QInt8 payloads are
+        // SMMLA panels (`ceil(n/2)*ceil(k/8)*16` bytes); mirror the reader's
+        // `validate_directory` rule so writer and loader agree byte-for-byte.
+        let expected =
+            if self.arch_target == 1 && dtype == WriteDType::QInt8PerChan && shape.len() == 2 {
+                crate::simd::pack::smmla_packed_len(shape[0], shape[1])
+            } else {
+                dtype.expected_byte_len(&name, &shape, numel)?
+            };
         if data.len() != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: data len {} != shape×dtype {} ({:?}, shape {:?})",

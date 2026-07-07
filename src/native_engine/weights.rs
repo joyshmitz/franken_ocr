@@ -511,7 +511,6 @@ impl Weights {
 
         let payload_base = header_end;
         let payload_len = bytes.len() - payload_base;
-        validate_directory(&header.tensors, payload_len)?;
 
         // Prefer the header's own fields; the preamble bytes are a cheap
         // pre-JSON sanity surface (and the source of truth if the header omits
@@ -521,6 +520,7 @@ impl Weights {
         } else {
             preamble_arch
         };
+        validate_directory(&header.tensors, payload_len, arch_target)?;
         let source_sha256 = if header.source_sha256.is_empty() {
             preamble_sha
         } else {
@@ -607,7 +607,7 @@ impl Weights {
 
         let payload_base = header_end;
         let payload_len = bytes.len() - payload_base;
-        validate_directory(&directory, payload_len)?;
+        validate_directory(&directory, payload_len, 0)?;
 
         Ok(Self {
             bytes,
@@ -833,17 +833,35 @@ impl Weights {
             )));
         }
         let (n, k) = (view.shape[0], view.shape[1]);
-        let expected_len = checked_shape_len(name, n, k, "n*k")?;
+        let expected_len = if self.arch_target == 1 {
+            crate::simd::pack::smmla_packed_len(n, k)
+        } else {
+            checked_shape_len(name, n, k, "n*k")?
+        };
         if view.data.len() != expected_len {
             return Err(FocrError::FormatMismatch(format!(
-                "QInt8 tensor {name:?}: {} payload bytes != n*k {}",
+                "QInt8 tensor {name:?}: {} payload bytes != expected {} (arch_target {})",
                 view.data.len(),
-                expected_len
+                expected_len,
+                self.arch_target
             )));
         }
         // int8 payload is a direct byte→i8 reinterpret (little-endian-agnostic;
         // one byte per element).
-        let w: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+        //
+        // An `--arch aarch64-smmla` artifact (arch_target 1, bd-2mo.3) stores
+        // SMMLA panels; un-permute back to the canonical row-major `[n, k]`
+        // here — a one-time load-cost, lossless by construction, so EVERY
+        // consumer keeps its row-major contract on every host (degrade to
+        // generic, never UB). The zero-shuffle packed fast path hands panels
+        // to the i8mm kernel directly when that tier is dispatched.
+        let w: Vec<i8> = if self.arch_target == 1 {
+            let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+            crate::simd::pack::smmla_unpack_panels(&packed, n, k)
+                .map_err(|e| FocrError::FormatMismatch(format!("QInt8 tensor {name:?}: {e}")))?
+        } else {
+            view.data.iter().map(|&b| b as i8).collect()
+        };
         let scales = decode_f32_le(view.scales)?;
         if scales.len() != n {
             return Err(FocrError::FormatMismatch(format!(
@@ -949,6 +967,7 @@ impl Weights {
 fn validate_directory(
     directory: &BTreeMap<String, TensorRecord>,
     payload_len: usize,
+    arch_target: u8,
 ) -> FocrResult<()> {
     for (name, rec) in directory {
         let end = rec.byte_offset.checked_add(rec.byte_len).ok_or_else(|| {
@@ -959,7 +978,15 @@ fn validate_directory(
                 "tensor {name:?} ends at {end} but payload is {payload_len} bytes"
             )));
         }
-        let expected = rec.expected_byte_len(name)?;
+        // `--arch aarch64-smmla` (arch_target 1, bd-2mo.3) stores int8 payloads
+        // as SMMLA panels: `ceil(n/2)*ceil(k/8)*16` bytes (== n*k whenever the
+        // shape tiles cleanly). Every other dtype is arch-independent.
+        let expected =
+            if arch_target == 1 && rec.dtype == DType::QInt8PerChan && rec.shape.len() == 2 {
+                crate::simd::pack::smmla_packed_len(rec.shape[0], rec.shape[1])
+            } else {
+                rec.expected_byte_len(name)?
+            };
         if rec.byte_len != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: byte_len {} != shape×dtype {} ({:?}, shape {:?})",

@@ -507,14 +507,10 @@ mod aarch64_impl {
 
     /// Pre-pack a region of a row-major `[rows, k]` matrix into SMMLA panels.
     ///
-    /// Output layout, walked by the micro-kernel as a flat `int8x16` stream:
-    /// for each K-block of 8 columns (`kb` of them, padded), and for each pair
-    /// of rows `(2p, 2p+1)`, emit 16 bytes = `[row(2p)[0..8], row(2p+1)[0..8]]`.
-    /// Rows beyond `rows` and columns beyond `k` are zero-filled (zero lanes
-    /// contribute zero to an int dot, so the packed GEMM is exact).
-    ///
-    /// Returns `(packed, row_pairs, kb)` where `row_pairs = ceil(rows/2)` and
-    /// `kb = ceil(k/8)`; `packed.len() == row_pairs * kb * 16`.
+    /// Delegates to the portable single source of truth
+    /// ([`crate::simd::pack::smmla_pack_panels`]) so the runtime kernel, the
+    /// offline `focr convert --arch aarch64-smmla` pre-packer, and the
+    /// loader's un-permute fallback can never drift (bd-2mo.3).
     fn pack_panels(
         src: &[i8],
         base_row: usize,
@@ -522,27 +518,7 @@ mod aarch64_impl {
         k: usize,
         src_k: usize,
     ) -> (Vec<i8>, usize, usize) {
-        let row_pairs = rows.div_ceil(2);
-        let kb = k.div_ceil(8);
-        let mut packed = vec![0i8; row_pairs * kb * 16];
-        for p in 0..row_pairs {
-            for block in 0..kb {
-                let panel = (p * kb + block) * 16;
-                let kcol = block * 8;
-                let kvalid = (k - kcol).min(8); // columns present in this block
-                for sub in 0..2 {
-                    let row = p * 2 + sub;
-                    if row >= rows {
-                        continue; // zero-padded tail row
-                    }
-                    let src_off = (base_row + row) * src_k + kcol;
-                    let dst_off = panel + sub * 8;
-                    packed[dst_off..dst_off + kvalid]
-                        .copy_from_slice(&src[src_off..src_off + kvalid]);
-                }
-            }
-        }
-        (packed, row_pairs, kb)
+        crate::simd::pack::smmla_pack_panels(src, base_row, rows, k, src_k)
     }
 
     /// SMMLA int8 GEMM with offline-style A/B pre-packing and 8×8 register

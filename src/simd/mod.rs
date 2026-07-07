@@ -47,6 +47,7 @@
 
 pub mod dispatch;
 pub mod int4;
+pub mod pack;
 pub mod scalar;
 
 // Arch-specific intrinsic modules. Each is compiled only on its native arch so

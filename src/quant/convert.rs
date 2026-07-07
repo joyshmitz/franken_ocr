@@ -228,7 +228,7 @@ pub fn safetensors_to_focrq(
             continue;
         }
         if is_decoder_int8_tensor_for(name, arch) {
-            quantize_decoder_tensor(&mut builder, weights, name)?;
+            quantize_decoder_tensor(&mut builder, weights, name, arch_target)?;
         } else {
             copy_high_precision_tensor(&mut builder, weights, name)?;
         }
@@ -289,6 +289,7 @@ fn quantize_decoder_tensor(
     builder: &mut FocrqBuilder,
     weights: &Weights,
     name: &str,
+    arch_target: u8,
 ) -> FocrResult<()> {
     let record = weights.record(name).ok_or_else(|| {
         FocrError::FormatMismatch(format!("convert: tensor {name:?} missing from directory"))
@@ -306,7 +307,21 @@ fn quantize_decoder_tensor(
     let q = nn::quantize_int8(&mat.data, n, k);
     // `i8 → u8` is a pure bit reinterpret (the reader does the inverse `b as i8`);
     // scales are little-endian f32 — the `.focrq` QInt8PerChan inline layout.
-    let weight_bytes: Vec<u8> = q.w.iter().map(|&v| v as u8).collect();
+    //
+    // `--arch aarch64-smmla` (arch_target 1, bd-2mo.3): the int8 payload is
+    // stored as OFFLINE-packed SMMLA panels — the same permutation the i8mm
+    // micro-kernel builds at runtime ([`crate::simd::pack::smmla_pack_panels`],
+    // the single source of truth), so a matching host loads contiguous
+    // register tiles with zero runtime shuffle. A pure permutation of the
+    // already-quantized bytes: lossless by construction, and the loader
+    // un-permutes on any non-SMMLA host (degrade to generic, never UB). The
+    // quantized VALUES are identical across every arch_target.
+    let weight_bytes: Vec<u8> = if arch_target == 1 {
+        let (panels, _pairs, _kb) = crate::simd::pack::smmla_pack_panels(&q.w, 0, n, k, k);
+        panels.iter().map(|&v| v as u8).collect()
+    } else {
+        q.w.iter().map(|&v| v as u8).collect()
+    };
     let scale_bytes: Vec<u8> = q.scales.iter().flat_map(|&s| s.to_le_bytes()).collect();
     builder.add_quantized(
         name,
@@ -460,6 +475,70 @@ mod tests {
         assert!(!is_decoder_int8_tensor(
             "vision_model.encoder.layers.2.mlp.fc2.weight"
         ));
+    }
+
+    /// bd-2mo.3/.3.1: the `--arch aarch64-smmla` payload is a LOSSLESS
+    /// permutation — the loader's un-permuted `qint8()` readback is
+    /// int8-byte-identical (and scale-identical) to the generic artifact's,
+    /// for every decoder tensor including padded shapes (odd n, k % 8 != 0).
+    /// Stronger than the dequant-equivalence acceptance criterion: equality
+    /// holds on the quantized integers themselves.
+    #[test]
+    fn smmla_arch_packing_is_a_lossless_permutation() {
+        let src = synthetic_safetensors();
+        let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let generic = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [7u8; 32], arch)
+            .expect("convert generic");
+        let packed = safetensors_to_focrq(&w, ConvertQuant::Int8, 1, [7u8; 32], arch)
+            .expect("convert smmla");
+        // The reorder is real: the blobs differ (padded tensors change length,
+        // multi-K-block tensors permute), yet load back logically identical.
+        assert_ne!(generic, packed, "arch 1 must actually reorder the payload");
+        let g = Weights::from_bytes(generic).expect("generic parse");
+        let p =
+            Weights::from_bytes(packed).expect("packed parse (census must accept panel lengths)");
+        assert_eq!(g.arch_target(), 0);
+        assert_eq!(p.arch_target(), 1);
+        for name in INT8_NAMES {
+            let a = g.qint8(name).expect("generic qint8");
+            let b = p.qint8(name).expect("packed qint8 (un-permuted at load)");
+            assert_eq!(a.w, b.w, "{name}: int8 weights identical across packings");
+            assert_eq!(
+                a.scales, b.scales,
+                "{name}: scales identical across packings"
+            );
+            assert_eq!((a.n, a.k), (b.n, b.k));
+            println!(
+                r#"{{"event":"prepack_equiv","arch":"aarch64-smmla","tensor":"{name}","n":{},"k":{},"ok":true}}"#,
+                a.n, a.k
+            );
+        }
+    }
+
+    /// bd-2mo.3 acceptance: same source → same packed bytes (content-hash
+    /// equal), for both the generic and the SMMLA packings.
+    #[test]
+    fn arch_packings_are_byte_deterministic() {
+        let src = synthetic_safetensors();
+        let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        for arch_target in [0u8, 1] {
+            let a = safetensors_to_focrq(&w, ConvertQuant::Int8, arch_target, [7u8; 32], arch)
+                .expect("convert");
+            let b = safetensors_to_focrq(&w, ConvertQuant::Int8, arch_target, [7u8; 32], arch)
+                .expect("convert again");
+            let ha = sha256_of_bytes(&a);
+            assert_eq!(
+                ha,
+                sha256_of_bytes(&b),
+                "arch {arch_target}: nondeterministic output"
+            );
+            let hex: String = ha.iter().map(|x| format!("{x:02x}")).collect();
+            println!(
+                r#"{{"event":"prepack_equiv","arch_target":{arch_target},"ok":true,"content_hash":"{hex}"}}"#
+            );
+        }
     }
 
     #[test]
