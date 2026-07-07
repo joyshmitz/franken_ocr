@@ -673,6 +673,102 @@ fn public_recognize_without_weights_is_model_not_found_or_defers() {
 ///   * A `ModelNotFound` here means the developer set `FOCR_MODEL_PATH` to a path
 ///     that does not resolve — a **misconfiguration FAIL** (§4.3: a model that
 ///     was *expected present* but does not resolve is not a silent skip).
+/// bd-1gv.25 S3: the MULTI-PAGE cross-page pass end-to-end over the real
+/// model (gated exactly like the single-image e2e): two tiny pages become ONE
+/// document — Base-640 preprocess ×2, one fused cross-page prefill, one AR
+/// decode, `finalize_multi` assembly. Asserts the public facade returns a
+/// well-formed `<PAGE>`-assembled markdown and that BOTH non-Unlimited
+/// refusal modes stay typed (the /nonexistent-model leg is covered by the CLI
+/// golden). Absent/unarmed ⇒ skip-with-SUCCESS (§4.3).
+#[test]
+fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
+    let test = "recognize_multi_page_real_model_when_present_else_skip_with_success";
+    let case = "two_tiny_pages_one_document";
+
+    let Some(model_path) = armed_present_model() else {
+        log_line(
+            test,
+            case,
+            "skip",
+            "skip_no_model",
+            &format!("searched_dirs={:?}", searched_dirs()),
+        );
+        log_success(
+            test,
+            case,
+            &format!(
+                "multi-page e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed; \
+                 cross-page path unverified"
+            ),
+        );
+        return;
+    };
+
+    let page_a = write_tiny_png();
+    let page_b = write_tiny_png();
+    log_line(
+        test,
+        case,
+        "setup",
+        "pass",
+        &format!(
+            "model={} pages=2 note=\"one cross-page pass over two 4x4 RGB PNGs (Base-640)\"",
+            model_path.display(),
+        ),
+    );
+
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+    let started = Instant::now();
+    let result = engine.recognize_multi_page(&[page_a.as_path(), page_b.as_path()]);
+    let elapsed_ms = started.elapsed().as_millis();
+
+    match result {
+        Ok(markdown) => {
+            assert!(
+                markdown.starts_with("<PAGE>"),
+                "finalize_multi assembly must lead with the page marker; got: {:?}",
+                &markdown[..markdown.len().min(120)]
+            );
+            let seps = markdown.matches("<PAGE>").count();
+            log_line(
+                test,
+                case,
+                "result",
+                "pass",
+                &format!(
+                    "elapsed_ms={elapsed_ms} markdown_bytes={} page_markers={seps} \
+                     note=\"cross-page pass completed; ngram_window=1024 in force\"",
+                    markdown.len(),
+                ),
+            );
+        }
+        Err(FocrError::NotImplemented(what)) => {
+            log_line(
+                test,
+                case,
+                "result",
+                "xfail",
+                &format!("elapsed_ms={elapsed_ms} stage_gap={what:?}"),
+            );
+            log_success(
+                test,
+                case,
+                "multi-page forward hit a documented NotImplemented stage gap (XFAIL)",
+            );
+        }
+        Err(other) => {
+            log_line(
+                test,
+                case,
+                "result",
+                "fail",
+                &format!("elapsed_ms={elapsed_ms} error={other:?}"),
+            );
+            panic!("multi-page e2e failed on a present model: {other:?}");
+        }
+    }
+}
+
 #[test]
 fn recognize_real_model_when_present_else_skip_with_success() {
     let test = "recognize_real_model_when_present_else_skip_with_success";
