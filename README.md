@@ -55,7 +55,8 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, TrOMR `staff` events for music runs, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
-| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
+| **Real-scan music gate** | The TrOMR lane has public-domain Spohr page/staff fixtures, human-verifiable attributes, a frozen MusicXML anchor, and a model-gated NDJSON runner so real engraved scans are measured separately from synthetic examples. |
+| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, `scripts/bench_guardrail.py` compares stage timings against frozen baselines, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited SIMD islands, each with a bit-identical scalar fallback. |
 
 ---
@@ -107,6 +108,7 @@ focr robot selftest
 scripts/ladder_scorecard.sh --self-test
 scripts/ladder_scorecard.sh --out scorecard.json
 python3 scripts/gauntlet_cert.py --self-test
+python3 scripts/bench_guardrail.py --self-test
 python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
   --scorecard-out /tmp/focr-release-scorecard.json
 python3 scripts/gauntlet_cert.py --release-readiness
@@ -459,9 +461,12 @@ focr ocr --model tromr.focrq --task music score-page.png -o score.musicxml
 focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
 scripts/tromr_convert_e2e.sh
 scripts/tromr_music_e2e.sh
+scripts/realscan_music_gate.sh
 ```
 
 The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. A multi-staff page succeeds when at least one staff recognizes, logging skipped staves with bbox and reason; an all-fail page errors with every staff reason named. The published `tromr.focrq` is an 82 MB all-f32 artifact with 260 tensors; int8 candidates remain gated until they are measured lossless. Local conversion is still available when you have your own TrOMR checkpoint.
+
+The real-scan music corpus lives in `tests/fixtures/realscan_music/`. It starts with public-domain Spohr page and staff fixtures, tier-1 attributes that can be verified by eye, and one frozen MusicXML regression anchor. `scripts/realscan_music_gate.sh` is model-gated and exits successfully when local TrOMR weights are absent; when weights are present it checks attributes, frozen anchors, and page-level `staff` event floors. This is the real-scan regression base for the TrOMR lane, not a claim that broad note-level SER coverage is complete.
 
 ### `focr convert <input>`
 
@@ -592,6 +597,8 @@ a green test line.
 | **FeatureUniverse / SurfaceMatrix** | `docs/FEATURE_PARITY.md`, `tests/surface_matrix.rs` | Accounts modeling features, ops, CLI surfaces, robot events, parity gates, and alien-artifact families as `present`, `partial`, `missing`, `n/a`, or `excluded`; partial never rounds up. |
 | **Three-pillar gauntlet cert** | `python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md --scorecard-out /tmp/focr-release-scorecard.json` | Scores the surface pillar from the live parity ledger and emits `franken_ocr.gauntlet.scorecard.v1`; performance and conformance gates stay separate, so one green pillar cannot hide another regression. |
 | **Release-readiness gate** | `python3 scripts/gauntlet_cert.py --release-readiness` | Reads the committed evidence artifacts for parity, surface, performance, determinism, deadlock watchdogs, robot schema, build matrix, installer, ledger completeness, doctor, ergonomics, certification bundle, and convergence; any red cell exits nonzero. |
+| **Benchmark guardrail** | `python3 scripts/bench_guardrail.py --stages artifacts/.../focr_stages.json --baseline benches/.bench-history/baseline.json --parity-receipt tests/fixtures/ladder_scorecard/scorecard_armed.json` | Compares fresh stage timings against committed per-regime baselines, refuses performance reporting without an all-green parity receipt, marks noisy or posture-mismatched rows ineligible, and exits successfully when model fixtures are absent. |
+| **Real-scan music corpus** | `scripts/realscan_music_gate.sh`, `tests/fixtures/realscan_music/` | Runs TrOMR over public-domain Spohr staff/page fixtures, checks human-verifiable attributes and frozen MusicXML anchors, and uses robot `staff` events for page-level floors. |
 | **Conformal ratchet** | `docs/conformance/RATCHET.md`, `src/conformance.rs` | Computes per-category lower bounds from Jeffreys posterior and Hoeffding instruments, then rejects any category that drops below its committed floor. |
 | **Ville e-process monitors** | `python3 scripts/gauntlet_cert.py --eprocess-fold test-log.ndjson --eprocess-state /tmp/focr-eprocess-state.json` | Folds live invariant observations for KV capacity, `K=6848` i32 no-overflow, same-input determinism, and SIMD-vs-scalar bit identity into persistent anytime-valid monitors. |
 | **Convergence gate** | `python3 scripts/gauntlet_cert.py --convergence docs/gauntlet/ROUNDS.jsonl` | Requires at least 10 gauntlet rounds and a clean tail before declaring the investigation converged. |
