@@ -1000,55 +1000,46 @@ fn attention(
     };
 
     // Compute attention head-by-head with explicit logits so we can add bias.
+    // Heads are independent and write disjoint output spans — run them across
+    // the pool (bd-av64.10 pass 2); per-head arithmetic is unchanged, so the
+    // result is bit-identical to the sequential loop. The inner matmuls also
+    // parallelize; rayon's work stealing shares the pool between the levels.
     let mut out = vec![0.0f32; nh * n * hd]; // [nh][n, hd]
-    let (mut t_bias, mut t_qk, mut t_add, mut t_sm, mut t_av) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for head in 0..nh {
-        let qh = &q[head * n * hd..(head + 1) * n * hd];
-        let kh = &k[head * n * hd..(head + 1) * n * hd];
-        let vh = &v[head * n * hd..(head + 1) * n * hd];
-        let t0 = std::time::Instant::now();
-        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, rh, rw, gh, gw, hd);
-        t_bias += t0.elapsed().as_secs_f64();
+    out.par_chunks_mut(n * hd)
+        .enumerate()
+        .try_for_each(|(head, out_chunk)| -> FocrResult<()> {
+            let qh = &q[head * n * hd..(head + 1) * n * hd];
+            let kh = &k[head * n * hd..(head + 1) * n * hd];
+            let vh = &v[head * n * hd..(head + 1) * n * hd];
+            let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, rh, rw, gh, gw, hd);
 
-        // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
-        let t0 = std::time::Instant::now();
-        let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
-        let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
-        let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
-        t_qk += t0.elapsed().as_secs_f64();
-        let t0 = std::time::Instant::now();
-        // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx) directly
-        // instead of dividing per element — bit-identical arithmetic in the
-        // same order, but branch/div-free and autovectorizable (bd-av64.10:
-        // the naive j/gw + j%gw form burned ~200M integer divisions per
-        // global block).
-        for i in 0..n {
-            let lrow = &mut lm.data[i * n..(i + 1) * n];
-            let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
-            for ky in 0..gh {
-                let bh = rel_h_bias[i * gh + ky];
-                let seg = &mut lrow[ky * gw..(ky + 1) * gw];
-                for (l, &bw) in seg.iter_mut().zip(brow_w) {
-                    *l = scale * *l + bh + bw;
+            // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
+            let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
+            let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
+            let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
+            // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx) directly
+            // instead of dividing per element — bit-identical arithmetic in the
+            // same order, but branch/div-free and autovectorizable (bd-av64.10:
+            // the naive j/gw + j%gw form burned ~200M integer divisions per
+            // global block).
+            for i in 0..n {
+                let lrow = &mut lm.data[i * n..(i + 1) * n];
+                let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
+                for ky in 0..gh {
+                    let bh = rel_h_bias[i * gh + ky];
+                    let seg = &mut lrow[ky * gw..(ky + 1) * gw];
+                    for (l, &bw) in seg.iter_mut().zip(brow_w) {
+                        *l = scale * *l + bh + bw;
+                    }
                 }
             }
-        }
-        t_add += t0.elapsed().as_secs_f64();
-        // softmax rows then weighted sum of v.
-        let t0 = std::time::Instant::now();
-        nn::softmax_rows(&mut lm)?;
-        t_sm += t0.elapsed().as_secs_f64();
-        let t0 = std::time::Instant::now();
-        let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
-        let head_out = nn::matmul(&lm, &vh_mat)?;
-        out[head * n * hd..(head + 1) * n * hd].copy_from_slice(&head_out.data);
-        t_av += t0.elapsed().as_secs_f64();
-    }
-    if n > 1000 {
-        super::timing_log(&format!(
-            "        attn.stages bias {t_bias:.3}s qk {t_qk:.3}s add {t_add:.3}s sm {t_sm:.3}s av {t_av:.3}s"
-        ));
-    }
+            // softmax rows then weighted sum of v.
+            nn::softmax_rows(&mut lm)?;
+            let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
+            let head_out = nn::matmul(&lm, &vh_mat)?;
+            out_chunk.copy_from_slice(&head_out.data);
+            Ok(())
+        })?;
 
     // Reassemble [n, dim] from [nh][n, hd] (head-major -> token rows).
     let mut ctx = vec![0.0f32; n * dim];
