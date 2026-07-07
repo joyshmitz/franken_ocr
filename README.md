@@ -53,7 +53,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Stage timing instrumentation** | `FOCR_TIMING=1` reports nested forward timings, including SAM hydrate/forward/block/attention/MLP splits, so perf work can separate artifact load, vision attention, decode, and output costs. |
 | **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
-| **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, stable documented exit codes, deterministic output under fixed sampling. |
+| **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, TrOMR `staff` events for music runs, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
 | **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited SIMD islands, each with a bit-identical scalar fallback. |
@@ -96,7 +96,7 @@ focr ocr --model tromr.focrq --task music score-page-or-staff.png -o score.music
 # 7. OCR only the pages you need from a scanned PDF; optionally split two-page spreads.
 focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
 
-# 8. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
+# 8. Stream NDJSON pipeline events for an agent (music runs also emit `staff` events).
 focr ocr page.png --robot
 focr robot triage
 
@@ -130,7 +130,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 **Scanned books are addressable.** PDF input no longer means "the whole document or nothing." `--pages 3,5-9` selects source pages with 1-based ranges, reports out-of-range requests against the document page count, and keeps source page numbers in JSON/robot output. The native renderer applies both PDF page `/Rotate` metadata and the rotation implied by the image placement matrix, which fixes scanned-book files that store portrait page images but display them landscape through a rotated `cm` transform. `--split-spreads` is opt-in for common two-page book scans: a wide rasterized page with a near-blank center gutter becomes left and right logical pages, while pages without a qualifying gutter pass through unsplit.
 
-**TrOMR page OMR is resilient.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, barline splitting, and broader corpus-quality metrics.
+**TrOMR page OMR is resilient.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. JSON output includes the ordered `staves` array for music runs, and robot mode emits one `staff` event for each recognized or skipped staff before `run_complete`. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, barline splitting, and broader corpus-quality metrics.
 
 **Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
 
@@ -319,7 +319,9 @@ structured JSON carries the rendered `markdown` plus a `layout` array, one
 source-image pixels. A PDF nests these under a per-page `pages` array; split
 spreads become separate logical page entries with the same source `page` number
 and a `"half": "left"` or `"right"` marker. This is the same shape `--json`
-prints to stdout.
+prints to stdout. TrOMR music runs also include a `staves` array in source order;
+each entry carries the 1-based staff number, page-space bbox, `recognized` or
+`skipped` status, and an optional skip reason.
 
 **Figures (`--extract-figures`).** The model sees figures/photos/diagrams it does not
 transcribe to text. With `--extract-figures`, those regions are cropped out of the
@@ -496,6 +498,12 @@ checkout or host. It returns one JSON object with a compact command reference,
 the live health payload, state-aware next commands, command templates, and the
 exit-code dictionary.
 
+For TrOMR music runs, robot mode adds a `staff` event before `run_complete` for
+each detected staff. The event carries the 1-based staff index, total detected
+staff count, page-space bbox, `recognized` or `skipped` status, and optional
+reason. Existing consumers can ignore it as an additive event; strict consumers
+should refresh their schema with `focr robot schema`.
+
 ### `focr runs` and `focr sync`
 
 `focr ocr` records each run in a local fsqlite store on a best-effort basis. A
@@ -555,6 +563,12 @@ gated until real kernels and parity evidence land.
 **Intel / AMD x86-64.** The x86 backend detects AVX-512-VNNI, AVX-VNNI, and AVX2 in that order, then falls back to scalar. AVX-VNNI and AVX-512-VNNI take the native dot-product path for int8 decode; AVX2 uses an exact non-saturating implementation rather than a shortcut that could corrupt accumulation. AMX is not advertised until there is a real AMX backend; `robot backends` reports the tier this binary will actually dispatch. The same binary therefore runs correctly on older AVX2-only Zen/Intel hosts and selects wider VNNI kernels on newer CPUs. The non-kernel glue is kept in plain, predictable loops so LLVM can vectorize it for the host CPU instead of forcing a brittle hand-written SIMD path.
 
 **Quantization policy.** The validated int8 path targets decoder GEMMs: dense MLPs, MoE expert/FFN matrices, and the per-token decode matmuls. The vision tower, projector, embeddings, MoE router, and all norms stay high precision. That split is deliberate: quantizing the vision side breaks OCR quality, while decoder int8 delivers the bandwidth win where it is safe.
+
+**Default fused QKV decode.** The int8 decoder stacks the q/k/v projection
+weights into one `[3*qkv_dim, hidden]` panel and runs one quantize-plus-GEMV pass
+per token instead of three separate projection calls. This is the default path
+because the ledgered proof shows byte-identical output with less decode overhead.
+Set `FOCR_QKV_FUSED=0` to restore the older three-call path for comparison.
 
 **TrOMR-specific CPU primitives.** The sheet-music lane has native staff preprocessing, global deskew and staff grouping, TF-SAME padding arithmetic, TF-SAME max-pool support, a Torch-parity GroupNorm kernel with optional fused ReLU, and a hybrid ResNetV2 plus ViT encoder checked at cosine 1.0 against oracle seams. Weight-standardized convolutions are folded during checkpoint export so the runtime can keep the conv path simple. The decoder includes self-attention, cross-attention, GEGLU, stream embeddings, and four output heads, then merges the rhythm/pitch/lift streams into semantic music tokens and partwise MusicXML. Opaque-alpha RGBA staff images take the RGB luma path rather than upstream's blanket inverted-alpha path, because the literal upstream rule blanks fully opaque demo staves; `docs/DISCREPANCIES.md` records the measured SER impact. The TrOMR closeout pins mean SER at 0.211 on committed single-staff examples and shows detection-lossless full-page reads at 0.125 / 0.040 SER for stacked staves. These pieces are scalar Rust loops designed for LLVM autovectorization across Apple Silicon and Intel/AMD CPUs; hand-written wide SIMD stays limited to int8 matmul kernels where the proof and measurement support it.
 
@@ -625,6 +639,7 @@ The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservati
 | `FOCR_MAX_NEW_TOKENS` | Cap the number of generated tokens (the engine's `max_length`; default 32768). An explicit `--max-length` flag outranks it. Capping never changes the per-step math, so a capped run's tokens are a true prefix of the full run's. |
 | `FOCR_DECODE_INT8` | Force the int8 decode cache/path for the native engine. `ocr-batch` also enables this internally unless `--f32` is passed. |
 | `FOCR_DECODE_STATELESS` | Force the stateless re-prefill decoder, kept as a parity oracle for the cached decode path. |
+| `FOCR_QKV_FUSED` | Controls the fused q/k/v int8 decode projection. Default is on; set `0`, `off`, `false`, or `no` to restore the older three-call projection path for parity or profiling comparisons. |
 | `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode pages together, with `FOCR_BATCH_SIZE` streams in flight. The default Unlimited-OCR spine uses the int8 R-SWA path; the dense zoo spine covers GOT-OCR2, SmolVLM2, and OneChart. Set `1`, `on`, or `true` to arm it; unset, blank, `0`, `off`, `false`, or `no` uses the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
 | `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 128 when the spine is armed; blank, invalid, or `0` also use that default, and larger values are capped at 256. |
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
