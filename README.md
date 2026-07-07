@@ -50,6 +50,7 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
 | **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
 | **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. |
+| **Stage timing instrumentation** | `FOCR_TIMING=1` reports nested forward timings, including SAM hydrate/forward/block/attention/MLP splits, so perf work can separate artifact load, vision attention, decode, and output costs. |
 | **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, stable documented exit codes, deterministic output under fixed sampling. |
@@ -549,6 +550,8 @@ gated until real kernels and parity evidence land.
 
 **Zoo performance evidence.** The latest zoo gauntlet keeps paired reference rows for GOT-OCR2, SmolVLM2, and OneChart. On an aarch64 host with NEON dotprod at eight threads, the native decode-per-token path measured 3.37x over Hugging Face CPU for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2. The ledger also records the full end-to-end rows, including the current artifact-load tax, so the project can improve throughput without hiding unfavorable totals.
 
+**Instrumentation and batch-spine bring-up.** `FOCR_TIMING=1` prints nested timing rows for the native forward, including SAM hydrate, SAM forward, per-block attention, and per-block MLP stages. That makes the current bottleneck visible: large pages can spend their wall time in vision attention rather than model artifact loading. The dense decoder batch spine also has a byte-identity-gated helper for Qwen/Llama and OPT-family decode steps. Prefill stays per stream; active non-EOS streams then advance through one batch step while each stream keeps its own KV cache and absolute position. The public `ocr-batch` path keeps `FOCR_BATCH_SPINE` as an opt-in switch while new batch plumbing earns correctness and perf evidence.
+
 **Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, proving i32 accumulation stays in range. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
 
 ---
@@ -615,6 +618,7 @@ The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservati
 | `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode all pages together, with `FOCR_BATCH_SIZE` streams in flight (default 8). Present ⇒ armed; unset (the default) runs the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
 | `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 8 when the spine is armed. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
+| `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. |
 | `FOCR_FORCE_ARCH` | Force an available SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`avxvnni`/`avx512vnni`) for CPU dispatch; used by `robot selftest`, `robot backends`, and pinned perf runs. |
 | `FOCR_RESAMPLE` | Preprocess resampling kernel. Unset (default): the `image` crate's CatmullRom. `pil-bicubic`: a Pillow-bit-exact fixed-point BICUBIC at every resize site, for reference-exact comparison against the PIL/torch oracle (DISC-001 in `docs/DISCREPANCIES.md`). |
 | `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). |
