@@ -16,7 +16,7 @@
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music`. All five ready models are available through `focr pull`, run through model-specific Rust kernels, and need no general ML framework, Python, CUDA, FFI at inference, or GPU. The single static binary parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON and fits in about 5 MB.
+**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music`. All five ready models are available through `focr pull`; TrOMR now publishes both the 61 MB int8 default artifact and an 86 MB f32 reference artifact. They run through model-specific Rust kernels and need no general ML framework, Python, CUDA, FFI at inference, or GPU. The single static binary parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON and fits in about 5 MB.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -46,11 +46,11 @@ The installer detects your platform, downloads the right prebuilt binary from th
 | **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
 | **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; page `/Rotate` and image-placement rotations are honored, `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
 | **Cross-page parsing** | `--multi-page` runs the Unlimited-OCR `infer_multi` contract over selected PDF pages or an image list, producing one document with `<PAGE>` boundaries instead of unrelated page parses. |
-| **Model zoo with pulls** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports both runtime status and pullable quant levels. Planned descriptors: TrOCR and pix2tex. |
+| **Model zoo with pulls** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports both runtime status and pullable quant levels. TrOMR pulls int8 by default and keeps `--quant f32` for bit-exact reference work. Planned descriptors: TrOCR and pix2tex. |
 | **int8 decode, ~2.5x faster** | Custom `.focrq` int8 expert/FFN weights, byte-identical to the f32 path on typical pages. The vision tower stays high precision, where quantizing it would wreck OCR. |
 | **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
 | **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
-| **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. The dense zoo path covers GOT-OCR2, SmolVLM2, and OneChart with per-page token budgets, and GOT-OCR2 now hydrates SAM/projector/embed state once per batch instead of once per page. |
+| **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. The dense zoo path covers GOT-OCR2, SmolVLM2, and OneChart with per-page token budgets. SAM and CLIP linears are hydrated and pre-transposed once, then reused across pages and batches. |
 | **Stage timing instrumentation** | `FOCR_TIMING=1` reports nested forward timings, including SAM hydrate/forward/block/attention/MLP splits, so perf work can separate artifact load, vision attention, decode, and output costs. |
 | **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
@@ -105,6 +105,8 @@ focr pull onechart
 focr ocr --model onechart.int8.focrq --task chart-data chart.png
 
 focr pull tromr
+focr ocr --model tromr.int8.focrq --task music score-page-or-staff.png -o score.musicxml
+focr pull tromr --quant f32                 # bit-exact reference artifact when needed
 focr ocr --model tromr.focrq --task music score-page-or-staff.png -o score.musicxml
 
 # 7. OCR only the pages you need from a scanned PDF; optionally split two-page spreads.
@@ -130,7 +132,7 @@ python3 scripts/gauntlet_cert.py --release-readiness
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 
 # TrOMR conversion is available for local sheet-music artifacts.
-focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
+focr convert /path/to/tromr/model.safetensors -o tromr.int8.focrq --quant int8 --model-id tromr
 ```
 
 After step 1 the weights live in `~/.cache/franken_ocr/models` and every later command runs fully offline.
@@ -141,13 +143,13 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 **A few models, every dimension fixed.** A general ML framework pays a generality tax on every operation: dynamic dtype dispatch, arbitrary shapes, autograd bookkeeping, broadcast machinery, and a device abstraction. `franken_ocr` runs a small set of hand-ported models whose important dimensions are known up front. For the default Unlimited-OCR path that means hidden 1280, 10 heads, head_dim 128, 64 experts, top-6 routing, MoE intermediate 896, R-SWA window 128, and vocab 129280. That buys shape-specialized kernels with no runtime shape branching in the hot loop. The scope is a few hand-tuned, certified models, not any model; there is no generic runtime underneath.
 
-**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. The table includes a `PULL` column from the embedded manifest, so a ready model is not confused with an unpublished local-only artifact. Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and TrOMR are all pullable today. Non-primary models install into per-model cache subdirectories with their tokenizer sidecars beside the `.focrq` artifact. TrOMR publishes an f32 artifact for now because its int8 path is still gated behind a measured-lossless proof.
+**Model status is explicit.** `focr models` is the source of truth for the runtime zoo. Ready models have a runtime forward arm and can be used with `focr ocr`; planned models are visible so agents and humans can see the roadmap without accidentally running the wrong architecture. The table includes a `PULL` column from the embedded manifest, so a ready model is not confused with an unpublished local-only artifact. Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and TrOMR are all pullable today. Non-primary models install into per-model cache subdirectories with their tokenizer sidecars beside the `.focrq` artifact. TrOMR publishes both int8 and f32 artifacts: the default pull is the smaller int8 artifact, while `focr pull tromr --quant f32` restores the bit-exact reference path for audits.
 
 **Scanned books are addressable.** PDF input no longer means "the whole document or nothing." `--pages 3,5-9` selects source pages with 1-based ranges, reports out-of-range requests against the document page count, and keeps source page numbers in JSON/robot output. The native renderer applies both PDF page `/Rotate` metadata and the rotation implied by the image placement matrix, which fixes scanned-book files that store portrait page images but display them landscape through a rotated `cm` transform. `--split-spreads` is opt-in for common two-page book scans: a wide rasterized page with a near-blank center gutter becomes left and right logical pages, while pages without a qualifying gutter pass through unsplit.
 
 **TrOMR page OMR is resilient.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, trims horizontal page margins to the detected ink extent, grows wide staff bands toward neighbor midlines so they fit the model's 1280-column position budget where possible, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. If a band is still too wide, setting `FOCR_TROMR_SPLIT=1` arms an experimental rescue that detects thin full-span barlines, splits the band into in-budget segments, and splices the streams (off by default: isolated segments measurably lose absolute pitch registration, so this trades content fidelity for recognition coverage — the skip with a named reason is the honest default). If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. JSON output includes the ordered `staves` array for music runs, and robot mode emits one `staff` event for each recognized or skipped staff before `run_complete`. The MusicXML emitter also adds annotate-only sanity comments for overfull bars, underfull middle bars, impossible durations, and cross-staff key mismatches; JSON and robot mode expose the same observations as `warnings` and `music_warning` events. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, and broader corpus-quality metrics.
 
-**Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
+**Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The CPU backend also records losing rows, such as the f32 TrOMR baseline, instead of turning them into marketing claims. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
 
 **Offline at inference.** The only network step is `focr pull`, which runs ahead of time. There is no Python, no CUDA, no FFI, and no GPU in the inference path. The async runtime that orchestrates I/O and cancellation is an owned internal detail; the library API is synchronous and blocking, so there is no async plumbing to thread through your code.
 
@@ -376,8 +378,9 @@ compose with `--split-spreads` or `--extract-figures` (per-page semantics).
 implies `--format` (an explicit `--format` composes idempotently) and needs the
 got-ocr2 model: `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `--task music`
 has two valid lanes: TrOMR is the native OMR path and returns MusicXML, while GOT-OCR2
-can still run its sheet-music format mode. Use `focr pull tromr`, then `--model tromr.focrq --task music`
-for a full printed/scanned page or a staff crop, or use the GOT lane
+can still run its sheet-music format mode. Use `focr pull tromr`, then `--model tromr.int8.focrq --task music`
+for a full printed/scanned page or a staff crop. Use `focr pull tromr --quant f32`
+and `--model tromr.focrq` when you need the bit-exact reference artifact. You can also use the GOT lane
 (`--model got-ocr2.int8.focrq --task music`). `--task describe` (photo description / VQA) is served by the smolvlm2
 model: `focr pull smolvlm2`, then `--model smolvlm2.int8.focrq --task describe`, optionally with `--question "What
 color is the car?"`. SmolVLM2 has no instruction modes; the task is the question
@@ -421,7 +424,8 @@ focr pull                                   # default int8, built-in manifest
 focr pull got-ocr2                          # structured OCR model
 focr pull smolvlm2                          # image description / VQA model
 focr pull onechart                          # chart-to-data model
-focr pull tromr                             # sheet-music OMR model (f32 today)
+focr pull tromr                             # sheet-music OMR model (int8 default)
+focr pull tromr --quant f32                 # bit-exact reference artifact
 focr pull --quant int8 --json               # explicit quant, machine-readable
 focr pull --manifest ./manifest.json        # override the manifest source
 ```
@@ -430,9 +434,10 @@ Downloads run over asupersync's native HTTP stack (rustls + webpki-roots), reass
 The primary Unlimited-OCR artifact installs directly under the cache root.
 Other models install under `~/.cache/franken_ocr/models/<model-id>/` so their
 tokenizer sidecars cannot collide. The resolver searches those subdirectories,
-so `--model onechart.int8.focrq` and `--model tromr.focrq` work after their
-pulls. TrOMR publishes one f32 quant today; a default `focr pull tromr` request
-reports the actual `f32` artifact instead of failing over the absent int8 quant.
+so `--model onechart.int8.focrq`, `--model tromr.int8.focrq`, and
+`--model tromr.focrq` work after their pulls. TrOMR publishes `int8` and `f32`;
+the default `focr pull tromr` fetches the int8 artifact, while
+`focr pull tromr --quant f32` fetches the bit-exact f32 reference artifact.
 
 ### `focr models`
 
@@ -451,7 +456,7 @@ focr models --json                          # machine-readable list
 | **`got-ocr2`** | ready | Specialized structured output the default cannot produce: formulas, tables, charts, molecular diagrams, geometry, and sheet music. | Heavier per page; `--task formula|tables|chart|molecular|geometry|music` implies `--format`. |
 | **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
 | **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
-| **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs the f32 `tromr.focrq` artifact and the rhythm, pitch, lift, and note tokenizer tables. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
+| **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs `tromr.int8.focrq` plus the rhythm, pitch, lift, and note tokenizer tables; `focr pull tromr --quant f32` installs the bit-exact `tromr.focrq` reference artifact. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
@@ -482,14 +487,16 @@ Run TrOMR sheet-music OMR:
 
 ```bash
 focr pull tromr
+focr ocr --model tromr.int8.focrq --task music score-page.png -o score.musicxml
+focr pull tromr --quant f32
 focr ocr --model tromr.focrq --task music score-page.png -o score.musicxml
-focr convert /path/to/tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
+focr convert /path/to/tromr/model.safetensors -o tromr.int8.focrq --quant int8 --model-id tromr
 scripts/tromr_convert_e2e.sh
 scripts/tromr_music_e2e.sh
 scripts/realscan_music_gate.sh
 ```
 
-The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. For genuinely over-wide systems, the page path uses the five detected staff-line anchors to find thin barline columns, splits at the farthest usable barline within the positional budget, recognizes each segment sequentially, and concatenates the semantic stream while suppressing continuation clef/key/time artifacts. A multi-staff page succeeds when at least one staff recognizes, logging skipped staves with bbox and reason; an all-fail page errors with every staff reason named. The published `tromr.focrq` is an 82 MB all-f32 artifact with 260 tensors; int8 candidates remain gated until they are measured lossless. Local conversion is still available when you have your own TrOMR checkpoint.
+The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. For genuinely over-wide systems, the page path uses the five detected staff-line anchors to find thin barline columns, splits at the farthest usable barline within the positional budget, recognizes each segment sequentially, and concatenates the semantic stream while suppressing continuation clef/key/time artifacts. A multi-staff page succeeds when at least one staff recognizes, logging skipped staves with bbox and reason; an all-fail page errors with every staff reason named. The published int8 artifact is 61 MB and quantizes the 40 decoder-GEMM candidate tensors; the 86 MB f32 artifact stays published for bit-exact reference work. The int8 default is accepted with a ledgered discrepancy on one degraded Spohr page where both int8 and f32 garble differently while the corpus gate verdict stays unchanged. Local conversion is still available when you have your own TrOMR checkpoint.
 
 The real-scan music corpus lives in `tests/fixtures/realscan_music/`. It starts with public-domain Spohr page and staff fixtures, tier-1 attributes that can be verified by eye, and one frozen MusicXML regression anchor. `scripts/realscan_music_gate.sh` is model-gated and exits successfully when local TrOMR weights are absent; when weights are present it checks attributes, frozen anchors, and page-level `staff` event floors. This is the real-scan regression base for the TrOMR lane, not a claim that broad note-level SER coverage is complete.
 
@@ -502,7 +509,7 @@ focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 focr convert got.safetensors -o got-ocr2.int8.focrq --quant int8 --model-id got-ocr2
 focr convert smolvlm2.safetensors -o smolvlm2.int8.focrq --quant int8 --model-id smolvlm2
 focr convert onechart.safetensors -o onechart.int8.focrq --quant int8 --model-id onechart
-focr convert tromr/model.safetensors -o tromr.focrq --quant int8 --model-id tromr
+focr convert tromr/model.safetensors -o tromr.int8.focrq --quant int8 --model-id tromr
 focr convert model.safetensors -o out.focrq --quant int8 --json
 ```
 
@@ -597,13 +604,13 @@ The current optimization stack is deliberately specific:
 |---|---|
 | **Decoder GEMMs** | Offline `.focrq` conversion packs validated decoder weights for int8 matmul while keeping accuracy-sensitive tensors high precision. |
 | **Per-token decode** | Fused QKV int8 projection, R-SWA generated-token ring KV, no per-op allocation in the hot loop, and scalar-or-SIMD dispatch through one entrypoint. |
-| **Vision work** | SAM attention windows run independently across Rayon; relative-position work is hoisted and walked in cache-friendly rows. |
+| **Vision work** | SAM and CLIP linear weights are pre-transposed at hydration, then cached on the model. SAM attention windows run independently across Rayon; relative-position work is hoisted and walked in cache-friendly rows. |
 | **Batch throughput** | `FOCR_BATCH_SPINE=1` advances active streams through shared decode steps while preserving each stream's KV cache, position, output cap, and byte identity. |
 | **TrOMR** | Staff detection, deskew, ink-extent trim, neighbor-bounded band growth, barline segmentation for over-budget systems, ResNetV2/ViT glue, and MusicXML emission are native Rust. |
 
-**Apple Silicon / ARM64.** The aarch64 backend detects NEON dot-product (`SDOT`) and matrix-multiply int8 (`SMMLA` / i8mm) at runtime. The hot decoder linears use packed int8 matmul kernels where the scalar fallback proves the exact result, while norms, softmax, preprocessing, and TrOMR's f32 vision/decoder glue stay as simple loops that LLVM can autovectorize. On macOS, dispatch prefers SDOT over SMMLA because measured M-series cores issue i8mm at a rate that does not beat the dot-product path once operand packing is included. On non-Apple ARM64, the order can favor SMMLA when the hardware makes it faster. Both tiers share the same scalar oracle, and `FOCR_FORCE_ARCH=sdot|smmla|scalar focr robot selftest` verifies the selected path on the current host. The SAM vision pass also exposes independent attention windows to Rayon and keeps relative-position work in cache-friendly row walks, which helps Apple cores stay busy outside the int8 decode kernels.
+**Apple Silicon / ARM64.** The aarch64 backend detects NEON dot-product (`SDOT`) and matrix-multiply int8 (`SMMLA` / i8mm) at runtime. The hot decoder linears use packed int8 matmul kernels where the scalar fallback proves the exact result, while norms, softmax, preprocessing, and TrOMR's f32 vision/decoder glue stay as simple loops that LLVM can autovectorize. On macOS, dispatch prefers SDOT over SMMLA because measured M-series cores issue i8mm at a rate that does not beat the dot-product path once operand packing is included. On non-Apple ARM64, the order can favor SMMLA when the hardware makes it faster. Both tiers share the same scalar oracle, and `FOCR_FORCE_ARCH=sdot|smmla|scalar focr robot selftest` verifies the selected path on the current host. The vision path reduces repeat work on Apple cores by hydrating SAM and CLIP weights once, storing GEMM-ready pre-transposed linears, exposing independent SAM attention windows to Rayon, and walking relative-position rows in cache-friendly order.
 
-**Intel / AMD x86-64.** The x86 backend detects AVX-512-VNNI, AVX-VNNI, and AVX2 in that order, then falls back to scalar. AVX-VNNI and AVX-512-VNNI take the native dot-product path for int8 decode; AVX2 uses an exact non-saturating implementation rather than a shortcut that could corrupt accumulation. AMX is not advertised until there is a real AMX backend; `robot backends` reports the tier this binary will actually dispatch. The same binary therefore runs correctly on older AVX2-only Zen/Intel hosts and selects wider VNNI kernels on newer CPUs. The non-kernel glue is kept in plain, predictable loops so LLVM can vectorize it for the host CPU instead of forcing a brittle hand-written SIMD path.
+**Intel / AMD x86-64.** The x86 backend detects AVX-512-VNNI, AVX-VNNI, and AVX2 in that order, then falls back to scalar. AVX-VNNI and AVX-512-VNNI take the native dot-product path for int8 decode; AVX2 uses an exact non-saturating implementation rather than a shortcut that could corrupt accumulation. AMX is not advertised until there is a real AMX backend; `robot backends` reports the tier this binary will actually dispatch. The same binary therefore runs correctly on older AVX2-only Zen/Intel hosts and selects wider VNNI kernels on newer CPUs. The model-level SAM/CLIP hydration cache and the pre-transposed linear layout also help x86 hosts by removing repeated full-weight transposes before the BLAS-like matmul calls. The non-kernel glue is kept in plain, predictable loops so LLVM can vectorize it for the host CPU instead of forcing a brittle hand-written SIMD path.
 
 **Quantization policy.** The validated int8 path targets decoder GEMMs: dense MLPs, MoE expert/FFN matrices, and the per-token decode matmuls. The vision tower, projector, embeddings, MoE router, and all norms stay high precision. That split is deliberate: quantizing the vision side breaks OCR quality, while decoder int8 delivers the bandwidth win where it is safe.
 
@@ -617,7 +624,7 @@ Set `FOCR_QKV_FUSED=0` to restore the older three-call path for comparison.
 
 **Zoo performance evidence.** The latest zoo gauntlet keeps paired reference rows for GOT-OCR2, SmolVLM2, and OneChart. On an aarch64 host with NEON dotprod at eight threads, the native decode-per-token path measured 3.37x over Hugging Face CPU for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2. The ledger also records the full end-to-end rows, including the current artifact-load tax, so the project can improve throughput without hiding unfavorable totals.
 
-**Instrumentation and batch-spine bring-up.** `FOCR_TIMING=1` prints nested timing rows for the native forward, including SAM hydrate, SAM forward, per-block attention, and per-block MLP stages. That makes the current bottleneck visible: large pages can spend their wall time in vision attention rather than model artifact loading. The SAM attention pass keeps the math bit-identical while reducing overhead: independent windows run across Rayon, relative-position tables are hoisted once per block, Q/K/V head splits copy contiguous slices, and the bias add walks `(ky, kx)` rows directly. The dense decoder batch spine also has a byte-identity-gated helper for Qwen/Llama and OPT-family decode steps. Prefill stays per stream; active non-EOS streams then advance through one batch step while each stream keeps its own KV cache, absolute position, and per-stream emission cap. The public `ocr-batch` path keeps `FOCR_BATCH_SPINE` as an opt-in switch while new batch plumbing earns correctness and perf evidence.
+**Instrumentation and batch-spine bring-up.** `FOCR_TIMING=1` prints nested timing rows for the native forward, including SAM hydrate, SAM forward, per-block attention, and per-block MLP stages. That makes the current bottleneck visible: large pages can spend their wall time in vision attention rather than model artifact loading. The vision hydration path now builds SAM and CLIP weight bundles once per loaded model, including GEMM-ready pre-transposed linears, so later pages skip repeated transpose work. The SAM attention pass keeps the math bit-identical while reducing overhead: independent windows run across Rayon, relative-position tables are hoisted once per block, Q/K/V head splits copy contiguous slices, and the bias add walks `(ky, kx)` rows directly. The dense decoder batch spine also has a byte-identity-gated helper for Qwen/Llama and OPT-family decode steps. Prefill stays per stream; active non-EOS streams then advance through one batch step while each stream keeps its own KV cache, absolute position, and per-stream emission cap. The public `ocr-batch` path keeps `FOCR_BATCH_SPINE` as an opt-in switch while new batch plumbing earns correctness and perf evidence.
 
 **Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, proving i32 accumulation stays in range. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
 
@@ -820,6 +827,7 @@ For the single-page `ocr` command, point `FOCR_MODEL_PATH` at the bf16 safetenso
 What this is and is not:
 
 - **int8 can repeat on hard tables.** int8 decode is roughly 2.5x faster and byte-identical to f32 on typical pages, but some dense tables (for example `page_0590`) can trigger repetition runs. The no-repeat n-gram guard and the f32 fallback are the documented kill-switches. The vision tower stays high precision because quantizing it breaks OCR.
+- **TrOMR int8 is default, with a documented fallback.** `focr pull tromr` fetches the smaller `tromr.int8.focrq` artifact. The corpus gate stays green, but the discrepancy ledger records one degraded public-domain Spohr page where int8 and f32 diverge into different bad token streams. Use `focr pull tromr --quant f32` and `--model tromr.focrq` when you need bit-exact reference behavior.
 - **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes pages in process (pure Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. The renderer applies page-level and image-placement rotations before OCR, so common scanned-book PDFs that display a rotated image through the content stream are not fed sideways to the model. `--pages` lets you run only the source pages you need, and `--split-spreads` can split common two-page book scans when the gutter is clear enough. The fast path covers common scanned-PDF codecs: JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported. Rasterize that PDF out of band and retry.
 - **Native Windows (x86_64) is supported and proven end-to-end; ARM64 is not yet.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10: the same 3.9 GB int8 weights, vision tower, and DeepSeek-V2 decoder produce the same markdown a Mac or Linux host does. `focr.exe robot selftest` passes 24/24 (int8 GEMM bit-identical to the scalar oracle, including the K=6848 overflow case). `focr pull` works on Windows too; the full 3.9 GB multi-part download, reassembly, and SHA-256 verify complete over the native async HTTP/TLS stack. The earlier send-path bug that surfaced as `WSAENOTCONN` / os error 10057 (`bd-15ow`) is fixed. The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`. The one remaining gap, tracked under epic `bd-3u97`, is that ARM64 Windows is not published.
 - **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, OneChart for chart-to-data extraction, and TrOMR for sheet-music OMR on full printed/scanned pages or staff crops. TrOCR and pix2tex remain descriptor-only roadmap items. Each ready model is transformed offline, distributed through the manifest with required sidecars, and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
