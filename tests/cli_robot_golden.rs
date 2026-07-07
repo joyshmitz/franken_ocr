@@ -1117,6 +1117,46 @@ fn robot_selftest_proves_per_model_kernel_parity_e2e() {
     );
 }
 
+/// bd-1gv.25 S2: `focr batch --multi-page` parses, routes to the cross-page
+/// pass, and (hermetically, with no model present) fails with the CLEAN
+/// ModelNotFound contract (exit 3) — proving the flag reaches the engine
+/// facade rather than being ignored or panicking. The /nonexistent-model leg
+/// proves the same via an explicit --model path.
+#[test]
+fn batch_multi_page_flag_routes_to_the_cross_page_pass() {
+    let test = "batch_multi_page_flag_routes_to_the_cross_page_pass";
+    let out = run_focr(&["ocr-batch", "a.png", "b.png", "--multi-page", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "no model in a hermetic HOME must be ModelNotFound exit 3; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out2 = run_focr(&[
+        "ocr-batch",
+        "a.png",
+        "b.png",
+        "--multi-page",
+        "--model",
+        "/nonexistent-model.focrq",
+        "--json",
+    ]);
+    assert_eq!(
+        out2.status.code(),
+        Some(3),
+        "an explicit missing model must be ModelNotFound exit 3; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    tlog!(test,
+        "case": "multi_page_flag",
+        "event": "result",
+        "inputs": {"argv": ["ocr-batch", "a.png", "b.png", "--multi-page", "--json"]},
+        "exit_code": out.status.code(),
+        "result": "pass",
+        "detail": "flag parses + routes; hermetic no-model and /nonexistent-model both exit 3 cleanly",
+    );
+}
+
 /// [R7] Robot mode is DATA-ONLY on stdout: every `robot <cmd>` writes a single
 /// pure-JSON line to stdout, with no human decoration mixed in (AGENTS.md Agent
 /// Ergonomics: "Do not mix human decoration with machine output in robot mode").

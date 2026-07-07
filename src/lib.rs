@@ -582,6 +582,43 @@ impl OcrEngine {
         })
     }
 
+    /// Multi-page CROSS-PAGE document parsing (bd-1gv.25) — the reference
+    /// `infer_multi` contract: one 32K pass where page N attends to pages
+    /// 1..N−1 (OQ-13), returning ONE assembled markdown with `<PAGE>`
+    /// separators. This is NOT [`OcrEngine::recognize_batch`] (independent
+    /// pages); use this when the pages form one document whose later pages
+    /// reference earlier content.
+    ///
+    /// # Errors
+    /// As [`crate::native_engine::OcrModel::recognize_multi_page`] — notably
+    /// `NotImplemented` for non-Unlimited-OCR artifacts and an actionable
+    /// error when the assembled prefix exceeds the 32K position budget.
+    pub fn recognize_multi_page(&self, images: &[&Path]) -> FocrResult<String> {
+        self.recognize_multi_page_with_model(&Self::model_path(), images)
+    }
+
+    /// Path-explicit form of [`OcrEngine::recognize_multi_page`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_multi_page`].
+    pub fn recognize_multi_page_with_model(
+        &self,
+        model_path: &Path,
+        images: &[&Path],
+    ) -> FocrResult<String> {
+        let model = self.model_at(model_path)?;
+        let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
+        let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
+        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
+        let budget = per_image
+            .checked_mul(count)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
+            let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
+            model.recognize_multi_page(&refs)
+        })
+    }
+
     fn stage_budget(stage: &str, default_ms: u64) -> Duration {
         let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
         let millis = std::env::var(&key)

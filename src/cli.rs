@@ -186,6 +186,13 @@ pub struct OcrBatchArgs {
     /// Use the f32 decoder instead of the default int8 throughput path.
     #[arg(long = "f32")]
     pub no_int8: bool,
+    /// Treat the images as ONE multi-page document (the Unlimited-OCR
+    /// `infer_multi` contract): a single cross-page pass where page N can
+    /// reference pages 1..N-1, emitting one markdown with `<PAGE>` separators.
+    /// Without this flag each image is parsed independently. Unlimited-OCR
+    /// only; the whole document must fit the 32K context.
+    #[arg(long)]
+    pub multi_page: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1839,6 +1846,34 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     let count = args.images.len();
     let total = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
+
+    if args.multi_page {
+        // ONE cross-page document pass (bd-1gv.25): page N attends to pages
+        // 1..N-1; output is one assembled markdown with <PAGE> separators.
+        let image_refs: Vec<&std::path::Path> = args
+            .images
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect();
+        let markdown = match model.as_deref() {
+            Some(m) => engine.recognize_multi_page_with_model(m, &image_refs),
+            None => engine.recognize_multi_page(&image_refs),
+        }?;
+        let elapsed = total.elapsed().as_secs_f64();
+        if args.json {
+            emit(&serde_json::json!({
+                "schema_version": robot::ROBOT_SCHEMA_VERSION,
+                "command": "batch.multi_page",
+                "pages": count,
+                "seconds": elapsed,
+                "markdown": markdown,
+            }));
+        } else {
+            println!("{markdown}");
+            eprintln!("[focr] multi-page: {count} pages in one cross-page pass, {elapsed:.2}s");
+        }
+        return Ok(());
+    }
 
     if native_engine::batch_scheduler::spine_enabled() {
         // Continuous-batch decode spine (FOCR_BATCH_SPINE=1): prefill + decode
