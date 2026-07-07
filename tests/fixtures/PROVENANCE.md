@@ -31,6 +31,7 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | `onechart/sample_chart.png`, `onechart/corpus/` (6 charts + `manifest.json` + `detok` goldens) | [R→C] | `scripts/gen_reference_fixtures_onechart.py` + the bd-2lje corpus generator (matplotlib, sha256s in `manifest.json`) | Same |
 | `tromr/tokenizer_{rhythm,pitch,lift,note}.json` | [C] | Upstream NetEase Polyphonic-TrOMR tables, byte-copied (Apache-2.0; byte-equality vs the zoo copies is asserted by `scripts/tromr_convert_e2e.sh` step 6) | Never regenerated — upstream-frozen |
 | `tromr/detokenize_goldens.json` | [R→C] | HF `tokenizers` WordLevel oracle over the committed tables (generated 2026-07-05; provenance in `_meta`) | Rerun per its `_meta.script` note |
+| `realscan_music/` | [C] | Public-domain Louis Spohr violin-school scans from Internet Archive, with tier-1 attributes, a frozen MusicXML anchor, and page/staff fixtures (bd-av64.6) | Hand-reviewed additions only; gate with `scripts/realscan_music_gate.sh` |
 | `ladder_scorecard/scorecard_{armed,unarmed}.json` | [R→C] | `scripts/ladder_scorecard.sh` folding the parity ladder's own NDJSON (armed: M4 host, 2026-07-06, f32 safetensors + `fixtures/native_f32` oracle set — all six gates green, L4 token-exact 1.0, L5 CER 0.0; unarmed: the skip-honest shape, `skipped_no_model:true`) | Rerun the script armed/unarmed; a changed scorecard is a reviewed parity change |
 
 ## The weights-gated fixture families (NOT in this tree)
