@@ -15,7 +15,14 @@ use serde_json::{Value, json};
 pub const ROBOT_SCHEMA_VERSION: u32 = 1;
 
 /// The event kinds emitted on the NDJSON stream (plan §7.3).
-pub const EVENT_KINDS: &[&str] = &["run_start", "stage", "page", "run_complete", "run_error"];
+pub const EVENT_KINDS: &[&str] = &[
+    "run_start",
+    "stage",
+    "page",
+    "staff",
+    "run_complete",
+    "run_error",
+];
 
 /// A machine-readable, self-describing schema for the robot event stream.
 pub fn robot_schema() -> Value {
@@ -93,9 +100,52 @@ pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
     })
 }
 
+/// One `staff` event from a TrOMR full-page music run (bd-av64.2): the
+/// detector found `total` staves; this staff either recognized into the
+/// MusicXML (`status: "ok"`) or was skipped with a reason. Additive to the
+/// v1 event set (a consumer ignoring unknown kinds is unaffected), matching
+/// the `page` precedent from bd-fck1.
+pub fn staff_event(
+    index: usize,
+    total: usize,
+    bbox: (usize, usize, usize, usize),
+    status: &str,
+    reason: Option<&str>,
+) -> Value {
+    let mut event = serde_json::json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "staff",
+        "staff": index + 1,
+        "total": total,
+        "bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+        "status": status,
+    });
+    if let Some(reason) = reason {
+        event["reason"] = serde_json::json!(reason);
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-av64.2: the `staff` event shape — 1-based staff number, total,
+    /// bbox array, status, and a reason only when skipped.
+    #[test]
+    fn staff_event_shapes_ok_and_skipped() {
+        let ok = staff_event(0, 5, (0, 292, 1168, 115), "ok", None);
+        assert_eq!(ok["event"], "staff");
+        assert_eq!(ok["staff"], 1);
+        assert_eq!(ok["total"], 5);
+        assert_eq!(ok["bbox"], serde_json::json!([0, 292, 1168, 115]));
+        assert_eq!(ok["status"], "ok");
+        assert!(ok.get("reason").is_none());
+        let skip = staff_event(3, 5, (0, 663, 1168, 114), "skipped", Some("1280 clamp"));
+        assert_eq!(skip["staff"], 4);
+        assert_eq!(skip["reason"], "1280 clamp");
+        assert!(EVENT_KINDS.contains(&"staff"), "schema advertises staff");
+    }
 
     #[test]
     fn schema_advertises_all_events() {

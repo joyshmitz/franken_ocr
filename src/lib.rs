@@ -235,6 +235,22 @@ pub struct OcrEngine {
 }
 
 impl OcrEngine {
+    /// Take (consume) the staff-level metadata from the most recent TrOMR
+    /// music forward on this engine's cached model, if any (bd-av64.2): the
+    /// recognized staves' detection indices + page-space bboxes and any
+    /// per-staff skips. Returns `None` when no model is loaded, the loaded
+    /// model has run no music forward since the last take, or the last
+    /// forward was not a music run. The CLI uses this to emit robot `staff`
+    /// events and the `--json` `staves` array.
+    #[must_use]
+    pub fn take_music_page_meta(&self) -> Option<native_engine::MusicPageMeta> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+            .and_then(|model| model.take_music_meta())
+    }
+
     /// Construct the engine, building the single owned `asupersync` runtime
     /// (plan §3.3: `worker_threads(2)`, `blocking_threads(1, 4)`,
     /// `thread_name_prefix("focr")`). The model is loaded lazily on the first

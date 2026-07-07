@@ -99,6 +99,14 @@ pub struct OcrModel {
     /// [`Self::tokenizer`] above.
     got_tokenizer: std::sync::OnceLock<crate::tokenizer::tiktoken::Tiktoken>,
     tromr_tokenizer: std::sync::OnceLock<crate::tokenizer::music::MusicTokenizer>,
+    /// Staff-level metadata from the most recent TrOMR full-page forward
+    /// (bd-av64.2 observability): recognized staves' indices + bboxes and the
+    /// per-staff skips. A side-channel rather than a widened forward return:
+    /// the `(text, w, h)` forward contract is shared by every model arm, and
+    /// the engine's one-live-forward discipline means "the last music
+    /// forward" is well-defined. Taken (consumed) by the CLI after a music
+    /// run to emit robot `staff` events and the `--json` staves array.
+    music_meta: std::sync::Mutex<Option<MusicPageMeta>>,
 }
 
 /// Process-global cache of the last-loaded model, keyed by resolved path.
@@ -614,6 +622,19 @@ pub fn model_resolution_search_dirs() -> Vec<PathBuf> {
     model_search_dirs()
 }
 
+/// Staff-level metadata from a TrOMR full-page music forward (bd-av64.2):
+/// what the staff detector found and what the per-staff recognition did with
+/// it. Surfaced through [`OcrModel::take_music_meta`] so the CLI can emit
+/// robot `staff` events and the `--json` `staves` array without widening the
+/// shared `(text, w, h)` forward contract.
+#[derive(Debug, Clone)]
+pub struct MusicPageMeta {
+    /// `(detection index, page-space bbox)` per RECOGNIZED staff, top-to-bottom.
+    pub staves: Vec<(usize, tromr::StaffBBox)>,
+    /// Staves that failed per-staff recognition (index, bbox, reason).
+    pub skips: Vec<tromr::StaffSkip>,
+}
+
 /// One parsed layout span from the model's grounding output: a ref/det label
 /// (`"title"`, `"text"`, `"image"`, …) plus its bounding boxes in PIXEL
 /// coordinates `[x1, y1, x2, y2]` for the source image (de-normalized from the
@@ -954,6 +975,7 @@ impl OcrModel {
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
             tromr_tokenizer: std::sync::OnceLock::new(),
+            music_meta: std::sync::Mutex::new(None),
         });
 
         let mut guard = model_cache_guard()?;
@@ -1143,6 +1165,13 @@ impl OcrModel {
     /// output is the MusicXML (the primary interop export); the model-native
     /// semantic stream is logged via [`timing_log`] and is the library-level
     /// [`tromr::MusicResult`] field.
+    /// Take (consume) the staff-level metadata recorded by the most recent
+    /// TrOMR full-page forward, if any (bd-av64.2). Non-music forwards never
+    /// set it; a second take returns `None` until the next music forward.
+    pub fn take_music_meta(&self) -> Option<MusicPageMeta> {
+        self.music_meta.lock().ok().and_then(|mut slot| slot.take())
+    }
+
     fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
         let t = std::time::Instant::now();
@@ -1175,6 +1204,12 @@ impl OcrModel {
                 .map(|(_, r, _)| r.semantic.len())
                 .sum::<usize>()
         ));
+        if let Ok(mut slot) = self.music_meta.lock() {
+            *slot = Some(MusicPageMeta {
+                staves: page.staves.iter().map(|(i, _, b)| (*i, *b)).collect(),
+                skips: page.skips.clone(),
+            });
+        }
         let xml = if page.staves.len() == 1 {
             page.staves
                 .into_iter()

@@ -958,9 +958,14 @@ fn write_ocr_output(
     rec: &Recognition,
     want_json: bool,
     figures: &[WrittenFigure],
+    music_meta: Option<&native_engine::MusicPageMeta>,
 ) -> FocrResult<()> {
     let contents = if want_json {
-        let mut s = serde_json::to_string_pretty(&rec.to_json(figures)).map_err(|e| {
+        let mut value = rec.to_json(figures);
+        if let Some(meta) = music_meta {
+            value["staves"] = music_meta_to_json(meta);
+        }
+        let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
                 "serializing OCR JSON for {}: {e}",
                 path.display()
@@ -1327,6 +1332,25 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         ),
     };
 
+    // Staff-level metadata from a TrOMR music forward (bd-av64.2): consumed
+    // once per run; None for every non-music run.
+    let music_meta = engine.take_music_page_meta();
+    if robot_mode && let Some(meta) = &music_meta {
+        let total = meta.staves.len() + meta.skips.len();
+        for (index, bbox) in &meta.staves {
+            emit(&robot::staff_event(*index, total, *bbox, "ok", None));
+        }
+        for skip in &meta.skips {
+            emit(&robot::staff_event(
+                skip.index,
+                total,
+                skip.bbox,
+                "skipped",
+                Some(&skip.reason),
+            ));
+        }
+    }
+
     let markdown = recognition.markdown();
     // `--json` forces JSON; a `.json` output path selects it implicitly. (When no
     // `-o` is given, `output_is_json(None)` is false, so stdout behavior is exactly
@@ -1337,7 +1361,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // regardless of mode, and is written FIRST so the file already exists when a
     // robot consumer sees the completion event below.
     if let Some(path) = args.output.as_deref() {
-        write_ocr_output(path, &recognition, want_json, &figures)?;
+        write_ocr_output(path, &recognition, want_json, &figures, music_meta.as_ref())?;
     }
 
     if robot_mode {
@@ -1359,11 +1383,49 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             if want_json { "json" } else { "markdown" }
         );
     } else if args.json {
-        emit(&recognition.to_json(&figures));
+        let mut value = recognition.to_json(&figures);
+        if let Some(meta) = &music_meta {
+            value["staves"] = music_meta_to_json(meta);
+        }
+        emit(&value);
     } else {
         println!("{markdown}");
     }
     Ok(())
+}
+
+/// The `--json` `staves` array for a music run (bd-av64.2): one entry per
+/// DETECTED staff in detection order — recognized staves as `status: "ok"`,
+/// failed ones as `status: "skipped"` with the reason. Absent entirely for
+/// non-music runs, so every existing consumer's shape is unchanged.
+fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value {
+    let mut entries: Vec<(usize, serde_json::Value)> = meta
+        .staves
+        .iter()
+        .map(|(index, bbox)| {
+            (
+                *index,
+                serde_json::json!({
+                    "staff": index + 1,
+                    "bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+                    "status": "ok",
+                }),
+            )
+        })
+        .chain(meta.skips.iter().map(|skip| {
+            (
+                skip.index,
+                serde_json::json!({
+                    "staff": skip.index + 1,
+                    "bbox": [skip.bbox.0, skip.bbox.1, skip.bbox.2, skip.bbox.3],
+                    "status": "skipped",
+                    "reason": skip.reason,
+                }),
+            )
+        }))
+        .collect();
+    entries.sort_by_key(|(index, _)| *index);
+    serde_json::Value::Array(entries.into_iter().map(|(_, v)| v).collect())
 }
 
 /// Run one recognition, transparently offering the first-run model download once
@@ -3155,6 +3217,34 @@ mod tests {
 
     /// bd-av64.11: the --pages spec parser — 1-based pages/ranges to
     /// deduplicated source-order 0-based indices, with loud usage errors.
+    /// bd-av64.2: the --json staves array interleaves recognized and skipped
+    /// staves in DETECTION order, 1-based, with reasons only on skips.
+    #[test]
+    fn music_meta_json_interleaves_in_detection_order() {
+        let meta = native_engine::MusicPageMeta {
+            staves: vec![(0, (0, 10, 800, 100)), (2, (0, 300, 800, 100))],
+            skips: vec![native_engine::tromr::StaffSkip {
+                index: 1,
+                bbox: (0, 150, 800, 90),
+                reason: "resized width 1296 exceeds the 1280 position clamp".into(),
+            }],
+        };
+        let v = music_meta_to_json(&meta);
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["staff"], 1);
+        assert_eq!(arr[0]["status"], "ok");
+        assert!(arr[0].get("reason").is_none());
+        assert_eq!(arr[1]["staff"], 2);
+        assert_eq!(arr[1]["status"], "skipped");
+        assert!(
+            arr[1]["reason"].as_str().unwrap_or("").contains("1280"),
+            "skip carries the reason"
+        );
+        assert_eq!(arr[2]["staff"], 3);
+        assert_eq!(arr[2]["bbox"], serde_json::json!([0, 300, 800, 100]));
+    }
+
     #[test]
     fn page_spec_parses_and_rejects() {
         // None => every page.
@@ -3240,12 +3330,12 @@ mod tests {
 
         // Markdown form: source lacks a trailing newline, so one is appended.
         let md_path = dir.join("out.md");
-        write_ocr_output(&md_path, &rec, false, &[]).expect("write md");
+        write_ocr_output(&md_path, &rec, false, &[], None).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
 
         // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
         let json_path = dir.join("out.json");
-        write_ocr_output(&json_path, &rec, true, &[]).expect("write json");
+        write_ocr_output(&json_path, &rec, true, &[], None).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");

@@ -139,6 +139,27 @@ done
 ok "MusicXML carries the certified structure (clef F4, CM, 3 measures)"
 ndj event=music result=pass elapsed_ms=$((t1 - t0))
 
+# Robot staff observability (bd-av64.2): the same staff through robot mode
+# must emit at least one parseable `staff` event with status ok.
+STAFF_EVENTS=$("$BIN" robot run "$STAFF" --task music --model "$MODEL" 2>/dev/null \
+  | python3 -c '
+import json, sys
+count = 0
+for line in sys.stdin:
+    e = json.loads(line)
+    if e.get("event") == "staff":
+        assert e.get("status") in ("ok", "skipped"), e
+        assert isinstance(e.get("bbox"), list) and len(e["bbox"]) == 4, e
+        count += 1
+print(count)')
+if [ "$STAFF_EVENTS" -lt 1 ]; then
+  fail "robot mode emitted no staff events"
+  ndj event=music check=staff_events result=fail count="$STAFF_EVENTS"
+  exit 1
+fi
+ok "robot mode emitted $STAFF_EVENTS parseable staff event(s)"
+ndj event=music check=staff_events result=pass count="$STAFF_EVENTS"
+
 step "5/5 REALSCAN"
 CROP="${FOCR_TROMR_REALSCAN_CROP:-}"
 if [ -n "$CROP" ] && [ -f "$CROP" ]; then
