@@ -288,12 +288,9 @@ mod tests {
             .mat("model.connector.modality_projection.proj.weight")
             .expect("connector proj tensor");
         assert_eq!((proj.rows, proj.cols), (960, 12288));
-        let lin = super::super::vision_sam::Linear {
-            w: proj.data,
-            b: Vec::new(),
-            out: 960,
-            in_: 12288,
-        };
+        let lin =
+            super::super::vision_sam::Linear::from_row_major(&proj.data, Vec::new(), 960, 12288)
+                .expect("connector linear");
         let x = Mat::from_vec(n_frames * 64, 12288, ps_ours);
         let ours = lin.apply(&x).expect("connector GEMM");
         let floor = fx["nondeterminism_floor"]["vision_maxabs_cross_thread"]

@@ -134,12 +134,7 @@ pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrRe
             proj.cols
         )));
     }
-    let lin = Linear {
-        w: proj.data,
-        b: Vec::new(),
-        out: 960,
-        in_: ps_cols,
-    };
+    let lin = Linear::from_row_major(&proj.data, Vec::new(), 960, ps_cols)?;
     lin.apply(&ps)
 }
 
@@ -330,21 +325,20 @@ mod tests {
             .map(|v| v.as_u64().unwrap() as u32)
             .collect();
         let got = describe_prompt_ids(&tk, 3, 4, DESCRIBE_QUESTION).expect("encode");
-        if got != want {
-            let pos = got
-                .iter()
-                .zip(&want)
-                .position(|(a, b)| a != b)
-                .unwrap_or_else(|| got.len().min(want.len()));
-            panic!(
-                "L0c prompt ids diverged at {pos}: got len {} want len {} \
-                 (got[{pos}..+4]={:?} want[{pos}..+4]={:?})",
-                got.len(),
-                want.len(),
-                &got[pos.min(got.len().saturating_sub(1))..got.len().min(pos + 4)],
-                &want[pos.min(want.len().saturating_sub(1))..want.len().min(pos + 4)]
-            );
-        }
+        let pos = got
+            .iter()
+            .zip(&want)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| got.len().min(want.len()));
+        assert!(
+            got == want,
+            "L0c prompt ids diverged at {pos}: got len {} want len {} \
+             (got[{pos}..+4]={:?} want[{pos}..+4]={:?})",
+            got.len(),
+            want.len(),
+            &got[pos.min(got.len().saturating_sub(1))..got.len().min(pos + 4)],
+            &want[pos.min(want.len().saturating_sub(1))..want.len().min(pos + 4)]
+        );
         eprintln!("[C7 L0c] {} prompt ids exact", got.len());
     }
 

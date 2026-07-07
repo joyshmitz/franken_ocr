@@ -39,12 +39,7 @@ pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResu
     let sam_t = transpose(&sam); // [256, 1024] token-major
     let w = weights.vec("model.mm_projector.weight")?; // [768*1024] row-major [out,in]
     let b = weights.vec("model.mm_projector.bias")?; // [768]
-    let proj = Linear {
-        w,
-        b,
-        out: HIDDEN,
-        in_: 1024,
-    };
+    let proj = Linear::from_row_major(&w, b, HIDDEN, 1024)?;
     proj.apply(&sam_t) // [256, 768]
 }
 
@@ -79,12 +74,12 @@ pub fn build_inputs_embeds(weights: &Weights, vision: &Mat, prompt_ids: &[u32]) 
 /// A missing tensor or a shape violation.
 pub fn number_head(weights: &Weights, hidden_row: &[f32]) -> FocrResult<Vec<f32>> {
     let lin = |i: usize, out, in_| -> FocrResult<Linear> {
-        Ok(Linear {
-            w: weights.vec(&format!("num_decoder.{i}.weight"))?,
-            b: weights.vec(&format!("num_decoder.{i}.bias"))?,
+        Linear::from_row_major(
+            &weights.vec(&format!("num_decoder.{i}.weight"))?,
+            weights.vec(&format!("num_decoder.{i}.bias"))?,
             out,
             in_,
-        })
+        )
     };
     let x = Mat::from_vec(1, HIDDEN, hidden_row.to_vec());
     let mut x = lin(0, 384, HIDDEN)?.apply(&x)?;

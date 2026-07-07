@@ -107,7 +107,7 @@ pub fn siglip_weights_from(weights: &Weights, prefix: &str) -> FocrResult<Siglip
                 b.len()
             )));
         }
-        Ok(Linear { w, b, out, in_ })
+        Linear::from_row_major(&w, b, out, in_)
     };
     let ln = |name: &str| -> FocrResult<LayerNormP> {
         let w = weights.vec(&format!("{name}.weight"))?;
@@ -337,11 +337,10 @@ mod tests {
         let wave = |n: usize, f: f32, a: f32| -> Vec<f32> {
             (0..n).map(|i| (i as f32 * f).sin() * a).collect()
         };
-        let linear = |out: usize, in_: usize, seed: f32| Linear {
-            w: wave(out * in_, 0.13 + seed, 0.02),
-            b: wave(out, 0.7 + seed, 0.01),
-            out,
-            in_,
+        let linear = |out: usize, in_: usize, seed: f32| {
+            let w = wave(out * in_, 0.13 + seed, 0.02);
+            Linear::from_row_major(&w, wave(out, 0.7 + seed, 0.01), out, in_)
+                .expect("synthetic linear shape")
         };
         let ln = |seed: f32| LayerNormP {
             w: (0..EMBED_DIM)

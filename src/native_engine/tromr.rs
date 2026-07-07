@@ -283,12 +283,7 @@ impl TromrEncoderW {
         }
 
         let lin = |wname: String, bname: String, out: usize, in_: usize| -> FocrResult<Linear> {
-            Ok(Linear {
-                w: weights.vec(&wname)?,
-                b: weights.vec(&bname)?,
-                out,
-                in_,
-            })
+            Linear::from_row_major(&weights.vec(&wname)?, weights.vec(&bname)?, out, in_)
         };
         let mut blocks = Vec::with_capacity(4);
         for i in 0..4 {
@@ -516,11 +511,14 @@ const SEED_NONOTE: u32 = 0;
 
 /// One attention sublayer's weights: `to_{q,k,v} [512, 256]` and the
 /// `on_attn` out projection `[512, 512]` — ALL bias-free (census §12/§16).
+/// Stored as pre-transposed [`Linear`]s (bd-av64.10): the AR loop applies
+/// these EVERY decode step, so building a projection per call re-transposed
+/// the same weights once per token per sublayer.
 struct AttnW {
-    to_q: Vec<f32>,
-    to_k: Vec<f32>,
-    to_v: Vec<f32>,
-    to_out: Vec<f32>,
+    to_q: Linear,
+    to_k: Linear,
+    to_v: Linear,
+    to_out: Linear,
 }
 
 /// A pre-branch LayerNorm's affine params.
@@ -578,20 +576,28 @@ impl TromrDecoderW {
         };
         let attn = |i: usize| -> FocrResult<AttnW> {
             let p = format!("decoder.net.attn_layers.layers.{i}.1.");
+            let nb = |suffix: &str, out: usize, in_: usize| -> FocrResult<Linear> {
+                Linear::from_row_major(
+                    &weights.vec(&format!("{p}{suffix}.weight"))?,
+                    Vec::new(),
+                    out,
+                    in_,
+                )
+            };
             Ok(AttnW {
-                to_q: weights.vec(&format!("{p}to_q.weight"))?,
-                to_k: weights.vec(&format!("{p}to_k.weight"))?,
-                to_v: weights.vec(&format!("{p}to_v.weight"))?,
-                to_out: weights.vec(&format!("{p}to_out.0.weight"))?,
+                to_q: nb("to_q", DEC_INNER, DIM)?,
+                to_k: nb("to_k", DEC_INNER, DIM)?,
+                to_v: nb("to_v", DEC_INNER, DIM)?,
+                to_out: nb("to_out.0", DEC_INNER, DEC_INNER)?,
             })
         };
         let head = |stream: &str, vocab: usize| -> FocrResult<Linear> {
-            Ok(Linear {
-                w: weights.vec(&format!("decoder.net.to_logits_{stream}.weight"))?,
-                b: weights.vec(&format!("decoder.net.to_logits_{stream}.bias"))?,
-                out: vocab,
-                in_: DIM,
-            })
+            Linear::from_row_major(
+                &weights.vec(&format!("decoder.net.to_logits_{stream}.weight"))?,
+                weights.vec(&format!("decoder.net.to_logits_{stream}.bias"))?,
+                vocab,
+                DIM,
+            )
         };
         let mut layers = Vec::with_capacity(4);
         for l in 0..4 {
@@ -602,30 +608,30 @@ impl TromrDecoderW {
                 ln_c: ln(format!("decoder.net.attn_layers.layers.{}.0.0", base + 1))?,
                 cross_attn: attn(base + 1)?,
                 ln_f: ln(format!("decoder.net.attn_layers.layers.{}.0.0", base + 2))?,
-                ff_proj: Linear {
-                    w: weights.vec(&format!(
+                ff_proj: Linear::from_row_major(
+                    &weights.vec(&format!(
                         "decoder.net.attn_layers.layers.{}.1.net.0.proj.weight",
                         base + 2
                     ))?,
-                    b: weights.vec(&format!(
+                    weights.vec(&format!(
                         "decoder.net.attn_layers.layers.{}.1.net.0.proj.bias",
                         base + 2
                     ))?,
-                    out: 2048,
-                    in_: DIM,
-                },
-                ff_out: Linear {
-                    w: weights.vec(&format!(
+                    2048,
+                    DIM,
+                )?,
+                ff_out: Linear::from_row_major(
+                    &weights.vec(&format!(
                         "decoder.net.attn_layers.layers.{}.1.net.3.weight",
                         base + 2
                     ))?,
-                    b: weights.vec(&format!(
+                    weights.vec(&format!(
                         "decoder.net.attn_layers.layers.{}.1.net.3.bias",
                         base + 2
                     ))?,
-                    out: DIM,
-                    in_: 1024,
-                },
+                    DIM,
+                    1024,
+                )?,
             });
         }
         Ok(Self {
@@ -644,14 +650,15 @@ impl TromrDecoderW {
 }
 
 /// Bias-free `[out, in]` projection: `y = x @ w^T`.
-fn proj_no_bias(x: &Mat, w: &[f32], out: usize) -> FocrResult<Mat> {
-    let lin = Linear {
-        w: w.to_vec(),
-        b: Vec::new(),
-        out,
-        in_: x.cols,
-    };
-    lin.apply(x)
+fn proj_no_bias(x: &Mat, w: &Linear, out: usize) -> FocrResult<Mat> {
+    if w.out != out {
+        return Err(crate::FocrError::Other(anyhow::anyhow!(
+            "tromr attention projection: out {} != expected {}",
+            w.out,
+            out
+        )));
+    }
+    w.apply(x)
 }
 
 /// One `on_attn` attention branch (self or cross — spec §4): q from `x_q`,
@@ -2941,11 +2948,15 @@ mod tests {
         let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
         let tk = fixture_tokenizer();
         let err = match recognize_page(&weights, &tk, &page) {
-            Ok(r) => panic!(
-                "both staves violate the clamp; expected a named error, got {} staves / {} skips",
-                r.staves.len(),
-                r.skips.len()
-            ),
+            Ok(r) => {
+                assert!(
+                    r.staves.len() == usize::MAX && r.skips.len() == usize::MAX,
+                    "both staves violate the clamp; expected a named error, got {} staves / {} skips",
+                    r.staves.len(),
+                    r.skips.len()
+                );
+                String::new()
+            }
             Err(e) => e.to_string(),
         };
         assert!(

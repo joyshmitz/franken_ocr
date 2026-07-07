@@ -75,12 +75,7 @@ pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResu
     let sam_t = transpose(&sam); // [256, 1024] token-major
     let w = weights.vec("model.mm_projector_vary.weight")?; // [1024*1024] row-major [out,in]
     let b = weights.vec("model.mm_projector_vary.bias")?; // [1024]
-    let proj = vision_sam::Linear {
-        w,
-        b,
-        out: 1024,
-        in_: 1024,
-    };
+    let proj = vision_sam::Linear::from_row_major(&w, b, 1024, 1024)?;
     proj.apply(&sam_t) // [256, 1024]
 }
 
@@ -189,12 +184,12 @@ pub fn recognize_batch(
     // the same amortization the MoE spine's vision stage performs.
     let th = std::time::Instant::now();
     let sam = vision_sam::sam_weights_from(weights, prefix)?;
-    let proj = vision_sam::Linear {
-        w: weights.vec("model.mm_projector_vary.weight")?,
-        b: weights.vec("model.mm_projector_vary.bias")?,
-        out: 1024,
-        in_: 1024,
-    };
+    let proj = vision_sam::Linear::from_row_major(
+        &weights.vec("model.mm_projector_vary.weight")?,
+        weights.vec("model.mm_projector_vary.bias")?,
+        1024,
+        1024,
+    )?;
     let embed = weights.mat("model.embed_tokens.weight")?;
     let (vocab, hidden) = (embed.rows, embed.cols);
     super::timing_log(&format!(

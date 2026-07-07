@@ -101,13 +101,20 @@ fn checked_conv_weight_len(
 
 // ── parameter bundles ──────────────────────────────────────────────────────
 
-/// A `nn.Linear` parameter pair (`[out, in]` row-major weight + length-`out`
-/// bias). PyTorch stores `Linear.weight` as `[out_features, in_features]`, so
-/// `y = x @ w^T + b`.
+/// A `nn.Linear` parameter pair, weight pre-transposed to the GEMM-ready
+/// `[in, out]` row-major layout plus a length-`out` bias.
+///
+/// PyTorch stores `Linear.weight` as `[out_features, in_features]`;
+/// [`Self::from_row_major`] transposes it ONCE at construction so `apply` is a
+/// straight matmul — bd-av64.10 measured the old transpose-at-apply-time as
+/// hundreds of MB of pure data movement per vision forward, and TrOMR's AR
+/// loop paid it PER DECODE STEP. Same floats in a different order ⇒ outputs
+/// byte-identical. The weight field is private so a mis-shaped Linear is
+/// unrepresentable outside the validating constructor.
 #[derive(Debug, Clone)]
 pub struct Linear {
-    /// `[out, in]` row-major weight.
-    pub w: Vec<f32>,
+    /// Weight pre-transposed to `[in_, out]` row-major.
+    wt: Mat,
     /// Length-`out` bias (may be empty for `bias=False`).
     pub b: Vec<f32>,
     /// Output features.
@@ -117,11 +124,40 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// Build from a PyTorch `[out, in]` row-major weight, transposing once and
+    /// validating every length at construction (fail-fast, so `apply` never
+    /// discovers a malformed bundle mid-forward).
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] when `w.len() != out*in` or a non-empty bias has
+    /// `b.len() != out`.
+    pub fn from_row_major(w: &[f32], b: Vec<f32>, out: usize, in_: usize) -> FocrResult<Self> {
+        let expected_weight_len = checked_shape_mul("vision_sam linear", out, in_, "out*in")?;
+        if w.len() != expected_weight_len {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: weight len {} != out*in {}",
+                w.len(),
+                expected_weight_len
+            )));
+        }
+        if !b.is_empty() && b.len() != out {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: bias len {} != out_features {}",
+                b.len(),
+                out
+            )));
+        }
+        // w is [out, in]; transpose to [in, out] so matmul([m,in],[in,out]).
+        let wt = Mat::from_vec(in_, out, transpose(w, out, in_));
+        Ok(Self { wt, b, out, in_ })
+    }
+
     /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`. Also the
     /// GOT `mm_projector_vary` connector (a plain Linear(1024→1024)+bias).
     ///
     /// # Errors
-    /// [`FocrError::Other`] if `x.cols != self.in_`.
+    /// [`FocrError::Other`] if `x.cols != self.in_` or the public shape
+    /// metadata was corrupted after construction.
     pub fn apply(&self, x: &Mat) -> FocrResult<Mat> {
         if x.cols != self.in_ {
             return Err(FocrError::Other(anyhow::anyhow!(
@@ -130,13 +166,13 @@ impl Linear {
                 self.in_
             )));
         }
-        let expected_weight_len =
-            checked_shape_mul("vision_sam linear", self.out, self.in_, "out*in")?;
-        if self.w.len() != expected_weight_len {
+        if self.wt.rows != self.in_ || self.wt.cols != self.out {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_sam linear: weight len {} != out*in {}",
-                self.w.len(),
-                expected_weight_len
+                "vision_sam linear: pretransposed weight shape [{}, {}] != [in,out] [{}, {}]",
+                self.wt.rows,
+                self.wt.cols,
+                self.in_,
+                self.out
             )));
         }
         if !self.b.is_empty() && self.b.len() != self.out {
@@ -146,10 +182,7 @@ impl Linear {
                 self.out
             )));
         }
-        // w is [out, in]; transpose to [in, out] so matmul([m,in],[in,out]).
-        let wt = transpose(&self.w, self.out, self.in_);
-        let wt_mat = Mat::from_vec(self.in_, self.out, wt);
-        let mut y = nn::matmul(x, &wt_mat)?;
+        let mut y = nn::matmul(x, &self.wt)?;
         if !self.b.is_empty() {
             for r in 0..y.rows {
                 let row = y.row_mut(r);
@@ -372,36 +405,36 @@ pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<Sa
         blocks.push(BlockP {
             norm1: ln(&format!("{b}.norm1"))?,
             attn: AttnP {
-                qkv: Linear {
-                    w: flat(&qkv_name)?,
-                    b: flat(&format!("{b}.attn.qkv.bias"))?,
-                    out: q_out,
-                    in_: q_in,
-                },
-                proj: Linear {
-                    w: flat(&proj_name)?,
-                    b: flat(&format!("{b}.attn.proj.bias"))?,
-                    out: proj_out,
-                    in_: proj_in,
-                },
+                qkv: Linear::from_row_major(
+                    &flat(&qkv_name)?,
+                    flat(&format!("{b}.attn.qkv.bias"))?,
+                    q_out,
+                    q_in,
+                )?,
+                proj: Linear::from_row_major(
+                    &flat(&proj_name)?,
+                    flat(&format!("{b}.attn.proj.bias"))?,
+                    proj_out,
+                    proj_in,
+                )?,
                 rel_pos_h: flat(&rph_name)?,
                 rel_pos_w: flat(&rpw_name)?,
                 size_h: rph_rows.div_ceil(2),
                 size_w: rpw_rows.div_ceil(2),
             },
             norm2: ln(&format!("{b}.norm2"))?,
-            lin1: Linear {
-                w: flat(&lin1_name)?,
-                b: flat(&format!("{b}.mlp.lin1.bias"))?,
-                out: lin1_out,
-                in_: lin1_in,
-            },
-            lin2: Linear {
-                w: flat(&lin2_name)?,
-                b: flat(&format!("{b}.mlp.lin2.bias"))?,
-                out: lin2_out,
-                in_: lin2_in,
-            },
+            lin1: Linear::from_row_major(
+                &flat(&lin1_name)?,
+                flat(&format!("{b}.mlp.lin1.bias"))?,
+                lin1_out,
+                lin1_in,
+            )?,
+            lin2: Linear::from_row_major(
+                &flat(&lin2_name)?,
+                flat(&format!("{b}.mlp.lin2.bias"))?,
+                lin2_out,
+                lin2_in,
+            )?,
             window,
         });
     }
@@ -1726,15 +1759,14 @@ mod tests {
         assert_eq!(transpose(&t, 3, 2), m);
     }
 
+    fn test_linear(w: Vec<f32>, b: Vec<f32>, out: usize, in_: usize) -> Linear {
+        Linear::from_row_major(&w, b, out, in_).expect("test linear shape is valid")
+    }
+
     #[test]
     fn linear_applies_weight_and_bias() -> FocrResult<()> {
         // w = [[1,2,3],[4,5,6]] (out=2,in=3), b=[10,20]
-        let lin = Linear {
-            w: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            b: vec![10.0, 20.0],
-            out: 2,
-            in_: 3,
-        };
+        let lin = test_linear(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![10.0, 20.0], 2, 3);
         // x = [[1,1,1]] -> y = [1+2+3+10, 4+5+6+20] = [16, 35]
         let x = Mat::from_vec(1, 3, vec![1.0, 1.0, 1.0]);
         let y = lin.apply(&x)?;
@@ -1746,38 +1778,17 @@ mod tests {
 
     #[test]
     fn linear_rejects_malformed_shapes_without_panic() {
-        let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
         assert_err_contains(
-            Linear {
-                w: vec![1.0; 5],
-                b: vec![],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&x),
+            Linear::from_row_major(&[1.0; 5], vec![], 2, 3),
             "weight len",
         );
         assert_err_contains(
-            Linear {
-                w: vec![1.0; 6],
-                b: vec![0.0],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&x),
+            Linear::from_row_major(&[1.0; 6], vec![0.0], 2, 3),
             "bias len",
         );
         let bad_x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
-        assert_err_contains(
-            Linear {
-                w: vec![1.0; 6],
-                b: vec![],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&bad_x),
-            "input cols",
-        );
+        let lin = test_linear(vec![1.0; 6], vec![], 2, 3);
+        assert_err_contains(lin.apply(&bad_x), "input cols");
     }
 
     #[test]
@@ -2069,18 +2080,8 @@ mod tests {
                 b: vec![0.0; dim],
             },
             attn: AttnP {
-                qkv: Linear {
-                    w: identity_block_3(dim),
-                    b: vec![0.0; 3 * dim],
-                    out: 3 * dim,
-                    in_: dim,
-                },
-                proj: Linear {
-                    w: identity_mat(dim),
-                    b: vec![0.0; dim],
-                    out: dim,
-                    in_: dim,
-                },
+                qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+                proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
                 rel_pos_h: vec![0.0; rel_rows * hd],
                 rel_pos_w: vec![0.0; rel_rows * hd],
                 size_h: size,
@@ -2090,18 +2091,13 @@ mod tests {
                 w: vec![1.0; dim],
                 b: vec![0.0; dim],
             },
-            lin1: Linear {
-                w: vec![0.0; MLP_HIDDEN * dim],
-                b: vec![0.0; MLP_HIDDEN],
-                out: MLP_HIDDEN,
-                in_: dim,
-            },
-            lin2: Linear {
-                w: vec![0.0; dim * MLP_HIDDEN],
-                b: vec![0.0; dim],
-                out: dim,
-                in_: MLP_HIDDEN,
-            },
+            lin1: test_linear(
+                vec![0.0; MLP_HIDDEN * dim],
+                vec![0.0; MLP_HIDDEN],
+                MLP_HIDDEN,
+                dim,
+            ),
+            lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
             window,
         }
     }
@@ -2205,18 +2201,8 @@ mod tests {
         let n = grid * grid;
         let rel_rows = 2 * grid - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: (0..rel_rows * hd)
                 .map(|i| ((i % 13) as f32 - 6.0) * 0.0011)
                 .collect(),
@@ -2250,16 +2236,20 @@ mod tests {
         let dim = EMBED_DIM;
         let x = Mat::from_vec(4, dim, vec![0.0; 4 * dim]);
 
+        // Each Linear is VALID in isolation (the constructor enforces that);
+        // its out is simply incompatible with the attention dim, which is
+        // exactly what attention's own shape guards must reject.
         let mut bad_qkv = tiny_block(0).attn;
-        bad_qkv.qkv.out = 3 * dim - 1;
-        bad_qkv.qkv.w = vec![0.0; bad_qkv.qkv.out * bad_qkv.qkv.in_];
-        bad_qkv.qkv.b = vec![0.0; bad_qkv.qkv.out];
+        bad_qkv.qkv = test_linear(
+            vec![0.0; (3 * dim - 1) * dim],
+            vec![0.0; 3 * dim - 1],
+            3 * dim - 1,
+            dim,
+        );
         assert_err_contains(attention(&bad_qkv, &x, 2, 2, None), "qkv shape");
 
         let mut bad_proj = tiny_block(0).attn;
-        bad_proj.proj.out = dim - 1;
-        bad_proj.proj.w = vec![0.0; bad_proj.proj.out * bad_proj.proj.in_];
-        bad_proj.proj.b = vec![0.0; bad_proj.proj.out];
+        bad_proj.proj = test_linear(vec![0.0; (dim - 1) * dim], vec![0.0; dim - 1], dim - 1, dim);
         assert_err_contains(attention(&bad_proj, &x, 2, 2, None), "proj shape");
     }
 
@@ -2298,9 +2288,17 @@ mod tests {
     #[test]
     fn block_forward_rejects_mlp_residual_shape_mismatch() {
         let mut blk = tiny_block(0);
-        blk.lin2.out = EMBED_DIM - 1;
-        blk.lin2.w = vec![0.0; blk.lin2.out * blk.lin2.in_];
-        blk.lin2.b = vec![0.0; blk.lin2.out];
+        // A VALID Linear (the constructor validates lengths) whose out is one
+        // short of EMBED_DIM, so the mlp output genuinely mismatches h1 and the
+        // residual shape guard fires. Mutating only the pub `out`/`b` fields
+        // would leave the private pre-transposed weight at the old width and
+        // panic in the bias add instead of erroring.
+        blk.lin2 = test_linear(
+            vec![0.0; (EMBED_DIM - 1) * MLP_HIDDEN],
+            vec![0.0; EMBED_DIM - 1],
+            EMBED_DIM - 1,
+            MLP_HIDDEN,
+        );
         let n = 4;
         let dim = EMBED_DIM;
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32 % 5.0) * 0.01).collect();
@@ -2321,18 +2319,8 @@ mod tests {
         let size = 2;
         let rel_rows = 2 * size - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: vec![0.0; rel_rows * hd],
             rel_pos_w: vec![0.0; rel_rows * hd],
             size_h: size,
@@ -2358,18 +2346,8 @@ mod tests {
         let n = grid * grid;
         let rel_rows = 2 * grid - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: (0..rel_rows * hd)
                 .map(|i| ((i % 17) as f32 - 8.0) * 0.0007)
                 .collect(),
@@ -2459,18 +2437,13 @@ mod tests {
                         b: vec![0.0; dim],
                     },
                     attn: AttnP {
-                        qkv: Linear {
-                            w: vec![0.0; 3 * dim * dim],
-                            b: vec![0.0; 3 * dim],
-                            out: 3 * dim,
-                            in_: dim,
-                        },
-                        proj: Linear {
-                            w: vec![0.0; dim * dim],
-                            b: vec![0.0; dim],
-                            out: dim,
-                            in_: dim,
-                        },
+                        qkv: test_linear(
+                            vec![0.0; 3 * dim * dim],
+                            vec![0.0; 3 * dim],
+                            3 * dim,
+                            dim,
+                        ),
+                        proj: test_linear(vec![0.0; dim * dim], vec![0.0; dim], dim, dim),
                         rel_pos_h: vec![0.0; rel_rows * hd],
                         rel_pos_w: vec![0.0; rel_rows * hd],
                         size_h: size,
@@ -2480,18 +2453,13 @@ mod tests {
                         w: vec![1.0; dim],
                         b: vec![0.0; dim],
                     },
-                    lin1: Linear {
-                        w: vec![0.0; MLP_HIDDEN * dim],
-                        b: vec![0.0; MLP_HIDDEN],
-                        out: MLP_HIDDEN,
-                        in_: dim,
-                    },
-                    lin2: Linear {
-                        w: vec![0.0; dim * MLP_HIDDEN],
-                        b: vec![0.0; dim],
-                        out: dim,
-                        in_: MLP_HIDDEN,
-                    },
+                    lin1: test_linear(
+                        vec![0.0; MLP_HIDDEN * dim],
+                        vec![0.0; MLP_HIDDEN],
+                        MLP_HIDDEN,
+                        dim,
+                    ),
+                    lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
                     window,
                 }
             })
@@ -2610,18 +2578,13 @@ mod tests {
                         b: vec![0.0; dim],
                     },
                     attn: AttnP {
-                        qkv: Linear {
-                            w: vec![0.0; 3 * dim * dim],
-                            b: vec![0.0; 3 * dim],
-                            out: 3 * dim,
-                            in_: dim,
-                        },
-                        proj: Linear {
-                            w: vec![0.0; dim * dim],
-                            b: vec![0.0; dim],
-                            out: dim,
-                            in_: dim,
-                        },
+                        qkv: test_linear(
+                            vec![0.0; 3 * dim * dim],
+                            vec![0.0; 3 * dim],
+                            3 * dim,
+                            dim,
+                        ),
+                        proj: test_linear(vec![0.0; dim * dim], vec![0.0; dim], dim, dim),
                         rel_pos_h: vec![0.0; rel_rows * hd],
                         rel_pos_w: vec![0.0; rel_rows * hd],
                         size_h: size,
@@ -2631,18 +2594,13 @@ mod tests {
                         w: vec![1.0; dim],
                         b: vec![0.0; dim],
                     },
-                    lin1: Linear {
-                        w: vec![0.0; MLP_HIDDEN * dim],
-                        b: vec![0.0; MLP_HIDDEN],
-                        out: MLP_HIDDEN,
-                        in_: dim,
-                    },
-                    lin2: Linear {
-                        w: vec![0.0; dim * MLP_HIDDEN],
-                        b: vec![0.0; dim],
-                        out: dim,
-                        in_: MLP_HIDDEN,
-                    },
+                    lin1: test_linear(
+                        vec![0.0; MLP_HIDDEN * dim],
+                        vec![0.0; MLP_HIDDEN],
+                        MLP_HIDDEN,
+                        dim,
+                    ),
+                    lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
                     window,
                 }
             })
@@ -2716,12 +2674,12 @@ mod tests {
         (x as f32) / 1000.0 - 0.5
     }
     fn rand_lin(out: usize, inn: usize, salt: usize) -> Linear {
-        Linear {
-            w: (0..out * inn).map(|i| det(i, salt)).collect(),
-            b: (0..out).map(|i| det(i, salt + 1)).collect(),
+        test_linear(
+            (0..out * inn).map(|i| det(i, salt)).collect(),
+            (0..out).map(|i| det(i, salt + 1)).collect(),
             out,
-            in_: inn,
-        }
+            inn,
+        )
     }
     fn rand_ln(dim: usize, salt: usize) -> LayerNormP {
         LayerNormP {
