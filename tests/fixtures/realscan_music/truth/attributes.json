@@ -55,8 +55,8 @@
     "staff_count": 12,
     "staff_count_note": "5 two-staff systems of No.16 + first system of No.17; verified by eye",
     "clefs_all": "G2",
-    "min_recognized": 5,
-    "xfail_note": "PROMOTED 2026-07-07 at floor 5 (was 0 recognized pre-bd-av64.14): fit-first geometry rescues 5 of the 7 detected bands; the 2 tightest duet bands still exceed the budget within their neighbor bounds \u2014 barline splitting (bd-av64.4) or finer detection owns the remainder"
+    "min_recognized": 7,
+    "xfail_note": "HARDENED 2026-07-07 at 7 = every detected staff: bd-av64.14 fit-first geometry rescued 5, bd-av64.4 barline splitting rescued the final 2 clamp-bound duet bands (0 recognized before the pair)"
   },
   "pages/spohr_p100.png": {
     "kind": "full_page_mixed_prose",

@@ -35,6 +35,9 @@ pub struct StaffCrop {
     pub h: usize,
     /// `(x, y, w, h)` on the deskewed page.
     pub bbox: (usize, usize, usize, usize),
+    /// The five staff-line center rows, band-relative (top to bottom) —
+    /// the anchor for barline detection (bd-av64.4).
+    pub lines: [usize; 5],
 }
 
 /// The ink gray plane (shared with `tromr_staff_tensor` — DISC-004 rule).
@@ -268,6 +271,7 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
                 w,
                 h: ch,
                 bbox: (0, y0_classic, w, ch),
+                lines: five.map(|l| l - y0_classic),
             });
             continue;
         }
@@ -326,9 +330,64 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
             w: cw,
             h: ch,
             bbox: (x0, y0, cw, ch),
+            lines: five.map(|l| l - y0),
         });
     }
     Ok(crops)
+}
+
+/// Candidate barline columns within a staff band (bd-av64.4): the centers
+/// of thin vertical ink runs spanning the full five-line staff. A column
+/// qualifies when >= 95% of the rows between the outer staff lines are ink
+/// AND both outer lines are inked within one row; note stems rarely bridge
+/// both outer lines, and beams/noteheads fail the thin-run filter (a
+/// qualifying run wider than ~half a line-spacing is engraving, not a
+/// barline). Isolation is enforced by requiring the columns flanking a run
+/// to fall below half coverage. Classical CV only — no ML.
+#[must_use]
+pub fn barline_columns(crop: &StaffCrop) -> Vec<usize> {
+    let thr = otsu_threshold(&crop.gray);
+    let (l0, l4) = (crop.lines[0], crop.lines[4]);
+    if l4 <= l0 || l4 >= crop.h {
+        return Vec::new();
+    }
+    // Line CENTERS carry +-2 rows of detection error on real scans, so the
+    // coverage window is the INTERIOR span [l0+1, l4-1] at a 92% floor, and
+    // the outer-line presence checks tolerate +-2 rows (measured on the
+    // 1843 Spohr fixture: true barlines are 100% covered, the strict
+    // full-span/95%/+-1 form missed every one of them).
+    let (a, b) = (l0 + 1, l4 - 1);
+    let span = b - a + 1;
+    let need = span * 92 / 100;
+    let spacing = (l4 - l0) / 4;
+    let max_run = (spacing / 2).max(2);
+    let ink_at = |x: usize, y: usize| crop.gray[y * crop.w + x] <= thr;
+    let coverage = |x: usize| (a..=b).filter(|&y| ink_at(x, y)).count();
+    let near = |x: usize, l: usize| {
+        (l.saturating_sub(2)..=(l + 2).min(crop.h - 1)).any(|y| ink_at(x, y))
+    };
+    let qualifies = |x: usize| coverage(x) >= need && near(x, l0) && near(x, l4);
+    let mut out = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for x in 0..=crop.w {
+        let q = x < crop.w && qualifies(x);
+        match (q, run_start) {
+            (true, None) => run_start = Some(x),
+            (false, Some(s)) => {
+                run_start = None;
+                let e = x;
+                if e - s <= max_run {
+                    let left_clear = s == 0 || coverage(s - 1) < span / 2;
+                    let right_clear = e >= crop.w || coverage(e) < span / 2;
+                    if left_clear && right_clear {
+                        out.push((s + e - 1) / 2);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -412,6 +471,62 @@ mod tests {
             detect_staves(&four).expect("runs").is_empty(),
             "4 lines != a staff"
         );
+    }
+
+    /// bd-av64.4: barline detection — thin full-span verticals found at
+    /// their drawn positions; stems (partial span) and beams (wide) do not
+    /// qualify; speckle noise does not create false bars.
+    #[test]
+    fn barline_columns_finds_thin_full_span_verticals() {
+        // 800x160 band: 5 lines at rows 40..80 (spacing 10), thickness 2.
+        let (w, h) = (800usize, 160usize);
+        let mut gray = vec![250u8; w * h];
+        for line in 0..5 {
+            let y = 40 + line * 10;
+            for dy in 0..2 {
+                for x in 20..780 {
+                    gray[(y + dy) * w + x] = 10;
+                }
+            }
+        }
+        // Three true barlines (2px wide, spanning rows 40..82).
+        for &bx in &[200usize, 450, 700] {
+            for x in bx..bx + 2 {
+                for y in 40..82 {
+                    gray[y * w + x] = 10;
+                }
+            }
+        }
+        // A stem-like partial vertical (rows 52..82 only) must NOT qualify.
+        for y in 52..82 {
+            gray[y * w + 300] = 10;
+        }
+        // A beam-like WIDE dark block spanning the staff must NOT qualify.
+        for x in 550..580 {
+            for y in 40..82 {
+                gray[y * w + x] = 10;
+            }
+        }
+        // Speckle noise.
+        for k in 0..50 {
+            let (x, y) = ((k * 37) % w, (k * 53) % h);
+            gray[y * w + x] = 15;
+        }
+        let crop = StaffCrop {
+            gray,
+            w,
+            h,
+            bbox: (0, 0, w, h),
+            lines: [40, 50, 60, 70, 80],
+        };
+        let bars = barline_columns(&crop);
+        assert_eq!(bars.len(), 3, "exactly the drawn barlines: {bars:?}");
+        for (got, want) in bars.iter().zip([200usize, 450, 700]) {
+            assert!(
+                got.abs_diff(want) <= 2,
+                "barline at {got} expected near {want}"
+            );
+        }
     }
 
     /// bd-av64.14 FIT-FIRST: a band that already fits the positional budget

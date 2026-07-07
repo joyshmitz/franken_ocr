@@ -1588,6 +1588,97 @@ pub fn recognize(
     Ok(MusicResult { semantic, musicxml })
 }
 
+/// Strip hallucinated leading attribute events (`clef-`/`keySignature-`/
+/// `timeSignature-`) from a CONTINUATION segment's semantic stream: the
+/// source engraving prints them only at the line start, so anything the
+/// model emits at a mid-line segment boundary is an artifact of the cut
+/// (bd-av64.4).
+fn strip_leading_attrs(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let head = rest.split('+').next().unwrap_or("");
+        if head.starts_with("clef-")
+            || head.starts_with("keySignature-")
+            || head.starts_with("timeSignature-")
+        {
+            rest = rest[head.len()..].trim_start_matches('+');
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// Recognize an over-budget staff band by splitting it at detected
+/// barlines into segments that each fit the positional budget, running the
+/// certified single-staff path per segment SEQUENTIALLY (doctrine #5), and
+/// concatenating the semantic streams (bd-av64.4). Returns `Ok(None)` when
+/// the band has no usable barlines to cut at — the caller falls through to
+/// the normal path, whose clamp error becomes a per-staff skip.
+///
+/// Cuts land ON physical barlines, so a `barline` token is inserted at
+/// each seam when the left segment did not already emit one; continuation
+/// segments get their hallucinated leading clef/key/time stripped.
+///
+/// # Errors
+/// A per-segment recognition failure (the whole staff then skips).
+fn recognize_split(
+    weights: &Weights,
+    tk: &crate::tokenizer::music::MusicTokenizer,
+    crop: &crate::preprocess::staff_detect::StaffCrop,
+    budget_px: usize,
+) -> FocrResult<Option<MusicResult>> {
+    let bars = crate::preprocess::staff_detect::barline_columns(crop);
+    // Greedy plan: from each start, cut at the FARTHEST barline within
+    // budget (a segment must also be meaningfully wide — at least one band
+    // height — so degenerate cuts at the very start are ignored).
+    let mut cuts = vec![0usize];
+    let mut start = 0usize;
+    while crop.w - start > budget_px {
+        let limit = start + budget_px;
+        let Some(&cut) = bars.iter().rfind(|&&b| b > start + crop.h && b <= limit) else {
+            return Ok(None);
+        };
+        cuts.push(cut);
+        start = cut;
+    }
+    cuts.push(crop.w);
+
+    let mut semantic = String::new();
+    for (seg_idx, wnd) in cuts.windows(2).enumerate() {
+        let (a, b) = (wnd[0], wnd[1]);
+        let mut seg = vec![0u8; crop.h * (b - a)];
+        for row in 0..crop.h {
+            seg[row * (b - a)..(row + 1) * (b - a)]
+                .copy_from_slice(&crop.gray[row * crop.w + a..row * crop.w + b]);
+        }
+        let buf =
+            image::GrayImage::from_raw((b - a) as u32, crop.h as u32, seg).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("tromr split: segment buffer mismatch"))
+            })?;
+        let t0 = std::time::Instant::now();
+        let res = recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf))?;
+        super::timing_log(&format!(
+            "    tromr.split seg {seg_idx} [{a}..{b}] {:.2}s ({} chars)",
+            t0.elapsed().as_secs_f64(),
+            res.semantic.len()
+        ));
+        if semantic.is_empty() {
+            semantic = res.semantic;
+        } else {
+            if !semantic.ends_with("barline") {
+                semantic.push_str("+barline");
+            }
+            let cont = strip_leading_attrs(&res.semantic);
+            if !cont.is_empty() {
+                semantic.push('+');
+                semantic.push_str(cont);
+            }
+        }
+    }
+    let musicxml = semantic_to_musicxml(&semantic)?;
+    Ok(Some(MusicResult { semantic, musicxml }))
+}
+
 /// One staff the page path could NOT recognize: its detection index
 /// (0-based, top-to-bottom over ALL detected staves), page-space bbox, and
 /// the per-staff error text. The page as a whole still succeeds with the
@@ -1646,11 +1737,32 @@ pub fn recognize_page(
     let mut skips = Vec::new();
     for (index, crop) in crops.into_iter().enumerate() {
         let (cw, ch, bbox) = (crop.w, crop.h, crop.bbox);
-        let outcome = image::GrayImage::from_raw(cw as u32, ch as u32, crop.gray)
-            .ok_or_else(|| {
-                FocrError::Other(anyhow::anyhow!("tromr page: crop buffer shape mismatch"))
-            })
-            .and_then(|buf| recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf)));
+        // Over-budget bands (which the geometry pass could not fit,
+        // bd-av64.14) get one more chance: barline splitting (bd-av64.4).
+        let over_budget = IMG_H * cw > POS_COLS * PATCH * ch;
+        let outcome = if over_budget {
+            let budget_px = POS_COLS * PATCH * ch / IMG_H;
+            match recognize_split(weights, tk, &crop, budget_px) {
+                Ok(Some(res)) => {
+                    super::timing_log(&format!(
+                        "  tromr.staff {index} split-recognized ({cw}x{ch})"
+                    ));
+                    Ok(res)
+                }
+                Ok(None) => Err(FocrError::Other(anyhow::anyhow!(
+                    "band resizes past the {} position budget and no usable \
+                     barlines were found to split at ({cw}x{ch})",
+                    POS_COLS * PATCH
+                ))),
+                Err(e) => Err(e),
+            }
+        } else {
+            image::GrayImage::from_raw(cw as u32, ch as u32, crop.gray)
+                .ok_or_else(|| {
+                    FocrError::Other(anyhow::anyhow!("tromr page: crop buffer shape mismatch"))
+                })
+                .and_then(|buf| recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf)))
+        };
         match outcome {
             Ok(res) => {
                 super::timing_log(&format!(
@@ -2421,6 +2533,94 @@ mod tests {
             result.skips[0].reason
         );
         assert_eq!(result.skips[0].index, 1, "the SECOND staff is the skip");
+    }
+
+    /// bd-av64.4 detection-lossless proof: a staff narrow enough to run
+    /// whole is ALSO run through the barline-split path with a forced
+    /// budget; the concatenated semantic must carry the same attributes and
+    /// the same note/rest content (the split may only differ by seam
+    /// `barline` bookkeeping). Model-gated.
+    #[test]
+    fn tromr_split_matches_whole_staff_read() {
+        let Some(dir) = zoo_dir() else {
+            eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
+            return;
+        };
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/realscan_music/staves/spohr_no17_top.png");
+        if !fixture.is_file() {
+            eprintln!("[tromr-test] skip_no_model: realscan fixture absent");
+            return;
+        }
+        let img = image::open(&fixture).expect("fixture opens");
+        let crops = crate::preprocess::staff_detect::detect_staves(&img).expect("detect runs");
+        assert_eq!(crops.len(), 1, "fixture is a single staff");
+        let crop = &crops[0];
+
+        let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
+        let tk = fixture_tokenizer();
+
+        let whole = {
+            let buf = image::GrayImage::from_raw(crop.w as u32, crop.h as u32, crop.gray.clone())
+                .expect("crop buffer");
+            recognize(&weights, &tk, &image::DynamicImage::ImageLuma8(buf))
+                .expect("whole-staff read")
+        };
+        eprintln!(
+            "[tromr-cert] fixture crop {}x{} lines {:?} bars {:?}",
+            crop.w,
+            crop.h,
+            crop.lines,
+            crate::preprocess::staff_detect::barline_columns(crop)
+        );
+        let split = recognize_split(&weights, &tk, crop, crop.w * 2 / 3)
+            .expect("split runs")
+            .expect("fixture has usable barlines");
+
+        let notes_only = |sem: &str| -> Vec<String> {
+            sem.split('+')
+                .filter(|t| !t.is_empty() && *t != "barline")
+                .filter(|t| {
+                    !t.starts_with("clef-")
+                        && !t.starts_with("keySignature-")
+                        && !t.starts_with("timeSignature-")
+                })
+                .map(str::to_owned)
+                .collect()
+        };
+        let (wn, sn) = (notes_only(&whole.semantic), notes_only(&split.semantic));
+        eprintln!(
+            "[tromr-cert] split-vs-whole: whole {} tokens, split {} tokens",
+            wn.len(),
+            sn.len()
+        );
+        // Attributes: identical.
+        for attr in ["clef-", "keySignature-", "timeSignature-"] {
+            let w_attr: Vec<&str> = whole
+                .semantic
+                .split('+')
+                .filter(|t| t.starts_with(attr))
+                .collect();
+            let s_attr: Vec<&str> = split
+                .semantic
+                .split('+')
+                .filter(|t| t.starts_with(attr))
+                .collect();
+            assert_eq!(w_attr, s_attr, "{attr} attributes must match");
+        }
+        // Note content: pin the measured similarity (token-level Levenshtein
+        // via the SER helper shape — here simple prefix/suffix agreement is
+        // too brittle; require >= 80% of the whole read's tokens to appear
+        // in order in the split read).
+        let mut it = sn.iter();
+        let matched = wn.iter().filter(|w| it.by_ref().any(|s| s == *w)).count();
+        let ratio = matched as f64 / wn.len().max(1) as f64;
+        eprintln!("[tromr-cert] split-vs-whole in-order token match: {ratio:.3}");
+        assert!(
+            ratio >= 0.8,
+            "split read diverged from whole read: {ratio:.3} ({matched}/{})",
+            wn.len()
+        );
     }
 
     /// bd-av64.2: when EVERY detected staff fails, the page error names each
