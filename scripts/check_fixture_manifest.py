@@ -32,7 +32,11 @@ def check(fixtures_dir: str, manifest_path: str) -> list[str]:
     on_disk = {
         name
         for name in os.listdir(fixtures_dir)
-        if not name.startswith(".")
+        # `.actual` files are the golden review loop's OWN diff aids — a
+        # failing golden writes `<fixture>.actual` beside the frozen file for
+        # review (GOLDEN.md §4). They are ephemeral local debris by design,
+        # never committed, so the manifest contract does not govern them.
+        if not name.startswith(".") and not name.endswith(".actual")
     }
     declared = set(entries)
 
