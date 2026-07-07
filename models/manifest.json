@@ -191,6 +191,23 @@
     "tromr": {
       "license_notice": "Polyphonic-TrOMR (NetEase) - Apache-2.0",
       "quants": {
+        "int8": {
+          "focrq": {
+            "filename": "tromr.int8.focrq",
+            "size": 61107485,
+            "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
+            "parts": [
+              {
+                "size": 61107485,
+                "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.int8.focrq"
+                ]
+              }
+            ]
+          }
+        },
         "f32": {
           "focrq": {
             "filename": "tromr.focrq",

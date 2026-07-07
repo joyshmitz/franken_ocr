@@ -431,11 +431,12 @@ pub struct PullOutcome {
 }
 
 /// Pick the quant entry for a pull. Exact match wins; otherwise, when the
-/// model publishes EXACTLY ONE quant, fall back to it — the CLI default is
-/// `int8`, TrOMR ships f32-only (int8 gated behind an unrun lossless
-/// proof), and failing `focr pull tromr` over a default flag serves no one.
-/// The returned tag is the ACTUAL quant (callers report it; `pull` prints a
-/// visible note when it differs from the request).
+/// model publishes EXACTLY ONE quant, fall back to it — failing a pull over
+/// a default flag serves no one when the model's only artifact is
+/// unambiguous (TrOMR shipped f32-only this way until the bd-av64.12
+/// lossless proof added int8). The returned tag is the ACTUAL quant
+/// (callers report it; `pull` prints a visible note when it differs from
+/// the request).
 ///
 /// # Errors
 /// [`FocrError::Usage`] when the quant is absent and the fallback is
@@ -814,8 +815,9 @@ mod tests {
         let tromr = &m.models["tromr"];
         assert_eq!(
             tromr.quants.keys().cloned().collect::<Vec<_>>(),
-            vec!["f32".to_string()],
-            "tromr publishes f32 only (int8 gated behind a lossless proof)"
+            vec!["f32".to_string(), "int8".to_string()],
+            "tromr publishes f32 AND int8 (bd-av64.12: 40 decoder GEMMs, \
+             golden byte-identical, corpus gate delta 0)"
         );
         assert_eq!(tromr.tokenizer.filename, "tokenizer_rhythm.json");
         let mut tromr_sidecars: Vec<&str> =

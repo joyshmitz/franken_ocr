@@ -74,6 +74,51 @@ since exact-token OCR fails in the tail.
 
 ---
 
+## DISC-005: TrOMR int8 weight storage diverges the token stream on ONE tier-2 degraded page (spohr_p100)
+
+- claim_id / evidence_id: CLAIM-tromr-int8-p100 → bd-av64.12 (measurement log in
+    the bead close note; comparison tree preserved in the session scratchpad)
+- Provenance: TrOMR export `model.safetensors` sha256 `41c88802…`
+    (`TROMR_EXPORT_MANIFEST.json`); f32 artifact `tromr.focrq` sha256
+    `a9d41485…` (models-tromr-v1); int8 artifact `tromr.int8.focrq` sha256
+    `cced11c0…` (models-tromr-v1, 40/260 tensors QInt8PerChan = exactly the
+    decoder-GEMM candidate set, 61 107 485 bytes vs 86 168 002 f32, −29 %);
+    fixture `tests/fixtures/realscan_music/pages/spohr_p100.png` sha256
+    `b3004420f8ca5de6…` (tier-2: goldens-labeled-NOT-truth, 1843 real scan).
+- CPU feature string: aarch64+neon+i8mm (Apple M4).
+- Exact command + env: `focr ocr --model <artifact> --task music
+    tests/fixtures/realscan_music/pages/spohr_p100.png` per artifact, byte-diff
+    of the two MusicXML outputs; `scripts/realscan_music_gate.sh` with
+    `FOCR_TROMR_DIR=<int8 dir>`.
+- Reference behavior: the published f32 artifact's forward (itself unreliable
+    on this page: repetition-runs — E4 quarters — and an `overfull_bar 448/256`
+    sanity annotation).
+- Our impl: int8 per-output-channel weight STORAGE with dequant-on-access in
+    `Weights::mat()/vec()` (`src/native_engine/weights.rs`) — compute stays f32;
+    the divergence is pure weight-rounding (`round(w/scale)*scale`), not an
+    int8 kernel.
+- Fallback / kill-switch state: artifact choice, not an env var — the f32
+    artifact stays published; `focr pull tromr --quant f32` restores the
+    reference bytes exactly (the round-trip test proves HP tensors byte-exact).
+- Measured impact: 5/6 corpus fixtures byte-identical MusicXML end-to-end,
+    including the committed golden `spohr_no17_top` (also byte-identical when
+    run from a clean-cache PULLED int8 artifact). Corpus gate delta 0: same
+    pass/xfail verdicts, same staff counts (p055 5/5, p100 3 recognized vs
+    floor 1). p100 only: token stream forks (int8 garbles with F4
+    repetition-runs where f32 garbles with E4 runs; both annotated overfull);
+    the fixture has no ground truth, so neither side is "correct" — the page's
+    truth floor (≥1 staff recognized) holds identically.
+- Resolution: ACCEPTED — int8 published as the default pull quant (matches the
+    zoo convention; 25 MB smaller download), f32 retained for bit-exact
+    reference work.
+- Tests affected: `quant::convert::tests::tromr_real_artifact_roundtrips_byte_exact`
+    (accepts the 0-int8 f32 artifact or the 40-int8 artifact, HP remainder
+    byte-exact); `weights::tests::qint8_records_dequant_on_access_via_mat_and_vec`;
+    `scripts/realscan_music_gate.sh` (green on both artifacts).
+- Review date: 2026-07-07.
+
+---
+
 ## DISC-004: TrOMR upstream `readimg` blanks fully-opaque RGBA inputs; opaque-alpha images take the RGB path here
 
 - claim_id / evidence_id: CLAIM-e8-alpha-ink → the armed E8/E9 cert logs

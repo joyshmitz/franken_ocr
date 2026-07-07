@@ -105,6 +105,7 @@ shape).
 | `models-onechart-v1` | `vocab.json` | 999 355 | `32b29acf82d33334…` |
 | `models-onechart-v1` | `merges.txt` | 456 318 | `1ce1664773c50f3e…` |
 | `models-onechart-v1` | `added_tokens.json` | 82 | `e1b04af1435ff5b4…` |
+| `models-tromr-v1` | `tromr.int8.focrq` | 61 107 485 | `cced11c0f05656dd…` |
 | `models-tromr-v1` | `tromr.focrq` (f32) | 86 168 002 | `a9d41485a98534ad…` |
 | `models-tromr-v1` | `tokenizer_rhythm.json` | 10 743 | `603bfef760e8424f…` |
 | `models-tromr-v1` | `tokenizer_pitch.json` | 2 682 | `2382e8b20c147329…` |
@@ -117,9 +118,11 @@ onechart = focrq + `vocab.json` + `merges.txt` + `added_tokens.json`
 (`Tokenizer::from_opt_dir`); tromr = focrq + all four `tokenizer_*.json`
 (`MusicTokenizer::from_dir`). TrOMR's `config.yaml` is **convert-time only**
 (zero runtime references) — attach it to the GH release for provenance if you
-like, but it is deliberately NOT in the manifest. TrOMR publishes **f32**
-(int8 stays gated until the measured-lossless proof, bd-av64.12); `focr pull
-tromr` works with the default `--quant int8` via the sole-quant fallback.
+like, but it is deliberately NOT in the manifest. TrOMR publishes **both
+quants** since bd-av64.12 ran the lossless proof (40 decoder GEMMs int8,
+committed golden byte-identical, corpus gate delta 0 — divergence ledgered as
+DISC-005): the default `focr pull tromr` now fetches `tromr.int8.focrq`;
+`--quant f32` fetches the bit-exact reference artifact.
 
 ## Upload — GitHub Releases (mirror 1, copy-paste)
 

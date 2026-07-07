@@ -783,6 +783,18 @@ impl Weights {
                 )));
             }
         };
+        if view.dtype == DType::QInt8PerChan {
+            // Transparent dequant-on-access (bd-av64.12): an int8-stored
+            // GEMM read through the f32 accessor reconstructs
+            // `w[o][j] = qw[o][j] * scale[o]` — the DEFINED meaning of the
+            // record. `qint8()` already un-permutes any offline packing, so
+            // row-major holds here. Consumers that want int8 COMPUTE keep
+            // calling `qint8()` directly; this arm only makes f32 engines
+            // (TrOMR's Seq2SeqDense forward) able to run quantized-storage
+            // artifacts.
+            let q = self.qint8(name)?;
+            return Ok(Mat::from_vec(q.n, q.k, dequant_qint8(&q)));
+        }
         let data = view
             .to_f32_vec()
             .map_err(|e| FocrError::FormatMismatch(format!("tensor {name:?}: {e}")))?;
@@ -805,8 +817,13 @@ impl Weights {
     /// [`FocrError::FormatMismatch`] if `name` is absent or the tensor is
     /// quantized.
     pub fn vec(&self, name: &str) -> FocrResult<Vec<f32>> {
-        self.tensor(name)?
-            .to_f32_vec()
+        let view = self.tensor(name)?;
+        if view.dtype == DType::QInt8PerChan {
+            // See `mat()`: transparent per-channel dequant of int8 records.
+            let q = self.qint8(name)?;
+            return Ok(dequant_qint8(&q));
+        }
+        view.to_f32_vec()
             .map_err(|e| FocrError::FormatMismatch(format!("tensor {name:?}: {e}")))
     }
 
@@ -1035,6 +1052,20 @@ fn validate_directory(
 /// # Errors
 /// [`FocrError::FormatMismatch`] for a quantized dtype or a length that is not a
 /// whole number of elements.
+/// Reconstruct the f32 weights a symmetric per-output-channel int8 record
+/// denotes: `w[o][j] = qw[o][j] * scale[o]` (bd-av64.12 dequant-on-access).
+fn dequant_qint8(q: &QInt8) -> Vec<f32> {
+    let mut out = Vec::with_capacity(q.w.len());
+    for (o, &scale) in q.scales.iter().enumerate() {
+        out.extend(
+            q.w[o * q.k..(o + 1) * q.k]
+                .iter()
+                .map(|&v| f32::from(v) * scale),
+        );
+    }
+    out
+}
+
 fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
     match dtype {
         DType::F32 => decode_f32_le(data),
@@ -1482,6 +1513,34 @@ mod tests {
     }
 
     #[test]
+    fn qint8_records_dequant_on_access_via_mat_and_vec() {
+        // bd-av64.12: an int8-stored GEMM read through the f32 accessors must
+        // reconstruct `w[o][j] = qw[o][j] * scale[o]` EXACTLY (same arithmetic
+        // as the expectation below), so f32 engines run quantized-storage
+        // artifacts transparently.
+        let w_bytes: Vec<u8> = [1i8, -2, 3, 4, -5, 6].iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
+        let mut payload = w_bytes;
+        payload.extend_from_slice(&scale_bytes);
+        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[2,3],\
+             \"byte_offset\":0,\"byte_len\":6,\"scales_offset\":6,\"scales_len\":8}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
+        let w = Weights::from_bytes(blob).unwrap();
+        let expect = vec![
+            1.0f32 * 0.1,
+            -2.0f32 * 0.1,
+            3.0f32 * 0.1,
+            4.0f32 * 0.2,
+            -5.0f32 * 0.2,
+            6.0f32 * 0.2,
+        ];
+        let m = w.mat("q").unwrap();
+        assert_eq!((m.rows, m.cols), (2, 3), "mat keeps the [n, k] shape");
+        assert_eq!(m.data, expect, "mat dequantizes per output channel");
+        assert_eq!(w.vec("q").unwrap(), expect, "vec dequantizes identically");
+    }
+
+    #[test]
     fn focrq_qint4_roundtrips() {
         // n=2, k=16, group_size=16 => 8 packed bytes/row (16 total), 2 scales.
         let packed: Vec<u8> = (0u8..16).collect();
@@ -1860,18 +1919,22 @@ mod tests {
     }
 
     #[test]
-    fn mat_rejects_quantized_tensor() {
-        let w_bytes: Vec<u8> = [1i8, 2, 3, 4].iter().map(|&v| v as u8).collect();
-        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
-        let mut payload = w_bytes.clone();
+    fn mat_rejects_qint4_tensor() {
+        let packed: Vec<u8> = (0u8..8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1]);
+        let mut payload = packed.clone();
         payload.extend_from_slice(&scale_bytes);
-        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[2,2],\
-             \"byte_offset\":0,\"byte_len\":4,\"scales_offset\":4,\"scales_len\":8}}";
+        let dir = "{\"q\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[1,16],\
+             \"byte_offset\":0,\"byte_len\":8,\"scales_offset\":8,\"scales_len\":4,\
+             \"group_size\":16,\"tier\":3}}";
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let w = Weights::from_bytes(blob).unwrap();
-        // mat() refuses quantized; qint8() succeeds.
+        // qint8 now transparently dequantizes through mat()/vec(); qint4 stays
+        // a typed quantized accessor only until that path has a proven f32
+        // meaning.
         assert!(w.mat("q").is_err());
-        assert!(w.qint8("q").is_ok());
+        assert!(w.vec("q").is_err());
+        assert!(w.qint4("q").is_ok());
     }
 
     /// bd-2mo.3: an `--arch aarch64-smmla` artifact (arch_target 1, panel

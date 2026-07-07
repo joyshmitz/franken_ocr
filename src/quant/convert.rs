@@ -126,13 +126,18 @@ pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
             || rest.ends_with(".fc1.weight")
             || rest.ends_with(".fc2.weight");
     }
-    // Seq2SeqDense (TrOMR, E2): default policy is ALL high-precision — the 40
-    // decoder GEMMs (`to_{q,k,v}`/`to_out.0` per attn sublayer, `net.0.proj`/
-    // `net.3` per ff, 8.4 M params) are int8 CANDIDATES gated on a measured
-    // lossless L4/L5 check that has not run yet (tromr-spec §11). Explicit
-    // `false` here beats the accidental suffix-mismatch fallthrough.
+    // Seq2SeqDense (TrOMR): the 40 decoder GEMMs (`to_{q,k,v}`/`to_out.0`
+    // per attn sublayer, `net.0.proj`/`net.3` per ff, 8.4 M params) are the
+    // int8 set — enabled by the bd-av64.12 measurement (see the bead: the
+    // corpus gate + goldens arbitrate losslessness; the encoder and every
+    // norm/embedding stay high-precision per the quant doctrine).
     if arch.decoder() == crate::native_engine::model_arch::Decoder::Seq2SeqDense {
-        return false;
+        return rest.ends_with(".to_q.weight")
+            || rest.ends_with(".to_k.weight")
+            || rest.ends_with(".to_v.weight")
+            || rest.ends_with(".to_out.0.weight")
+            || rest.ends_with(".net.0.proj.weight")
+            || rest.ends_with(".net.3.weight");
     }
     if rest.contains(".self_attn.") {
         return rest.ends_with(".q_proj.weight")
@@ -1217,9 +1222,11 @@ mod tests {
     #[test]
     fn tromr_real_artifact_roundtrips_byte_exact() {
         // E2 byte-parity proof on the REAL export (model-gated skip-with-SUCCESS):
-        // every tensor in tromr.focrq must be byte-identical to the WS-folded
-        // safetensors (ALL high-precision — zero int8 records), and the v2
-        // header must self-declare the arch + license.
+        // every high-precision tensor in tromr.focrq must be byte-identical to
+        // the WS-folded safetensors, and any int8 record must be EXACTLY one of
+        // the 40 measured decoder-GEMM candidates (bd-av64.12) with a 2-D shape
+        // carried over and per-channel scales present. Accepts both artifacts:
+        // the published f32 (0 int8) and an int8 convert (40 int8).
         let Some(dir) = std::env::var_os("FOCR_TROMR_DIR").map(std::path::PathBuf::from) else {
             eprintln!("[convert-test] skip_no_model: FOCR_TROMR_DIR unset (E2 real-artifact leg)");
             return;
@@ -1239,37 +1246,60 @@ mod tests {
             "same tensor directory (nothing dropped/added)"
         );
         assert_eq!(st_names.len(), 260, "census §12 minus note_mask");
+        let tromr = crate::native_engine::model_arch::arch_by_id("tromr").unwrap();
+        let mut int8 = 0usize;
         for name in &st_names {
             let a = st.tensor(name).expect("source tensor");
             let b = fq.tensor(name).expect("converted tensor");
-            assert_eq!(a.dtype, b.dtype, "{name}: dtype must carry over (no int8)");
             assert_eq!(a.shape, b.shape, "{name}: shape");
-            assert_eq!(a.data, b.data, "{name}: bytes must round-trip exactly");
-            assert!(
-                b.scales.is_empty(),
-                "{name}: no quant scales on an HP tensor"
-            );
+            if b.dtype == crate::native_engine::weights::DType::QInt8PerChan {
+                assert!(
+                    is_decoder_int8_tensor_for(name, tromr),
+                    "{name}: int8 record outside the candidate set"
+                );
+                assert!(!b.scales.is_empty(), "{name}: int8 needs per-chan scales");
+                int8 += 1;
+            } else {
+                assert_eq!(a.dtype, b.dtype, "{name}: HP dtype must carry over");
+                assert_eq!(a.data, b.data, "{name}: HP bytes must round-trip exactly");
+                assert!(
+                    b.scales.is_empty(),
+                    "{name}: no quant scales on an HP tensor"
+                );
+            }
         }
+        assert!(
+            int8 == 0 || int8 == 40,
+            "int8 census must be the f32 artifact (0) or the full candidate set (40), got {int8}"
+        );
         eprintln!(
-            "[convert-test] tromr round-trip PROVEN: {} tensors byte-exact, 0 int8",
-            st_names.len()
+            "[convert-test] tromr round-trip PROVEN: {} tensors ({} int8, rest byte-exact)",
+            st_names.len(),
+            int8
         );
     }
 
     #[test]
-    fn tromr_classifier_is_all_high_precision() {
-        // E2 (bd-3jo6.5.2, tromr-spec §11): Seq2SeqDense defaults to ZERO int8
-        // tensors — the 40 decoder GEMMs are candidates behind a measured gate
-        // that has not run. Every real §12 name (incl. the candidates) must
-        // classify high-precision.
+    fn tromr_classifier_marks_exactly_the_candidate_gemm_suffixes() {
+        // bd-av64.12 (supersedes the pre-measurement all-HP default of
+        // bd-3jo6.5.2): the 40 decoder GEMMs (`to_{q,k,v}`/`to_out.0` per attn
+        // sublayer, `net.0.proj`/`net.3` per ff) classify int8 — measured
+        // lossless on the truth-tier corpus (golden byte-identical, gate
+        // delta 0). Everything else (embeddings, norms, heads, the WHOLE
+        // encoder) stays high-precision.
         let tromr = crate::native_engine::model_arch::arch_by_id("tromr").unwrap();
         for name in [
-            // the int8 CANDIDATES (still HP by default)
             "decoder.net.attn_layers.layers.0.1.to_q.weight",
+            "decoder.net.attn_layers.layers.0.1.to_k.weight",
+            "decoder.net.attn_layers.layers.0.1.to_v.weight",
             "decoder.net.attn_layers.layers.1.1.to_out.0.weight",
             "decoder.net.attn_layers.layers.2.1.net.0.proj.weight",
             "decoder.net.attn_layers.layers.2.1.net.3.weight",
-            // embeddings / norms / heads / encoder
+        ] {
+            assert!(is_decoder_int8_tensor_for(name, tromr), "{name} is int8");
+        }
+        for name in [
+            // embeddings / norms / heads / encoder stay HP
             "decoder.net.rhythm_emb.emb.weight",
             "decoder.net.attn_layers.layers.0.0.0.weight",
             "decoder.net.to_logits_rhythm.weight",
@@ -1278,8 +1308,10 @@ mod tests {
             // a Qwen-shaped name under the tromr prefix must ALSO stay HP
             // (the explicit Seq2SeqDense branch, not suffix fallthrough)
             "decoder.net.attn_layers.layers.0.self_attn.q_proj.weight",
+            // biases NEVER quantize, even on candidate sublayers
+            "decoder.net.attn_layers.layers.2.1.net.0.proj.bias",
         ] {
-            assert!(!is_decoder_int8_tensor_for(name, tromr), "{name}");
+            assert!(!is_decoder_int8_tensor_for(name, tromr), "{name} stays HP");
         }
     }
 
