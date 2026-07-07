@@ -1635,14 +1635,14 @@ pub fn generate_greedy_batched(
     weights: &Weights,
     cfg: &DecoderConfig,
     inputs_embeds: &[Mat],
-    max_new: usize,
+    caps: &[usize],
     eos: u32,
 ) -> FocrResult<Vec<Vec<u32>>> {
-    if inputs_embeds.is_empty() || max_new == 0 {
+    if inputs_embeds.is_empty() || caps.iter().all(|&c| c == 0) {
         return Ok(vec![Vec::new(); inputs_embeds.len()]);
     }
     let w = GotDecodeWeights::build(weights, cfg)?;
-    generate_greedy_batched_with(&w, inputs_embeds, max_new, eos)
+    generate_greedy_batched_with(&w, inputs_embeds, caps, eos)
 }
 
 /// [`generate_greedy_batched`] over PRE-BUILT decode weights — the testable
@@ -1650,24 +1650,32 @@ pub fn generate_greedy_batched(
 fn generate_greedy_batched_with(
     w: &GotDecodeWeights,
     inputs_embeds: &[Mat],
-    max_new: usize,
+    caps: &[usize],
     eos: u32,
 ) -> FocrResult<Vec<Vec<u32>>> {
+    debug_assert_eq!(inputs_embeds.len(), caps.len());
     let cfg = &w.cfg;
+    // The scheduler's global cap is the loosest page cap; tighter pages carry
+    // their own per-stream `max_emit` (a page whose position budget binds
+    // must emit EXACTLY what its solo run would).
+    let max_new = caps.iter().copied().max().unwrap_or(0);
     let mut stream_caches: Vec<Vec<Qwen2KvCache>> = Vec::with_capacity(inputs_embeds.len());
     let mut pages: Vec<batch_scheduler::PageStream> = Vec::with_capacity(inputs_embeds.len());
     for (i, embeds) in inputs_embeds.iter().enumerate() {
         let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
-            .map(|_| Qwen2KvCache::new(cfg.kv_dim(), embeds.rows + max_new))
+            .map(|_| Qwen2KvCache::new(cfg.kv_dim(), embeds.rows + caps[i]))
             .collect();
         let last_logits = forward_prefill_seed(w, embeds, &mut caches)?;
         stream_caches.push(caches);
-        pages.push(batch_scheduler::PageStream::new(
-            i,
-            embeds.rows,
-            &[],
-            Mat::from_vec(1, cfg.vocab_size, last_logits),
-        ));
+        pages.push(
+            batch_scheduler::PageStream::new(
+                i,
+                embeds.rows,
+                &[],
+                Mat::from_vec(1, cfg.vocab_size, last_logits),
+            )
+            .with_max_emit(caps[i]),
+        );
     }
     let mut sched = batch_scheduler::BatchScheduler::from_env(max_new);
     let mut step = DenseDecoderBatchStep {
@@ -2092,9 +2100,25 @@ mod tests {
                 .iter()
                 .map(|e| generate_greedy_kvcache_with(&w, e, max_new, u32::MAX).expect("solo"))
                 .collect();
+            let caps = vec![max_new; pages.len()];
             let batched =
-                generate_greedy_batched_with(&w, &pages, max_new, u32::MAX).expect("batched");
+                generate_greedy_batched_with(&w, &pages, &caps, u32::MAX).expect("batched");
             assert_eq!(solo, batched, "family {family:?}: cap-bounded ids diverged");
+
+            // Mixed PER-STREAM caps: each page must emit exactly its own
+            // solo-run stream under its own cap (the position-budget case).
+            let mixed = [6usize, 3, 5];
+            let solo_mixed: Vec<Vec<u32>> = pages
+                .iter()
+                .zip(&mixed)
+                .map(|(e, &m)| generate_greedy_kvcache_with(&w, e, m, u32::MAX).expect("solo"))
+                .collect();
+            let batched_mixed =
+                generate_greedy_batched_with(&w, &pages, &mixed, u32::MAX).expect("batched");
+            assert_eq!(
+                solo_mixed, batched_mixed,
+                "family {family:?}: mixed per-stream caps diverged"
+            );
 
             // Case 2: a REAL mid-stream EOS — pick page 1's 3rd solo token as
             // EOS so that stream retires early while the others continue.
@@ -2104,7 +2128,7 @@ mod tests {
                 .map(|e| generate_greedy_kvcache_with(&w, e, max_new, eos).expect("solo"))
                 .collect();
             let batched_eos =
-                generate_greedy_batched_with(&w, &pages, max_new, eos).expect("batched");
+                generate_greedy_batched_with(&w, &pages, &caps, eos).expect("batched");
             assert_eq!(
                 solo_eos, batched_eos,
                 "family {family:?}: EOS-retirement ids diverged"

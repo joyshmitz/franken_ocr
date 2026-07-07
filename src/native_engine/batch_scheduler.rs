@@ -139,6 +139,10 @@ pub struct PageStream {
     pub done: bool,
     /// Retired specifically because EOS was emitted.
     pub eos: bool,
+    /// Optional PER-STREAM emission cap (A7.5: e.g. a page whose position
+    /// budget binds tighter than the batch cap). `None` = the scheduler's
+    /// global `max_length` alone.
+    pub max_emit: Option<usize>,
 }
 
 impl PageStream {
@@ -160,7 +164,15 @@ impl PageStream {
             last_hidden,
             done: false,
             eos: false,
+            max_emit: None,
         }
+    }
+
+    /// Set a per-stream emission cap (see [`Self::max_emit`]).
+    #[must_use]
+    pub fn with_max_emit(mut self, cap: usize) -> Self {
+        self.max_emit = Some(cap);
+        self
     }
 
     /// Tokens emitted by decode (excludes the prompt/reference context).
@@ -353,7 +365,10 @@ impl BatchScheduler {
                 let s = &mut streams[i];
                 s.generated.push(out.token);
                 s.position += 1;
-                if out.is_eos || s.emitted().len() >= self.max_length {
+                let cap = s
+                    .max_emit
+                    .map_or(self.max_length, |m| m.min(self.max_length));
+                if out.is_eos || s.emitted().len() >= cap {
                     s.done = true;
                     s.eos = out.is_eos;
                     retire.push(k);

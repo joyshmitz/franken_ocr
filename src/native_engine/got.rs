@@ -197,8 +197,9 @@ pub fn recognize_batch(
     let tg = std::time::Instant::now();
     let mut cfg = DecoderConfig::got_ocr2();
     cfg.no_repeat_ngram_size = no_repeat_ngram_override(cfg.no_repeat_ngram_size);
+    let caps = vec![max_new; embeds_list.len()];
     let id_streams =
-        decoder_qwen2::generate_greedy_batched(weights, &cfg, &embeds_list, max_new, EOS_ID)?;
+        decoder_qwen2::generate_greedy_batched(weights, &cfg, &embeds_list, &caps, EOS_ID)?;
     super::timing_log(&format!(
         "  got.generate(batch of {}) {} tokens {:.2}s",
         imgs.len(),
@@ -257,6 +258,62 @@ mod tests {
             text,
             "HelloGOT-OCR2.0 Thequickbrownfaxjumps overthelazydog. 1234567890+=% Invoice#A-4217Total:$1,234.56",
             "GOT e2e OCR output regressed"
+        );
+    }
+
+    /// **A7.5 — the dense batch-spine LOSSLESS e2e gate (bd-3jo6.1.7.5).**
+    /// Model-gated (FOCR_GOT_MODEL + FOCR_GOT_TIKTOKEN, skip-with-SUCCESS):
+    /// [`recognize_batch`] over TWO different pages must equal [`recognize`]
+    /// run per page — string-identical, the armed twin of the in-module
+    /// scheduler gates (and the durable form of the manual `ocr-batch`
+    /// byte-identity proof).
+    #[test]
+    fn recognize_batch_matches_sequential_e2e() {
+        let (Ok(model), Ok(tkp)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_GOT_TIKTOKEN"),
+        ) else {
+            eprintln!(
+                r#"{{"test":"got_batch_e2e","event":"result","result":"skip_no_model","reason":"FOCR_GOT_MODEL/FOCR_GOT_TIKTOKEN unset","native_path_ran":true,"fallback_target":"/nonexistent"}}"#
+            );
+            return;
+        };
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+        let tk = Tiktoken::from_qwen_tiktoken(&std::fs::read(&tkp).expect("qwen.tiktoken"))
+            .expect("tiktoken");
+        let img1 = image::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/sample_text.png"
+        ))
+        .expect("page 1");
+        let img2 = image::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/format_corpus/table.png"
+        ))
+        .expect("page 2");
+
+        let solo: Vec<String> = [&img1, &img2]
+            .iter()
+            .map(|im| {
+                recognize(&weights, &tk, im, "model.vision_tower_high", 64, false)
+                    .expect("sequential recognize")
+            })
+            .collect();
+        let batched = recognize_batch(
+            &weights,
+            &tk,
+            &[&img1, &img2],
+            "model.vision_tower_high",
+            64,
+            false,
+        )
+        .expect("batched recognize");
+        assert_eq!(
+            solo, batched,
+            "A7.5 LOSSLESS contract broken: batched != sequential on the armed model"
+        );
+        eprintln!(
+            r#"{{"test":"got_batch_e2e","event":"result","result":"pass","pages":2,"identical":true}}"#
         );
     }
 

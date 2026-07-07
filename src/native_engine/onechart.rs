@@ -308,18 +308,30 @@ pub fn recognize(
         tg.elapsed().as_secs_f64()
     ));
 
-    // D5 tap: the decode step whose INPUT is the generated <Number> sees the
-    // post-final-norm hidden of [prompt + generated[..=pos]] — recompute it
-    // through the certified prefill (first fire wins, OQ-D4).
+    finish_recognition(weights, tk, &cfg, &prompt_ids, &vision, ids)
+}
+
+/// The shared post-decode finish (D5-D8): the `<Number>` head tap (first fire
+/// wins, recomputed through the certified prefill), the strip/brace-complete
+/// repair, and the self-verify verdict — identical for the sequential and
+/// batched paths by construction (this IS the sequential tail, extracted).
+fn finish_recognition(
+    weights: &Weights,
+    tk: &crate::tokenizer::Tokenizer,
+    cfg: &super::decoder_qwen2::DecoderConfig,
+    prompt_ids: &[u32],
+    vision: &Mat,
+    ids: Vec<u32>,
+) -> FocrResult<ChartResult> {
     let pred_locs = match ids
         .iter()
         .position(|&id| id == crate::tokenizer::special_opt::NUMBER)
     {
         Some(pos) => {
-            let mut full = prompt_ids.clone();
+            let mut full = prompt_ids.to_vec();
             full.extend_from_slice(&ids[..=pos]);
-            let embeds_tap = build_inputs_embeds(weights, &vision, &full)?;
-            let hidden = super::decoder_qwen2::prefill_final_hidden(weights, &cfg, &embeds_tap)?;
+            let embeds_tap = build_inputs_embeds(weights, vision, &full)?;
+            let hidden = super::decoder_qwen2::prefill_final_hidden(weights, cfg, &embeds_tap)?;
             let last = &hidden.data[(hidden.rows - 1) * hidden.cols..];
             let mut locs = number_head(weights, last)?;
             locs.truncate(100);
@@ -363,6 +375,62 @@ fn transpose(m: &Mat) -> Mat {
         }
     }
     Mat::from_vec(c, r, out)
+}
+
+/// Batched OneChart chart→dict over MANY images (A7.5): vision + splice per
+/// image sequentially, ONE continuous-batch OPT greedy decode, then the
+/// per-page `<Number>` head tap + repair + verdict — per image byte-identical
+/// to [`recognize`] (the learned-position budget rides the per-stream cap).
+///
+/// # Errors
+/// As [`recognize`].
+pub fn recognize_batch(
+    weights: &Weights,
+    tk: &crate::tokenizer::Tokenizer,
+    imgs: &[&image::DynamicImage],
+    max_new: usize,
+) -> FocrResult<Vec<ChartResult>> {
+    let tv = std::time::Instant::now();
+    let prompt_ids = chart_prompt_ids(tk)?;
+    let mut visions: Vec<Mat> = Vec::with_capacity(imgs.len());
+    let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
+    let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
+    for img in imgs {
+        let image = crate::preprocess::onechart_view_tensor(img);
+        let vision = vision_features(weights, &image, "model.vision_tower")?;
+        let embeds = build_inputs_embeds(weights, &vision, &prompt_ids)?;
+        // OQ-D7: the learned position table has 4096 usable rows — hard-stop.
+        caps.push(max_new.min(4096usize.saturating_sub(embeds.rows)));
+        visions.push(vision);
+        embeds_list.push(embeds);
+    }
+    super::timing_log(&format!(
+        "  onechart.vision+splice(batch of {}) {:.2}s",
+        imgs.len(),
+        tv.elapsed().as_secs_f64()
+    ));
+    let tg = std::time::Instant::now();
+    let cfg = super::decoder_qwen2::DecoderConfig::onechart();
+    let id_streams = super::decoder_qwen2::generate_greedy_batched(
+        weights,
+        &cfg,
+        &embeds_list,
+        &caps,
+        crate::tokenizer::special_opt::BOS_EOS,
+    )?;
+    super::timing_log(&format!(
+        "  onechart.generate(batch of {}) {} tokens {:.2}s",
+        imgs.len(),
+        id_streams.iter().map(Vec::len).sum::<usize>(),
+        tg.elapsed().as_secs_f64()
+    ));
+    // The number-head tap + repair + verdict stay the per-page path — the
+    // SAME finish() the sequential recognize applies.
+    id_streams
+        .into_iter()
+        .zip(&visions)
+        .map(|(ids, vision)| finish_recognition(weights, tk, &cfg, &prompt_ids, vision, ids))
+        .collect()
 }
 
 #[cfg(test)]

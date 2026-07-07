@@ -1487,8 +1487,11 @@ impl OcrModel {
         // int8 by construction (the QInt8 panels), so it needs only the master
         // spine switch; the per-page id-stream is byte-identical to the
         // sequential loop (decoder_qwen2's scheduler-level gate).
-        if !spine && batch_scheduler::spine_enabled() && self.arch().id() == "got-ocr2" {
-            match self.recognize_batch_dense_got(image_paths) {
+        if !spine
+            && batch_scheduler::spine_enabled()
+            && matches!(self.arch().id(), "got-ocr2" | "smolvlm2" | "onechart")
+        {
+            match self.recognize_batch_dense(image_paths) {
                 Ok(results) => return results,
                 Err(err) => {
                     let msg = err.to_string();
@@ -1521,16 +1524,16 @@ impl OcrModel {
     /// The DENSE continuous-batch body (A7.5): decode every page's image +
     /// prompt into `inputs_embeds` sequentially (one live vision forward at a
     /// time), then ONE [`decoder_qwen2::generate_greedy_batched`] drive over
-    /// all pages. Per-page image failures are recorded per page; the
-    /// surviving pages still batch. The outer `Err` is reserved for
-    /// batch-level failures (tokenizer/weights), mirroring the MoE spine.
-    fn recognize_batch_dense_got(
-        &self,
-        image_paths: &[&Path],
-    ) -> FocrResult<Vec<FocrResult<String>>> {
-        let tk = self.got_tokenizer()?;
-        let format = got_format_requested();
-        let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
+    /// all pages, dispatched per arch (GOT / SmolVLM2 / OneChart). Per-page
+    /// image failures are recorded per page; the surviving pages still batch.
+    /// The outer `Err` is reserved for batch-level failures
+    /// (tokenizer/weights), mirroring the MoE spine.
+    fn recognize_batch_dense(&self, image_paths: &[&Path]) -> FocrResult<Vec<FocrResult<String>>> {
+        let arch_id = self.arch().id();
+        let max_new = match arch_id {
+            "got-ocr2" => self.decode_params.max_length.min(got::MAX_NEW_TOKENS),
+            _ => self.decode_params.max_length,
+        };
         let t = std::time::Instant::now();
         // Decode images per page; a bad page keeps its own error and is
         // excluded from the batch (the sequential loop's per-page semantics).
@@ -1552,22 +1555,42 @@ impl OcrModel {
             use image::GenericImageView;
             let dims: Vec<(u32, u32)> = imgs.iter().map(|im| im.dimensions()).collect();
             let refs: Vec<&image::DynamicImage> = imgs.iter().collect();
-            let texts = got::recognize_batch(
-                &self.weights,
-                tk,
-                &refs,
-                self.arch().vision_tower_prefix(),
-                max_new,
-                format,
-            )?;
+            let texts: Vec<String> = match arch_id {
+                "got-ocr2" => got::recognize_batch(
+                    &self.weights,
+                    self.got_tokenizer()?,
+                    &refs,
+                    self.arch().vision_tower_prefix(),
+                    max_new,
+                    got_format_requested(),
+                )?,
+                "smolvlm2" => smolvlm2::recognize_batch(
+                    &self.weights,
+                    self.tokenizer()?,
+                    &refs,
+                    &smolvlm2_question(),
+                    max_new,
+                )?,
+                "onechart" => {
+                    onechart::recognize_batch(&self.weights, self.tokenizer()?, &refs, max_new)?
+                        .into_iter()
+                        .map(|r| r.json_text)
+                        .collect()
+                }
+                other => {
+                    return Err(FocrError::Other(anyhow::anyhow!(
+                        "dense batch spine: unrouted arch {other}"
+                    )));
+                }
+            };
             // The SAME per-page finalize the sequential path applies
-            // (recognize -> forward_got -> postprocess::finalize).
+            // (recognize -> forward_<arch> -> postprocess::finalize).
             for ((slot, text), (iw, ih)) in live.into_iter().zip(texts).zip(dims) {
                 out[slot] = Some(postprocess::finalize(&text, iw, ih));
             }
         }
         timing_log(&format!(
-            "got forward(batch of {}) {:.2}s",
+            "{arch_id} forward(batch of {}) {:.2}s",
             image_paths.len(),
             t.elapsed().as_secs_f64()
         ));

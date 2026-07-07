@@ -201,6 +201,52 @@ pub fn recognize(
     Ok(tk.decode_skip_special(&ids)?.trim().to_string())
 }
 
+/// Batched SmolVLM2 describe/VQA over MANY images (A7.5): vision + splice
+/// run SEQUENTIALLY per image (one live forward), then ONE continuous-batch
+/// greedy decode — per image byte-identical to [`recognize`] (the per-page
+/// position-budget clamp rides the scheduler's per-stream cap).
+///
+/// # Errors
+/// As [`recognize`].
+pub fn recognize_batch(
+    weights: &Weights,
+    tk: &Tokenizer,
+    imgs: &[&DynamicImage],
+    question: &str,
+    max_new: usize,
+) -> FocrResult<Vec<String>> {
+    let tv = std::time::Instant::now();
+    let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
+    let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
+    for img in imgs {
+        let pre = preprocess::preprocess_smolvlm2(img)?;
+        let vision = vision_rows(weights, &pre.frames, pre.n_frames)?;
+        let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
+        let embeds = build_inputs_embeds(weights, &vision, &prompt_ids)?;
+        caps.push(max_new.min(MAX_POSITION.saturating_sub(embeds.rows)));
+        embeds_list.push(embeds);
+    }
+    super::timing_log(&format!(
+        "  smolvlm2.vision+splice(batch of {}) {:.2}s",
+        imgs.len(),
+        tv.elapsed().as_secs_f64()
+    ));
+    let tg = std::time::Instant::now();
+    let cfg = DecoderConfig::smolvlm2();
+    let id_streams =
+        decoder_qwen2::generate_greedy_batched(weights, &cfg, &embeds_list, &caps, EOS_ID)?;
+    super::timing_log(&format!(
+        "  smolvlm2.generate(batch of {}) {} tokens {:.2}s",
+        imgs.len(),
+        id_streams.iter().map(Vec::len).sum::<usize>(),
+        tg.elapsed().as_secs_f64()
+    ));
+    id_streams
+        .iter()
+        .map(|ids| Ok(tk.decode_skip_special(ids)?.trim().to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
