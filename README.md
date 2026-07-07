@@ -369,9 +369,19 @@ OCR many images in one process, loading the model once and reusing it across all
 ```bash
 focr ocr-batch a.png b.png c.png --json     # one load, many pages
 focr ocr-batch *.png --f32                  # use the high-precision f32 decode path
+FOCR_BATCH_SPINE=1 focr ocr-batch *.png --json
+FOCR_BATCH_SPINE=1 FOCR_BATCH_SIZE=64 focr ocr-batch *.png --json
+FOCR_BATCH_SPINE=1 FOCR_BATCH_PACK=1 focr ocr-batch *.png --json
+FOCR_BATCH_SPINE=0 focr ocr-batch *.png --json   # force the sequential oracle path
 ```
 
-`--f32` runs the f32 decode path instead of int8 (see [Limitations](#limitations) for when this matters).
+`ocr-batch` loads the model once either way. With `FOCR_BATCH_SPINE=1`, the
+default Unlimited-OCR path uses the int8 R-SWA spine and the dense zoo path
+batches GOT-OCR2, SmolVLM2, and OneChart decode streams. `FOCR_BATCH_SIZE`
+defaults to 128 active streams and clamps at 256; `FOCR_BATCH_PACK=1` groups
+similar prefill lengths before restoring output order. `--f32` runs the f32
+decode path instead of int8 (see [Limitations](#limitations) for when this
+matters).
 
 ### `focr pull`
 
@@ -615,8 +625,8 @@ The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservati
 | `FOCR_MAX_NEW_TOKENS` | Cap the number of generated tokens (the engine's `max_length`; default 32768). An explicit `--max-length` flag outranks it. Capping never changes the per-step math, so a capped run's tokens are a true prefix of the full run's. |
 | `FOCR_DECODE_INT8` | Force the int8 decode cache/path for the native engine. `ocr-batch` also enables this internally unless `--f32` is passed. |
 | `FOCR_DECODE_STATELESS` | Force the stateless re-prefill decoder, kept as a parity oracle for the cached decode path. |
-| `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode pages together, with `FOCR_BATCH_SIZE` streams in flight. The default Unlimited-OCR spine uses the int8 R-SWA path; the dense zoo spine covers GOT-OCR2, SmolVLM2, and OneChart. Present ⇒ armed; unset (the default) runs the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
-| `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 128 when the spine is armed and is capped at 256. |
+| `FOCR_BATCH_SPINE` | Arm the continuous-batch decode spine for the int8 `focr ocr-batch` path: prefill + decode pages together, with `FOCR_BATCH_SIZE` streams in flight. The default Unlimited-OCR spine uses the int8 R-SWA path; the dense zoo spine covers GOT-OCR2, SmolVLM2, and OneChart. Set `1`, `on`, or `true` to arm it; unset, blank, `0`, `off`, `false`, or `no` uses the proven sequential per-image loop. Per-page output is byte-identical either way; only throughput differs. |
+| `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 128 when the spine is armed; blank, invalid, or `0` also use that default, and larger values are capped at 256. |
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
 | `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. |
