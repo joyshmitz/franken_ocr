@@ -333,6 +333,41 @@ pub fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult
     })
 }
 
+/// Multi-page per-page preprocess (bd-1gv.25/bd-1gv.26): the reference
+/// `infer_multi` SQUASHES each page to `size × size` when `image_size <= 640`
+/// (`image.resize((image_size, image_size))` — aspect-DESTROYING, unlike the
+/// single-image Base mode's aspect-preserving `ImageOps.pad`), then the
+/// already-square view passes the pad untouched. The multi-page oracle run
+/// caught this divergence: padding instead of squashing garbles the glyph
+/// geometry the model was trained to read in multi-page mode.
+///
+/// Same normalize as Base mode (the 0.5/0.5 transform in [`view_tensor`]);
+/// the resample kernel follows [`resample_kind`] (CatmullRom shipped,
+/// `FOCR_RESAMPLE=pil-bicubic` for oracle-exact comparison — DISC-001).
+///
+/// # Errors
+/// Rejects a non-positive `base_size` exactly like [`preprocess_dynamic`].
+pub fn preprocess_dynamic_squash(img: DynamicImage, base_size: usize) -> FocrResult<Preprocessed> {
+    let mode = PreprocessMode::Base { base_size };
+    let validated = validate_mode(mode)?;
+    let original_size = img.dimensions();
+    // PIL-faithful bicubic UNCONDITIONALLY at this site (not the
+    // env-keyed [`resample_exact`]): at the multi-page 2.9x squash the
+    // shipped CatmullRom kernel measurably garbles glyphs into OCR junk,
+    // while the PIL kernel reproduces the reference plate text byte-exactly
+    // (bd-1gv.26 oracle run, page_0009+page_0014). Parity outranks the
+    // kernel-uniformity nicety (doctrine #1).
+    let squashed =
+        pil_resample::resize_bicubic(&img.to_rgb8(), validated.base_size, validated.base_size);
+    Ok(Preprocessed {
+        mode,
+        global: view_tensor(&squashed.into()),
+        tiles: Vec::new(),
+        crop_grid: CropGrid::single(),
+        original_size,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ValidatedMode {
     base_size: u32,

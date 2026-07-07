@@ -1558,12 +1558,14 @@ impl OcrModel {
         Self::ensure_arch_implemented(self.arch())?;
 
         // ── per-page Base-640 preprocess (multi-page forces no-crop, §2.4) ──
-        let mode = preprocess::PreprocessMode::Base {
-            base_size: MULTI_PAGE_BASE_SIZE,
-        };
         let mut pres = Vec::with_capacity(image_paths.len());
         for path in image_paths {
-            pres.push(preprocess::preprocess_image(path, mode)?);
+            let img = image::open(path)
+                .map_err(|e| FocrError::InputDecode(format!("{}: {e}", path.display())))?;
+            pres.push(preprocess::preprocess_dynamic_squash(
+                img,
+                MULTI_PAGE_BASE_SIZE,
+            )?);
         }
         self.recognize_multi_page_pres(pres, None)
     }
@@ -1591,12 +1593,12 @@ impl OcrModel {
             )));
         }
         Self::ensure_arch_implemented(self.arch())?;
-        let mode = preprocess::PreprocessMode::Base {
-            base_size: MULTI_PAGE_BASE_SIZE,
-        };
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
-            pres.push(preprocess::preprocess_dynamic(img, mode)?);
+            pres.push(preprocess::preprocess_dynamic_squash(
+                img,
+                MULTI_PAGE_BASE_SIZE,
+            )?);
         }
         self.recognize_multi_page_pres(pres, None)
     }
@@ -1629,12 +1631,12 @@ impl OcrModel {
             )));
         }
         Self::ensure_arch_implemented(self.arch())?;
-        let mode = preprocess::PreprocessMode::Base {
-            base_size: MULTI_PAGE_BASE_SIZE,
-        };
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
-            pres.push(preprocess::preprocess_dynamic(img, mode)?);
+            pres.push(preprocess::preprocess_dynamic_squash(
+                img,
+                MULTI_PAGE_BASE_SIZE,
+            )?);
         }
         self.recognize_multi_page_pres(pres, Some(on_page))
     }
