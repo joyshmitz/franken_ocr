@@ -20,7 +20,7 @@
 //!   [R2] that line canonicalizes BYTE-FOR-BYTE to the frozen
 //!        `tests/fixtures/robot_schema_v1.json` contract fixture.               -> robot_schema_matches_frozen_contract_fixture
 //!   [R3] `schema_version` == `ROBOT_SCHEMA_VERSION` (== 1).                    -> robot_schema_advertises_version_and_all_events
-//!   [R4] every `EVENT_KIND` (`run_start,stage,page,run_complete,run_error`)
+//!   [R4] every `EVENT_KIND` (`run_start,stage,page,staff,run_complete,run_error`)
 //!        is present in the advertised `events`.                                -> robot_schema_advertises_version_and_all_events
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
 //!   [R6] `robot backends` is a single JSON line; host CPU/SIMD fields scrubbed. -> robot_backends_golden
@@ -639,7 +639,14 @@ fn unified_diff(expected: &str, actual: &str) -> String {
 /// `robot::ROBOT_SCHEMA_VERSION`.
 const EXPECTED_SCHEMA_VERSION: u64 = 1;
 /// `robot::EVENT_KINDS` — every kind MUST appear in the advertised `events`.
-const EXPECTED_EVENT_KINDS: &[&str] = &["run_start", "stage", "page", "run_complete", "run_error"];
+const EXPECTED_EVENT_KINDS: &[&str] = &[
+    "run_start",
+    "stage",
+    "page",
+    "staff",
+    "run_complete",
+    "run_error",
+];
 
 // ════════════════════════════════════════════════════════════════════════════
 // [R1]–[R4] ROBOT-SCHEMA CONTRACT TEST (the agent-ergonomics contract — bd-zc1o)
@@ -976,6 +983,138 @@ fn robot_backends_golden() {
         "logical_cpus field must be present (scrubbed); got:\n{scrubbed}"
     );
     assert_golden(test, "robot_backends", &format!("{scrubbed}\n"));
+}
+
+/// [A12/bd-3jo6.1.12] `focr robot selftest` e2e: EVERY registered int8-decoder
+/// model gets a machine-readable parity verdict against the scalar oracle on
+/// this host, each with its own worst-case-K overflow row (doctrine #6 per
+/// model). Runs weight-free by design (synthetic operands), so this e2e needs
+/// no model gating. A second leg forces `FOCR_FORCE_ARCH=scalar` end-to-end to
+/// prove the override reaches the dispatcher through the CLI and the scalar
+/// floor is self-consistent (oracle vs oracle can never diverge).
+#[test]
+fn robot_selftest_proves_per_model_kernel_parity_e2e() {
+    let test = "robot_selftest_proves_per_model_kernel_parity_e2e";
+    let out = run_focr(&["robot", "selftest"]);
+    assert!(
+        out.status.success(),
+        "robot selftest must exit 0 on a parity-clean host; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("selftest line");
+    let v = parse_json_line(line, "robot selftest");
+
+    assert_eq!(
+        v["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION),
+        "selftest must carry schema_version; line: {line}"
+    );
+    assert_eq!(v["command"].as_str(), Some("robot.selftest"));
+    assert_eq!(v["verdict"].as_str(), Some("pass"));
+    assert_eq!(v["all_ok"].as_bool(), Some(true));
+    let total = v["cases_total"].as_u64().expect("cases_total");
+    assert_eq!(
+        v["cases_passed"].as_u64(),
+        Some(total),
+        "every case must pass on the build host; line: {line}"
+    );
+    assert!(total > 0, "selftest must actually run cases");
+
+    // The per-model rollup: every registered int8 decoder, stable ids, all pass.
+    let models = v["models"].as_array().expect("models array");
+    let ids: Vec<&str> = models
+        .iter()
+        .map(|m| m["id"].as_str().expect("model id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["unlimited-ocr", "got-ocr2", "smolvlm2", "onechart"],
+        "the rollup must enumerate every registered int8 decoder (TrOMR is f32-only by design)"
+    );
+    for m in models {
+        assert_eq!(
+            m["verdict"].as_str(),
+            Some("pass"),
+            "model {} must pass on the build host",
+            m["id"]
+        );
+    }
+
+    // Doctrine #6 PER MODEL: each zoo decoder carries its own worst-case-K
+    // overflow row (constant-extreme operands at that model's largest K).
+    let cases = v["cases"].as_array().expect("cases array");
+    for want in [
+        "overflow:max_mag_k6848",
+        "got-ocr2:overflow_k2816",
+        "smolvlm2:overflow_k2560",
+        "onechart:overflow_k3072",
+    ] {
+        assert!(
+            cases.iter().any(|c| c["label"].as_str() == Some(want)),
+            "worst-case-K overflow row {want} must be present; labels: {:?}",
+            cases
+                .iter()
+                .map(|c| c["label"].as_str().unwrap_or(""))
+                .collect::<Vec<_>>()
+        );
+    }
+    tlog!(test,
+        "case": "native_tier",
+        "event": "stage",
+        "stage": "selftest_native",
+        "inputs": {"argv": ["robot", "selftest"]},
+        "result": "pass",
+        "detail": {
+            "selected": v["selected"].clone(),
+            "cases_total": total,
+            "models": ids,
+        },
+    );
+
+    // Leg 2: force the scalar tier END-TO-END. `run_focr` scrubs
+    // FOCR_FORCE_ARCH for hermeticity, so build the command by hand with the
+    // same hermetic env plus the override.
+    let mut command = Command::new(focr_bin());
+    command
+        .args(["robot", "selftest"])
+        .env_remove("FOCR_MODEL_PATH")
+        .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
+        .env("HOME", hermetic_home())
+        .env("LOCALAPPDATA", hermetic_home())
+        .env("USERPROFILE", hermetic_home())
+        .env_remove(FORCE_TEST_ERROR_ENV)
+        .env("FOCR_FORCE_ARCH", "scalar");
+    let out = run_focr_command(command, &["robot", "selftest"]);
+    assert!(
+        out.status.success(),
+        "scalar-forced selftest must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("scalar selftest line");
+    let v = parse_json_line(line, "robot selftest (scalar)");
+    assert_eq!(
+        v["selected"].as_str(),
+        Some("scalar"),
+        "FOCR_FORCE_ARCH=scalar must reach the dispatcher e2e; line: {line}"
+    );
+    assert_eq!(v["verdict"].as_str(), Some("pass"));
+    tlog!(test,
+        "case": "forced_scalar",
+        "event": "result",
+        "stage": "selftest_scalar",
+        "inputs": {"argv": ["robot", "selftest"], "env": {"FOCR_FORCE_ARCH": "scalar"}},
+        "result": "pass",
+        "detail": "override reaches dispatch e2e; scalar floor self-consistent",
+    );
 }
 
 /// [R7] Robot mode is DATA-ONLY on stdout: every `robot <cmd>` writes a single

@@ -3,6 +3,7 @@
     "run_start",
     "stage",
     "page",
+    "staff",
     "run_complete",
     "run_error"
   ],
