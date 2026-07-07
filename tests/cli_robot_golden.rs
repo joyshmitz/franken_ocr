@@ -20,7 +20,8 @@
 //!   [R2] that line canonicalizes BYTE-FOR-BYTE to the frozen
 //!        `tests/fixtures/robot_schema_v1.json` contract fixture.               -> robot_schema_matches_frozen_contract_fixture
 //!   [R3] `schema_version` == `ROBOT_SCHEMA_VERSION` (== 1).                    -> robot_schema_advertises_version_and_all_events
-//!   [R4] every `EVENT_KIND` (`run_start,stage,page,staff,run_complete,run_error`)
+//!   [R4] every `EVENT_KIND`
+//!        (`run_start,stage,page,staff,music_warning,run_complete,run_error`)
 //!        is present in the advertised `events`.                                -> robot_schema_advertises_version_and_all_events
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
 //!   [R6] `robot backends` is a single JSON line; host CPU/SIMD fields scrubbed. -> robot_backends_golden
@@ -644,6 +645,7 @@ const EXPECTED_EVENT_KINDS: &[&str] = &[
     "stage",
     "page",
     "staff",
+    "music_warning",
     "run_complete",
     "run_error",
 ];
