@@ -1995,10 +1995,24 @@ fn gemv_i8_sharded(x: &[f32], qw: &QInt8, tiles: usize) -> Vec<f32> {
 const QKV_FUSED_ENV: &str = "FOCR_QKV_FUSED";
 
 /// Read [`QKV_FUSED_ENV`] ONCE into a process-wide bool (build-time only; never
-/// touched per-token).
+/// touched per-token). DEFAULT **ON** since 2026-07-07 (bd-241s): the fused
+/// path is the ledgered LOSSLESS win (NEGATIVE_EVIDENCE 2026-06-27 KEPT entry:
+/// M4 −8.9% / x86-avx2 −21% decode; byte-identical proven by the unit gate +
+/// page_0590 sha + 20-page CER; re-confirmed 2026-07-07: 0.072→0.052 s/tok
+/// best-of-3 on page_0009 @8T, outputs byte-identical). `FOCR_QKV_FUSED=0`
+/// restores the three-call path — now the kill-switch, no longer the default.
 fn qkv_fused_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(QKV_FUSED_ENV).is_some())
+    *FLAG.get_or_init(|| {
+        match std::env::var(QKV_FUSED_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("0" | "off" | "false" | "no") => false,
+            _ => true,
+        }
+    })
 }
 
 /// Stack three same-shaped `[n, k]` per-output-channel int8 weights into ONE
