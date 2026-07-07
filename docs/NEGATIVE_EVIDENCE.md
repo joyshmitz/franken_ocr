@@ -205,6 +205,61 @@ synthetic before/after microbenches that retire or keep one narrow loop lever
 and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
 claims.
 
+2026-07-07 | NEGATIVE(reverted) | TrOMR 1-crop-page routing through the refined staff band (bd-av64.13 item b, `recognize_page` single-staff branch)
+  claim_id: CLAIM-bd-av64.13-onecrop-route   evidence_id: bd-av64.13 close note + this entry
+  model source commit + fixture hash: same TrOMR export/artifact as the TTA entry below; fixtures = committed realscan_music corpus v1
+  CPU feature string: arm64 Apple M4 (f32 forward)
+  exact command + env: FOCR_BIN=<release focr> bash scripts/realscan_music_gate.sh  (routing active unconditionally in the build under test; whole-image fallback retained on crop failure)
+  fallback / kill-switch state: none (the lever was the default path in the test build; reverted same-day)
+  measured before -> after vs reference:
+    HYPOTHESIS: a page whose detector finds EXACTLY 1 staff should route through the refined crop (FIT-FIRST geometry +
+    per-band residual-skew refinement) so the measured -0.7 deg key knife-edge gets lever-1 protection on 1-crop inputs.
+    GATE VERDICT: spohr_no17_top (the committed golden, a clean single-staff crop) REGRESSED — time signature dropped
+    ("time != 3/4") AND bar-1 note flip (E5:quarter -> G5:quarter); golden no longer byte-stable. Every other fixture held.
+    MECHANISM: band extraction re-trims an already-tight crop; the decode is knife-edge sensitive to exactly those margins
+    (the same sensitivity FIT-FIRST exists to protect on the >=2-staff path, where historic geometry is preserved bit-identically).
+    On a pre-cropped staff the whole image IS the historic geometry.
+  bit-exact correctness proof: revert restores gate ALL PASS incl. golden byte-stable (re-run same command)
+  disposition: REVERT (contract comment at recognize_page's <2 branch records the measurement in-code)
+  do-not-retry: "do not route 1-crop pages through band extraction unless the crop is proven pixel-identical to the input
+    (or the corpus gains skewed single-staff fixtures that measure a net win, bd-av64.15) — the certified whole-image read
+    is the historic geometry for pre-cropped staves"
+  per-lever tally: W 0 / L 1 / N 0
+  agent: RubyCove
+  evidence dir: none (reproduces from the committed corpus at the pre-revert commit)
+
+2026-07-07 | NEGATIVE(reverted) | TrOMR micro-rotation self-consistency vote (bd-av64.13 lever 2, `FOCR_TROMR_TTA=3` in `src/native_engine/tromr.rs::recognize_voted`)
+  claim_id: CLAIM-bd-av64.13-tta-vote   evidence_id: bd-av64.13 close note + this entry (per-candidate logs inline below)
+  model source commit + fixture hash:
+    Polyphonic-TrOMR export model.safetensors sha256 41c88802… (TROMR_EXPORT_MANIFEST.json); tromr.focrq sha256 a9d41485… (all-f32)
+    fixtures: tests/fixtures/realscan_music (corpus v1, committed) — the measuring instrument, not a synthetic bench
+  CPU feature string: arm64 Apple M4 (TrOMR forward is f32; no SIMD tier lever involved)
+  exact command + env:
+    FOCR_TROMR_TTA=3 FOCR_BIN=<release focr> bash scripts/realscan_music_gate.sh   (vs the identical unarmed control)
+    per-candidate diagnostics: FOCR_TROMR_TTA=3 FOCR_TIMING=1 focr ocr --model tromr.focrq --task music <staff.png>
+  fallback / kill-switch state: lever was env-gated OFF by default; the unarmed path was byte-identical to the certified pipeline (early-return)
+  measured before -> after vs reference:
+    DESIGN: decode each staff at 0.0/-0.4/+0.4 deg (deskew shear kernel), majority-vote key+time, tie-break by fewest
+    bar-sum sanity warnings, final tie -> the 0 deg certified decode.
+    corpus gate: unarmed ALL PASS (22.5 s) -> armed 1 FAIL (spohr_no17_sys attributes REGRESSED, time != 3/4) at 62.9 s (2.8x);
+    the no21 time XFAIL (the lever's target) did NOT flip.
+    MECHANISM (per-candidate logs): micro-rotation makes the model DROP the time signature on degraded 1843 scans
+    (3 of 4 measured staves omit timeSignature at ±0.4 deg). An omitted attribute (a) cannot form a majority and
+    (b) INVERTS the bar-sum scorer — no declared time means no checkable bar constraint, so the degraded decode scores
+    0 warnings and beats the honest 0 deg decode that declared its time and got flagged (no17_sys staff 1: correct
+    "3/4 + 3 warnings" lost to "no time + 0 warnings"; no21_sys staff 2: the TRUTH "3/4" at +0.4 deg lost to the silent 0 deg).
+    SCORER-V2 DRY RUN (attribute-presence ranked above warning count, evaluated against the same logged candidates):
+    fixes the no17_sys regression but still does not flip no21 (staff 2's presence-tie resolves to "C" = 4/4, staff 1's
+    majority is 4/4 either way) -> best-known variant nets ZERO corpus improvement at 2.8x cost.
+  bit-exact correctness proof: unarmed path structurally unchanged (env early-return); control gate run ALL PASS incl. golden byte-stable
+  disposition: REVERT (code removed same-day; the pure vote fn + property tests live in this entry's commit history)
+  do-not-retry: "do not retry rotation-TTA voting on TrOMR unless (1) the bd-av64.15 corpus expansion provides a held-out
+    calibration set (scorer tuning on the 6 measuring fixtures is overfit by construction) AND (2) the scorer ranks
+    attribute PRESENCE above warning count — omission-inversion is the failure mode that killed v1"
+  per-lever tally: W 0 / L 1 / N 0
+  agent: RubyCove
+  evidence dir: none (fixtures are committed; per-candidate logs reproduce with the two commands above at the pre-revert commit)
+
 2026-06-25 | NEGATIVE(reverted) | strided-destination projector transpose in `src/native_engine/vision_bridge.rs::transpose`
   claim_id: CLAIM-bd-1gv.10.1-projector-transpose-store-order   evidence_id: artifacts/perf/bd-1gv.10.1/
   model source commit + fixture hash:

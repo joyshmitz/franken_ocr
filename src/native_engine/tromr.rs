@@ -1891,7 +1891,13 @@ pub struct PageRecognition {
 /// Contract: 0 or 1 detected staves ⇒ the image is treated as a single
 /// pre-cropped staff and recognized WHOLE (preserves the certified
 /// single-staff path exactly — detection adds nothing there, and its error
-/// IS the page error); ≥ 2 staves ⇒ the per-crop path, top-to-bottom, where
+/// IS the page error; bd-av64.13 MEASURED the alternative 2026-07-07 and
+/// the gate said no — routing a 1-crop page through the refined band
+/// regressed spohr_no17_top, dropping its time signature and flipping a
+/// note, because band extraction re-trims pixels the knife-edge-sensitive
+/// decode needed. The sub-degree-skew exposure on this route stays
+/// documented in bd-av64.13/.15); ≥ 2 staves ⇒ the per-crop path,
+/// top-to-bottom, where
 /// ONE bad crop must never abort the page (bd-av64.2: a real book page with
 /// one over-wide staff band previously died whole via `?`-propagation —
 /// Cadwallader p169, 2026-07-06). A failed staff becomes a [`StaffSkip`];
