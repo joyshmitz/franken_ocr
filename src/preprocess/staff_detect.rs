@@ -252,9 +252,34 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
     for (i, five) in staves.iter().enumerate() {
         let spacing = (five[4] - five[0]) as f64 / 4.0;
         let margin = (2.0 * spacing).round() as usize * 2;
-        // Neighbor-aware vertical bounds: a band may extend to the midline
-        // toward the adjacent staff (page edge otherwise), so bands never
-        // swallow a neighbor's lines no matter how far they extend.
+        let y0_classic = five[0].saturating_sub(margin);
+        let y1_classic = (five[4] + margin + 1).min(h);
+
+        // FIT-FIRST (bd-av64.14): when the classic full-width band already
+        // fits the positional budget, keep it BIT-IDENTICAL to the historic
+        // geometry — recognition is knife-edge sensitive to crop margins,
+        // so geometry only changes where the old geometry hard-failed.
+        if img_h * w <= budget * (y1_classic - y0_classic) {
+            let ch = y1_classic - y0_classic;
+            let mut crop = vec![0u8; ch * w];
+            crop.copy_from_slice(&gray[y0_classic * w..y1_classic * w]);
+            crops.push(StaffCrop {
+                gray: crop,
+                w,
+                h: ch,
+                bbox: (0, y0_classic, w, ch),
+            });
+            continue;
+        }
+
+        // Over budget: (1) trim the band to its ink extent (staff lines span
+        // the system, so any column inside holds >= 5 ink pixels; a >= 2
+        // floor keeps specks from stretching the band to the page margins),
+        // padded by ~2 line-spacings; (2) if still over, extend vertically
+        // toward the neighbor midlines (measured: a staff at ~30% of the
+        // frame still reads correctly, while width overflow is a hard
+        // failure). A band that cannot reach the budget is emitted as-is —
+        // per-staff recovery (bd-av64.2) skips it with a named reason.
         let lo_bound = if i > 0 {
             (staves[i - 1][4] + five[0]) / 2
         } else {
@@ -265,14 +290,8 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
         } else {
             h
         };
-        let mut y0 = five[0].saturating_sub(margin).max(lo_bound);
-        let mut y1 = (five[4] + margin + 1).min(h).min(hi_bound);
-
-        // (1) Horizontal ink-extent trim: the staff lines span the system,
-        // so any column inside it holds >= 5 ink pixels; a >= 2 floor keeps
-        // isolated specks from stretching the band to the page margins.
-        // Pad the ink extent by ~2 line-spacings each side (never tighter
-        // than the ink itself).
+        let mut y0 = y0_classic.max(lo_bound);
+        let mut y1 = y1_classic.min(hi_bound);
         let col_ink = |x: usize, a: usize, b: usize| -> usize {
             (a..b).filter(|&y| gray[y * w + x] <= thr).count()
         };
@@ -285,21 +304,12 @@ pub fn detect_staves(img: &DynamicImage) -> FocrResult<Vec<StaffCrop>> {
             x1 -= 1;
         }
         if x1 <= x0 {
-            // No ink columns at all (cannot happen for a grouped staff, but
-            // stay defensive): keep the full width.
             x0 = 0;
             x1 = w;
         }
         let pad = (2.0 * spacing).round() as usize;
         x0 = x0.saturating_sub(pad);
         x1 = (x1 + pad).min(w);
-
-        // (2) Extend-to-fit: if the trimmed band still resizes past the
-        // positional budget, grow it vertically toward the neighbor bounds
-        // (measured: a staff occupying as little as ~30% of the frame still
-        // reads correctly, while width overflow is a hard failure). A band
-        // that cannot reach the budget within its bounds is emitted as-is —
-        // the per-staff recovery (bd-av64.2) skips it with a named reason.
         let step = spacing.max(1.0).round() as usize;
         while img_h * (x1 - x0) > budget * (y1 - y0) && (y0 > lo_bound || y1 < hi_bound) {
             y0 = y0.saturating_sub(step).max(lo_bound);
@@ -404,23 +414,39 @@ mod tests {
         );
     }
 
-    /// bd-av64.14: horizontal ink-extent trim — page margins (columns with
-    /// no ink) leave the band; the ink span plus ~2-spacing pads stays.
+    /// bd-av64.14 FIT-FIRST: a band that already fits the positional budget
+    /// keeps the historic full-width geometry EXACTLY (recognition is
+    /// margin-sensitive; geometry changes only where the old form
+    /// hard-failed on the clamp).
+    #[test]
+    fn fitting_bands_keep_the_classic_full_width_geometry() {
+        let img = synth_page(800, 260, &[80]);
+        let crops = detect_staves(&img).expect("detects");
+        assert_eq!(crops.len(), 1);
+        let (x0, y0, cw, ch) = crops[0].bbox;
+        assert_eq!((x0, cw), (0, 800), "full width kept");
+        // classic band: 2*(2*spacing) margins around the 5-line span.
+        assert_eq!(y0, 40, "classic top margin");
+        assert_eq!(ch, 121, "classic band height");
+    }
+
+    /// bd-av64.14: horizontal ink-extent trim — on an OVER-BUDGET band
+    /// (classic full width 3000 x ~120 resizes to 3200 > 1280), page
+    /// margins leave the band; the ink span plus ~2-spacing pads stays.
     #[test]
     fn trim_cuts_page_margins_but_keeps_ink() {
-        // Hand-drawn staff with WIDE page margins: lines span x 200..600 on
-        // an 800-wide page (spacing 10 => trim pad 20).
-        let mut gray = vec![250u8; 800 * 260];
+        // Ink spans x 200..2600 on a 3000-wide page (spacing 10 => pad 20).
+        let mut gray = vec![250u8; 3000 * 260];
         for line in 0..5 {
             let y = 80 + line * 10;
             for dy in 0..2 {
-                for x in 200..600 {
-                    gray[(y + dy) * 800 + x] = 10;
+                for x in 200..2600 {
+                    gray[(y + dy) * 3000 + x] = 10;
                 }
             }
         }
         let img =
-            DynamicImage::ImageLuma8(image::GrayImage::from_raw(800, 260, gray).expect("synth"));
+            DynamicImage::ImageLuma8(image::GrayImage::from_raw(3000, 260, gray).expect("synth"));
         let crops = detect_staves(&img).expect("detects");
         assert_eq!(crops.len(), 1);
         let (x0, _y0, cw, _ch) = crops[0].bbox;
@@ -429,7 +455,7 @@ mod tests {
             "left margin trimmed to pad (x0 {x0})"
         );
         assert!(
-            x0 + cw <= 650 && x0 + cw >= 600,
+            x0 + cw <= 2650 && x0 + cw >= 2600,
             "right margin trimmed (x0+cw {})",
             x0 + cw
         );

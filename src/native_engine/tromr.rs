@@ -2368,32 +2368,33 @@ mod tests {
         assert!(s11 <= 0.15, "staff1 SER {s11} regressed (measured 0.040)");
     }
 
-    /// bd-av64.2: ONE unfittable staff band must not abort the page — the
-    /// real failure class from Cadwallader p169 (2026-07-06). Post
+    /// bd-av64.2: ONE unfittable staff band must not abort the page. Post
     /// bd-av64.14 geometry (ink-extent trim + extend-to-fit), a staff only
-    /// skips when it genuinely CANNOT fit the 1280 positional budget: ink
-    /// spanning a canvas 30x wider than tall, where even a band grown to
-    /// the whole page height resizes past the budget. The good staff is
-    /// the upstream example pasted at natural width — its ink trims narrow
-    /// and fits comfortably on the same canvas. Model-gated.
+    /// skips when it genuinely CANNOT fit the 1280 positional budget. Two
+    /// hand-drawn staves on a 12000px-wide canvas: the first's ink spans
+    /// 7000px with vertical room for extend-to-fit (needs 128*7040/1280 =
+    /// 704 rows; ~845 available), the second spans the full width with only
+    /// ~780 rows available (needs 1200) — it must skip, the page must
+    /// succeed. Content quality is NOT this test's concern (the SER certs
+    /// own that); control flow is. Model-gated.
     #[test]
     fn tromr_page_skips_overwide_staff_and_keeps_the_rest() {
         let Some(dir) = zoo_dir() else {
             eprintln!("[tromr-test] skip_no_model: FOCR_TROMR_DIR unset");
             return;
         };
-        let examples = dir.join("../tromr-upstream/examples");
-        if !examples.join("1.png").is_file() {
-            eprintln!("[tromr-test] skip_no_model: upstream examples absent");
-            return;
-        }
-        let a = image::open(examples.join("1.png")).expect("ex1").to_rgb8();
-        let (page_w, h) = (12_000u32, a.height() + 260);
+        let (page_w, h) = (12_000u32, 1_600u32);
         let mut page = image::RgbImage::from_pixel(page_w, h, image::Rgb([255, 255, 255]));
-        image::imageops::overlay(&mut page, &a, 40, 20);
-        let bad_top = a.height() + 120;
         for line in 0..5u32 {
-            let y = bad_top + line * 10;
+            let y = 250 + line * 10; // fittable staff: ink 40..7040
+            for dy in 0..2 {
+                for x in 40..7_040u32 {
+                    page.put_pixel(x, y + dy, image::Rgb([10, 10, 10]));
+                }
+            }
+        }
+        for line in 0..5u32 {
+            let y = 1_400 + line * 10; // unfittable staff: full width
             for dy in 0..2 {
                 for x in 0..page_w {
                     page.put_pixel(x, y + dy, image::Rgb([10, 10, 10]));
@@ -2405,24 +2406,21 @@ mod tests {
         let weights = Weights::load(&dir.join("tromr.focrq")).expect("artifact loads");
         let tk = fixture_tokenizer();
         let result = recognize_page(&weights, &tk, &page)
-            .expect("page with one over-wide staff must still succeed (bd-av64.2)");
+            .expect("page with one unfittable staff must still succeed (bd-av64.2)");
         eprintln!(
             "[tromr-cert] resilience: {} recognized, {} skipped ({:?})",
             result.staves.len(),
             result.skips.len(),
             result.skips.iter().map(|s| &s.reason).collect::<Vec<_>>()
         );
-        assert_eq!(result.staves.len(), 1, "the in-clamp staff recognizes");
-        assert_eq!(result.skips.len(), 1, "the over-wide staff skips");
+        assert_eq!(result.staves.len(), 1, "the fittable staff recognizes");
+        assert_eq!(result.skips.len(), 1, "the unfittable staff skips");
         assert!(
             result.skips[0].reason.contains("1280"),
             "skip reason names the clamp: {}",
             result.skips[0].reason
         );
-        assert!(
-            !result.staves[0].1.semantic.is_empty(),
-            "the surviving staff carries real content"
-        );
+        assert_eq!(result.skips[0].index, 1, "the SECOND staff is the skip");
     }
 
     /// bd-av64.2: when EVERY detected staff fails, the page error names each

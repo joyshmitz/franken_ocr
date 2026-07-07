@@ -55,16 +55,14 @@
     "staff_count": 12,
     "staff_count_note": "5 two-staff systems of No.16 + first system of No.17; verified by eye",
     "clefs_all": "G2",
-    "min_recognized": 6,
-    "xfail": true,
-    "xfail_note": "detector finds 7 staves but ALL hit the 1280 width clamp (dense 12-staff layout, short bands); the bd-av64.14 ink-extent-trim class \u2014 flips green when .14 lands"
+    "min_recognized": 5,
+    "xfail_note": "PROMOTED 2026-07-07 at floor 5 (was 0 recognized pre-bd-av64.14): fit-first geometry rescues 5 of the 7 detected bands; the 2 tightest duet bands still exceed the budget within their neighbor bounds \u2014 barline splitting (bd-av64.4) or finer detection owns the remainder"
   },
   "pages/spohr_p100.png": {
     "kind": "full_page_mixed_prose",
     "staff_count_detectable": 3,
     "staff_count_note": "3 full-width example staves embedded in prose (the detector-precision class); several inline snippet staves are legitimately sub-detectable",
     "min_recognized": 1,
-    "xfail": true,
-    "xfail_note": "same wide-band clamp class as p055 (staves span full page width incl margins)"
+    "xfail_note": "PROMOTED 2026-07-07: bd-av64.14 fit-first geometry (ink-extent trim + extend-to-fit on over-budget bands) recognizes the prose-embedded staves; was 0 recognized before"
   }
 }
