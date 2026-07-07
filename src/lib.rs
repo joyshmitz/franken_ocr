@@ -619,6 +619,38 @@ impl OcrEngine {
         })
     }
 
+    /// [`OcrEngine::recognize_multi_page`] over in-memory images (the PDF
+    /// rasterizer's entry — pages never touch disk).
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_multi_page`].
+    pub fn recognize_multi_page_dynamic(
+        &self,
+        images: Vec<image::DynamicImage>,
+    ) -> FocrResult<String> {
+        self.recognize_multi_page_dynamic_with_model(&Self::model_path(), images)
+    }
+
+    /// Path-explicit form of [`OcrEngine::recognize_multi_page_dynamic`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_multi_page`].
+    pub fn recognize_multi_page_dynamic_with_model(
+        &self,
+        model_path: &Path,
+        images: Vec<image::DynamicImage>,
+    ) -> FocrResult<String> {
+        let model = self.model_at(model_path)?;
+        let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
+        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
+        let budget = per_image
+            .checked_mul(count)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
+            model.recognize_multi_page_dynamic(images)
+        })
+    }
+
     fn stage_budget(stage: &str, default_ms: u64) -> Duration {
         let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
         let millis = std::env::var(&key)

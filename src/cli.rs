@@ -306,6 +306,13 @@ pub struct OcrRequestArgs {
     /// by default; a page with no detectable gutter passes through unsplit.
     #[arg(long)]
     pub split_spreads: bool,
+    /// ONE cross-page pass over the whole document (PDF inputs only; the
+    /// Unlimited-OCR `infer_multi` contract): page N can reference pages
+    /// 1..N-1, output is one markdown with `<PAGE>` separators. Composes
+    /// with `--pages`. The document must fit the 32K context (~290 pages).
+    /// Without this flag each page is parsed independently.
+    #[arg(long)]
+    pub multi_page: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +330,7 @@ pub struct OcrRequest {
     pub question: Option<String>,
     pub pages: Option<String>,
     pub split_spreads: bool,
+    pub multi_page: bool,
 }
 
 impl OcrArgs {
@@ -401,6 +409,7 @@ impl OcrRequestArgs {
             question: self.question.clone(),
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
+            multi_page: self.multi_page,
         })
     }
 
@@ -1293,11 +1302,20 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // the figure-aware variants additionally crop the `![](images/…)` regions out
     // of the source and rewrite the markdown references to the saved files.
     let is_pdf = pdf::looks_like_pdf(&request.image);
-    if !is_pdf && (request.pages.is_some() || request.split_spreads) {
+    if !is_pdf && (request.pages.is_some() || request.split_spreads || request.multi_page) {
         return Err(FocrError::Usage(format!(
-            "--pages/--split-spreads select and split PDF pages, but {} is not a PDF",
+            "--pages/--split-spreads/--multi-page operate on PDF pages, but {} is not a PDF \
+             (for an image list, use `focr ocr-batch --multi-page`)",
             request.image.display()
         )));
+    }
+    if request.multi_page && (request.split_spreads || figure_plan.is_some()) {
+        return Err(FocrError::Usage(
+            "--multi-page is one cross-page pass over whole pages; it does not compose \
+             with --split-spreads or --extract-figures (run those per-page passes \
+             separately)"
+                .into(),
+        ));
     }
     if request.split_spreads && figure_plan.is_some() {
         return Err(FocrError::Usage(
@@ -1322,6 +1340,10 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             doc.markdown = writer.process_page(1, &doc.markdown, raw)?;
             (Recognition::Single(doc), writer.into_written())
         }
+        (None, true) if request.multi_page => (
+            Recognition::Pdf(recognize_pdf_multi_page(&engine, &request, robot_mode)?),
+            Vec::new(),
+        ),
         (None, true) => (
             Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode)?),
             Vec::new(),
@@ -1571,6 +1593,59 @@ struct PdfPageLayout {
 struct PdfRecognition {
     markdown: String,
     pages: Vec<PdfPageLayout>,
+}
+
+/// `--multi-page` (bd-2z0y): rasterize the selected PDF pages and run ONE
+/// cross-page pass over the whole document (the Unlimited-OCR `infer_multi`
+/// contract, bd-1gv.25) — page N attends to pages 1..N−1; the output is one
+/// markdown with `<PAGE>` separators. Per-page bbox layout is not produced in
+/// this mode (the reference emits document-level markdown), so `pages` is
+/// empty in the JSON. A page that fails to RASTER is skipped with the same
+/// surfaced page event as the per-page path (the pass runs over the pages
+/// that rendered); decode errors are whole-document by construction.
+fn recognize_pdf_multi_page(
+    engine: &OcrEngine,
+    request: &OcrRequest,
+    robot_mode: bool,
+) -> FocrResult<PdfRecognition> {
+    let pages = pdf::PdfPages::open(&request.image)?;
+    let page_count = pages.len();
+    let mut images: Vec<image::DynamicImage> = Vec::new();
+    let mut first_error: Option<FocrError> = None;
+    for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
+        match pages.render(idx) {
+            Ok(image) => images.push(image),
+            Err(e) => {
+                if robot_mode {
+                    emit(&robot::page_skipped_event(idx + 1, &e));
+                } else {
+                    eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                }
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "recognize_pdf_multi_page: no pages selected from {}",
+                request.image.display()
+            ))
+        }));
+    }
+    let markdown = recognize_with_autodownload(request, robot_mode, |model| {
+        let imgs = images.clone();
+        match model {
+            Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
+            None => engine.recognize_multi_page_dynamic(imgs),
+        }
+    })?;
+    Ok(PdfRecognition {
+        markdown,
+        pages: Vec::new(),
+    })
 }
 
 /// Recognize every page of a PDF, concatenating the per-page markdown into one
@@ -2834,6 +2909,7 @@ mod tests {
                     question: None,
                     pages: None,
                     split_spreads: false,
+                    multi_page: false,
                 },
                 json: false,
                 output: None,
@@ -2865,6 +2941,7 @@ mod tests {
                         question: None,
                         pages: None,
                         split_spreads: false,
+                        multi_page: false,
                     },
                 }),
             },
@@ -2890,6 +2967,7 @@ mod tests {
                 question: None,
                 pages: None,
                 split_spreads: false,
+                multi_page: false,
             },
             json: false,
             output: None,
@@ -3407,6 +3485,7 @@ mod tests {
                 question: None,
                 pages: None,
                 split_spreads: false,
+                multi_page: false,
             },
             json: false,
             output: None,

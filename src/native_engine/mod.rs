@@ -1560,7 +1560,45 @@ impl OcrModel {
         for path in image_paths {
             pres.push(preprocess::preprocess_image(path, mode)?);
         }
+        self.recognize_multi_page_pres(pres)
+    }
 
+    /// [`Self::recognize_multi_page`] over in-memory images — the PDF path's
+    /// entry (pages are rasterized in-memory, never written to disk).
+    ///
+    /// # Errors
+    /// As [`Self::recognize_multi_page`].
+    pub fn recognize_multi_page_dynamic(
+        &self,
+        images: Vec<image::DynamicImage>,
+    ) -> FocrResult<String> {
+        if images.is_empty() {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "recognize_multi_page_dynamic: images must be non-empty"
+            )));
+        }
+        if self.arch().id() != model_arch::default_arch().id() {
+            return Err(FocrError::NotImplemented(format!(
+                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
+                 contract; model {:?} parses pages independently (use the plain \
+                 multi-input/batch path)",
+                self.arch().id()
+            )));
+        }
+        Self::ensure_arch_implemented(self.arch())?;
+        let mode = preprocess::PreprocessMode::Base {
+            base_size: MULTI_PAGE_BASE_SIZE,
+        };
+        let mut pres = Vec::with_capacity(images.len());
+        for img in images {
+            pres.push(preprocess::preprocess_dynamic(img, mode)?);
+        }
+        self.recognize_multi_page_pres(pres)
+    }
+
+    /// The shared multi-page core (bd-1gv.25): per-page vision, ONE fused
+    /// cross-page prefill, ONE decode, `finalize_multi` assembly.
+    fn recognize_multi_page_pres(&self, pres: Vec<Preprocessed>) -> FocrResult<String> {
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = std::time::Instant::now();
         let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());

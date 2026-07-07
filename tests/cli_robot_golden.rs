@@ -1117,6 +1117,34 @@ fn robot_selftest_proves_per_model_kernel_parity_e2e() {
     );
 }
 
+/// bd-2z0y: `focr ocr --multi-page` is PDF-only and refuses non-composable
+/// flags with clean Usage errors (exit 2) — never a panic, never a silent
+/// per-page fallback.
+#[test]
+fn ocr_multi_page_flag_guards_are_typed_usage_errors() {
+    let test = "ocr_multi_page_flag_guards_are_typed_usage_errors";
+    // Non-PDF input: --multi-page is a usage error naming the batch alternative.
+    let out = run_focr(&["ocr", "scan.png", "--multi-page"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--multi-page on a non-PDF must be Usage exit 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ocr-batch --multi-page"),
+        "the error must point at the image-list alternative; got: {stderr}"
+    );
+    tlog!(test,
+        "case": "non_pdf_guard",
+        "event": "result",
+        "inputs": {"argv": ["ocr", "scan.png", "--multi-page"]},
+        "exit_code": out.status.code(),
+        "result": "pass",
+    );
+}
+
 /// bd-1gv.25 S2: `focr batch --multi-page` parses, routes to the cross-page
 /// pass, and (hermetically, with no model present) fails with the CLEAN
 /// ModelNotFound contract (exit 3) — proving the flag reaches the engine
