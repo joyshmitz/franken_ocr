@@ -242,7 +242,7 @@ cargo build --release
 2. **Fetch the weights once:** `focr pull`. This downloads about 3.9 GB of int8 weights plus `tokenizer.json` into `~/.cache/franken_ocr/models`, verifying every byte by SHA256 against a committed manifest.
 3. **Verify your CPU kernel** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM is bit-identical to the scalar oracle on this host.
 4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output (markdown + bounding boxes), `-o out.md` / `-o out.json` to write a file, or `--robot` for an NDJSON event stream.
-5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`.
+5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`. Add `--multi-page` to parse them as ONE cross-referencing document instead of independent pages.
 
 ---
 
@@ -346,6 +346,16 @@ splitting. `--split-spreads` is also PDF-only and off by default. It looks for
 wide raster pages with a near-blank vertical gutter near the center, then OCRs
 the left and right halves as separate logical pages; no qualifying gutter means
 the page remains unsplit.
+
+**Multi-page cross-page parsing (`--multi-page`).** By default every page is
+parsed independently. `--multi-page` instead runs ONE pass over the whole
+document — the Unlimited-OCR `infer_multi` contract — so page N can reference
+content on pages 1..N-1, and the output is a single Markdown document with
+`<PAGE>` separators. On `focr ocr` it is PDF-only and composes with `--pages`;
+for an image list use `focr ocr-batch page1.png page2.png --multi-page`. The
+whole document must fit the 32K context (roughly 290 pages); over-budget
+requests fail with an actionable error instead of truncating. It does not
+compose with `--split-spreads` or `--extract-figures` (per-page semantics).
 
 **Tasks (`--task`).** Convenience routing over the model zoo (`focr models`). `--task ocr`
 (the default) is plain document OCR, unchanged. `--task formula`, `tables`, `chart`,
