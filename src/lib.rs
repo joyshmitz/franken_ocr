@@ -227,6 +227,12 @@ where
     Ok(n)
 }
 
+/// Boxed per-page streaming sink for multi-page passes (bd-2z0y): called
+/// with the 1-based page index and the trimmed raw body as each `<PAGE>`
+/// boundary is crossed in the token stream. `Send` because the pass runs on
+/// the engine's blocking pool.
+pub type PageSink = Box<dyn FnMut(usize, &str) + Send>;
+
 pub struct OcrEngine {
     /// The single owned async runtime. All public methods block on it.
     runtime: Runtime,
@@ -648,6 +654,31 @@ impl OcrEngine {
             .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             model.recognize_multi_page_dynamic(images)
+        })
+    }
+
+    /// [`OcrEngine::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING
+    /// sink (bd-2z0y): `on_page(k, body)` fires from the decode driver as
+    /// page `k`'s `<PAGE>` boundary is crossed in the token stream (boxed +
+    /// `Send` because the pass runs on the blocking pool). The returned
+    /// markdown is still the full terminal assembly.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_multi_page`].
+    pub fn recognize_multi_page_dynamic_streaming_with_model(
+        &self,
+        model_path: &Path,
+        images: Vec<image::DynamicImage>,
+        mut on_page: PageSink,
+    ) -> FocrResult<String> {
+        let model = self.model_at(model_path)?;
+        let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
+        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
+        let budget = per_image
+            .checked_mul(count)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
+            model.recognize_multi_page_dynamic_streaming(images, &mut *on_page)
         })
     }
 

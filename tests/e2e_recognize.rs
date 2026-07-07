@@ -769,6 +769,82 @@ fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
     }
 }
 
+/// bd-2z0y: the STREAMING multi-page pass end-to-end over the real model —
+/// the per-page sink fires from the decode driver at `<PAGE>` boundaries,
+/// pages arrive in order starting at 1, the stream's page count equals the
+/// terminal assembly's marker count, and the terminal markdown is byte-equal
+/// to the non-streaming pass (streaming adds visibility, never changes the
+/// result). Absent/unarmed ⇒ skip-with-SUCCESS.
+#[test]
+fn multi_page_streaming_matches_terminal_assembly_when_armed() {
+    let test = "multi_page_streaming_matches_terminal_assembly_when_armed";
+    let case = "two_tiny_pages_streamed";
+
+    let Some(model_path) = armed_present_model() else {
+        log_success(
+            test,
+            case,
+            &format!("streaming e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed"),
+        );
+        return;
+    };
+
+    let load = |p: &PathBuf| image::open(p).expect("tiny fixture decodes");
+    let page_a = write_tiny_png();
+    let page_b = write_tiny_png();
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+
+    // Streaming pass: collect (page, body) events.
+    let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let sink = Box::new(move |page: usize, body: &str| {
+        sink_events
+            .lock()
+            .expect("sink mutex")
+            .push((page, body.to_string()));
+    });
+    let streamed = engine
+        .recognize_multi_page_dynamic_streaming_with_model(
+            &model_path,
+            vec![load(&page_a), load(&page_b)],
+            sink,
+        )
+        .expect("streaming multi-page pass");
+
+    // Non-streaming pass over the SAME pages must assemble byte-identically.
+    let plain = engine
+        .recognize_multi_page_dynamic_with_model(&model_path, vec![load(&page_a), load(&page_b)])
+        .expect("plain multi-page pass");
+    assert_eq!(
+        streamed, plain,
+        "streaming must not change the terminal assembly"
+    );
+
+    let events = events.lock().expect("events mutex").clone();
+    let markers = streamed.matches("<PAGE>").count();
+    assert_eq!(
+        events.len(),
+        markers,
+        "one streamed page per terminal <PAGE> marker; events: {events:?}"
+    );
+    for (i, (page, _)) in events.iter().enumerate() {
+        assert_eq!(*page, i + 1, "pages must stream in order from 1");
+    }
+    log_line(
+        test,
+        case,
+        "result",
+        "pass",
+        &format!(
+            "streamed_pages={} markers={} markdown_bytes={} note=\"stream == terminal assembly\"",
+            events.len(),
+            markers,
+            streamed.len(),
+        ),
+    );
+}
+
 #[test]
 fn recognize_real_model_when_present_else_skip_with_success() {
     let test = "recognize_real_model_when_present_else_skip_with_success";

@@ -149,6 +149,11 @@ const MULTI_PAGE_BASE_SIZE: usize = 640;
 /// pages in one 32K pass").
 const MAX_POSITION_EMBEDDINGS: usize = 32768;
 
+/// Streaming sink for completed multi-page bodies (bd-2z0y): called with the
+/// 1-based page index and the trimmed raw body as each `<PAGE>` boundary is
+/// crossed in the token stream.
+type PageSink<'a> = &'a mut dyn FnMut(usize, &str);
+
 /// Env override for the generated-token cap (`max_length` in [`DecodeParams`]).
 /// Unset ⇒ the reference default ([`sampler::DEFAULT_MAX_LENGTH`]). Setting it
 /// only LOWERS the practical decode cost during bring-up / bounded runs — it
@@ -1560,7 +1565,7 @@ impl OcrModel {
         for path in image_paths {
             pres.push(preprocess::preprocess_image(path, mode)?);
         }
-        self.recognize_multi_page_pres(pres)
+        self.recognize_multi_page_pres(pres, None)
     }
 
     /// [`Self::recognize_multi_page`] over in-memory images — the PDF path's
@@ -1593,12 +1598,55 @@ impl OcrModel {
         for img in images {
             pres.push(preprocess::preprocess_dynamic(img, mode)?);
         }
-        self.recognize_multi_page_pres(pres)
+        self.recognize_multi_page_pres(pres, None)
+    }
+
+    /// [`Self::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING sink
+    /// (bd-2z0y): `on_page(k, body)` fires as soon as page `k`'s `<PAGE>`
+    /// boundary is crossed IN the token stream (the next page's marker
+    /// arrives, or the decode ends), carrying the trimmed raw body. The
+    /// terminal return value is still the full [`postprocess::finalize_multi`]
+    /// assembly — streaming adds visibility, never changes the result.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_multi_page`].
+    pub fn recognize_multi_page_dynamic_streaming(
+        &self,
+        images: Vec<image::DynamicImage>,
+        on_page: &mut dyn FnMut(usize, &str),
+    ) -> FocrResult<String> {
+        if images.is_empty() {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "recognize_multi_page_dynamic_streaming: images must be non-empty"
+            )));
+        }
+        if self.arch().id() != model_arch::default_arch().id() {
+            return Err(FocrError::NotImplemented(format!(
+                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
+                 contract; model {:?} parses pages independently (use the plain \
+                 multi-input/batch path)",
+                self.arch().id()
+            )));
+        }
+        Self::ensure_arch_implemented(self.arch())?;
+        let mode = preprocess::PreprocessMode::Base {
+            base_size: MULTI_PAGE_BASE_SIZE,
+        };
+        let mut pres = Vec::with_capacity(images.len());
+        for img in images {
+            pres.push(preprocess::preprocess_dynamic(img, mode)?);
+        }
+        self.recognize_multi_page_pres(pres, Some(on_page))
     }
 
     /// The shared multi-page core (bd-1gv.25): per-page vision, ONE fused
-    /// cross-page prefill, ONE decode, `finalize_multi` assembly.
-    fn recognize_multi_page_pres(&self, pres: Vec<Preprocessed>) -> FocrResult<String> {
+    /// cross-page prefill, ONE decode, `finalize_multi` assembly. `on_page`
+    /// (bd-2z0y) streams each completed page body as its boundary is crossed.
+    fn recognize_multi_page_pres(
+        &self,
+        pres: Vec<Preprocessed>,
+        on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<String> {
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = std::time::Instant::now();
         let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());
@@ -1657,7 +1705,48 @@ impl OcrModel {
             ..self.decode_params.clone()
         };
         let td = std::time::Instant::now();
-        let generated = self.generate_with(inputs_embeds, &prompt_ids, &params)?;
+        let generated = match on_page {
+            None => self.generate_with(inputs_embeds, &prompt_ids, &params)?,
+            Some(on_page) => {
+                // Streaming (bd-2z0y): a per-committed-token observer feeds a
+                // [`postprocess::PageStream`]. Boundary checks re-decode the
+                // emitted ids every STREAM_CHECK_EVERY tokens — a full decode
+                // is a linear byte-concat, trivial next to a decode step's
+                // GEMMs — and PageStream is idempotent over re-fed prefixes.
+                // Streaming is BEST-EFFORT: a decode error inside the observer
+                // stops the stream (the terminal decode below still surfaces
+                // real errors); it never changes the emitted ids.
+                const STREAM_CHECK_EVERY: usize = 8;
+                let tok = self.tokenizer()?;
+                let mut stream = postprocess::PageStream::new();
+                let mut ids: Vec<u32> = Vec::new();
+                let mut stream_broken = false;
+                let mut observer = |id: u32| {
+                    ids.push(id);
+                    if stream_broken || !ids.len().is_multiple_of(STREAM_CHECK_EVERY) {
+                        return;
+                    }
+                    match tok.decode(&ids) {
+                        Ok(text) => stream.feed(&text, &mut *on_page),
+                        Err(_) => stream_broken = true,
+                    }
+                };
+                let generated = self.generate_with_observer(
+                    inputs_embeds,
+                    &prompt_ids,
+                    &params,
+                    Some(&mut observer),
+                )?;
+                // End of decode: flush the final in-flight page (EOS marker
+                // stripped, exactly as finalize_multi strips it before split).
+                if !stream_broken && let Ok(text) = tok.decode(&generated) {
+                    let text = postprocess::strip_eos(&text);
+                    stream.feed(&text, &mut *on_page);
+                    stream.finish(&text, &mut *on_page);
+                }
+                generated
+            }
+        };
         timing_log(&format!(
             "multi_page.decode {} tokens {:.2}s",
             generated.len(),
@@ -2273,12 +2362,26 @@ impl OcrModel {
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
     ) -> FocrResult<Vec<u32>> {
+        self.generate_with_observer(inputs_embeds, prompt_ids, params, None)
+    }
+
+    /// [`Self::generate_with`] plus an optional PER-COMMITTED-TOKEN observer
+    /// (bd-2z0y streaming): called synchronously from the sequential decode
+    /// driver after each token joins `emitted`, in emission order — never
+    /// from inside a rayon fan-out. `None` is byte-for-byte today's paths.
+    fn generate_with_observer(
+        &self,
+        inputs_embeds: Mat,
+        prompt_ids: &[u32],
+        params: &sampler::DecodeParams,
+        observer: Option<&mut dyn FnMut(u32)>,
+    ) -> FocrResult<Vec<u32>> {
         if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
-            self.generate_stateless(inputs_embeds, prompt_ids, params)
+            self.generate_stateless(inputs_embeds, prompt_ids, params, observer)
         } else if int8_decode_requested() {
-            self.generate_cached_i8(inputs_embeds, prompt_ids, params)
+            self.generate_cached_i8(inputs_embeds, prompt_ids, params, observer)
         } else {
-            self.generate_cached(inputs_embeds, prompt_ids, params)
+            self.generate_cached(inputs_embeds, prompt_ids, params, observer)
         }
     }
 
@@ -2301,6 +2404,7 @@ impl OcrModel {
         inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
+        mut observer: Option<&mut dyn FnMut(u32)>,
     ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
@@ -2347,6 +2451,9 @@ impl OcrModel {
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
+            if let Some(f) = observer.as_deref_mut() {
+                f(step.token_id);
+            }
             if step.is_eos {
                 break;
             }
@@ -2388,6 +2495,7 @@ impl OcrModel {
         inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
+        mut observer: Option<&mut dyn FnMut(u32)>,
     ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
@@ -2448,7 +2556,8 @@ impl OcrModel {
         // spec loop is skipped and the `while` runs EXACTLY today's code, untouched.
         // The params half is `DecodeParams::matches_frozen_spec_ban` (sampler.rs),
         // gated by `tests/spec_decode_gate.rs`, so guard and gate cannot drift.
-        let spec_decode = spec_decode_enabled() && params.matches_frozen_spec_ban();
+        let spec_decode =
+            spec_decode_enabled() && params.matches_frozen_spec_ban() && observer.is_none();
         if spec_decode {
             self.spec_decode_i8(
                 wc,
@@ -2488,6 +2597,9 @@ impl OcrModel {
             };
             generated.push(step.token_id);
             emitted.push(step.token_id);
+            if let Some(f) = observer.as_deref_mut() {
+                f(step.token_id);
+            }
             if step.is_eos {
                 break;
             }
@@ -2731,6 +2843,7 @@ impl OcrModel {
         mut inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
+        mut observer: Option<&mut dyn FnMut(u32)>,
     ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
 
@@ -2762,6 +2875,9 @@ impl OcrModel {
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
+            if let Some(f) = observer.as_deref_mut() {
+                f(step.token_id);
+            }
             if step.is_eos {
                 break;
             }

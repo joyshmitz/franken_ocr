@@ -89,6 +89,26 @@ pub fn run_error_event(err: &FocrError) -> Value {
 /// the skip reason is machine-classifiable, and `message` carries the human
 /// detail. `page` is an advertised [`EVENT_KINDS`] kind, so this finalizes a slice
 /// of its payload without changing the advertised event set (schema stays v1).
+/// Build a robot-mode `page` event for one DECODED page of a `--multi-page`
+/// cross-page pass (bd-2z0y): emitted as the page's `<PAGE>` boundary is
+/// crossed in the token stream, so a machine consumer sees per-page progress
+/// (and the raw body) during a long single-pass decode instead of one silent
+/// wait for `run_complete`. `page` is 1-based in the MODEL's emission order;
+/// `text` is the trimmed raw body (the polished markdown arrives in the
+/// terminal `run_complete`). Additive payload on the advertised `page` kind —
+/// schema stays v1.
+#[must_use]
+pub fn page_decoded_event(page: usize, text: &str) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "page",
+        "status": "decoded",
+        "page": page,
+        "chars": text.chars().count(),
+        "text": text,
+    })
+}
+
 pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
     json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
@@ -211,6 +231,19 @@ mod tests {
         assert_eq!(event["markdown"], "# Title\n\nbody text");
         // The terminal success event is an advertised kind (no schema bump).
         assert!(EVENT_KINDS.contains(&"run_complete"));
+    }
+
+    #[test]
+    fn page_decoded_event_carries_the_streamed_body() {
+        let event = page_decoded_event(2, "# Chapter\nBody.");
+        assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
+        assert_eq!(event["event"], "page");
+        assert_eq!(event["status"], "decoded");
+        assert_eq!(event["page"], 2);
+        assert_eq!(event["chars"], 15);
+        assert_eq!(event["text"], "# Chapter\nBody.");
+        // `page` is an advertised kind, so no schema bump is implied.
+        assert!(EVENT_KINDS.contains(&"page"));
     }
 
     #[test]

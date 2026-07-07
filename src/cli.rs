@@ -1637,9 +1637,23 @@ fn recognize_pdf_multi_page(
     }
     let markdown = recognize_with_autodownload(request, robot_mode, |model| {
         let imgs = images.clone();
-        match model {
-            Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
-            None => engine.recognize_multi_page_dynamic(imgs),
+        // Robot mode streams a `page` event per crossed <PAGE> boundary
+        // (bd-2z0y); the terminal run_complete still carries the assembled
+        // markdown. The default-model arm resolves the same path an explicit
+        // model would, so both arms stream.
+        if robot_mode {
+            let sink = Box::new(|page: usize, body: &str| {
+                emit(&robot::page_decoded_event(page, body));
+            });
+            let model_path = model
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(OcrEngine::model_path);
+            engine.recognize_multi_page_dynamic_streaming_with_model(&model_path, imgs, sink)
+        } else {
+            match model {
+                Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
+                None => engine.recognize_multi_page_dynamic(imgs),
+            }
         }
     })?;
     Ok(PdfRecognition {

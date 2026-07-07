@@ -505,6 +505,71 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     Ok(format!("<PAGE>\n{body}"))
 }
 
+/// Incremental `<PAGE>`-boundary scanner for STREAMING multi-page decodes
+/// (bd-2z0y): fed the full decoded-so-far text, it emits each page body as
+/// soon as the NEXT page's marker arrives (page k is complete when marker
+/// k+1 appears; the final page completes at end-of-decode via
+/// [`PageStream::finish`]).
+///
+/// Pure string logic — the token→text decode happens in the caller — so the
+/// boundary semantics are unit-tested without a tokenizer. Mirrors
+/// [`finalize_multi`]'s split contract: text before the FIRST marker is
+/// discarded (the reference `split('<PAGE>')[1:]`), and streamed bodies are
+/// `.trim()`-ed raw model text (the polished per-page markdown still comes
+/// from the terminal [`finalize_multi`] assembly).
+#[derive(Debug, Default)]
+pub struct PageStream {
+    /// Byte offset just past the last CONSUMED marker (the current page's
+    /// body starts here). `None` until the first marker arrives.
+    body_start: Option<usize>,
+    /// 1-based index of the page currently being decoded.
+    current_page: usize,
+}
+
+impl PageStream {
+    /// Fresh scanner (no marker seen yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scan `full_text` (the ENTIRE decoded text so far — the caller may call
+    /// this as often or as rarely as it likes; the scanner is idempotent over
+    /// already-seen prefixes) and emit every newly COMPLETED page body.
+    pub fn feed(&mut self, full_text: &str, mut on_page: impl FnMut(usize, &str)) {
+        loop {
+            match self.body_start {
+                None => {
+                    // Waiting for the FIRST marker (page 1's start).
+                    let Some(pos) = full_text.find(PAGE_MARKER) else {
+                        return;
+                    };
+                    self.body_start = Some(pos + PAGE_MARKER.len());
+                    self.current_page = 1;
+                }
+                Some(start) => {
+                    let Some(rel) = full_text[start..].find(PAGE_MARKER) else {
+                        return;
+                    };
+                    let end = start + rel;
+                    on_page(self.current_page, full_text[start..end].trim());
+                    self.body_start = Some(end + PAGE_MARKER.len());
+                    self.current_page += 1;
+                }
+            }
+        }
+    }
+
+    /// End of decode: emit the final in-flight page (marker seen, no
+    /// successor marker). A decode that never emitted a marker emits nothing
+    /// (matching [`finalize_multi`] discarding pre-marker text).
+    pub fn finish(self, full_text: &str, mut on_page: impl FnMut(usize, &str)) {
+        if let Some(start) = self.body_start {
+            on_page(self.current_page, full_text[start..].trim());
+        }
+    }
+}
+
 /// Parse the layout (ref/det spans) from raw decoded text and return each span's
 /// label plus its pixel-rescaled boxes, for callers that need the bounding-box
 /// geometry (overlay drawing, structured layout export) rather than the markdown
@@ -719,6 +784,53 @@ mod tests {
         assert!(md.contains("x := y"));
         assert!(md.contains("![](images/0.jpg)"));
         assert!(!md.contains("\\coloneqq"));
+    }
+
+    #[test]
+    fn page_stream_streams_bodies_as_markers_arrive() {
+        let mut ps = PageStream::new();
+        let mut got: Vec<(usize, String)> = Vec::new();
+        // Incremental growth: nothing before the first marker; page 1 lands
+        // only when marker 2 arrives; idempotent over re-fed prefixes.
+        ps.feed("preamble ", |i, s| got.push((i, s.to_string())));
+        assert!(got.is_empty());
+        ps.feed("preamble <PAGE>\nalpha", |i, s| {
+            got.push((i, s.to_string()))
+        });
+        assert!(got.is_empty(), "page 1 is still in flight");
+        let text = "preamble <PAGE>\nalpha\n<PAGE>\nbeta";
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got, vec![(1, "alpha".to_string())]);
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got.len(), 1, "re-feeding the same text must not re-emit");
+        ps.finish(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(
+            got,
+            vec![(1, "alpha".to_string()), (2, "beta".to_string())],
+            "finish flushes the final in-flight page"
+        );
+        println!(r#"{{"check":"page_stream_boundaries","pages":2,"result":"pass"}}"#);
+    }
+
+    #[test]
+    fn page_stream_without_markers_streams_nothing() {
+        // Mirrors finalize_multi's split()[1:] — pre-marker text is discarded.
+        let ps = PageStream::new();
+        let mut got = 0usize;
+        ps.finish("no markers at all", |_, _| got += 1);
+        assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn page_stream_marker_split_across_feeds_is_caught() {
+        // The caller re-feeds the FULL text, so a marker that was previously
+        // truncated mid-bytes ("<PA") completes on a later feed.
+        let mut ps = PageStream::new();
+        let mut got: Vec<usize> = Vec::new();
+        ps.feed("<PAGE>one <PA", |i, _| got.push(i));
+        assert!(got.is_empty());
+        ps.feed("<PAGE>one <PAGE>two", |i, _| got.push(i));
+        assert_eq!(got, vec![1]);
     }
 
     #[test]
