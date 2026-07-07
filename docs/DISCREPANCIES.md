@@ -202,7 +202,15 @@ since exact-token OCR fails in the tail.
     prefix; markers 8-vs-9; plate still exact) — the fork compounds across
     pages exactly as §2.5's graceful-degradation curve expects; the UNCAPPED
     10-page subject runs to the 32768 position cap and terminates cleanly
-    (31653 + 1115 prefill = 32768) where the bf16 oracle EOSes at 7117. The fork is the same
+    (31653 + 1115 prefill = 32768) where the bf16 oracle EOSes at 7117.
+    AT 20 PAGES THE REFERENCE ITSELF COLLAPSES (frozen:
+    tests/fixtures/multi_page/p20_raw.md, sha 0c148a9e25e8…): 10469 tokens
+    but only 7 `<PAGE>` markers for 20 pages, ending in a repetition run
+    ("The CAME was a strong enough…") — long-horizon degradation past ~10
+    pages at 640 is a property of the REFERENCE MODEL, not of this port; no
+    CER gate is meaningful against a degenerate oracle, so the committed
+    rungs stop at the 10-page leg and the 20-page fixture stands as the
+    upper-bound evidence. The fork is the same
     precision-trajectory class as DISC-003 (greedy path divergence at a
     near-tie under a different summation/precision), amplified here by the
     lossy 640 squash making footer glyphs genuinely ambiguous.
