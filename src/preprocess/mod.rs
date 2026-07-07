@@ -1115,6 +1115,25 @@ mod tests {
         assert_eq!(p.num_views(), 1);
     }
 
+    /// The multi-page per-page census (bd-1gv.25): `infer_multi` runs every
+    /// page at Base 640 ⇒ `num_queries(640) = 10` ⇒ `(10+1)·10 + 1 = 111`
+    /// placeholder slots per page — the exact per-page block the reference
+    /// concatenates at the prompt's single `<image>` position.
+    #[test]
+    fn multi_page_base_640_placeholder_is_111() {
+        assert_eq!(num_queries(640), 10);
+        let p = Preprocessed {
+            mode: PreprocessMode::Base { base_size: 640 },
+            global: view_tensor(&solid(8, 8, [0, 0, 0])),
+            tiles: Vec::new(),
+            crop_grid: CropGrid::single(),
+            original_size: (8, 8),
+        };
+        assert_eq!(p.placeholder_token_count(), 111);
+        assert_eq!(p.num_views(), 1);
+        println!(r#"{{"check":"multi_page_census_640","per_page":111,"result":"pass"}}"#);
+    }
+
     /// The Gundam multi-tile totals from the OQ-18 census table:
     /// 273 global + (10W+1)(10H) local.
     #[test]

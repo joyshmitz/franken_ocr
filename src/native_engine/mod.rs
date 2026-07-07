@@ -136,6 +136,19 @@ const MODEL_QUANT_ENV: &str = "FOCR_QUANT";
 // are embodied by this fused forward + the frozen decoder constants.
 const BASE_PROMPT_TEXT: &str = "document parsing.";
 
+/// Reference `infer_multi` task prompt (`'<image>Multi page parsing.'`,
+/// `modeling_unlimitedocr.py:1139` — the single `<image>` position carries ALL
+/// pages' token blocks; bd-1gv.25).
+const MULTI_PAGE_PROMPT_TEXT: &str = "Multi page parsing.";
+/// Reference `infer_multi` global-view edge (`image_size=640`, NOT the
+/// single-image 1024): every page is resized+padded to 640² Base mode, so the
+/// per-page placeholder block is `(10+1)·10 + 1 = 111` tokens (OQ-18).
+const MULTI_PAGE_BASE_SIZE: usize = 640;
+/// `max_position_embeddings` — the hard 32K cap one cross-page pass must fit
+/// in ([SPEC-101]; plan §2.1 "constant-KV long-output decoding of dozens of
+/// pages in one 32K pass").
+const MAX_POSITION_EMBEDDINGS: usize = 32768;
+
 /// Env override for the generated-token cap (`max_length` in [`DecodeParams`]).
 /// Unset ⇒ the reference default ([`sampler::DEFAULT_MAX_LENGTH`]). Setting it
 /// only LOWERS the practical decode cost during bring-up / bounded runs — it
@@ -1504,6 +1517,118 @@ impl OcrModel {
     /// path (the bd-1azu.13 gate). The spine is the int8 throughput path; if int8
     /// is not requested it stays on the sequential fallback so the result tracks
     /// whatever oracle is in force.
+    /// Multi-page document orchestration (bd-1gv.25) — the reference
+    /// `infer_multi` contract, THE headline "Unlimited" feature (plan §2.1):
+    /// every page's Base-640 vision block joins ONE frozen cross-page
+    /// reference KV, then a single AR decode runs over the whole document —
+    /// page N attends to pages 1..N−1 (OQ-13: cross-page DEPENDENT, never a
+    /// concatenation of independent single-page parses).
+    ///
+    /// Returns the assembled markdown: the model emits `<PAGE>` separators
+    /// and [`postprocess::finalize_multi`] applies the reference
+    /// `save_results` per-page post-pass + rejoin.
+    ///
+    /// # Errors
+    /// * [`FocrError::NotImplemented`] for a non-Unlimited-OCR artifact —
+    ///   `infer_multi` is the Unlimited contract; zoo models parse pages
+    ///   independently via [`Self::recognize_batch`].
+    /// * [`FocrError::Other`] on an empty page list or when the assembled
+    ///   cross-page prefix cannot fit the 32K position budget (actionable:
+    ///   says how many tokens over and suggests splitting the document).
+    /// * Any preprocess / vision / decode error, as [`Self::recognize`].
+    pub fn recognize_multi_page(&self, image_paths: &[&Path]) -> FocrResult<String> {
+        if image_paths.is_empty() {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "recognize_multi_page: image_paths must be non-empty"
+            )));
+        }
+        if self.arch().id() != model_arch::default_arch().id() {
+            return Err(FocrError::NotImplemented(format!(
+                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
+                 contract; model {:?} parses pages independently (use the plain \
+                 multi-input/batch path)",
+                self.arch().id()
+            )));
+        }
+        Self::ensure_arch_implemented(self.arch())?;
+
+        // ── per-page Base-640 preprocess (multi-page forces no-crop, §2.4) ──
+        let mode = preprocess::PreprocessMode::Base {
+            base_size: MULTI_PAGE_BASE_SIZE,
+        };
+        let mut pres = Vec::with_capacity(image_paths.len());
+        for path in image_paths {
+            pres.push(preprocess::preprocess_image(path, mode)?);
+        }
+
+        // ── vision tower per page, sequential (§6.5: one live forward) ──────
+        let tv = std::time::Instant::now();
+        let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());
+        for pre in &pres {
+            let mut feats = self.vision_tower(pre)?;
+            if feats.len() != 1 {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "recognize_multi_page: Base-mode page produced {} vision blocks; expected 1",
+                    feats.len()
+                )));
+            }
+            globals.push(feats.remove(0));
+        }
+        timing_log(&format!(
+            "multi_page.vision ({} pages) {:.2}s",
+            pres.len(),
+            tv.elapsed().as_secs_f64()
+        ));
+
+        // ── ONE cross-page prompt + embeds (all blocks at the single <image>) ─
+        let (prompt_ids, images_seq_mask) = self.build_prompt_multi(&pres)?;
+        if prompt_ids.len() + 1 > MAX_POSITION_EMBEDDINGS {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "recognize_multi_page: the assembled {}-page prefix is {} tokens — over the \
+                 {MAX_POSITION_EMBEDDINGS} position budget by {} with no room to generate; \
+                 split the document into smaller multi-page passes",
+                pres.len(),
+                prompt_ids.len(),
+                (prompt_ids.len() + 1).saturating_sub(MAX_POSITION_EMBEDDINGS),
+            )));
+        }
+        let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
+        let image_newline = Self::image_newline(&self.weights)?;
+        let view_seperator = Self::view_seperator(&self.weights)?;
+        let grid = preprocess::num_queries(MULTI_PAGE_BASE_SIZE);
+        connector::fuse_no_crop(
+            &self.weights,
+            &mut inputs_embeds,
+            &globals,
+            grid,
+            grid,
+            &image_newline,
+            &view_seperator,
+            &images_seq_mask,
+        )?;
+
+        // ── ONE decode across the whole document (OQ-13) ─────────────────────
+        // ngram_window 1024 (multi) per OQ-18; generation capped so
+        // prefix + generated never exceeds the 32K positions.
+        let params = sampler::DecodeParams {
+            ngram_window: sampler::NGRAM_WINDOW_MULTI,
+            max_length: self
+                .decode_params
+                .max_length
+                .min(MAX_POSITION_EMBEDDINGS - prompt_ids.len()),
+            ..self.decode_params.clone()
+        };
+        let td = std::time::Instant::now();
+        let generated = self.generate_with(inputs_embeds, &prompt_ids, &params)?;
+        timing_log(&format!(
+            "multi_page.decode {} tokens {:.2}s",
+            generated.len(),
+            td.elapsed().as_secs_f64()
+        ));
+        let decoded = self.tokenizer()?.decode(&generated)?;
+        postprocess::finalize_multi(&decoded, pres.len())
+    }
+
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
@@ -2098,12 +2223,24 @@ impl OcrModel {
     /// The first decode-stage error — e.g. [`FocrError::FormatMismatch`] if the
     /// embedding table is absent, or a sampler/lm_head failure.
     fn generate(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
+        self.generate_with(inputs_embeds, prompt_ids, &self.decode_params)
+    }
+
+    /// [`Self::generate`] with EXPLICIT decode params — the multi-page path
+    /// (bd-1gv.25) selects `ngram_window = 1024` per OQ-18 while single-image
+    /// callers keep the engine's own params verbatim.
+    fn generate_with(
+        &self,
+        inputs_embeds: Mat,
+        prompt_ids: &[u32],
+        params: &sampler::DecodeParams,
+    ) -> FocrResult<Vec<u32>> {
         if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
-            self.generate_stateless(inputs_embeds, prompt_ids)
+            self.generate_stateless(inputs_embeds, prompt_ids, params)
         } else if int8_decode_requested() {
-            self.generate_cached_i8(inputs_embeds, prompt_ids)
+            self.generate_cached_i8(inputs_embeds, prompt_ids, params)
         } else {
-            self.generate_cached(inputs_embeds, prompt_ids)
+            self.generate_cached(inputs_embeds, prompt_ids, params)
         }
     }
 
@@ -2121,8 +2258,12 @@ impl OcrModel {
     ///
     /// # Errors
     /// As [`Self::generate`].
-    fn generate_cached(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
-        let params = &self.decode_params;
+    fn generate_cached(
+        &self,
+        inputs_embeds: Mat,
+        prompt_ids: &[u32],
+        params: &sampler::DecodeParams,
+    ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
 
@@ -2204,8 +2345,12 @@ impl OcrModel {
     ///
     /// # Errors
     /// As [`Self::generate_cached`].
-    fn generate_cached_i8(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
-        let params = &self.decode_params;
+    fn generate_cached_i8(
+        &self,
+        inputs_embeds: Mat,
+        prompt_ids: &[u32],
+        params: &sampler::DecodeParams,
+    ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
 
@@ -2277,6 +2422,7 @@ impl OcrModel {
                 vocab,
                 hidden_dim,
                 prefill_len,
+                params,
             )?;
         }
         while !spec_decode && emitted.len() < params.max_length {
@@ -2377,8 +2523,8 @@ impl OcrModel {
         vocab: usize,
         hidden_dim: usize,
         prefill_len: usize,
+        params: &sampler::DecodeParams,
     ) -> FocrResult<()> {
-        let params = &self.decode_params;
         // Own a mutable copy of the seed hidden (the prefill last row); the caller's
         // `last_hidden` stays intact for the guarded sequential `while` (which only
         // runs when spec decode is OFF). Each commit replaces this with the freshly
@@ -2546,8 +2692,8 @@ impl OcrModel {
         &self,
         mut inputs_embeds: Mat,
         prompt_ids: &[u32],
+        params: &sampler::DecodeParams,
     ) -> FocrResult<Vec<u32>> {
-        let params = &self.decode_params;
         let hidden_dim = inputs_embeds.cols;
 
         let table = self.weights.mat("model.embed_tokens.weight")?;
@@ -2672,6 +2818,34 @@ impl OcrModel {
         for _ in 0..n_image {
             ids.push(tok.image_id());
             mask.push(true);
+        }
+        for id in text {
+            ids.push(id);
+            mask.push(false);
+        }
+        Ok((ids, mask))
+    }
+
+    /// Multi-page prompt id-stream (bd-1gv.25): `BOS + [page-1 block] + … +
+    /// [page-N block] + "Multi page parsing."` — the reference `infer_multi`
+    /// concatenates every page's placeholder block at the prompt's single
+    /// `<image>` position, each block already carrying its own trailing
+    /// separator token (the `+ 1` in the per-page census, identical in shape
+    /// to the single-image 273-slot block, just at base 640 ⇒ 111 slots).
+    fn build_prompt_multi(&self, pres: &[Preprocessed]) -> FocrResult<(Vec<u32>, Vec<bool>)> {
+        let tok = self.tokenizer()?;
+        let text = tok.encode(MULTI_PAGE_PROMPT_TEXT)?;
+        let n_image: usize = pres.iter().map(Preprocessed::placeholder_token_count).sum();
+        let total = 1 + n_image + text.len();
+        let mut ids = Vec::with_capacity(total);
+        let mut mask = Vec::with_capacity(total);
+        ids.push(tok.bos_id());
+        mask.push(false);
+        for pre in pres {
+            for _ in 0..pre.placeholder_token_count() {
+                ids.push(tok.image_id());
+                mask.push(true);
+            }
         }
         for id in text {
             ids.push(id);
