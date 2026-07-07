@@ -2004,14 +2004,13 @@ const QKV_FUSED_ENV: &str = "FOCR_QKV_FUSED";
 fn qkv_fused_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        match std::env::var(QKV_FUSED_ENV)
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("0" | "off" | "false" | "no") => false,
-            _ => true,
-        }
+        !matches!(
+            std::env::var(QKV_FUSED_ENV)
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
     })
 }
 
