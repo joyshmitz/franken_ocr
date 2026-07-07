@@ -442,6 +442,23 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
     reader: ImageReader<R>,
 ) -> image::ImageResult<DynamicImage> {
     let mut decoder = reader.into_decoder()?;
+    // Decompression-bomb bound (bd-10sb.1 — found by the image_decode fuzz
+    // target on its FIRST bounded smoke): a 100-byte PNG declaring a 2^31+4
+    // height made `from_decoder` attempt a 38.6 GB allocation. Same 1 Gpx
+    // policy as the PDF raster path (`pdf.rs` MAX_PIXELS), enforced BEFORE
+    // any pixel allocation, plus the decoder's own internal limits.
+    const MAX_PIXELS: u64 = 1 << 30; // 1 Gpx (matches pdf.rs)
+    let (w, h) = decoder.dimensions();
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+        ));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1 << 17);
+    limits.max_image_height = Some(1 << 17);
+    limits.max_alloc = Some(4 << 30);
+    decoder.set_limits(limits)?;
     let orientation = decoder.orientation()?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
@@ -1325,6 +1342,34 @@ mod tests {
         let gray = 2.0 * (f32::from(PAD_FILL) / 255.0) - 1.0;
         // s for (x=0, y=0) is 0; channel 0.
         assert!((p.global.pixels.get(0, 0) - gray).abs() < 1e-6);
+    }
+
+    /// The image_decode fuzz target's day-one find (bd-10sb.1): this exact
+    /// 100-byte PNG declares 6 x 2^31+4 dimensions — pre-fix, decode
+    /// attempted a 38.6 GB allocation (a DoS on any untrusted-image ingest).
+    /// The decode funnel's 1 Gpx bound must reject it as a typed
+    /// InputDecode error BEFORE any pixel allocation.
+    #[test]
+    fn decompression_bomb_png_is_rejected_before_allocation() {
+        const BOMB: [u8; 100] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x06, 0x80, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x22, 0x66, 0xd9, 0x14, 0x00, 0x00, 0x00, 0x56, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x01, 0xed, 0xc0, 0x03, 0xa0, 0x24, 0x3b, 0x6b, 0xd5, 0xaf, 0xc2, 0x67, 0x3f, 0x1a,
+            0x1e, 0x0d, 0x8f, 0x86, 0x47, 0xc3, 0xa3, 0xa1, 0xf2, 0xea, 0x3c, 0x10, 0x50, 0x79,
+            0x75, 0x1e, 0x08, 0xa8, 0xbc, 0x3a, 0x0f, 0x04, 0xfc, 0x23, 0x74, 0xa4, 0x02, 0x0d,
+            0x6a, 0x18, 0x6a, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+            0x60, 0x82,
+        ];
+        let err = decode_bytes(&BOMB).expect_err("2^31-height PNG must be rejected");
+        assert!(
+            matches!(err, crate::FocrError::InputDecode(_)),
+            "bomb must be a typed InputDecode, got {err:?}"
+        );
+        // And the whole preprocess entry stays total on it too.
+        let err = preprocess_bytes(&BOMB, PreprocessMode::base()).expect_err("rejected");
+        assert!(matches!(err, crate::FocrError::InputDecode(_)));
+        println!(r#"{{"check":"decompression_bomb_bound","bytes":100,"result":"pass"}}"#);
     }
 
     #[test]

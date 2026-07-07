@@ -27,7 +27,10 @@ use crate::error::{FocrError, FocrResult};
 
 pub mod music;
 mod ops;
-mod pretok;
+/// Pure pretokenizers (public for the fuzz harness — bd-10sb.1: the
+/// hand-rolled Unicode split classes are an untrusted-input surface; the
+/// fuzz targets assert totality + lossless re-join over arbitrary text).
+pub mod pretok;
 pub mod tiktoken;
 mod unicode_tables;
 
