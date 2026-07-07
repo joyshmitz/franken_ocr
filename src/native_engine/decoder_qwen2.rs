@@ -33,6 +33,7 @@
 //! stays **argmax-exact** to `generate_greedy` (hence the torch oracle L4) while giving
 //! every core work at m = 1 (the row-parallel kernel is single-threaded there).
 
+use super::batch_scheduler;
 use super::decoder;
 use super::nn;
 use super::sampler;
@@ -1367,9 +1368,6 @@ fn qwen2_decode_step(
 /// `[stream][layer]` [`Qwen2KvCache`]s, each stream at its OWN length. The
 /// dense analogue of `rswa::BatchedRingCache` (dense models attend the whole
 /// prefix — no ring, no eviction).
-// Wired into the dense `BatchStep` in the next A7.5 chunk (bd-3jo6.1.7.5);
-// until then the in-module bit-identity gates are the only callers.
-#[cfg_attr(not(test), allow(dead_code))]
 struct BatchedQwen2KvCache {
     streams: Vec<Vec<Qwen2KvCache>>,
 }
@@ -1378,18 +1376,16 @@ impl BatchedQwen2KvCache {
     /// Build from per-stream seeded caches (one inner `Vec` per stream,
     /// `n_layers` caches each — exactly what per-stream prefill seeding
     /// produces).
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_streams(streams: Vec<Vec<Qwen2KvCache>>) -> Self {
         Self { streams }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn num_streams(&self) -> usize {
         self.streams.len()
     }
 
     /// Stream `s`'s next absolute position (== its cached row count).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn position(&self, s: usize) -> usize {
         self.streams[s][0].n_kv
     }
@@ -1402,16 +1398,17 @@ impl BatchedQwen2KvCache {
 ///
 /// # Errors
 /// Any shape/norm error from the underlying kernels.
-#[cfg_attr(not(test), allow(dead_code))]
 fn qwen2_batched_decode_step(
     w: &GotDecodeWeights,
     caches: &mut BatchedQwen2KvCache,
+    active: &[usize],
     xs: &[Mat],
     positions: &[usize],
 ) -> FocrResult<Vec<Vec<f32>>> {
     let b = xs.len();
     debug_assert_eq!(b, positions.len());
-    debug_assert_eq!(b, caches.num_streams());
+    debug_assert_eq!(b, active.len());
+    debug_assert!(active.iter().all(|&s| s < caches.num_streams()));
     let cfg = &w.cfg;
     let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
     let (num_heads, head_dim) = (cfg.num_attention_heads, cfg.head_dim);
@@ -1453,9 +1450,9 @@ fn qwen2_batched_decode_step(
                 decoder::apply_rope(&mut q, &ropes[s])?;
                 decoder::apply_rope(&mut k, &ropes[s])?;
             }
-            caches.streams[s][l].append(&k.data, v);
+            caches.streams[active[s]][l].append(&k.data, v);
             let ctx = qwen2_decode_attention(
-                &caches.streams[s][l],
+                &caches.streams[active[s]][l],
                 &q.data,
                 num_heads,
                 head_dim,
@@ -1542,6 +1539,151 @@ fn qwen2_batched_decode_step(
     Ok(logits)
 }
 
+// ── A7.5 part 2: the dense continuous-batch generate (bd-3jo6.1.7.5) ──
+
+/// The dense [`batch_scheduler::BatchStep`]: the scheduler's per-stream
+/// "hidden" IS the `[1, vocab]` LOGITS row (seeded from prefill, replaced
+/// each advance), which maps the dense m=1 loop onto the scheduler contract
+/// with byte-equal semantics:
+///
+///  * the token pick is the SAME [`argmax_no_repeat`] over the SAME emitted
+///    history (dense prompt ids are never in `generated` — prefill is
+///    `inputs_embeds` — so `history == ids` exactly as the m=1 loop);
+///  * the advance is [`qwen2_batched_decode_step`] over the non-EOS subset
+///    (bit-identical per stream, gated in-module);
+///  * positions mirror the m=1 `caches.n_kv` progression (`prefill_len`,
+///    then +1 per step — the scheduler's own accounting).
+struct DenseDecoderBatchStep<'w> {
+    w: &'w GotDecodeWeights,
+    caches: BatchedQwen2KvCache,
+    eos: u32,
+}
+
+impl batch_scheduler::BatchStep for DenseDecoderBatchStep<'_> {
+    fn step(
+        &mut self,
+        slots: &[batch_scheduler::StreamSlot<'_>],
+    ) -> FocrResult<Vec<batch_scheduler::StreamOut>> {
+        let cfg = &self.w.cfg;
+        let n = cfg.no_repeat_ngram_size;
+        // 1. Pick each stream's next token from its CURRENT logits row.
+        let picks: Vec<(u32, bool)> = slots
+            .iter()
+            .map(|sl| {
+                let t = argmax_no_repeat(&sl.hidden.data, sl.history, n) as u32;
+                (t, t == self.eos)
+            })
+            .collect();
+        // 2. Advance the non-EOS subset in ONE batched forward.
+        let mut active: Vec<usize> = Vec::new();
+        let mut embeds: Vec<Mat> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        for (k, sl) in slots.iter().enumerate() {
+            if !picks[k].1 {
+                active.push(sl.slot_index);
+                embeds.push(decoder::embed_tokens(
+                    &self.w.embed,
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                    &[picks[k].0],
+                )?);
+                positions.push(sl.position);
+            }
+        }
+        let logits = if active.is_empty() {
+            Vec::new()
+        } else {
+            qwen2_batched_decode_step(self.w, &mut self.caches, &active, &embeds, &positions)?
+        };
+        // 3. Assemble StreamOuts (EOS streams carry a dummy hidden the
+        //    scheduler never reads).
+        let mut li = 0usize;
+        Ok(picks
+            .into_iter()
+            .map(|(token, is_eos)| {
+                if is_eos {
+                    batch_scheduler::StreamOut {
+                        token,
+                        is_eos,
+                        new_hidden: Mat::from_vec(1, 1, vec![0.0]),
+                    }
+                } else {
+                    let row = Mat::from_vec(1, cfg.vocab_size, logits[li].clone());
+                    li += 1;
+                    batch_scheduler::StreamOut {
+                        token,
+                        is_eos: false,
+                        new_hidden: row,
+                    }
+                }
+            })
+            .collect())
+    }
+}
+
+/// Continuous-batch greedy decode over MANY pages' `inputs_embeds` — the
+/// batched twin of [`generate_greedy_kvcache`] (A7.5). The decode-time weights
+/// build ONCE for the whole batch; each page's prefill seeds sequentially
+/// (one live forward at a time, doctrine #5); the [`batch_scheduler`] then
+/// drives batched decode steps with admit/retire/backfill. Per stream the
+/// id-stream is BYTE-IDENTICAL to [`generate_greedy_kvcache`] run alone (the
+/// in-module gate proves it on both dense families).
+///
+/// # Errors
+/// Any prefill/decode/scheduler error; `model.embed_tokens.weight` missing.
+pub fn generate_greedy_batched(
+    weights: &Weights,
+    cfg: &DecoderConfig,
+    inputs_embeds: &[Mat],
+    max_new: usize,
+    eos: u32,
+) -> FocrResult<Vec<Vec<u32>>> {
+    if inputs_embeds.is_empty() || max_new == 0 {
+        return Ok(vec![Vec::new(); inputs_embeds.len()]);
+    }
+    let w = GotDecodeWeights::build(weights, cfg)?;
+    generate_greedy_batched_with(&w, inputs_embeds, max_new, eos)
+}
+
+/// [`generate_greedy_batched`] over PRE-BUILT decode weights — the testable
+/// seam (the in-module gate drives synthetic weights through it).
+fn generate_greedy_batched_with(
+    w: &GotDecodeWeights,
+    inputs_embeds: &[Mat],
+    max_new: usize,
+    eos: u32,
+) -> FocrResult<Vec<Vec<u32>>> {
+    let cfg = &w.cfg;
+    let mut stream_caches: Vec<Vec<Qwen2KvCache>> = Vec::with_capacity(inputs_embeds.len());
+    let mut pages: Vec<batch_scheduler::PageStream> = Vec::with_capacity(inputs_embeds.len());
+    for (i, embeds) in inputs_embeds.iter().enumerate() {
+        let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
+            .map(|_| Qwen2KvCache::new(cfg.kv_dim(), embeds.rows + max_new))
+            .collect();
+        let last_logits = forward_prefill_seed(w, embeds, &mut caches)?;
+        stream_caches.push(caches);
+        pages.push(batch_scheduler::PageStream::new(
+            i,
+            embeds.rows,
+            &[],
+            Mat::from_vec(1, cfg.vocab_size, last_logits),
+        ));
+    }
+    let mut sched = batch_scheduler::BatchScheduler::from_env(max_new);
+    let mut step = DenseDecoderBatchStep {
+        w,
+        caches: BatchedQwen2KvCache::from_streams(stream_caches),
+        eos,
+    };
+    let out = sched.run(pages, &mut step)?;
+    let stats = sched.stats();
+    debug_assert!(
+        stats.max_concurrent_forwards <= 1,
+        "dense spine: >1 live forward"
+    );
+    Ok(out)
+}
+
 /// **O(n)-per-token** greedy decode: identical id-stream to [`generate_greedy`] but
 /// with a full-causal KV cache instead of re-running prefill each step. The bit-for-bit
 /// equality is enforced by reusing [`nn::linear_int8_dynamic`] for every GEMM (the
@@ -1567,6 +1709,18 @@ pub fn generate_greedy_kvcache(
     eos: u32,
 ) -> FocrResult<Vec<u32>> {
     let w = GotDecodeWeights::build(weights, cfg)?;
+    generate_greedy_kvcache_with(&w, inputs_embeds, max_new, eos)
+}
+
+/// [`generate_greedy_kvcache`] over PRE-BUILT decode weights — the seam the
+/// batched gate compares against (same body, weights built by the caller).
+fn generate_greedy_kvcache_with(
+    w: &GotDecodeWeights,
+    inputs_embeds: &Mat,
+    max_new: usize,
+    eos: u32,
+) -> FocrResult<Vec<u32>> {
+    let cfg = &w.cfg;
     let n = inputs_embeds.rows;
     let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
         .map(|_| Qwen2KvCache::new(cfg.kv_dim(), n + max_new))
@@ -1578,7 +1732,7 @@ pub fn generate_greedy_kvcache(
         DECODE_LMHEAD_NS.store(0, Ordering::Relaxed);
     }
     let tseed = std::time::Instant::now();
-    let last_logits = forward_prefill_seed(&w, inputs_embeds, &mut caches)?;
+    let last_logits = forward_prefill_seed(w, inputs_embeds, &mut caches)?;
     let seed_s = tseed.elapsed().as_secs_f64();
     let tdec = std::time::Instant::now();
     let mut ids = Vec::new();
@@ -1592,7 +1746,7 @@ pub fn generate_greedy_kvcache(
         let te = decoder::embed_tokens(&w.embed, cfg.vocab_size, cfg.hidden_size, &[next])?;
         // the new token occupies the position after every currently-cached row.
         let position = caches[0].n_kv;
-        let logits = qwen2_decode_step(&w, &mut caches, &te, position)?;
+        let logits = qwen2_decode_step(w, &mut caches, &te, position)?;
         next = argmax_no_repeat(&logits, &ids, cfg.no_repeat_ngram_size) as u32;
     }
     if timing {
@@ -1883,8 +2037,10 @@ mod tests {
                     .collect();
                 let positions: Vec<usize> = (0..b).map(|s| batched.position(s)).collect();
 
+                let active: Vec<usize> = (0..b).collect();
                 let batch_logits =
-                    qwen2_batched_decode_step(&w, &mut batched, &xs, &positions).expect("batched");
+                    qwen2_batched_decode_step(&w, &mut batched, &active, &xs, &positions)
+                        .expect("batched");
                 for s in 0..b {
                     let solo_logits =
                         qwen2_decode_step(&w, &mut solo[s], &xs[s], positions[s]).expect("solo");
@@ -1901,6 +2057,66 @@ mod tests {
             }
             println!(
                 "{{\"check\":\"batched_dense_decode_bit_identity\",\"family\":\"{family:?}\",\"streams\":{b},\"steps\":4,\"result\":\"pass\"}}"
+            );
+        }
+    }
+
+    /// THE scheduler-level lossless gate: [`generate_greedy_batched_with`]'s
+    /// id-stream per page is IDENTICAL to [`generate_greedy_kvcache_with`] run
+    /// per page alone — mixed prefill lengths, both dense families, and BOTH
+    /// termination shapes (cap-bounded with an unreachable EOS; genuine EOS
+    /// retirement mid-batch with backfill-order preserved).
+    #[test]
+    fn batched_generate_ids_match_solo_per_page() {
+        for family in [DecoderFamily::QwenLlama, DecoderFamily::Opt] {
+            let w = synth_weights(family);
+            let hidden = w.cfg.hidden_size;
+            // Three pages with DIFFERENT prompt lengths (deterministic embeds).
+            let pages: Vec<Mat> = [3usize, 6, 4]
+                .iter()
+                .enumerate()
+                .map(|(p, &rows)| {
+                    Mat::from_vec(
+                        rows,
+                        hidden,
+                        (0..rows * hidden)
+                            .map(|i| det_f32(i + p * 50_021) * 0.25)
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            // Case 1: unreachable EOS — every stream runs to the cap.
+            let max_new = 6usize;
+            let solo: Vec<Vec<u32>> = pages
+                .iter()
+                .map(|e| generate_greedy_kvcache_with(&w, e, max_new, u32::MAX).expect("solo"))
+                .collect();
+            let batched =
+                generate_greedy_batched_with(&w, &pages, max_new, u32::MAX).expect("batched");
+            assert_eq!(solo, batched, "family {family:?}: cap-bounded ids diverged");
+
+            // Case 2: a REAL mid-stream EOS — pick page 1's 3rd solo token as
+            // EOS so that stream retires early while the others continue.
+            let eos = solo[1][2];
+            let solo_eos: Vec<Vec<u32>> = pages
+                .iter()
+                .map(|e| generate_greedy_kvcache_with(&w, e, max_new, eos).expect("solo"))
+                .collect();
+            let batched_eos =
+                generate_greedy_batched_with(&w, &pages, max_new, eos).expect("batched");
+            assert_eq!(
+                solo_eos, batched_eos,
+                "family {family:?}: EOS-retirement ids diverged"
+            );
+            assert!(
+                solo_eos
+                    .iter()
+                    .any(|ids| ids.last() == Some(&eos) && ids.len() < max_new),
+                "family {family:?}: the EOS case never actually retired early — test defanged"
+            );
+            println!(
+                r#"{{"check":"batched_generate_ids_match_solo","family":"{family:?}","pages":3,"result":"pass"}}"#
             );
         }
     }

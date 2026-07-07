@@ -1650,7 +1650,6 @@ fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
 /// [`gemv_i8_bias_prequant`] — so row `r` is BYTE-FOR-BYTE the m=1 result for
 /// stream `r` alone (the lossless contract; gated in-module and by the dense
 /// bit-identity suite).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn gemm_i8_bias_prequant_batched(
     rows: &[(&[i8], f32)],
     qw: &QInt8,

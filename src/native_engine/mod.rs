@@ -1483,6 +1483,22 @@ impl OcrModel {
             && int8_decode_requested()
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
             && self.arch().id() == model_arch::default_arch().id();
+        // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
+        // int8 by construction (the QInt8 panels), so it needs only the master
+        // spine switch; the per-page id-stream is byte-identical to the
+        // sequential loop (decoder_qwen2's scheduler-level gate).
+        if !spine && batch_scheduler::spine_enabled() && self.arch().id() == "got-ocr2" {
+            match self.recognize_batch_dense_got(image_paths) {
+                Ok(results) => return results,
+                Err(err) => {
+                    let msg = err.to_string();
+                    return image_paths
+                        .iter()
+                        .map(|_| Err(FocrError::Other(anyhow::anyhow!("{msg}"))))
+                        .collect();
+                }
+            }
+        }
         if !spine {
             return image_paths.iter().map(|p| self.recognize(p)).collect();
         }
@@ -1500,6 +1516,65 @@ impl OcrModel {
                     .collect()
             }
         }
+    }
+
+    /// The DENSE continuous-batch body (A7.5): decode every page's image +
+    /// prompt into `inputs_embeds` sequentially (one live vision forward at a
+    /// time), then ONE [`decoder_qwen2::generate_greedy_batched`] drive over
+    /// all pages. Per-page image failures are recorded per page; the
+    /// surviving pages still batch. The outer `Err` is reserved for
+    /// batch-level failures (tokenizer/weights), mirroring the MoE spine.
+    fn recognize_batch_dense_got(
+        &self,
+        image_paths: &[&Path],
+    ) -> FocrResult<Vec<FocrResult<String>>> {
+        let tk = self.got_tokenizer()?;
+        let format = got_format_requested();
+        let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
+        let t = std::time::Instant::now();
+        // Decode images per page; a bad page keeps its own error and is
+        // excluded from the batch (the sequential loop's per-page semantics).
+        let mut out: Vec<Option<FocrResult<String>>> =
+            (0..image_paths.len()).map(|_| None).collect();
+        let mut live: Vec<usize> = Vec::new();
+        let mut imgs: Vec<image::DynamicImage> = Vec::new();
+        for (i, p) in image_paths.iter().enumerate() {
+            crate::cancel_checkpoint()?;
+            match preprocess::decode_path(p) {
+                Ok(img) => {
+                    live.push(i);
+                    imgs.push(img);
+                }
+                Err(e) => out[i] = Some(Err(e)),
+            }
+        }
+        if !imgs.is_empty() {
+            use image::GenericImageView;
+            let dims: Vec<(u32, u32)> = imgs.iter().map(|im| im.dimensions()).collect();
+            let refs: Vec<&image::DynamicImage> = imgs.iter().collect();
+            let texts = got::recognize_batch(
+                &self.weights,
+                tk,
+                &refs,
+                self.arch().vision_tower_prefix(),
+                max_new,
+                format,
+            )?;
+            // The SAME per-page finalize the sequential path applies
+            // (recognize -> forward_got -> postprocess::finalize).
+            for ((slot, text), (iw, ih)) in live.into_iter().zip(texts).zip(dims) {
+                out[slot] = Some(postprocess::finalize(&text, iw, ih));
+            }
+        }
+        timing_log(&format!(
+            "got forward(batch of {}) {:.2}s",
+            image_paths.len(),
+            t.elapsed().as_secs_f64()
+        ));
+        Ok(out
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(FocrError::Other(anyhow::anyhow!("page skipped")))))
+            .collect())
     }
 
     /// The continuous-batch spine body for [`Self::recognize_batch`]: prefill every
@@ -2614,10 +2689,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup (not a delete of source)
         // resolve_model accepts an existing path; the container reader types
         // the junk as a format fault (exit 7).
-        let err = match r {
-            Ok(_) => panic!("junk artifact must error, not load"),
-            Err(e) => e,
-        };
+        let err = r.expect_err("junk artifact must error, not load");
         assert!(
             matches!(err, FocrError::FormatMismatch(_)),
             "expected FormatMismatch (exit 7) on a junk artifact, got {err:?}"

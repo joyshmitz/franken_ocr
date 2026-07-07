@@ -165,6 +165,52 @@ pub fn recognize(
     Ok(tk.decode_skip_special(&ids)?.trim().to_string())
 }
 
+/// Batched GOT recognition over MANY pages (A7.5, bd-3jo6.1.7.5): vision +
+/// splice run SEQUENTIALLY per page (one live forward at a time, doctrine #5),
+/// then ONE continuous-batch greedy decode over every page's `inputs_embeds`
+/// ([`decoder_qwen2::generate_greedy_batched`] — per page byte-identical to
+/// [`recognize`], the scheduler-level gate proves it). Returns one decoded
+/// string per input page, in input order.
+///
+/// # Errors
+/// As [`recognize`].
+pub fn recognize_batch(
+    weights: &Weights,
+    tk: &Tiktoken,
+    imgs: &[&DynamicImage],
+    prefix: &str,
+    max_new: usize,
+    format: bool,
+) -> FocrResult<Vec<String>> {
+    let prompt_ids = ocr_prompt_ids(tk, format)?;
+    let tv = std::time::Instant::now();
+    let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
+    for img in imgs {
+        let image = preprocess::got_view_tensor(img);
+        embeds_list.push(build_inputs_embeds(weights, &image, &prompt_ids, prefix)?);
+    }
+    super::timing_log(&format!(
+        "  got.vision+splice(batch of {}) {:.2}s",
+        imgs.len(),
+        tv.elapsed().as_secs_f64()
+    ));
+    let tg = std::time::Instant::now();
+    let mut cfg = DecoderConfig::got_ocr2();
+    cfg.no_repeat_ngram_size = no_repeat_ngram_override(cfg.no_repeat_ngram_size);
+    let id_streams =
+        decoder_qwen2::generate_greedy_batched(weights, &cfg, &embeds_list, max_new, EOS_ID)?;
+    super::timing_log(&format!(
+        "  got.generate(batch of {}) {} tokens {:.2}s",
+        imgs.len(),
+        id_streams.iter().map(Vec::len).sum::<usize>(),
+        tg.elapsed().as_secs_f64()
+    ));
+    id_streams
+        .iter()
+        .map(|ids| Ok(tk.decode_skip_special(ids)?.trim().to_string()))
+        .collect()
+}
+
 /// `[r, c]` row-major → `[c, r]` row-major (channel-major SAM output → token-major).
 fn transpose(m: &Mat) -> Mat {
     let (r, c) = (m.rows, m.cols);
