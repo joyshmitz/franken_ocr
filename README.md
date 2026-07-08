@@ -7,8 +7,8 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![source tag: v0.5.2](https://img.shields.io/badge/source_tag-v0.5.2-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/tree/v0.5.2)
-[![binary release: v0.5.1](https://img.shields.io/badge/binary_release-v0.5.1-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.5.1)
+[![source tag: v0.6.0](https://img.shields.io/badge/source_tag-v0.6.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/tree/v0.6.0)
+[![binary release: v0.6.0](https://img.shields.io/badge/binary_release-v0.6.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.6.0)
 [![status: working](https://img.shields.io/badge/status-working-success.svg)](#quick-example)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![toolchain: nightly](https://img.shields.io/badge/toolchain-nightly-purple.svg)](./rust-toolchain.toml)
@@ -18,7 +18,7 @@
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music`. All five ready models are available through `focr pull`; TrOMR now publishes both the 61 MB int8 default artifact and an 86 MB f32 reference artifact. They run through model-specific Rust kernels and need no general ML framework, Python, CUDA, FFI at inference, or GPU. The single static binary parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON and fits in about 5 MB.
+**A pure-Rust, memory-safe, CPU-only OCR engine for a small family of hand-ported vision-language models.** Baidu Unlimited-OCR is the fast default for document OCR, GOT-OCR2 handles specialized structured formats, SmolVLM2 handles image description and VQA, OneChart extracts chart data, and Polyphonic-TrOMR turns full scanned sheet-music pages or staff crops into MusicXML through `--task music`. All five ready models are available through `focr pull`; TrOMR now publishes both the 61 MB int8 default artifact and an 86 MB f32 reference artifact. They run through model-specific Rust kernels and need no general ML framework, Python, CUDA, FFI at inference, or GPU. The single portable binary parses document images and PDFs into Markdown, MusicXML, structured JSON, or versioned NDJSON; the current release assets are about 13 to 17 MB depending on platform.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -29,7 +29,11 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/
 
 </div>
 
-The installer detects your platform, resolves the latest published GitHub binary release (currently `v0.5.1`), verifies the downloaded asset by SHA256, and puts `focr` on your PATH. The source tree is tagged `v0.5.2`; binary release assets follow when the release is published. Then `focr pull` fetches the weights once and you run offline forever after.
+The installer detects your platform, resolves the latest published GitHub binary release (currently `v0.6.0`), verifies the downloaded asset by SHA256, and puts `focr` on your PATH. Then `focr pull` fetches the weights once and every later inference run is offline.
+
+### Current Release
+
+`v0.6.0` is the first release cut after the full gauntlet closed: the source tag and binary assets were published together on 2026-07-08, the release-readiness gate is 13/13 green, and the Unlimited-OCR performance ledger contains paired end-to-end rows where the native int8 path beats the pinned Hugging Face/PyTorch bf16 CPU reference at matched thread counts. The release ships raw executables for macOS Apple Silicon, macOS Intel, Linux x86-64, Linux ARM64, and Windows x86-64, each with a SHA256 sidecar.
 
 ---
 
@@ -43,14 +47,14 @@ The installer detects your platform, resolves the latest published GitHub binary
 
 | Feature | What it does |
 |---|---|
-| **One static binary** | No Python, no CUDA, no FFI at inference, no GPU. About 5 MB; portable to hosts where `ort`/CUDA cannot build. |
+| **One portable binary** | No Python, no CUDA, no FFI at inference, no GPU. Current release assets are about 13 to 17 MB; portable to hosts where `ort`/CUDA cannot build. |
 | **Works offline** | `focr pull` fetches and verifies the weights once into `~/.cache/franken_ocr/models`; inference never touches the network. The default loader memory-maps `.focrq` and safetensors artifacts, so multi-GB weights page in lazily and share the OS page cache across runs. |
 | **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
 | **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; page `/Rotate` and image-placement rotations are honored, `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
 | **Cross-page parsing** | `--multi-page` runs the Unlimited-OCR `infer_multi` contract over selected PDF pages or an image list, producing one document with `<PAGE>` boundaries instead of unrelated page parses. |
 | **Model zoo with pulls** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports both runtime status and pullable quant levels. TrOMR pulls int8 by default and keeps `--quant f32` for bit-exact reference work. Planned descriptors: TrOCR and pix2tex. |
 | **int8 decode, ~2.5x faster** | Custom `.focrq` int8 expert/FFN weights, byte-identical to the f32 path on typical pages. The vision tower stays high precision, where quantizing it would wreck OCR. |
-| **Runtime ISA dispatch** | One binary per architecture selects the best int8 kernel tier at load via CPU feature detection: ARM SDOT / SMMLA (i8mm), x86 AVX2 / AVX-VNNI / AVX-512-VNNI. |
+| **Runtime ISA dispatch** | One binary per architecture selects the best proven int8 kernel tier at load via CPU feature detection: Apple Silicon prefers NEON dot-product (`SDOT`), non-Apple ARM64 can use `SMMLA` / i8mm, and x86 selects AVX-512-VNNI, AVX-VNNI, AVX2, or scalar. |
 | **Measured zoo gauntlet** | `docs/PERF_LEDGER.md` records paired HF CPU reference rows. On Apple SDOT at thread parity, decode-per-token ratios are 3.37x for GOT-OCR2, 2.58x for OneChart, and 1.67x for SmolVLM2; end-to-end rows are also kept, including slower cases. |
 | **Batch throughput path** | `focr ocr-batch` loads weights once; the optional continuous-batch spine can prefill/decode multiple pages together while preserving per-page bytes. The dense zoo path covers GOT-OCR2, SmolVLM2, and OneChart with per-page token budgets. SAM, CLIP, and SigLIP towers plus their connector/embed tables are hydrated once, then reused across pages and batches. |
 | **Stage timing instrumentation** | `FOCR_TIMING=1` reports nested forward timings, including SAM hydrate/forward/block/attention/MLP splits, so perf work can separate artifact load, vision attention, decode, and output costs. |
@@ -169,7 +173,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 
 `franken_ocr` is the only one of these built for a fixed, hand-tuned set of models on CPU.
 
-| | `franken_ocr` source v0.5.2 / binary v0.5.1 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
+| | `franken_ocr` v0.6.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
 |---|---|---|---|---|
 | Language / runtime | Pure Rust, one binary | Python + HF transformers | C++ | C++ |
 | Primary target | CPU | CUDA GPU | CPU/GPU | CPU/GPU |
@@ -200,7 +204,7 @@ After step 1 the weights live in `~/.cache/franken_ocr/models` and every later c
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
-The script detects your OS and CPU architecture, downloads the matching asset from the latest published binary release, verifies the SHA256 sidecar, and installs `focr`. At the time this source tag was cut, the latest published binary release was `v0.5.1`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
+The script detects your OS and CPU architecture, downloads the matching asset from the latest published binary release, verifies the SHA256 sidecar, and installs `focr`. At the time this source tag was cut, the latest published binary release was `v0.6.0`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
 
 On native Windows, install from PowerShell:
 
@@ -212,7 +216,7 @@ This downloads the `focr-x86_64-pc-windows-msvc.exe` binary, verifies it by SHA2
 
 ### Manual binary download
 
-Release binaries are raw executables, not tar.gz archives. Each one is a single portable file that dispatches the ISA tier at runtime, so there is one binary per architecture (no per-CPU-feature variant). Sizes are roughly 4.7 to 5.9 MB. Linux binaries are gnu (glibc), not musl.
+Release binaries are raw executables, not tar.gz archives. Each one is a single portable file that dispatches the ISA tier at runtime, so there is one binary per architecture (no per-CPU-feature variant). Current `v0.6.0` binary sizes range from about 12.9 MB for Apple Silicon to about 17.3 MB for Linux x86-64. Linux binaries are gnu (glibc), not musl.
 
 | Platform | Asset |
 |---|---|
@@ -225,7 +229,7 @@ Release binaries are raw executables, not tar.gz archives. Each one is a single 
 Each asset has a `<asset>.sha256` sidecar in the standard `"<hex>  <asset>"` format. Download the binary and its sidecar from the release base URL, verify, then install. Example for Apple Silicon:
 
 ```bash
-base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.5.1
+base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.6.0
 asset=focr-aarch64-apple-darwin-neon-sdot-i8mm
 
 curl -fsSLO "$base/$asset"
