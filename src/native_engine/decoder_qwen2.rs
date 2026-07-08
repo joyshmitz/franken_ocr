@@ -1051,12 +1051,15 @@ impl GotDecodeWeights {
         // halves the head's resident memory (no f32 `[hidden, vocab]` copy).
         let head_src: &[f32] = untied_head.as_deref().unwrap_or(&embed);
         // Lever policy (doctrine #2 / OQ-6): the int8+refine head is measured
-        // byte-identical on GOT only; an UNTIED arch defaults to the f32
-        // pretransposed head until its own L4 cert lands (the same env can
-        // force the lever on for experiments — not OnceLock-cached here, build
-        // runs once per generation).
+        // byte-identical on GOT (tied) AND on the untied SmolVLM2 head
+        // (2026-07-08 cert: paired describe outputs byte-identical f32-head vs
+        // int8+refine, armed L5 VQA green under the lever, full describe/VQA
+        // e2e suite pass; lm_head 6.99 -> 1.10 ms/tok, decode +40%). Both arms
+        // now default ON; FOCR_GOT_INT8_LMHEAD=0 is the kill-switch back to
+        // the f32 pretransposed head (not OnceLock-cached here, build runs
+        // once per generation).
         let int8_head = if cfg.lm_head.is_some() {
-            env_tristate("FOCR_GOT_INT8_LMHEAD", false)
+            env_tristate("FOCR_GOT_INT8_LMHEAD", true)
         } else {
             got_int8_lmhead_enabled()
         };
