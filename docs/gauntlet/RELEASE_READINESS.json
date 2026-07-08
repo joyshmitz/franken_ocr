@@ -70,7 +70,8 @@
   },
   {
    "cell": "certification_bundle",
-   "evidence": "bd-wp8.9 OPEN: FINAL_GAUNTLET_REPORT + bundle JSONs not yet produced",
+   "detail": "certified=False at v0.5.0-13-gf1ac972; refusals: readiness has red cells: certification_bundle, gauntlet_convergence; convergence not met: rounds=8/10 tail_clean=False; evidence older than 24h (or missing): docs/PERF_LEDGER.md",
+   "evidence": "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
    "status": "red"
   },
   {

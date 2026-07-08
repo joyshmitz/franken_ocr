@@ -21,8 +21,8 @@
   ]
  },
  "generated_by": "scripts/gauntlet_cert.py --bundle",
- "git_describe": "v0.5.0-13-gf1ac972",
- "git_head": "f1ac972fe4cecee4c5093310174a0b2322cd6956",
+ "git_describe": "v0.5.0-18-gb757bc0",
+ "git_head": "b757bc0c21f1dd9f74ac177922aad35b924c18ce",
  "high_severity_counterexamples": 0,
  "readiness": {
   "blocking_cells": [
@@ -33,7 +33,7 @@
   "red": 2
  },
  "refusal_reasons": [
-  "readiness has red cells: certification_bundle, gauntlet_convergence",
+  "readiness has red cells: gauntlet_convergence",
   "convergence not met: rounds=8/10 tail_clean=False",
   "evidence older than 24h (or missing): docs/PERF_LEDGER.md"
  ],

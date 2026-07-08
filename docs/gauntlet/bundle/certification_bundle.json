@@ -4,50 +4,50 @@
   {
    "age_hours": -0.0,
    "artifact": "docs/gauntlet/RELEASE_READINESS.json",
-   "sha256": "58999941a0a8a51bc8ed8fa79f76d98e78ff3cae9fa9e8a7c72b942953b6f43c"
+   "sha256": "2fd1eb8dd25fc128f236d49bb54019b5357e705bc2bd4453b87d343a2d8a0492"
   },
   {
-   "age_hours": 0.82,
+   "age_hours": 1.35,
    "artifact": "docs/gauntlet/ROUNDS.jsonl",
    "sha256": "647949e9d672a3c4814b01672267fbe255272e8b9f327c0b0eb81cee25bd01ed"
   },
   {
-   "age_hours": 0.18,
+   "age_hours": 0.72,
    "artifact": "docs/gauntlet/EPROCESS_STATE.json",
    "sha256": "f32b661afa4015b5368c216892030af9a4bd0fc0aee04569367c5bbda45ec91e"
   },
   {
-   "age_hours": 0.6,
+   "age_hours": 1.13,
    "artifact": "docs/gauntlet/RELEASE_SCORECARD.json",
    "sha256": "1670d7f45834cebbe3602649890e64de75e4d628256b9f07b5c1fffe268be424"
   },
   {
-   "age_hours": 0.01,
+   "age_hours": 0.54,
    "artifact": "tests/fixtures/ladder_scorecard/scorecard_armed.json",
    "sha256": "c3513f9639176adf4c2bbc43756ad30685bc4230454e0d15849f91df6138a891"
   },
   {
-   "age_hours": 21.85,
+   "age_hours": 22.38,
    "artifact": "benches/.bench-history/baseline.json",
    "sha256": "769425fc6154d9ca61983b02df8f61a817bb6fed55ddde6f8d1bdc29086b3689"
   },
   {
-   "age_hours": 3.14,
+   "age_hours": 3.67,
    "artifact": "docs/DISCREPANCIES.md",
    "sha256": "1451dcbc7375ed93c2624329ef6de2def47dfb7cda00e6d636c524b6cc1b25a9"
   },
   {
-   "age_hours": 0.79,
+   "age_hours": 0.14,
    "artifact": "docs/NEGATIVE_EVIDENCE.md",
-   "sha256": "9f9d297d023ffd36d7c30d2c0d72087d483507e7dd9a360c4aecf7ac8f69cb60"
+   "sha256": "ac86519c2b4468409657704881dacf6944e314791965713c61b9d5bf5ac2e10e"
   },
   {
-   "age_hours": 28.63,
+   "age_hours": 29.16,
    "artifact": "docs/PERF_LEDGER.md",
    "sha256": "cb6634c0ce1a3b1a52333adda70d1a050f71cfa563c1c89ddbb866f3165de450"
   },
   {
-   "age_hours": 5.61,
+   "age_hours": 6.15,
    "artifact": "docs/FEATURE_PARITY.md",
    "sha256": "dd1f2fd5f19356dc4701d1aaba75114cb2ed76dc59c87a4ace29103ae399fdcb"
   }

@@ -796,11 +796,30 @@ def release_readiness(out_path: str | None) -> int:
             "src/doctor.rs + tests/doctor_fixtures.rs (8 fixture roundtrips: fix/undo byte-identical, dry-run zero-blast, lock, chokepoint code-search)",
         )
     )
+    # LIVE cell (was a hardcoded red while wp8.9's generator didn't exist):
+    # green iff the bundle's certificate exists AND says certified — which the
+    # --bundle mode only writes when readiness (minus this cell's own
+    # chicken-and-egg), convergence, and evidence freshness all hold. On the
+    # certifying run itself, --bundle regenerates readiness FIRST (this cell
+    # red), certifies on the OTHER predicates, then the next readiness
+    # regeneration reads the now-certified certificate and flips green.
+    bundle_detail = "docs/gauntlet/bundle/release_certificate.json absent (run --bundle)"
+    bundle_ok = False
+    try:
+        cert = load_json("docs/gauntlet/bundle/release_certificate.json")
+        bundle_ok = cert.get("certified") is True
+        bundle_detail = (
+            f"certified={cert.get('certified')} at {cert.get('git_describe') or cert.get('git_head', '')[:12]}"
+            + ("" if bundle_ok else f"; refusals: {'; '.join(cert.get('refusal_reasons', []))[:200]}")
+        )
+    except OSError:
+        pass
     cells.append(
         _cell(
             "certification_bundle",
-            "red",
-            "bd-wp8.9 OPEN: FINAL_GAUNTLET_REPORT + bundle JSONs not yet produced",
+            "green" if bundle_ok else "red",
+            "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
+            bundle_detail,
         )
     )
     rounds_path = p("docs/gauntlet/ROUNDS.jsonl")
@@ -863,7 +882,7 @@ def produce_bundle(out_dir: str) -> int:
     now = _time.time()
 
     # 1. Fresh readiness (regenerated, not the cached artifact).
-    readiness_rc = release_readiness(p("docs/gauntlet/RELEASE_READINESS.json"))
+    release_readiness(p("docs/gauntlet/RELEASE_READINESS.json"))
     with open(p("docs/gauntlet/RELEASE_READINESS.json"), encoding="utf-8") as f:
         readiness = json.load(f)
 
@@ -916,12 +935,16 @@ def produce_bundle(out_dir: str) -> int:
     head = _git("rev-parse", "HEAD")
     describe = _git("describe", "--tags", "--always")
 
-    certified = readiness_rc == 0 and bool(conv.get("converged")) and not stale
+    # The bundle cell itself is excluded from ITS OWN certification predicate
+    # (it can only turn green AFTER a certified certificate exists — the
+    # readiness cell reads the certificate this function writes).
+    external_blocking = [
+        c for c in readiness.get("blocking_cells", []) if c != "certification_bundle"
+    ]
+    certified = not external_blocking and bool(conv.get("converged")) and not stale
     reasons: list[str] = []
-    if readiness_rc != 0:
-        reasons.append(
-            "readiness has red cells: " + ", ".join(readiness.get("blocking_cells", []))
-        )
+    if external_blocking:
+        reasons.append("readiness has red cells: " + ", ".join(external_blocking))
     if not conv.get("converged"):
         reasons.append(
             f"convergence not met: rounds={conv.get('rounds')}/10 tail_clean={conv.get('tail_clean')}"
