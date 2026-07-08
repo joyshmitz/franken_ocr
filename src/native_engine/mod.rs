@@ -101,6 +101,9 @@ pub struct OcrModel {
     /// page loop re-hydrated all three EVERY page). Only populated for the
     /// `got-ocr2` arch.
     got_statics: std::sync::OnceLock<got::GotStatics>,
+    /// Lazily-hydrated OneChart model-constant tensors (same idiom; only
+    /// populated for the `onechart` arch).
+    onechart_statics: std::sync::OnceLock<onechart::OnechartStatics>,
     /// Lazily-loaded, then reused BPE tokenizer. The `tokenizer.json` is ~9.9 MB;
     /// parsing it once and caching it on the model amortizes that across every
     /// page of a multi-page document (e.g. a PDF) instead of re-reading and
@@ -1006,6 +1009,7 @@ impl OcrModel {
             decoder_cache_i8: std::sync::OnceLock::new(),
             clip_cache: std::sync::OnceLock::new(),
             got_statics: std::sync::OnceLock::new(),
+            onechart_statics: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
             tromr_tokenizer: std::sync::OnceLock::new(),
@@ -1176,7 +1180,7 @@ impl OcrModel {
         let (w, h) = img.dimensions();
         let tk = self.tokenizer()?;
         let max_new = self.decode_params.max_length;
-        let res = onechart::recognize(&self.weights, tk, img, max_new)?;
+        let res = onechart::recognize(&self.weights, self.onechart_statics()?, tk, img, max_new)?;
         timing_log(&format!(
             "onechart forward {:.2}s (reliable_distance {:?} reliable {:?})",
             t.elapsed().as_secs_f64(),
@@ -1882,12 +1886,16 @@ impl OcrModel {
                     &smolvlm2_question(),
                     max_new,
                 )?,
-                "onechart" => {
-                    onechart::recognize_batch(&self.weights, self.tokenizer()?, &refs, max_new)?
-                        .into_iter()
-                        .map(|r| r.json_text)
-                        .collect()
-                }
+                "onechart" => onechart::recognize_batch(
+                    &self.weights,
+                    self.onechart_statics()?,
+                    self.tokenizer()?,
+                    &refs,
+                    max_new,
+                )?
+                .into_iter()
+                .map(|r| r.json_text)
+                .collect(),
                 other => {
                     return Err(FocrError::Other(anyhow::anyhow!(
                         "dense batch spine: unrouted arch {other}"
@@ -2094,6 +2102,23 @@ impl OcrModel {
         let built = got::hydrate_statics(&self.weights, self.arch().vision_tower_prefix())?;
         let _ = self.got_statics.set(built);
         Ok(self.got_statics.get().expect("got statics just set"))
+    }
+
+    /// The lazily-hydrated OneChart model-constant tensors — see
+    /// [`Self::got_statics`].
+    ///
+    /// # Errors
+    /// A missing or mis-shaped OneChart tensor.
+    fn onechart_statics(&self) -> FocrResult<&onechart::OnechartStatics> {
+        if let Some(c) = self.onechart_statics.get() {
+            return Ok(c);
+        }
+        let built = onechart::hydrate_statics(&self.weights, self.arch().vision_tower_prefix())?;
+        let _ = self.onechart_statics.set(built);
+        Ok(self
+            .onechart_statics
+            .get()
+            .expect("onechart statics just set"))
     }
 
     /// Connector + int8 prefill for ONE page whose vision features are ALREADY
