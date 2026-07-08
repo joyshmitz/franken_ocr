@@ -1046,49 +1046,31 @@ fn attention(
             let vh = &v[head * n * hd..(head + 1) * n * hd];
             let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, rh, rw, gh, gw, hd);
 
-            // logits = scale * (Q @ K^T) + decomposed rel-pos bias, processed
-            // in ROW TILES (bd-av64.10): the full [n, n] score matrix at the
-            // global n = 4096 is 64 MB/head — GEMM-write, bias-rewrite,
-            // softmax-rewrite, GEMM-read is four DRAM round-trips. A [TILE, n]
-            // tile stays cache-resident through all four stages. Per-row
-            // arithmetic is UNCHANGED (each query row's scores/bias/softmax/AV
-            // never see the other rows); the windowed path (n ≤ 512) runs as
-            // ONE tile, i.e. exactly the historic shapes. Byte-identity of the
-            // tiled GEMM dims is proven empirically (goldens + L2 + e2e
-            // byte-diffs — see the bead).
-            const TILE: usize = 128;
-            let tile_rows = if n > 512 { TILE } else { n };
+            // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
+            let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
             let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
-            let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
-            let mut r0 = 0usize;
-            while r0 < n {
-                let r1 = (r0 + tile_rows).min(n);
-                let rows = r1 - r0;
-                let q_tile = Mat::from_vec(rows, hd, qh[r0 * hd..r1 * hd].to_vec());
-                let mut lm = nn::matmul(&q_tile, &kt_mat)?;
-                // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx)
-                // directly instead of dividing per element — bit-identical
-                // arithmetic in the same order, branch/div-free (bd-av64.10:
-                // the naive j/gw + j%gw form burned ~200M integer divisions
-                // per global block). `gi` is the ABSOLUTE query index.
-                for i in 0..rows {
-                    let gi = r0 + i;
-                    let lrow = &mut lm.data[i * n..(i + 1) * n];
-                    let brow_w = &rel_w_bias[gi * gw..(gi + 1) * gw];
-                    for ky in 0..gh {
-                        let bh = rel_h_bias[gi * gh + ky];
-                        let seg = &mut lrow[ky * gw..(ky + 1) * gw];
-                        for (l, &bw) in seg.iter_mut().zip(brow_w) {
-                            *l = scale * *l + bh + bw;
-                        }
+            let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
+            // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx) directly
+            // instead of dividing per element — bit-identical arithmetic in the
+            // same order, but branch/div-free and autovectorizable (bd-av64.10:
+            // the naive j/gw + j%gw form burned ~200M integer divisions per
+            // global block).
+            for i in 0..n {
+                let lrow = &mut lm.data[i * n..(i + 1) * n];
+                let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
+                for ky in 0..gh {
+                    let bh = rel_h_bias[i * gh + ky];
+                    let seg = &mut lrow[ky * gw..(ky + 1) * gw];
+                    for (l, &bw) in seg.iter_mut().zip(brow_w) {
+                        *l = scale * *l + bh + bw;
                     }
                 }
-                // softmax rows then weighted sum of v, tile-local.
-                nn::softmax_rows(&mut lm)?;
-                let tile_out = nn::matmul(&lm, &vh_mat)?;
-                out_chunk[r0 * hd..r1 * hd].copy_from_slice(&tile_out.data);
-                r0 = r1;
             }
+            // softmax rows then weighted sum of v.
+            nn::softmax_rows(&mut lm)?;
+            let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
+            let head_out = nn::matmul(&lm, &vh_mat)?;
+            out_chunk.copy_from_slice(&head_out.data);
             Ok(())
         })?;
 
