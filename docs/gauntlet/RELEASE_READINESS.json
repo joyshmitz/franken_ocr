@@ -70,7 +70,7 @@
   },
   {
    "cell": "certification_bundle",
-   "detail": "certified=False at v0.5.0-13-gf1ac972; refusals: readiness has red cells: certification_bundle, gauntlet_convergence; convergence not met: rounds=8/10 tail_clean=False; evidence older than 24h (or missing): docs/PERF_LEDGER.md",
+   "detail": "certified=False at v0.5.0-18-gb757bc0; refusals: readiness has red cells: gauntlet_convergence; convergence not met: rounds=8/10 tail_clean=False; evidence older than 24h (or missing): docs/PERF_LEDGER.md",
    "evidence": "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
    "status": "red"
   },
