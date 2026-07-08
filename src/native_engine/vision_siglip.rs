@@ -308,6 +308,135 @@ fn self_attention(blk: &SiglipBlockP, x: &Mat) -> FocrResult<Mat> {
     blk.out.apply(&merged)
 }
 
+/// Batched analogue of [`self_attention`] over an `[F·seq, dim]` stacked
+/// buffer (bd-av64.10, the in-code "batched-GEMM stacking lever"): the
+/// q/k/v/out projections are M-batched (row-independent, so each output row's
+/// K-reduction is unchanged — the bd-1azu.10 byte-identity property), and the
+/// SDPA runs with `num_bh = F·heads` where block `f·heads + h` covers frame
+/// `f`'s tokens ONLY — strictly block-diagonal across frames, byte-identical
+/// to attending each frame separately.
+fn self_attention_batched(
+    blk: &SiglipBlockP,
+    x: &Mat,
+    frames: usize,
+    seq: usize,
+) -> FocrResult<Mat> {
+    let q = blk.q.apply(x)?;
+    let k = blk.k.apply(x)?;
+    let v = blk.v.apply(x)?;
+
+    // Repack [F·seq, 768] → frame-then-head-major [F·heads, seq, 64].
+    let head_span = seq * HEAD_DIM;
+    let mut qf = vec![0.0f32; frames * NUM_HEADS * head_span];
+    let mut kf = vec![0.0f32; frames * NUM_HEADS * head_span];
+    let mut vf = vec![0.0f32; frames * NUM_HEADS * head_span];
+    for f in 0..frames {
+        for s in 0..seq {
+            let row = f * seq + s;
+            let (qr, kr, vr) = (q.row(row), k.row(row), v.row(row));
+            for h in 0..NUM_HEADS {
+                let src = h * HEAD_DIM;
+                let dst = (f * NUM_HEADS + h) * head_span + s * HEAD_DIM;
+                qf[dst..dst + HEAD_DIM].copy_from_slice(&qr[src..src + HEAD_DIM]);
+                kf[dst..dst + HEAD_DIM].copy_from_slice(&kr[src..src + HEAD_DIM]);
+                vf[dst..dst + HEAD_DIM].copy_from_slice(&vr[src..src + HEAD_DIM]);
+            }
+        }
+    }
+
+    let ctx = nn::sdpa(
+        &qf,
+        &kf,
+        &vf,
+        frames * NUM_HEADS,
+        seq,
+        seq,
+        HEAD_DIM,
+        HEAD_DIM,
+        ATTN_SCALE,
+        false,
+    );
+
+    // Unpack back to [F·seq, 768] rows.
+    let mut merged = Mat::zeros(frames * seq, EMBED_DIM);
+    for f in 0..frames {
+        for h in 0..NUM_HEADS {
+            for s in 0..seq {
+                let src = (f * NUM_HEADS + h) * head_span + s * HEAD_DIM;
+                let dst_row = merged.row_mut(f * seq + s);
+                dst_row[h * HEAD_DIM..(h + 1) * HEAD_DIM]
+                    .copy_from_slice(&ctx[src..src + HEAD_DIM]);
+            }
+        }
+    }
+    blk.out.apply(&merged)
+}
+
+/// One pre-LN encoder block over an `[F·seq, dim]` stacked buffer: identical
+/// to [`encoder_block`] except the attention is frame-block-diagonal. The
+/// norms, MLP, activation, and residuals are row-wise, so stacking is a no-op
+/// on their math.
+fn encoder_block_batched(
+    blk: &SiglipBlockP,
+    x: &mut Mat,
+    frames: usize,
+    seq: usize,
+) -> FocrResult<()> {
+    let h = nn::layer_norm(x, Some(&blk.ln1.w), Some(&blk.ln1.b), LN_EPS)?;
+    let attn = self_attention_batched(blk, &h, frames, seq)?;
+    add_assign(x, &attn)?;
+
+    let h2 = nn::layer_norm(x, Some(&blk.ln2.w), Some(&blk.ln2.b), LN_EPS)?;
+    let mut m = blk.fc1.apply(&h2)?;
+    nn::gelu_tanh(&mut m);
+    let m = blk.fc2.apply(&m)?;
+    add_assign(x, &m)
+}
+
+/// [`forward_frames`] with the transformer stack run ONCE over all frames
+/// stacked `[F·1024, 768]` (bd-av64.10): every GEMM sees M = F·1024 instead
+/// of 13 small ramps, and the SDPA is frame-block-diagonal. Byte-identical to
+/// the sequential path (proven by `batched_frames_match_sequential_byte_for_byte`
+/// on the real block geometry, plus the armed oracle certs); the per-frame
+/// patch embed stays per-frame (conv, small).
+///
+/// # Errors
+/// [`FocrError::Other`] on a length/frame-count mismatch or any kernel-shape
+/// violation.
+pub fn forward_frames_batched(
+    w: &SiglipWeights,
+    pixels: &[f32],
+    n_frames: usize,
+) -> FocrResult<Vec<Mat>> {
+    let frame_len = 3 * IMG_SIDE * IMG_SIDE;
+    if n_frames == 0 || pixels.len() != n_frames * frame_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_siglip forward_frames_batched: buffer len {} != n_frames {n_frames} * {frame_len}",
+            pixels.len()
+        )));
+    }
+    // Per-frame embeddings, stacked row-major into [F·TOKENS, EMBED_DIM].
+    let mut x = Mat::zeros(n_frames * TOKENS, EMBED_DIM);
+    for f in 0..n_frames {
+        let e = embed_frame(w, &pixels[f * frame_len..(f + 1) * frame_len])?;
+        x.data[f * TOKENS * EMBED_DIM..(f + 1) * TOKENS * EMBED_DIM].copy_from_slice(&e.data);
+    }
+    for blk in &w.blocks {
+        encoder_block_batched(blk, &mut x, n_frames, TOKENS)?;
+    }
+    let post = nn::layer_norm(&x, Some(&w.post_ln.w), Some(&w.post_ln.b), LN_EPS)?;
+    // Split back into one [TOKENS, EMBED_DIM] Mat per frame.
+    let mut out = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        out.push(Mat::from_vec(
+            TOKENS,
+            EMBED_DIM,
+            post.data[f * TOKENS * EMBED_DIM..(f + 1) * TOKENS * EMBED_DIM].to_vec(),
+        ));
+    }
+    Ok(out)
+}
+
 /// `a += b`, shape-checked.
 fn add_assign(a: &mut Mat, b: &Mat) -> FocrResult<()> {
     if a.shape() != b.shape() {
@@ -595,5 +724,39 @@ mod tests {
             max_abs <= 1e-2,
             "SigLIP post-LN maxabs {max_abs:.3e} > 1e-2 — investigate before tightening"
         );
+    }
+
+    /// bd-av64.10: the frame-batched tower must equal the sequential path
+    /// BIT-FOR-BIT — M-batched GEMMs keep each output row's K-reduction, and
+    /// the SDPA blocks are frame-disjoint. Real per-block geometry (768/12
+    /// heads/3072) at depth 1, three frames of distinct synthetic pixels.
+    #[test]
+    fn batched_frames_match_sequential_byte_for_byte() {
+        let w = synthetic_weights_depth(1);
+        let frames = 3usize;
+        let frame_len = 3 * IMG_SIDE * IMG_SIDE;
+        let pixels: Vec<f32> = (0..frames * frame_len)
+            .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+            .collect();
+        let sequential = forward_frames(&w, &pixels, frames).expect("sequential");
+        let batched = forward_frames_batched(&w, &pixels, frames).expect("batched");
+        assert_eq!(sequential.len(), batched.len());
+        for (f, (a, b)) in sequential.iter().zip(&batched).enumerate() {
+            assert_eq!(a.shape(), b.shape(), "frame {f} shape");
+            for (i, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "frame {f} element {i}: {x} vs {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_frames_reject_bad_buffer() {
+        let w = synthetic_weights_depth(1);
+        assert!(forward_frames_batched(&w, &[0.0; 7], 1).is_err());
+        assert!(forward_frames_batched(&w, &[], 0).is_err());
     }
 }

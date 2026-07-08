@@ -109,7 +109,15 @@ pub fn describe_prompt_ids(
 /// A hydration/forward error, or a shape violation.
 pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrResult<Mat> {
     let sw = vision_siglip::siglip_weights_from(weights, "model.vision_model")?;
-    let post = vision_siglip::forward_frames(&sw, frames, n_frames)?;
+    // The frame-batched tower (bd-av64.10): one transformer pass over all
+    // frames stacked, byte-identical to the sequential per-frame path
+    // (vision_siglip::tests::batched_frames_match_sequential_byte_for_byte).
+    // FOCR_SIGLIP_SEQ=1 is the kill-switch back to the per-frame loop.
+    let post = if std::env::var_os("FOCR_SIGLIP_SEQ").is_some_and(|v| v == "1") {
+        vision_siglip::forward_frames(&sw, frames, n_frames)?
+    } else {
+        vision_siglip::forward_frames_batched(&sw, frames, n_frames)?
+    };
 
     let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
     let mut ps = Mat::zeros(n_frames * IMG_SLOTS_PER_FRAME, ps_cols);
