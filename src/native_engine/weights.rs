@@ -10,9 +10,11 @@
 //!   byte_len, scales_offset, scales_len, group_size?, tier?}`) indexing one
 //!   contiguous payload by byte range. Quantized tensors carry their scales
 //!   inline (int8 per-output-channel, int4 per-group). The container is read
-//!   with the `franken_whisper` ggml/safetensors parser pattern: read the whole
-//!   file into one `Vec<u8>`, validate the magic, parse the header, then index
-//!   the payload by byte range — no per-tensor copies until an accessor asks.
+//!   with the `franken_whisper` ggml/safetensors parser pattern: keep one
+//!   backing blob, validate the magic, parse the header, then index the payload
+//!   by byte range — no per-tensor copies until an accessor asks. The backing is
+//!   a read-only mmap by default and an owned `Vec<u8>` when `FOCR_NO_MMAP=1` is
+//!   set or mapping fails.
 //!
 //! * The **safetensors fallback**: the upstream 6.67 GB bf16 shard, so weights
 //!   can load before the quantizer/converter exists. Standard safetensors
@@ -33,12 +35,10 @@
 //! checkpoint is rejected at load time with [`FocrError::FormatMismatch`], not
 //! surfaced later as garbage OCR output.
 //!
-//! Memory mapping note: the `memmap2` crate is **not** a dependency
-//! (Cargo.toml is owned centrally and not editable from this module), so the
-//! loader falls back to reading the file fully into one `Vec<u8>` — the same
-//! pattern `franken_whisper` uses. The accessor API is mmap-shaped (byte-range
-//! views into the backing buffer), so swapping in an mmap later is a backing
-//! store change, not an API change.
+//! Memory mapping note: `Weights::load` uses a read-only `memmap2` mapping by
+//! default, so large artifacts page in lazily and can reuse the OS page cache
+//! across runs. The owned `Vec<u8>` path remains the parser core for tests,
+//! converters, `FOCR_NO_MMAP=1`, and filesystems where mapping fails.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -350,15 +350,16 @@ impl TensorView<'_> {
 /// The loaded weight set for one model: the whole backing blob plus the tensor
 /// directory indexing it by byte range (PROPOSED_ARCHITECTURE.md §6.12).
 ///
-/// `bytes` holds the entire file (the read-to-`Vec` fallback for an absent
-/// `memmap2`). For `.focrq` the directory's byte offsets are payload-relative,
-/// so `payload_base` records where the payload begins inside `bytes`; for
+/// `bytes` holds one backing blob: a read-only mmap by default, or an owned
+/// buffer for tests, converters, `FOCR_NO_MMAP=1`, and mmap-failure fallback.
+/// For `.focrq` the directory's byte offsets are payload-relative, so
+/// `payload_base` records where the payload begins inside `bytes`; for
 /// safetensors the same field points just past the header. Every accessor
 /// resolves `bytes[payload_base + off .. payload_base + off + len]`.
 #[derive(Debug)]
 pub struct Weights {
-    /// The entire on-disk blob, read once.
-    bytes: Vec<u8>,
+    /// The entire on-disk blob — owned bytes or a read-only mmap ([`Backing`]).
+    bytes: Backing,
     /// Offset of the payload region within `bytes`.
     payload_base: usize,
     /// `name -> record` directory.
@@ -377,6 +378,60 @@ pub struct Weights {
     is_focrq: bool,
 }
 
+/// The weight blob's storage: an owned buffer (tests, converters, the
+/// `FOCR_NO_MMAP=1` kill-switch / mmap-failure fallback) or a read-only
+/// memory map (the default load path, bd-2mo.22) — 3.6 GB artifacts page in
+/// lazily instead of being fully read per CLI invocation, and the OS page
+/// cache is shared across runs. Both deref to `&[u8]`; every reader below is
+/// backing-agnostic.
+enum Backing {
+    /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
+    Owned(Vec<u8>),
+    /// Read-only file mapping.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::Owned(v) => v,
+            Backing::Mapped(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Debug for Backing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backing::Owned(v) => write!(f, "Backing::Owned({} bytes)", v.len()),
+            Backing::Mapped(m) => write!(f, "Backing::Mapped({} bytes)", m.len()),
+        }
+    }
+}
+
+/// The ONE unsafe call in the loader — the read-only mmap island, mirroring
+/// the `simd::arm`/`simd::x86` island pattern (crate policy is
+/// `deny(unsafe_code)` with documented, minimal islands).
+#[allow(unsafe_code)]
+mod mmap_island {
+    /// Map `file` read-only.
+    ///
+    /// # Safety argument
+    /// `Mmap::map` is `unsafe` because another process truncating the file
+    /// mid-use is UB. The supported envelope makes that unreachable in
+    /// practice: model artifacts are immutable-once-written by the pull /
+    /// convert contract (writers create a fresh file and rename), the map is
+    /// read-only, and the same concurrent-mutation caveat already applied to
+    /// the read-to-Vec path as data corruption. `FOCR_NO_MMAP=1` restores the
+    /// owned-bytes path for hosts/filesystems outside that envelope.
+    pub(super) fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+        // SAFETY: read-only mapping of an immutable-by-contract artifact; see
+        // the function doc for the envelope.
+        unsafe { memmap2::Mmap::map(file) }
+    }
+}
+
 impl Default for Weights {
     /// An empty weight set (no tensors). Used by forward-module tests to
     /// construct a `Weights` without a real blob: every accessor on it returns
@@ -386,7 +441,7 @@ impl Default for Weights {
     /// cleanly errors rather than panicking.
     fn default() -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Backing::Owned(Vec::new()),
             payload_base: 0,
             directory: BTreeMap::new(),
             arch_target: 0,
@@ -402,11 +457,12 @@ impl Weights {
     /// Load a `.focrq` blob, or fall back to a raw safetensors shard, from
     /// `path`.
     ///
-    /// The whole file is read into one `Vec<u8>`; the magic decides the format
-    /// (`b"FOCRQ\0"` → `.focrq`, the safetensors `u64` header-length prefix
-    /// otherwise). The census is NOT run here (the caller supplies the expected
-    /// name set via [`Weights::load_with_census`]); a bare `load` just parses
-    /// and indexes.
+    /// A read-only mmap is attempted first unless `FOCR_NO_MMAP=1` is set; any
+    /// mmap failure falls back to an owned `Vec<u8>`. The magic decides the
+    /// format (`b"FOCRQ\0"` → `.focrq`, the safetensors `u64`
+    /// header-length prefix otherwise). The census is NOT run here (the caller
+    /// supplies the expected name set via [`Weights::load_with_census`]); a
+    /// bare `load` just parses and indexes.
     ///
     /// # Errors
     /// * [`FocrError::ModelNotFound`] if the file can't be read.
@@ -414,6 +470,15 @@ impl Weights {
     ///   version newer than this binary, or a directory that overruns the
     ///   payload.
     pub fn load(path: &Path) -> FocrResult<Self> {
+        // Default: read-only mmap (bd-2mo.22) — lazy page-in + cross-run page
+        // cache instead of a full multi-GB read per invocation. Kill-switch
+        // `FOCR_NO_MMAP=1` (or any mmap failure) restores the owned read.
+        if std::env::var_os("FOCR_NO_MMAP").is_none()
+            && let Ok(file) = std::fs::File::open(path)
+            && let Ok(map) = mmap_island::map_readonly(&file)
+        {
+            return Self::from_backing(Backing::Mapped(map));
+        }
         let bytes = std::fs::read(path).map_err(|e| {
             FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
         })?;
@@ -445,6 +510,18 @@ impl Weights {
     /// # Errors
     /// [`FocrError::FormatMismatch`] on any structural problem.
     pub fn from_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+        Self::from_backing(Backing::Owned(bytes))
+    }
+
+    /// Test-only probe: did this load take the mmap backing?
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        matches!(self.bytes, Backing::Mapped(_))
+    }
+
+    /// Parse + index a blob in either backing (the shared core of
+    /// [`Weights::load`] / [`Weights::from_bytes`]).
+    fn from_backing(bytes: Backing) -> FocrResult<Self> {
         if bytes.len() >= FOCRQ_MAGIC.len() && &bytes[..FOCRQ_MAGIC.len()] == FOCRQ_MAGIC {
             Self::from_focrq_bytes(bytes)
         } else {
@@ -459,7 +536,7 @@ impl Weights {
     /// payload`. The provenance/config and the tensor directory all live in the
     /// header JSON (the byte fields before it are the fixed-size preamble that a
     /// reader can validate before parsing JSON).
-    fn from_focrq_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+    fn from_focrq_bytes(bytes: Backing) -> FocrResult<Self> {
         // Fixed preamble: magic(6) + version(4) + arch(1) + sha256(32) +
         // header_len(8) = 51 bytes minimum.
         const PREAMBLE: usize = 6 + 4 + 1 + 32 + 8;
@@ -543,7 +620,7 @@ impl Weights {
     /// payload`. The JSON maps `name -> {dtype, shape, data_offsets:[beg,end]}`
     /// (offsets are payload-relative); a `__metadata__` key, if present, is
     /// skipped.
-    fn from_safetensors_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+    fn from_safetensors_bytes(bytes: Backing) -> FocrResult<Self> {
         if bytes.len() < 8 {
             return Err(FocrError::FormatMismatch(format!(
                 "safetensors truncated: {} bytes < 8-byte header length prefix",
@@ -1292,7 +1369,7 @@ mod tests {
 
     fn synthetic_weights(record: TensorRecord, bytes: Vec<u8>) -> Weights {
         Weights {
-            bytes,
+            bytes: Backing::Owned(bytes),
             payload_base: 0,
             directory: BTreeMap::from([("x".to_owned(), record)]),
             arch_target: 0,
@@ -2008,6 +2085,46 @@ mod tests {
             matches!(err, FocrError::FormatMismatch(_)),
             "wrong panel length must FormatMismatch, got {err:?}"
         );
+    }
+
+    /// bd-2mo.22: the default load path memory-maps the artifact, and the
+    /// mapped view is BYTE-IDENTICAL to the owned read — every tensor, every
+    /// scale, the whole directory. (The `FOCR_NO_MMAP=1` kill-switch and the
+    /// mmap-failure fallback share the owned path this compares against.)
+    #[test]
+    fn mmap_load_is_byte_identical_to_owned_read() {
+        let (n, k) = (3usize, 5usize);
+        let w_rm: Vec<i8> = (0..n * k).map(|i| (i as i8) - 7).collect();
+        let w_bytes: Vec<u8> = w_rm.iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = w_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            w_bytes.len(),
+            w_bytes.len()
+        );
+        let blob = build_focrq(1, 0, [0u8; 32], &dir, &payload);
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("focr_mmap_eq_{}.focrq", std::process::id()));
+        std::fs::write(&tmp, &blob).expect("write temp artifact");
+
+        let mapped = Weights::load(&tmp).expect("mmap load");
+        assert!(
+            mapped.is_mapped() || std::env::var_os("FOCR_NO_MMAP").is_some(),
+            "default load must take the mmap backing"
+        );
+        let owned = Weights::from_bytes(blob).expect("owned parse");
+
+        let a: Vec<&str> = mapped.names().collect();
+        let b: Vec<&str> = owned.names().collect();
+        assert_eq!(a, b, "directory identical");
+        let qa = mapped.qint8("q").expect("mapped qint8");
+        let qb = owned.qint8("q").expect("owned qint8");
+        assert_eq!(qa.w, qb.w);
+        assert_eq!(qa.scales, qb.scales);
+        println!(r#"{{"check":"mmap_owned_equivalence","result":"pass"}}"#);
     }
 
     #[test]
