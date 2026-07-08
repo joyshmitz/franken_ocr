@@ -96,6 +96,11 @@ pub struct OcrModel {
     /// per process instead of per view/page. Only populated for archs whose
     /// pipeline runs the CLIP tower (the Baidu path).
     clip_cache: std::sync::OnceLock<vision_clip::ClipWeights>,
+    /// Lazily-hydrated, then reused GOT model-constant tensors (SAM tower +
+    /// projector + widened embed table, ~1 GB f32 — bd-av64.10: the sequential
+    /// page loop re-hydrated all three EVERY page). Only populated for the
+    /// `got-ocr2` arch.
+    got_statics: std::sync::OnceLock<got::GotStatics>,
     /// Lazily-loaded, then reused BPE tokenizer. The `tokenizer.json` is ~9.9 MB;
     /// parsing it once and caching it on the model amortizes that across every
     /// page of a multi-page document (e.g. a PDF) instead of re-reading and
@@ -1000,6 +1005,7 @@ impl OcrModel {
             decode_params: decode_params_from_env(),
             decoder_cache_i8: std::sync::OnceLock::new(),
             clip_cache: std::sync::OnceLock::new(),
+            got_statics: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
             tromr_tokenizer: std::sync::OnceLock::new(),
@@ -1126,14 +1132,7 @@ impl OcrModel {
         // charts/molecular/geometry/sheet-music); default plain `OCR: ` unchanged.
         let format = got_format_requested();
         let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
-        let text = got::recognize(
-            &self.weights,
-            tk,
-            img,
-            self.arch().vision_tower_prefix(),
-            max_new,
-            format,
-        )?;
+        let text = got::recognize(&self.weights, self.got_statics()?, tk, img, max_new, format)?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
         Ok((text, w, h))
     }
@@ -1870,9 +1869,9 @@ impl OcrModel {
             let texts: Vec<String> = match arch_id {
                 "got-ocr2" => got::recognize_batch(
                     &self.weights,
+                    self.got_statics()?,
                     self.got_tokenizer()?,
                     &refs,
-                    self.arch().vision_tower_prefix(),
                     max_new,
                     got_format_requested(),
                 )?,
@@ -2080,6 +2079,21 @@ impl OcrModel {
         ));
         let _ = self.clip_cache.set(built);
         Ok(self.clip_cache.get().expect("clip cache just set"))
+    }
+
+    /// The lazily-hydrated GOT model-constant tensors (bd-av64.10), built once
+    /// per model and reused by the sequential AND batch page paths — same
+    /// idiom as [`Self::clip_weights`].
+    ///
+    /// # Errors
+    /// A missing or mis-shaped GOT tensor.
+    fn got_statics(&self) -> FocrResult<&got::GotStatics> {
+        if let Some(c) = self.got_statics.get() {
+            return Ok(c);
+        }
+        let built = got::hydrate_statics(&self.weights, self.arch().vision_tower_prefix())?;
+        let _ = self.got_statics.set(built);
+        Ok(self.got_statics.get().expect("got statics just set"))
     }
 
     /// Connector + int8 prefill for ONE page whose vision features are ALREADY

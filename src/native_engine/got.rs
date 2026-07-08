@@ -70,13 +70,56 @@ pub const IMAGE_TOKEN_LEN: usize = 256;
 ///
 /// # Errors
 /// The first vision-stage error (missing/mis-shaped tensor or kernel failure).
-pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResult<Mat> {
-    let sam = vision_sam::forward_prefix(weights, image, prefix)?; // [1024, 256] channel-major
+pub fn vision_features(statics: &GotStatics, image: &Mat) -> FocrResult<Mat> {
+    let side = (image.cols as f64).sqrt() as usize;
+    if side * side != image.cols || image.rows != 3 {
+        return Err(crate::FocrError::Other(anyhow::anyhow!(
+            "got vision: expected [3, side*side] input, got [{}, {}]",
+            image.rows,
+            image.cols
+        )));
+    }
+    let sam = vision_sam::forward_with(&statics.sam, image, side, side)?; // [1024, 256]
     let sam_t = transpose(&sam); // [256, 1024] token-major
-    let w = weights.vec("model.mm_projector_vary.weight")?; // [1024*1024] row-major [out,in]
-    let b = weights.vec("model.mm_projector_vary.bias")?; // [1024]
-    let proj = vision_sam::Linear::from_row_major(&w, b, 1024, 1024)?;
-    proj.apply(&sam_t) // [256, 1024]
+    statics.proj.apply(&sam_t) // [256, 1024]
+}
+
+/// The per-model-constant GOT tensors — the SAM tower, the `mm_projector_vary`
+/// projector, and the widened `embed_tokens` table (~1 GB f32 together) —
+/// hydrated ONCE and cached on the [`super::OcrModel`] (bd-av64.10: the
+/// sequential page loop re-hydrated all three EVERY page, ~0.3–0.4 s/page of
+/// pure bf16→f32 widening; same residency the batch path already held).
+pub struct GotStatics {
+    /// The hydrated SAM-ViT-B tower.
+    pub sam: vision_sam::SamWeights,
+    /// The `mm_projector_vary` connector (pre-transposed).
+    pub proj: vision_sam::Linear,
+    /// The widened `[vocab, hidden]` embed table.
+    pub embed: Mat,
+}
+
+/// Hydrate a [`GotStatics`] from the artifact (`prefix` names the SAM tower,
+/// e.g. `model.vision_tower_high`).
+///
+/// # Errors
+/// A missing or mis-shaped tensor.
+pub fn hydrate_statics(weights: &Weights, prefix: &str) -> FocrResult<GotStatics> {
+    let th = std::time::Instant::now();
+    let statics = GotStatics {
+        sam: vision_sam::sam_weights_from(weights, prefix)?,
+        proj: vision_sam::Linear::from_row_major(
+            &weights.vec("model.mm_projector_vary.weight")?,
+            weights.vec("model.mm_projector_vary.bias")?,
+            1024,
+            1024,
+        )?,
+        embed: weights.mat("model.embed_tokens.weight")?,
+    };
+    super::timing_log(&format!(
+        "  got.hydrate(cached) {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    Ok(statics)
 }
 
 /// Build the GOT decoder `inputs_embeds`: embed the prompt id-stream against the
@@ -87,13 +130,12 @@ pub fn vision_features(weights: &Weights, image: &Mat, prefix: &str) -> FocrResu
 /// A vision/embed error, or a [`connector::masked_scatter`] mismatch (the number
 /// of `<imgpad>` rows must equal `vision_features.rows`).
 pub fn build_inputs_embeds(
-    weights: &Weights,
+    statics: &GotStatics,
     image: &Mat,
     prompt_ids: &[u32],
-    prefix: &str,
 ) -> FocrResult<Mat> {
-    let tokens = vision_features(weights, image, prefix)?; // [256, 1024]
-    let embed = weights.mat("model.embed_tokens.weight")?; // [vocab, hidden]
+    let tokens = vision_features(statics, image)?; // [256, 1024]
+    let embed = &statics.embed; // [vocab, hidden]
     let (vocab, hidden) = (embed.rows, embed.cols);
     let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, prompt_ids)?;
     let mask: Vec<bool> = prompt_ids.iter().map(|&id| id == IMG_PAD_ID).collect();
@@ -131,16 +173,16 @@ pub fn ocr_prompt_ids(tk: &Tiktoken, format: bool) -> FocrResult<Vec<u32>> {
 /// A preprocess, vision, decode, or tokenizer error.
 pub fn recognize(
     weights: &Weights,
+    statics: &GotStatics,
     tk: &Tiktoken,
     img: &DynamicImage,
-    prefix: &str,
     max_new: usize,
     format: bool,
 ) -> FocrResult<String> {
     let tv = std::time::Instant::now();
     let image = preprocess::got_view_tensor(img);
     let prompt_ids = ocr_prompt_ids(tk, format)?;
-    let inputs_embeds = build_inputs_embeds(weights, &image, &prompt_ids, prefix)?;
+    let inputs_embeds = build_inputs_embeds(statics, &image, &prompt_ids)?;
     super::timing_log(&format!(
         "  got.vision+splice {:.2}s",
         tv.elapsed().as_secs_f64()
@@ -171,48 +213,20 @@ pub fn recognize(
 /// As [`recognize`].
 pub fn recognize_batch(
     weights: &Weights,
+    statics: &GotStatics,
     tk: &Tiktoken,
     imgs: &[&DynamicImage],
-    prefix: &str,
     max_new: usize,
     format: bool,
 ) -> FocrResult<Vec<String>> {
     let prompt_ids = ocr_prompt_ids(tk, format)?;
     let tv = std::time::Instant::now();
-    // Hydrate ONCE per batch (bd-av64.10 profiling: the sequential loop
-    // re-hydrated SAM + projector + the widened embed table EVERY page):
-    // the same amortization the MoE spine's vision stage performs.
-    let th = std::time::Instant::now();
-    let sam = vision_sam::sam_weights_from(weights, prefix)?;
-    let proj = vision_sam::Linear::from_row_major(
-        &weights.vec("model.mm_projector_vary.weight")?,
-        weights.vec("model.mm_projector_vary.bias")?,
-        1024,
-        1024,
-    )?;
-    let embed = weights.mat("model.embed_tokens.weight")?;
-    let (vocab, hidden) = (embed.rows, embed.cols);
-    super::timing_log(&format!(
-        "  got.hydrate(batch) {:.2}s",
-        th.elapsed().as_secs_f64()
-    ));
-    let mask_of = |ids: &[u32]| -> Vec<bool> { ids.iter().map(|&id| id == IMG_PAD_ID).collect() };
+    // The model-constant tensors arrive pre-hydrated from the OcrModel cache
+    // (bd-av64.10): batches AND sequential pages share one hydration.
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
     for img in imgs {
         let image = preprocess::got_view_tensor(img);
-        let side = (image.cols as f64).sqrt() as usize;
-        if side * side != image.cols || image.rows != 3 {
-            return Err(crate::FocrError::Other(anyhow::anyhow!(
-                "got batch vision: expected [3, side*side] input, got [{}, {}]",
-                image.rows,
-                image.cols
-            )));
-        }
-        let sam_out = vision_sam::forward_with(&sam, &image, side, side)?; // [1024, 256]
-        let tokens = proj.apply(&transpose(&sam_out))?; // [256, 1024]
-        let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, &prompt_ids)?;
-        connector::masked_scatter(&mut inputs_embeds, &tokens, &mask_of(&prompt_ids))?;
-        embeds_list.push(inputs_embeds);
+        embeds_list.push(build_inputs_embeds(statics, &image, &prompt_ids)?);
     }
     super::timing_log(&format!(
         "  got.vision+splice(batch of {}) {:.2}s",
@@ -276,8 +290,8 @@ mod tests {
         ))
         .expect("sample image");
 
-        let text = recognize(&weights, &tk, &img, "model.vision_tower_high", 64, false)
-            .expect("recognize");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high").expect("statics");
+        let text = recognize(&weights, &statics, &tk, &img, 64, false).expect("recognize");
         eprintln!("[B11 e2e] {text:?}");
         assert_eq!(
             text,
@@ -317,22 +331,15 @@ mod tests {
         ))
         .expect("page 2");
 
+        let statics = hydrate_statics(&weights, "model.vision_tower_high").expect("statics");
         let solo: Vec<String> = [&img1, &img2]
             .iter()
             .map(|im| {
-                recognize(&weights, &tk, im, "model.vision_tower_high", 64, false)
-                    .expect("sequential recognize")
+                recognize(&weights, &statics, &tk, im, 64, false).expect("sequential recognize")
             })
             .collect();
-        let batched = recognize_batch(
-            &weights,
-            &tk,
-            &[&img1, &img2],
-            "model.vision_tower_high",
-            64,
-            false,
-        )
-        .expect("batched recognize");
+        let batched = recognize_batch(&weights, &statics, &tk, &[&img1, &img2], 64, false)
+            .expect("batched recognize");
         assert_eq!(
             solo, batched,
             "A7.5 LOSSLESS contract broken: batched != sequential on the armed model"
@@ -373,8 +380,8 @@ mod tests {
             .expect("tiktoken");
         let img = image::open(&path).expect("corpus image");
 
-        let text = recognize(&weights, &tk, &img, "model.vision_tower_high", 512, true)
-            .expect("recognize --format");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high").expect("statics");
+        let text = recognize(&weights, &statics, &tk, &img, 512, true).expect("recognize --format");
         eprintln!("[format corpus {asset}] {text:?}");
         assert!(!text.is_empty(), "{asset}: `--format` output is empty");
         assert!(
@@ -491,8 +498,9 @@ mod tests {
         assert_eq!(img_flat.len(), 3 * side * side, "image not [3,1024,1024]");
         let image = Mat::from_vec(3, side * side, img_flat);
 
-        let embeds = build_inputs_embeds(&weights, &image, &prompt_ids, "model.vision_tower_high")
-            .expect("build inputs_embeds");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high").expect("statics");
+        let embeds =
+            build_inputs_embeds(&statics, &image, &prompt_ids).expect("build inputs_embeds");
         assert_eq!(embeds.rows, prompt_ids.len());
         assert_eq!(embeds.cols, 1024);
 
