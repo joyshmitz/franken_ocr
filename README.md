@@ -56,7 +56,7 @@ The installer detects your platform, resolves the latest published GitHub binary
 | **Durable run history** | `focr ocr` records best-effort local telemetry in fsqlite; `focr runs` and `focr sync` expose the run log as plain text, JSON, NDJSON, or locked JSONL. |
 | **Bounded long-doc memory** | R-SWA keeps generated-token KV constant (window 128) while the reference block is held as a frozen, never-evicted global KV. |
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, TrOMR `staff` and `music_warning` events for music runs, stable documented exit codes, deterministic output under fixed sampling. |
-| **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU and emits a single JSON verdict. |
+| **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU, including per-model verdicts for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart. |
 | **Real-scan music gate** | The TrOMR lane has public-domain Spohr page/staff fixtures, human-verifiable attributes, a frozen MusicXML anchor, and a model-gated NDJSON runner so real engraved scans are measured separately from synthetic examples. |
 | **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, `tests/property_suite.rs` exercises generator-driven invariants, `scripts/bench_guardrail.py` compares stage timings against frozen baselines, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited islands: SIMD kernels with bit-identical scalar fallbacks, plus the read-only mmap loader. |
@@ -117,7 +117,7 @@ focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
 focr ocr page.png --robot
 focr robot triage
 
-# 9. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
+# 9. Prove the int8 kernels on THIS CPU are bit-identical to the scalar oracle.
 focr robot selftest
 
 # 10. Generate the parity-ladder and release-readiness scorecards used by release gates.
@@ -256,7 +256,7 @@ cargo build --release
 
 1. **Install** the binary with the curl one-liner, or download and verify a release asset by hand.
 2. **Fetch the weights once:** `focr pull`. This downloads about 3.9 GB of int8 weights plus `tokenizer.json` into `~/.cache/franken_ocr/models`, verifying every byte by SHA256 against a committed manifest.
-3. **Verify your CPU kernel** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM is bit-identical to the scalar oracle on this host.
+3. **Verify your CPU kernels** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM cases, including the model-specific rows for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart, are bit-identical to the scalar oracle on this host.
 4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output (markdown + bounding boxes), `-o out.md` / `-o out.json` to write a file, or `--robot` for an NDJSON event stream.
 5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`. Add `--multi-page` to parse them as ONE cross-referencing document instead of independent pages.
 
@@ -532,7 +532,7 @@ focr robot selftest                          # int8 kernel vs scalar oracle on t
 focr robot triage                            # quick_ref + health + recommendations + commands
 ```
 
-`focr robot selftest` runs the dispatched int8 GEMM against a bit-identical scalar oracle across a shape battery, including the worst-case `K=6848` i32-accumulation overflow case, and emits a single JSON verdict; it exits 1 if any parity case diverges. It has passed 24/24 on Apple SDOT and on a real x86 AVX2 box. Set `FOCR_FORCE_ARCH` to verify a specific ISA tier.
+`focr robot selftest` runs the dispatched int8 GEMM against a bit-identical scalar oracle across a shape battery, including the worst-case `K=6848` i32-accumulation overflow case, and emits a single JSON verdict; it exits 1 if any parity case diverges. The current Apple SDOT evidence passes 44/44 cases and reports per-model verdicts for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart. Earlier x86 AVX2 evidence passed the pre-zoo 24-case battery. Set `FOCR_FORCE_ARCH` to verify a specific ISA tier.
 
 `focr robot triage` is the first command an agent should run in an unfamiliar
 checkout or host. It returns one JSON object with a compact command reference,
@@ -638,7 +638,7 @@ Set `FOCR_QKV_FUSED=0` to restore the older three-call path for comparison.
 
 **Instrumentation and batch-spine bring-up.** `FOCR_TIMING=1` prints nested timing rows for the native forward, including SAM hydrate, SAM forward, per-block attention, and per-block MLP stages. That makes the current bottleneck visible: large pages can spend their wall time in vision attention rather than model artifact loading. The vision hydration path now builds SAM, CLIP, and SigLIP weight bundles once per loaded model, including GEMM-ready pre-transposed linears, so later pages skip repeated transpose work. GOT-OCR2, SmolVLM2, and OneChart apply the same model-cache pattern to their vision towers, projectors, and widened embed tables. The SAM attention pass keeps the math bit-identical while reducing overhead: independent windows run across Rayon, relative-position tables are hoisted once per block, Q/K/V head splits copy contiguous slices, and the bias add walks `(ky, kx)` rows directly. The dense decoder batch spine also has a byte-identity-gated helper for Qwen/Llama and OPT-family decode steps. Prefill stays per stream; active non-EOS streams then advance through one batch step while each stream keeps its own KV cache, absolute position, and per-stream emission cap. The public `ocr-batch` path keeps `FOCR_BATCH_SPINE` as an opt-in switch while new batch plumbing earns correctness and perf evidence.
 
-**Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, proving i32 accumulation stays in range. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
+**Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, plus model-specific overflow rows for the ready int8 decoder families. The current Apple SDOT artifact passes 44/44 cases and reports per-model verdicts for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
 
 ---
 
