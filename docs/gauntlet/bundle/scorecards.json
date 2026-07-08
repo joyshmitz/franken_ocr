@@ -1,0 +1,169 @@
+{
+ "artifact": "franken_ocr.bundle_scorecards.v1",
+ "readiness_cells": [
+  {
+   "cell": "parity_l0_l5",
+   "detail": "L0 max_abs_diff=0.0078432; L1 cosine=1; L2 max_abs_diff=8.76188e-05; L3 cosine=1; L4 token_exact_fraction=1; L5 cer=0",
+   "evidence": "tests/fixtures/ladder_scorecard/scorecard_armed.json",
+   "status": "green"
+  },
+  {
+   "cell": "surface_parity",
+   "detail": "missing MUST rows: none; partial MUST rows (enumerated debt): 4",
+   "evidence": "docs/FEATURE_PARITY.md \u00a712-\u00a715 (lock: tests/surface_matrix.rs)",
+   "status": "green"
+  },
+  {
+   "cell": "perf_vs_reference",
+   "detail": "check_ledgers exit 0; gauntlet ratio rows present: True",
+   "evidence": "docs/PERF_LEDGER.md + scripts/check_ledgers.py",
+   "status": "green"
+  },
+  {
+   "cell": "determinism",
+   "detail": "obs=1 e=0.001 rejected=None",
+   "evidence": "docs/gauntlet/EPROCESS_STATE.json (INV-DETERMINISM)",
+   "status": "green"
+  },
+  {
+   "cell": "deadlock_watchdog",
+   "detail": "armed capacity cert p50/p95/p99 = 6.83/7.41/9.58 s/page (bd-re8.18)",
+   "evidence": "tests/many_pages_without_deadlock.rs (+ cancel_and_panic_faults.rs)",
+   "status": "green"
+  },
+  {
+   "cell": "robot_schema",
+   "evidence": "tests/fixtures/robot_schema_v1.json + runs_schema.json (tests: cli_robot_golden, surface_matrix)",
+   "status": "green"
+  },
+  {
+   "cell": "build_matrix",
+   "detail": "release-history cell; re-verified at each release cut",
+   "evidence": "v0.3.0 GH release (tag f4796b3): darwin x2, linux x2, win-msvc + shasum sidecars",
+   "status": "green"
+  },
+  {
+   "cell": "installer",
+   "evidence": "install.sh (+ published checksum sidecars per release)",
+   "status": "green"
+  },
+  {
+   "cell": "ledger_completeness",
+   "detail": "exit 0",
+   "evidence": "scripts/check_ledgers.py over DISCREPANCIES.md + NEGATIVE_EVIDENCE.md + PERF_LEDGER.md",
+   "status": "green"
+  },
+  {
+   "cell": "agent_ergonomics",
+   "detail": "median uplift +550 across 5 dimensions; heatmap debt filed (doctor fixtures, ocr-batch golden)",
+   "evidence": "docs/ergonomics/AUDIT.md + tests/agent_ergonomics_regression.rs (6 pinned changes; 11 landed)",
+   "status": "green"
+  },
+  {
+   "cell": "doctor",
+   "evidence": "src/doctor.rs + tests/doctor_fixtures.rs (8 fixture roundtrips: fix/undo byte-identical, dry-run zero-blast, lock, chokepoint code-search)",
+   "status": "green"
+  },
+  {
+   "cell": "certification_bundle",
+   "evidence": "bd-wp8.9 OPEN: FINAL_GAUNTLET_REPORT + bundle JSONs not yet produced",
+   "status": "red"
+  },
+  {
+   "cell": "gauntlet_convergence",
+   "detail": "rounds=8/10, tail_clean=False",
+   "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
+   "status": "red"
+  }
+ ],
+ "rounds": [
+  {
+   "date": "2026-07-06",
+   "new_findings": 0,
+   "notes": "first FORMAL round, run after the day's build waves landed; the waves themselves found+fixed 3 genuine defects pre-round (exit-1 artifact misclassification, non-hermetic goldens, AppleDouble shard glob) - counted in their beads, not in this round",
+   "pillars": {
+    "conformance": "full cargo test suite green (0 FAILED; incl fault_suite, doctor_fixtures 8/8, cancel_and_panic, goldens 36/36, metamorphic, watchdog)",
+    "perf": "check_ledgers exit 0; A11 fairness-pinned ratios standing (decode/tok 3.37x/1.67x/2.58x vs hf-f32)",
+    "surface": "surface_matrix 4/4 + conformance_matrix green; FEATURE_PARITY measured (159p/17pa/5m/4x); RELEASE_SCORECARD regenerated"
+   },
+   "round": 1
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 0,
+   "notes": "second formal round after a real find-fix cycle: A7.5 parts 1-3 (dense batch spine, lossless at four levels), doctor subsystem, fault suite, ergonomics pass, the av64 lane's vision instrumentation + v0.4.0 release cut, and the 44-bead Phase-1 evidence sweep all landed between rounds; the round itself found nothing new",
+   "pillars": {
+    "conformance": "full cargo test suite green (0 FAILED) after the dense-spine waves + doctor + v0.4.0 cut",
+    "perf": "check_ledgers green; new tromr baseline row + dense-spine armed stage pairs (SmolVLM2 decode 1.32x, OneChart 1.27x) ledgered",
+    "surface": "surface_matrix + enumeration locks green; measured scoreboard standing"
+   },
+   "round": 2
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 1,
+   "notes": "finding #1 = cross-session integration defect: the concurrent lane's staff robot event shipped without refreshing the frozen schema contract, so `cargo test` was red on main until this round's fix. Exactly the class the convergence loop exists to catch. Sub-epic A (foundation) closed this round with A12 as its last child.",
+   "pillars": {
+    "conformance": "full cargo test suite run CAUGHT a real defect: the robot-schema frozen contract (robot_schema_v1.json + EXPECTED_EVENT_KINDS) was stale after the staff event landed (8af3887) \u2014 suite red on main; fixed via sanctioned UPDATE_GOLDENS loop, cli_robot_golden 37/37 after (adb4ee6); all other targets green (931 lib + integrations)",
+    "perf": "check_ledgers exit 0; no perf claims this round (quiet-host gate correctly refusing the bd-2mo.26 runbook at loadavg>2)",
+    "surface": "robot selftest surface GREW per-model verdicts (A12, bd-3jo6.1.12): models[] array with stable ids, 44/44 cases on sdot+smmla+scalar incl per-model worst-case-K overflow rows; new e2e robot_selftest_proves_per_model_kernel_parity_e2e locks it"
+   },
+   "round": 3
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 2,
+   "notes": "the find-fix loop working exactly as designed: standing up the cross-page oracle for bd-1gv.26 immediately falsified the S1 preprocess assumption (Base-pad) and exposed a kernel-fidelity cliff the single-image 1024 path never showed. Both fixes landed same-round with the rung that now pins them.",
+   "pillars": {
+    "conformance": "NEW ORACLE (infer_multi, scripts/baseline/run_baidu_reference_multi.py) CAUGHT TWO REAL BUGS in the fresh multi-page path: (1) per-page preprocess used aspect-preserving pad where the reference SQUASHES to 640x640 (garbled glyph geometry); (2) the shipped CatmullRom kernel at the 2.9x squash destroys OCR while PIL-bicubic reproduces the reference plate BYTE-EXACTLY \u2014 both fixed (preprocess_dynamic_squash, PIL kernel hard-wired at the site) and gated by the new armed L5_multi_page rung (CER 0.1791 vs budget 0.25, plate containment exact)",
+    "perf": "check_ledgers exit 0; no perf claims (host loud; bd-2mo.26 runbook still gated on quiet)",
+    "surface": "L5-multi rung added to the parity ladder (fixture invariants always-on, model+corpus gated armed leg); DISC-004 recorded (precision-trajectory fork after the plate, ledger-linted)"
+   },
+   "round": 4
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 1,
+   "notes": "second consecutive round where NEW verification infrastructure immediately found a genuine defect (round 4: the multi-page oracle; round 5: the fuzzer). The find-fix loop is converging on the input-hardening tail exactly as METHODOLOGY intends.",
+   "pillars": {
+    "conformance": "NEW FUZZ HARNESS (bd-10sb.1, cargo-fuzz x4 targets) CAUGHT A REAL DoS ON ITS FIRST 512-RUN SMOKE: a 100-byte PNG declaring 6 x 2^31+4 dimensions made preprocess_bytes attempt a 38.6 GB allocation (the PDF path was bomb-bounded in bd-2zpu; the direct image ingest never was). Fixed at the single decode funnel (pdf.rs 1 Gpx policy pre-allocation + decoder width/height/alloc limits); the exact artifact is a committed corpus seed AND an always-on unit regression (typed InputDecode). All 4 targets now smoke clean",
+    "perf": "check_ledgers green; no perf claims (quiet-host gate still parked)",
+    "surface": "property suite (proptest, 5 runners incl SIMD==scalar over dispatched+packed-B, i32-vs-i64 overflow up to K=6848, focrq mutation totality, armed BPE round-trip) runs in the default cargo test lane; fuzz targets + committed seed corpus in fuzz/"
+   },
+   "round": 5
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 1,
+   "notes": "KEY LONG-HORIZON OBSERVATION (not a defect): the 20-page reference run COLLAPSES \u2014 7 <PAGE> markers for 20 pages + a repetition-run tail (frozen tests/fixtures/multi_page/p20_raw.md). Degradation past ~10 pages at 640 belongs to the reference model itself; no CER gate is meaningful against a degenerate oracle. Third consecutive round where the finding was cross-session/ledger-integrity class rather than engine math.",
+   "pillars": {
+    "conformance": "check_ledgers was RED on main (finding: the concurrent lane's DISC-005 missed the exact Provenance field token and both bd-av64.13 NEGATIVE entries used non-artifacts/perf evidence_ids) \u2014 repaired same-round (field token expanded; artifacts/perf/bd-av64.13/ pointer README + SHA256SUMS); lint exit 0",
+    "perf": "no perf claims; quiet-host gate still parked (loadavg >3 all day from sbh/spotlight daemons)",
+    "surface": "L5-multi rung parameterized + 10-page long-horizon leg ARMED (CER 0.4045 <= 0.50, plate exact, markers 8-vs-9, subject capped 7600 = true prefix); the degradation curve now has two measured points (2p 0.179 -> 10p 0.405) + the 32K-cap behavior (uncapped subject terminates cleanly at exactly 32768 positions)"
+   },
+   "round": 6
+  },
+  {
+   "date": "2026-07-07",
+   "new_findings": 4,
+   "notes": "the always-on safety net exists again and caught a real cross-arch bug within hours. new_findings=4 resets the clean tail \u2014 honest accounting; the convergence loop continues.",
+   "pillars": {
+    "conformance": "GITHUB ACTIONS REVIVED AND MADE GREEN (bd-4yks): standing the CI lane back up found FOUR genuine defects same-round \u2014 (1) the provisioning guard threw on upstream frankensqlite's migration off the /dp/asupersync path dep (every run dead in ~1min since Actions revived); (2) check_release_linkage's byte-scan false-positived on bare python/torch substrings that a CORRECT binary embeds (OneChart's task prompt IS 'a python dict'; ft-kernel-cpu panic paths embed frankentorch) \u2014 the long-standing 'check.sh stops early locally' wedge, now linkage-indicator tokens only; (3) the fixture-manifest checker aborted the whole gate on the golden loop's own .actual diff aids; (4) the revived aarch64 advisory matrix caught a tier-dependent test bug on its FIRST run: the smmla lossless-permutation test compared raw bytes across layouts and fails wherever SMMLA is the dispatched tier (Neoverse runners; also explains the earlier mislabeled local 'flake') \u2014 fixed layout-aware, verified native + forced-smmla",
+    "perf": "no perf claims; quiet-host gate still parked",
+    "surface": "gate (macos-15 + ubuntu) GREEN on real runners running the FULL check.sh battery; advisory 5-target matrix live (4/6 green; aarch64-windows pre-known bd-3u97); bench-guardrail advisory job + gate-log artifacts added; dist workflow green; scripts/check.sh runs END-TO-END locally for the first time"
+   },
+   "round": 7
+  },
+  {
+   "date": "2026-07-08",
+   "new_findings": 0,
+   "notes": "first CLEAN round after the round-7 reset: the day's verification infrastructure (multi-page oracle, fuzzer, CI) all re-ran deep with zero new findings \u2014 the input-hardening tail is converging.",
+   "pillars": {
+    "conformance": "DEEP verification sweep found NOTHING: 4 fuzz targets x 5min = 4.7M total runs zero crashes (focrq 1.55M, safetensors 1.54M, image_decode 562K post-bomb-fix, pretok 1.06M; corpus growth committed); proptest at PROPTEST_CASES=2048 (32x default) 8/8 green (SIMD==scalar incl packed-B, i32-vs-i64 to K=6848, preprocess totality, focrq mutation totality, armed BPE round-trip)",
+    "perf": "check_ledgers green; no perf claims (quiet window still pending)",
+    "surface": "CI verification run at 7777e34: gate green both platforms + advisory matrix 6/6 GREEN (the layout-aware fix cured BOTH aarch64 targets \u2014 windows-msvc-aarch64's red was the same test bug, not a platform gap; the full 5-target cross-compile + lib-test floor is proven)"
+   },
+   "round": 8
+  }
+ ]
+}

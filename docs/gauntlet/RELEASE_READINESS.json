@@ -75,7 +75,7 @@
   },
   {
    "cell": "gauntlet_convergence",
-   "detail": "rounds=0/10, tail_clean=False",
+   "detail": "rounds=8/10, tail_clean=False",
    "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
    "status": "red"
   }

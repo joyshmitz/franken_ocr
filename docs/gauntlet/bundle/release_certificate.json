@@ -1,0 +1,41 @@
+{
+ "artifact": "franken_ocr.release_certificate.v1",
+ "certified": false,
+ "constants": {
+  "CERTIFICATION_MAX_EVIDENCE_AGE_HOURS": 24.0,
+  "CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES": 0,
+  "CERTIFICATION_MIN_VERIFICATION_PCT": 100.0,
+  "CERTIFICATION_REQUIRED_SUITE_PASS_RATE_PCT": 100.0
+ },
+ "convergence": {
+  "check": "gauntlet-convergence",
+  "clean_ceiling": 3,
+  "converged": false,
+  "min_rounds": 10,
+  "result": "fail",
+  "rounds": 8,
+  "tail_clean": false,
+  "tail_findings": [
+   4,
+   0
+  ]
+ },
+ "generated_by": "scripts/gauntlet_cert.py --bundle",
+ "git_describe": "v0.5.0-10-g50d5dad",
+ "git_head": "50d5dadaca3d46680506bb537d0040c650f4d849",
+ "high_severity_counterexamples": 0,
+ "readiness": {
+  "blocking_cells": [
+   "certification_bundle",
+   "gauntlet_convergence"
+  ],
+  "green": 11,
+  "red": 2
+ },
+ "refusal_reasons": [
+  "readiness has red cells: certification_bundle, gauntlet_convergence",
+  "convergence not met: rounds=8/10 tail_clean=False",
+  "evidence older than 24h (or missing): docs/gauntlet/EPROCESS_STATE.json, docs/gauntlet/RELEASE_SCORECARD.json, tests/fixtures/ladder_scorecard/scorecard_armed.json, docs/PERF_LEDGER.md"
+ ],
+ "template": "strict-conformant-release.v1"
+}

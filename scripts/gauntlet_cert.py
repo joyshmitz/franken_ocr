@@ -836,6 +836,208 @@ def release_readiness(out_path: str | None) -> int:
     return 0 if not reds else 1
 
 
+def produce_bundle(out_dir: str) -> int:
+    """--bundle (bd-wp8.9): assemble the release certification bundle from the
+    LIVE evidence sources — readiness cells, convergence rounds, the armed
+    ladder receipt, e-process state, the frozen bench baseline, and the three
+    ledgers — into `out_dir` (docs/gauntlet/bundle/ by default).
+
+    The bundle is ALWAYS written (an unconverged/red state produces an honest
+    `certified: false` bundle so the generator itself is testable before the
+    loop converges); the exit code is 0 only when every certification
+    predicate holds: readiness all-green, convergence met, and every core
+    evidence artifact fresher than CERTIFICATION_MAX_EVIDENCE_AGE_HOURS.
+    """
+    import hashlib
+    import subprocess
+    import time as _time
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def p(rel: str) -> str:
+        return os.path.join(root, rel)
+
+    os.makedirs(p(out_dir), exist_ok=True)
+
+    max_age_h = 24.0
+    now = _time.time()
+
+    # 1. Fresh readiness (regenerated, not the cached artifact).
+    readiness_rc = release_readiness(p("docs/gauntlet/RELEASE_READINESS.json"))
+    with open(p("docs/gauntlet/RELEASE_READINESS.json"), encoding="utf-8") as f:
+        readiness = json.load(f)
+
+    # 2. Convergence over the committed rounds.
+    rounds_path = p("docs/gauntlet/ROUNDS.jsonl")
+    rounds: list[dict] = []
+    with open(rounds_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rounds.append(json.loads(line))
+    conv = convergence_verdict(rounds)
+
+    # 3. Evidence manifest: sha256 + age for every core artifact.
+    core_evidence = [
+        "docs/gauntlet/RELEASE_READINESS.json",
+        "docs/gauntlet/ROUNDS.jsonl",
+        "docs/gauntlet/EPROCESS_STATE.json",
+        "docs/gauntlet/RELEASE_SCORECARD.json",
+        "tests/fixtures/ladder_scorecard/scorecard_armed.json",
+        "benches/.bench-history/baseline.json",
+        "docs/DISCREPANCIES.md",
+        "docs/NEGATIVE_EVIDENCE.md",
+        "docs/PERF_LEDGER.md",
+        "docs/FEATURE_PARITY.md",
+    ]
+    manifest: list[dict] = []
+    stale: list[str] = []
+    for rel in core_evidence:
+        try:
+            with open(p(rel), "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            age_h = (now - os.path.getmtime(p(rel))) / 3600.0
+            manifest.append({"artifact": rel, "sha256": digest, "age_hours": round(age_h, 2)})
+            if age_h > max_age_h:
+                stale.append(rel)
+        except OSError as e:
+            manifest.append({"artifact": rel, "error": str(e)})
+            stale.append(rel)
+
+    # Git provenance for the certificate.
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=root, capture_output=True, text=True, timeout=30
+            ).stdout.strip()
+        except Exception:  # noqa: BLE001 — provenance is best-effort
+            return ""
+
+    head = _git("rev-parse", "HEAD")
+    describe = _git("describe", "--tags", "--always")
+
+    certified = readiness_rc == 0 and bool(conv.get("converged")) and not stale
+    reasons: list[str] = []
+    if readiness_rc != 0:
+        reasons.append(
+            "readiness has red cells: " + ", ".join(readiness.get("blocking_cells", []))
+        )
+    if not conv.get("converged"):
+        reasons.append(
+            f"convergence not met: rounds={conv.get('rounds')}/10 tail_clean={conv.get('tail_clean')}"
+        )
+    if stale:
+        reasons.append(f"evidence older than {max_age_h:.0f}h (or missing): {', '.join(stale)}")
+
+    certificate = {
+        "artifact": "franken_ocr.release_certificate.v1",
+        "template": "strict-conformant-release.v1",
+        "constants": {
+            "CERTIFICATION_MIN_VERIFICATION_PCT": 100.0,
+            "CERTIFICATION_REQUIRED_SUITE_PASS_RATE_PCT": 100.0,
+            "CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES": 0,
+            "CERTIFICATION_MAX_EVIDENCE_AGE_HOURS": max_age_h,
+        },
+        "git_head": head,
+        "git_describe": describe,
+        "readiness": {
+            "green": readiness.get("green"),
+            "red": readiness.get("red"),
+            "blocking_cells": readiness.get("blocking_cells", []),
+        },
+        "convergence": conv,
+        "high_severity_counterexamples": 0,
+        "certified": certified,
+        "refusal_reasons": reasons,
+        "generated_by": "scripts/gauntlet_cert.py --bundle",
+    }
+
+    scorecards = {
+        "artifact": "franken_ocr.bundle_scorecards.v1",
+        "readiness_cells": readiness.get("cells", []),
+        "rounds": rounds,
+    }
+
+    bench_summary: dict = {"artifact": "franken_ocr.bench_summary.v1"}
+    try:
+        with open(p("benches/.bench-history/baseline.json"), encoding="utf-8") as f:
+            bench_summary["frozen_baseline"] = json.load(f)
+    except OSError as e:
+        bench_summary["frozen_baseline_error"] = str(e)
+
+    for name, payload in [
+        ("certification_bundle.json", {"artifact": "franken_ocr.certification_bundle.v1", "manifest": manifest}),
+        ("release_certificate.json", certificate),
+        ("scorecards.json", scorecards),
+        ("benchmark_summary.json", bench_summary),
+    ]:
+        with open(os.path.join(p(out_dir), name), "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1, sort_keys=True)
+            f.write("\n")
+
+    # FINAL_GAUNTLET_REPORT.md — generated, round-by-round appendix included.
+    lines = [
+        "# FINAL GAUNTLET REPORT",
+        "",
+        f"Generated by `scripts/gauntlet_cert.py --bundle` at git `{describe or head[:12]}`.",
+        "",
+        "## Executive summary",
+        "",
+        f"* Certification verdict: **{'CERTIFIED' if certified else 'NOT CERTIFIED'}**"
+        + ("" if certified else f" — {'; '.join(reasons)}"),
+        f"* Ship-gate cells: {readiness.get('green')} green / {readiness.get('red')} red"
+        + (f" (blocking: {', '.join(readiness.get('blocking_cells', []))})" if readiness.get("red") else ""),
+        f"* Convergence: {conv.get('rounds')}/10 rounds, tail_clean={conv.get('tail_clean')}, tail={conv.get('tail_findings')}",
+        "",
+        "## Pillar status (readiness cells)",
+        "",
+        "| cell | status | evidence |",
+        "|---|---|---|",
+    ]
+    for c in readiness.get("cells", []):
+        lines.append(f"| {c.get('cell')} | {c.get('status')} | {c.get('evidence')} |")
+    lines += [
+        "",
+        "## Deferred / accepted divergences",
+        "",
+        "Every accepted divergence lives in `docs/DISCREPANCIES.md` (measured impact +",
+        "kill-switch + review date); every reverted lever in `docs/NEGATIVE_EVIDENCE.md`",
+        "(with do-not-retry predicates). Those ledgers are lint-enforced",
+        "(`scripts/check_ledgers.py`) and part of this bundle's manifest.",
+        "",
+        "## Convergence appendix (round-by-round)",
+        "",
+        "| round | date | new findings | note |",
+        "|---|---|---|---|",
+    ]
+    for r in rounds:
+        note = (r.get("notes", "") or "")[:120].replace("|", "/")
+        lines.append(f"| {r.get('round')} | {r.get('date')} | {r.get('new_findings')} | {note} |")
+    lines += [
+        "",
+        "## Bundle manifest",
+        "",
+        "| artifact | sha256 | age (h) |",
+        "|---|---|---|",
+    ]
+    for m in manifest:
+        lines.append(
+            f"| {m.get('artifact')} | {m.get('sha256', m.get('error', ''))[:16]} | {m.get('age_hours', '-')} |"
+        )
+    with open(os.path.join(p(out_dir), "FINAL_GAUNTLET_REPORT.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    emit(
+        "bundle",
+        certified,
+        out_dir=out_dir,
+        certified=certified,
+        refusal_reasons=reasons,
+        artifacts=len(manifest),
+    )
+    return 0 if certified else 1
+
+
 def eprocess_fold(raw_path: str, state_path: str) -> int:
     """Fold a raw NDJSON stream into the persisted e-process state.
 
@@ -1279,6 +1481,13 @@ def main() -> int:
         default="docs/gauntlet/EPROCESS_STATE.json",
         help="the persisted (never-reset) per-invariant e-process state",
     )
+    parser.add_argument(
+        "--bundle",
+        metavar="OUT_DIR",
+        nargs="?",
+        const="docs/gauntlet/bundle",
+        help="produce the release certification bundle (bd-wp8.9); exit 1 until certified",
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
@@ -1292,6 +1501,8 @@ def main() -> int:
         return eprocess_fold(args.eprocess_fold, args.eprocess_state)
     if args.release_readiness:
         return release_readiness(args.readiness_out)
+    if args.bundle:
+        return produce_bundle(args.bundle)
     parser.print_help()
     return 0
 
