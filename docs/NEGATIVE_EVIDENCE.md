@@ -205,6 +205,30 @@ synthetic before/after microbenches that retire or keep one narrow loop lever
 and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
 claims.
 
+2026-07-07 | NEGATIVE(reverted) | row-tiled SAM global-attention score matrix (bd-av64.10, commits c5e535a+8bd4037 reverted)
+  claim_id: CLAIM-bd-av64.10-attn-row-tile   evidence_id: artifacts/perf/bd-av64.10-rowtile/
+  model source commit + fixture hash: unlimited-ocr.int8.focrq sha256 d8c5fcf2… + got-ocr2.int8.focrq sha256 4da43d79…; page_0009.png + got sample_text.png
+  CPU feature string: aarch64+neon (f32 attention path)
+  exact command + env: interleaved same-regime pairs, FOCR_SAM_TILE=0 (untiled) vs =128, FOCR_TIMING=1 focr ocr page_0009.png; 4 pairs
+  fallback / kill-switch state: FOCR_SAM_TILE measurement knob (removed with the revert)
+  measured before -> after vs reference:
+    HYPOTHESIS: the [4096,4096] per-head score matrix (64 MB) makes four DRAM round-trips (GEMM-write, bias, softmax, GEMM-read);
+    a [128,4096] row tile stays cache-resident through all four stages -> save the traffic.
+    BYTE-IDENTITY: PROVEN — tiled outputs byte-identical on BOTH real models (unlimited page + GOT sample), i.e. the ft sgemm
+    per-element K-reduction order is M-invariant. The restructuring was numerically pure; it just wasn't faster:
+    UNTILED WINS ALL 4 PAIRS: sam.forward 3.62/3.62/3.74/3.71 s untiled vs 3.76/3.84/3.86/3.76 s tiled (~+3% regression tiled).
+    ROOT CAUSE: tiling turns 2 large GEMMs/head into 64 small dispatches/head (1024/block) — dispatch + lost intra-GEMM
+    parallelism outweigh the cache benefit; on M4's unified memory the score-matrix round-trips were never the wall
+    (heads already overlap traffic with compute across the 10-way head parallelism).
+  bit-exact correctness proof: byte-identical outputs both arms (above); revert restores the exact pre-lever source
+  disposition: REVERT (8bd4037 reverts c5e535a, which a concurrent session had committed mid-measurement)
+  do-not-retry: "do not re-tile SAM attention on Apple-silicon unified memory unless a profile shows the score matrix
+    actually DRAM-bound (e.g. a low-bandwidth x86 target) — and then tile WITHOUT multiplying GEMM dispatches (fused
+    bias+softmax inside one blocked kernel, not a loop of nn::matmul calls)"
+  per-lever tally: W 0 / L 1 / N 0
+  agent: RubyCove
+  evidence dir: artifacts/perf/bd-av64.10-rowtile/
+
 2026-07-07 | NEGATIVE(reverted) | polynomial-exp softmax in SAM attention (bd-av64.10 remaining-lever list, `FOCR_SAM_FAST_EXP` in `nn::softmax_rows_fast`)
   claim_id: CLAIM-bd-av64.10-simd-exp   evidence_id: artifacts/perf/bd-av64.10-simd-exp/ (pointers; measured tables inline below)
   model source commit + fixture hash: unlimited-ocr.int8.focrq sha256 d8c5fcf2… (published); real page fixture = franken_ocr_work/pages/page_0009.png (the A11 corpus page)
