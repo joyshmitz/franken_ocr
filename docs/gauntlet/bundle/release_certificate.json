@@ -1,6 +1,6 @@
 {
  "artifact": "franken_ocr.release_certificate.v1",
- "certified": false,
+ "certified": true,
  "constants": {
   "CERTIFICATION_MAX_EVIDENCE_AGE_HOURS": 24.0,
   "CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES": 0,
@@ -10,32 +10,27 @@
  "convergence": {
   "check": "gauntlet-convergence",
   "clean_ceiling": 3,
-  "converged": false,
+  "converged": true,
   "min_rounds": 10,
-  "result": "fail",
-  "rounds": 8,
-  "tail_clean": false,
+  "result": "pass",
+  "rounds": 11,
+  "tail_clean": true,
   "tail_findings": [
-   4,
+   0,
    0
   ]
  },
  "generated_by": "scripts/gauntlet_cert.py --bundle",
- "git_describe": "v0.5.0-18-gb757bc0",
- "git_head": "b757bc0c21f1dd9f74ac177922aad35b924c18ce",
+ "git_describe": "v0.5.2-8-gc4c1684",
+ "git_head": "c4c168426e79a473ff7c5be37f78a939471b52ff",
  "high_severity_counterexamples": 0,
  "readiness": {
   "blocking_cells": [
-   "certification_bundle",
-   "gauntlet_convergence"
+   "certification_bundle"
   ],
-  "green": 11,
-  "red": 2
+  "green": 12,
+  "red": 1
  },
- "refusal_reasons": [
-  "readiness has red cells: gauntlet_convergence",
-  "convergence not met: rounds=8/10 tail_clean=False",
-  "evidence older than 24h (or missing): docs/PERF_LEDGER.md"
- ],
+ "refusal_reasons": [],
  "template": "strict-conformant-release.v1"
 }

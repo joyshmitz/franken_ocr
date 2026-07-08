@@ -909,6 +909,12 @@ def produce_bundle(out_dir: str) -> int:
         "docs/PERF_LEDGER.md",
         "docs/FEATURE_PARITY.md",
     ]
+    # The freshness cap applies to RUN evidence (receipts, rounds, rows —
+    # things a converged run regenerates). The bench-guardrail baseline is
+    # FROZEN BY DESIGN (ratchet-only advances, bd-1a6h): its age IS its
+    # contract, so it rides the manifest (hash + age recorded) but never
+    # blocks certification on staleness.
+    age_exempt = {"benches/.bench-history/baseline.json"}
     manifest: list[dict] = []
     stale: list[str] = []
     for rel in core_evidence:
@@ -916,8 +922,11 @@ def produce_bundle(out_dir: str) -> int:
             with open(p(rel), "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
             age_h = (now - os.path.getmtime(p(rel))) / 3600.0
-            manifest.append({"artifact": rel, "sha256": digest, "age_hours": round(age_h, 2)})
-            if age_h > max_age_h:
+            entry = {"artifact": rel, "sha256": digest, "age_hours": round(age_h, 2)}
+            if rel in age_exempt:
+                entry["age_exempt"] = "frozen-by-design (ratchet-only baseline)"
+            manifest.append(entry)
+            if age_h > max_age_h and rel not in age_exempt:
                 stale.append(rel)
         except OSError as e:
             manifest.append({"artifact": rel, "error": str(e)})

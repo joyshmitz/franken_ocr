@@ -66,15 +66,15 @@
   },
   {
    "cell": "certification_bundle",
-   "detail": "certified=False at v0.5.0-13-gf1ac972; refusals: readiness has red cells: certification_bundle, gauntlet_convergence; convergence not met: rounds=8/10 tail_clean=False; evidence older than 24h (or missing): docs/PERF_LEDGER.md",
+   "detail": "certified=False at v0.5.2-8-gc4c1684; refusals: evidence older than 24h (or missing): benches/.bench-history/baseline.json",
    "evidence": "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
    "status": "red"
   },
   {
    "cell": "gauntlet_convergence",
-   "detail": "rounds=8/10, tail_clean=False",
+   "detail": "rounds=11/10, tail_clean=True",
    "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
-   "status": "red"
+   "status": "green"
   }
  ],
  "rounds": [
@@ -165,6 +165,39 @@
     "surface": "CI verification run at 7777e34: gate green both platforms + advisory matrix 6/6 GREEN (the layout-aware fix cured BOTH aarch64 targets \u2014 windows-msvc-aarch64's red was the same test bug, not a platform gap; the full 5-target cross-compile + lib-test floor is proven)"
    },
    "round": 8
+  },
+  {
+   "date": "2026-07-08",
+   "new_findings": 3,
+   "notes": "the round that closes the perf pillar. The find-fix cycles were all in the measurement harness itself \u2014 the engine measured clean on the first honest window.",
+   "pillars": {
+    "conformance": "the runbook's CER leg re-proved text parity fresh: CER_norm 0.00943 (page_0009) / 0.03529 (page_0014) focr-int8 vs the pinned bf16 reference, det spans stripped, same runs as the timings; stdout identical across every timed run on BOTH sides (determinism held under measurement)",
+    "perf": "THE PILLAR CLOSES FRESH: bd-2mo.26 rows applied (e2e 3.41x/2.81x vs torch bf16, vision 5.4-5.6x, prefill 4.6-4.9x, decode/tok 1.85-1.92x), shadow-checked, cv% 0.0-4.5 all under the 5% bar, FORCE=1 recorded with the noisy first take honestly discarded; check_ledgers exit 0",
+    "surface": "three genuine harness defects found+fixed by RUNNING the release machinery in its first real window (3f2f97e): (1) check_ledgers kill-switch scan crashed on AppleDouble ._*.rs in exFAT-$TMPDIR shadow repos; (2) gauntlet_timing's vocabulary predated the bd-av64.10 vision instrumentation and refused real runs; (3) the runbook's evidence home was hardcoded onto immutable committed evidence (OUT_DIR knob added)"
+   },
+   "round": 9
+  },
+  {
+   "date": "2026-07-08",
+   "new_findings": 0,
+   "notes": "first fully-clean round with ALL THREE PILLARS fresh (parity receipts re-armed yesterday, perf rows landed this morning, the battery green now). Tail [3,0]; one more clean round converges.",
+   "pillars": {
+    "conformance": "the FULL gate battery (scripts/check.sh) green end-to-end immediately after the head-to-head landed: every ledger/oracle/fixture/schema validator + installer e2e + fmt + check --all-targets + clippy -D warnings + full cargo test + ubs --diff, exit 0",
+    "perf": "the fresh G2 rows stand (3.41x/2.81x e2e vs torch bf16, cv%-gated); bench guardrail baseline untouched",
+    "surface": "no surface deltas this round; the ledger rows from round 9 lint clean (check_ledgers exit 0 inside the battery)"
+   },
+   "round": 10
+  },
+  {
+   "date": "2026-07-08",
+   "new_findings": 0,
+   "notes": "second consecutive clean round (tail [0,0]) at 11 rounds \u2014 THE CONVERGENCE GATE IS MET. All three pillars fresh within 24h: parity receipts (armed ladder + multi-page rungs), perf (the 3.41x/2.81x head-to-head), conformance (round-10 full battery + this sweep).",
+   "pillars": {
+    "conformance": "deep verification sweep on the post-head-to-head tree (mmap loader + harness fixes included): 4 fuzz targets x 4min = 3.65M total runs zero crashes (focrq 1.32M, safetensors 1.35M, image_decode 225K, pretok 747K); proptest at PROPTEST_CASES=2048 8/8 green",
+    "perf": "the fresh G2 rows stand; ledgers lint green",
+    "surface": "no deltas; the GitHub runner queue has been frozen 3+ hours (infrastructure, not workflow \u2014 the c248e6d/c4c1684 CI verdicts land whenever it drains and supplement this round)"
+   },
+   "round": 11
   }
  ]
 }

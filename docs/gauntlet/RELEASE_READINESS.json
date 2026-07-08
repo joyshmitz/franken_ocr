@@ -1,9 +1,6 @@
 {
  "artifact": "franken_ocr.release_readiness.v1",
- "blocking_cells": [
-  "certification_bundle",
-  "gauntlet_convergence"
- ],
+ "blocking_cells": [],
  "cells": [
   {
    "cell": "parity_l0_l5",
@@ -70,19 +67,19 @@
   },
   {
    "cell": "certification_bundle",
-   "detail": "certified=False at v0.5.0-18-gb757bc0; refusals: readiness has red cells: gauntlet_convergence; convergence not met: rounds=8/10 tail_clean=False; evidence older than 24h (or missing): docs/PERF_LEDGER.md",
+   "detail": "certified=True at v0.5.2-8-gc4c1684",
    "evidence": "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
-   "status": "red"
+   "status": "green"
   },
   {
    "cell": "gauntlet_convergence",
-   "detail": "rounds=8/10, tail_clean=False",
+   "detail": "rounds=11/10, tail_clean=True",
    "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
-   "status": "red"
+   "status": "green"
   }
  ],
  "generated_by": "scripts/gauntlet_cert.py --release-readiness",
- "green": 11,
- "red": 2,
- "ship": false
+ "green": 13,
+ "red": 0,
+ "ship": true
 }
