@@ -206,7 +206,7 @@ and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
 claims.
 
 2026-07-07 | NEGATIVE(reverted) | polynomial-exp softmax in SAM attention (bd-av64.10 remaining-lever list, `FOCR_SAM_FAST_EXP` in `nn::softmax_rows_fast`)
-  claim_id: CLAIM-bd-av64.10-simd-exp   evidence_id: this entry (paired logs + diffs in the session scratchpad fastexp/)
+  claim_id: CLAIM-bd-av64.10-simd-exp   evidence_id: artifacts/perf/bd-av64.10-simd-exp/ (pointers; measured tables inline below)
   model source commit + fixture hash: unlimited-ocr.int8.focrq sha256 d8c5fcf2… (published); real page fixture = franken_ocr_work/pages/page_0009.png (the A11 corpus page)
   CPU feature string: aarch64+neon (softmax is the f32 path; int8 tier irrelevant)
   exact command + env: paired A/B, 2 runs per arm, adjacent same-regime: FOCR_TIMING=1 [FOCR_SAM_FAST_EXP=1] focr ocr --model unlimited-ocr.int8.focrq page_0009.png
