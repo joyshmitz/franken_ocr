@@ -14,6 +14,7 @@
 [![toolchain: nightly](https://img.shields.io/badge/toolchain-nightly-purple.svg)](./rust-toolchain.toml)
 [![unsafe: forbidden*](https://img.shields.io/badge/unsafe-forbidden*-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 [![default model: Baidu Unlimited-OCR](https://img.shields.io/badge/default_model-Baidu_Unlimited--OCR-teal.svg)](https://huggingface.co/baidu/Unlimited-OCR)
+[![release readiness: 13/13 green](https://img.shields.io/badge/release_readiness-13%2F13_green-success.svg)](#conformance-and-release-evidence)
 
 </div>
 
@@ -58,7 +59,7 @@ The installer detects your platform, resolves the latest published GitHub binary
 | **Agent-first** | Versioned NDJSON robot mode, a self-describing `robot schema`, one-shot `robot triage`, TrOMR `staff` and `music_warning` events for music runs, stable documented exit codes, deterministic output under fixed sampling. |
 | **Provable kernels** | `focr robot selftest` re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on your CPU, including per-model verdicts for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart. |
 | **Real-scan music gate** | The TrOMR lane has public-domain Spohr page/staff fixtures, human-verifiable attributes, a frozen MusicXML anchor, and a model-gated NDJSON runner so real engraved scans are measured separately from synthetic examples. |
-| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, `tests/property_suite.rs` exercises generator-driven invariants, `scripts/bench_guardrail.py` compares stage timings against frozen baselines, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and release-readiness gate. |
+| **Release evidence** | `scripts/ladder_scorecard.sh` folds the L0-L5 parity ladder, `docs/FEATURE_PARITY.md` accounts the surface area, `tests/property_suite.rs` exercises generator-driven invariants, the committed fuzz corpus seeds four libFuzzer targets, `scripts/bench_guardrail.py` compares stage timings against frozen baselines, and `scripts/gauntlet_cert.py` computes the three-pillar scorecard, invariant monitors, and 13/13 release-readiness gate. |
 | **Memory-safe** | `#![forbid(unsafe_code)]` everywhere except small audited islands: SIMD kernels with bit-identical scalar fallbacks, plus the read-only mmap loader. |
 
 ---
@@ -658,6 +659,7 @@ a green test line.
 | **Real-scan music corpus** | `scripts/realscan_music_gate.sh`, `tests/fixtures/realscan_music/` | Runs TrOMR over public-domain Spohr staff/page fixtures, checks human-verifiable attributes and frozen MusicXML anchors, and uses robot `staff` events for page-level floors. |
 | **TrOMR page resilience** | `cargo test --lib native_engine::tromr::tests::tromr_page` | Checks stacked-staff order, measured single-staff SER floors, one fittable-plus-one-unfittable staff page, and all-fail pages whose error names every skipped staff. |
 | **Property invariants** | `cargo test --test property_suite` | Runs bounded proptest cases for SIMD-vs-scalar int8 GEMM identity, K=6848 i32 accumulation, preprocess geometry, `.focrq` parser totality under byte mutation, and tokenizer round-trip when a tokenizer artifact is present. |
+| **Fuzz seed corpus** | `fuzz/corpus/`, `cargo fuzz run focrq_parse\|safetensors_parse\|image_decode\|pretok_split` | Seeds four untrusted-input fuzz targets covering `.focrq` parsing, safetensors parsing, image ingest, and pretokenizer splitting. The latest post-head-to-head sweep ran 3.65M cases with zero crashes, and the repo keeps the resulting corpus growth under `fuzz/corpus/`. |
 | **Conformal ratchet** | `docs/conformance/RATCHET.md`, `src/conformance.rs` | Computes per-category lower bounds from Jeffreys posterior and Hoeffding instruments, then rejects any category that drops below its committed floor. |
 | **Ville e-process monitors** | `python3 scripts/gauntlet_cert.py --eprocess-fold test-log.ndjson --eprocess-state /tmp/focr-eprocess-state.json` | Folds live invariant observations for KV capacity, `K=6848` i32 no-overflow, same-input determinism, and SIMD-vs-scalar bit identity into persistent anytime-valid monitors. |
 | **Convergence gate** | `python3 scripts/gauntlet_cert.py --convergence docs/gauntlet/ROUNDS.jsonl` | Requires at least 10 gauntlet rounds and a clean tail before declaring the investigation converged. |
@@ -683,7 +685,7 @@ python3 scripts/gauntlet_cert.py --from-parity docs/FEATURE_PARITY.md \
 python3 scripts/gauntlet_cert.py --release-readiness
 ```
 
-The committed `docs/gauntlet/RELEASE_SCORECARD.json` is intentionally conservative while residual history is still accumulating: its lower bound is not inflated into a pretend release win. `docs/gauntlet/RELEASE_READINESS.json` is a separate all-green ship-gate artifact; it is allowed to stay red while named Phase-5 deliverables remain open. The current convergence cell records six of the ten required gauntlet rounds with a clean tail, so the release evidence is moving forward without claiming final certification early.
+The committed `docs/gauntlet/RELEASE_SCORECARD.json` stays conservative: its surface lower bound is not inflated beyond the evidence in `docs/FEATURE_PARITY.md`. The separate ship gate, `docs/gauntlet/RELEASE_READINESS.json`, is now all green: 13/13 cells pass with `ship: true`, including the certification bundle and gauntlet convergence cells. The convergence ledger records 11 rounds against a 10-round requirement with a clean tail, after a full gate battery and a fresh deep sweep over the post-head-to-head tree.
 
 ---
 
