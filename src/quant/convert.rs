@@ -507,8 +507,20 @@ mod tests {
         assert_eq!(p.arch_target(), 1);
         for name in INT8_NAMES {
             let a = g.qint8(name).expect("generic qint8");
-            let b = p.qint8(name).expect("packed qint8 (un-permuted at load)");
-            assert_eq!(a.w, b.w, "{name}: int8 weights identical across packings");
+            let b = p.qint8(name).expect("packed qint8");
+            // LAYOUT-AWARE compare (the bug CI's aarch64 advisory matrix caught
+            // on its first revived run): on a host whose dispatched tier is
+            // SMMLA (Neoverse-class; NOT the M4, which prefers SDOT) the
+            // loader CORRECTLY keeps the offline panels, so the logical
+            // equality must un-permute before comparing raw bytes.
+            let b_rm = match b.layout {
+                crate::native_engine::tensor::WeightLayout::RowMajor => b.w.clone(),
+                crate::native_engine::tensor::WeightLayout::SmmlaPanels => {
+                    crate::simd::pack::smmla_unpack_panels(&b.w, b.n, b.k)
+                        .expect("panel stream length is loader-validated")
+                }
+            };
+            assert_eq!(a.w, b_rm, "{name}: int8 weights identical across packings");
             assert_eq!(
                 a.scales, b.scales,
                 "{name}: scales identical across packings"
