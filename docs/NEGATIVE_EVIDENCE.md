@@ -205,6 +205,32 @@ synthetic before/after microbenches that retire or keep one narrow loop lever
 and preserve the raw artifact bundles for gauntlet follow-up; they are not G2
 claims.
 
+2026-07-07 | NEGATIVE(reverted) | polynomial-exp softmax in SAM attention (bd-av64.10 remaining-lever list, `FOCR_SAM_FAST_EXP` in `nn::softmax_rows_fast`)
+  claim_id: CLAIM-bd-av64.10-simd-exp   evidence_id: this entry (paired logs + diffs in the session scratchpad fastexp/)
+  model source commit + fixture hash: unlimited-ocr.int8.focrq sha256 d8c5fcf2… (published); real page fixture = franken_ocr_work/pages/page_0009.png (the A11 corpus page)
+  CPU feature string: aarch64+neon (softmax is the f32 path; int8 tier irrelevant)
+  exact command + env: paired A/B, 2 runs per arm, adjacent same-regime: FOCR_TIMING=1 [FOCR_SAM_FAST_EXP=1] focr ocr --model unlimited-ocr.int8.focrq page_0009.png
+  fallback / kill-switch state: lever env-gated OFF by default; unarmed path structurally unchanged (branch at the single softmax call site)
+  measured before -> after vs reference:
+    DESIGN: Cephes-split branch-free poly exp (LLVM-autovectorizable, honoring doctrine #3) replacing the per-element libm expf
+    inside a transcription of the reference kernel's exact max/pairwise-sum/divide structure. UNIT ACCURACY PROVEN: worst rel err
+    2.53e-7 (~2.1 ulp) over [-87, 10]; softmax probability drift <= 1.1e-8 absolute vs the reference kernel.
+    WALL CLOCK: sam.forward ref 3.49/3.80 s vs fast 3.75/3.48 s — ZERO. ROOT CAUSE: the "softmax exp = 0.15 s/block" target was
+    profiled BEFORE pass 2 made global attention head-parallel; the exp now runs inside the parallel section, amortized across all
+    cores (~0.06 s wall ceiling). The lever's premise had already been optimized away by a different lever.
+    OUTPUT: the <=1.1e-8 probability drift STILL forked the greedy decode on the FIRST measured page — "CHARING CROSS" (the
+    reference's CORRECT reading of the real place name) degraded to "CHAIRING CROSS", plus a heading trajectory fork
+    ("THE WORLD'S FIRST" -> "THE WORLD'S LITTLE TOUR"). The fast arm was self-consistent across runs — a deterministic wrong answer.
+  bit-exact correctness proof: revert is a net-zero source diff; unarmed byte-identity was structural (branch)
+  disposition: REVERT (code removed same-day; the exp implementation + accuracy tests live in this entry's session history)
+  do-not-retry: "do not retry approximate exp (or ANY sub-ulp numerics substitution) in the vision softmax unless (1) a fresh
+    profile shows it on the sequential critical path again (e.g. after an online-softmax restructuring changes the parallel
+    shape), AND (2) the full 20-page corpus token-exactness gate arbitrates. LESSON: 1e-8 probability drift flips greedy tokens
+    on real pages — the vision path has NO numerics slack; 'accuracy proven at the unit level' does not transfer to token-exactness."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: RubyCove
+  evidence dir: none (reproduces from the two commands above at this entry's commit)
+
 2026-07-07 | NEGATIVE(reverted) | TrOMR 1-crop-page routing through the refined staff band (bd-av64.13 item b, `recognize_page` single-staff branch)
   claim_id: CLAIM-bd-av64.13-onecrop-route   evidence_id: artifacts/perf/bd-av64.13/ (pointers; measured tables inline below + the bead close note)
   model source commit + fixture hash: same TrOMR export/artifact as the TTA entry below; fixtures = committed realscan_music corpus v1
