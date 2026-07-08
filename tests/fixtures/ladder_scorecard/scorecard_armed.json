@@ -60,7 +60,7 @@
    "gate": "L5",
    "outcome": "pass",
    "meaningful": true,
-   "parity_rows": 2,
+   "parity_rows": 4,
    "worst": {
     "metric": "cer",
     "value": 0.0,

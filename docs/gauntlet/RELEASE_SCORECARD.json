@@ -25,8 +25,8 @@
   "\u00a79 Op map": 0.0
  },
  "per_category_mean": {
-  "\u00a71 Modeling features": 0.650943,
-  "\u00a710 Op map": 0.595238,
+  "\u00a71 Modeling features": 0.660377,
+  "\u00a710 Op map": 0.607142,
   "\u00a711 `.focrq` weight transformation & quant recipe": 0.666666,
   "\u00a712 CLI surface": 0.631944,
   "\u00a713 Robot / NDJSON event contract": 0.666666,
@@ -42,7 +42,7 @@
   "\u00a79 Op map": 0.666666
  },
  "pillar": "surface",
- "point_estimate": 0.633851,
+ "point_estimate": 0.635274,
  "residual_history_n": 0,
  "source": "docs/FEATURE_PARITY.md"
 }

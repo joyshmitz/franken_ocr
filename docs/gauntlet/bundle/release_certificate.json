@@ -21,8 +21,8 @@
   ]
  },
  "generated_by": "scripts/gauntlet_cert.py --bundle",
- "git_describe": "v0.5.0-10-g50d5dad",
- "git_head": "50d5dadaca3d46680506bb537d0040c650f4d849",
+ "git_describe": "v0.5.0-13-gf1ac972",
+ "git_head": "f1ac972fe4cecee4c5093310174a0b2322cd6956",
  "high_severity_counterexamples": 0,
  "readiness": {
   "blocking_cells": [
@@ -35,7 +35,7 @@
  "refusal_reasons": [
   "readiness has red cells: certification_bundle, gauntlet_convergence",
   "convergence not met: rounds=8/10 tail_clean=False",
-  "evidence older than 24h (or missing): docs/gauntlet/EPROCESS_STATE.json, docs/gauntlet/RELEASE_SCORECARD.json, tests/fixtures/ladder_scorecard/scorecard_armed.json, docs/PERF_LEDGER.md"
+  "evidence older than 24h (or missing): docs/PERF_LEDGER.md"
  ],
  "template": "strict-conformant-release.v1"
 }
