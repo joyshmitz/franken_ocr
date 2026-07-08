@@ -107,16 +107,16 @@ pub fn describe_prompt_ids(
 ///
 /// # Errors
 /// A hydration/forward error, or a shape violation.
-pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrResult<Mat> {
-    let sw = vision_siglip::siglip_weights_from(weights, "model.vision_model")?;
+pub fn vision_rows(statics: &SmolStatics, frames: &[f32], n_frames: usize) -> FocrResult<Mat> {
+    let sw = &statics.siglip;
     // The frame-batched tower (bd-av64.10): one transformer pass over all
     // frames stacked, byte-identical to the sequential per-frame path
     // (vision_siglip::tests::batched_frames_match_sequential_byte_for_byte).
     // FOCR_SIGLIP_SEQ=1 is the kill-switch back to the per-frame loop.
     let post = if std::env::var_os("FOCR_SIGLIP_SEQ").is_some_and(|v| v == "1") {
-        vision_siglip::forward_frames(&sw, frames, n_frames)?
+        vision_siglip::forward_frames(sw, frames, n_frames)?
     } else {
-        vision_siglip::forward_frames_batched(&sw, frames, n_frames)?
+        vision_siglip::forward_frames_batched(sw, frames, n_frames)?
     };
 
     let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
@@ -134,6 +134,29 @@ pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrRe
         ps.data[dst_start..dst_start + shuffled.data.len()].copy_from_slice(&shuffled.data);
     }
 
+    statics.proj.apply(&ps)
+}
+
+/// The per-model-constant SmolVLM2 tensors — the SigLIP tower, the
+/// `modality_projection` connector, and the widened text embed table —
+/// hydrated ONCE and cached on the [`super::OcrModel`] (bd-av64.10 pass 6/7
+/// idiom: the describe/VQA path re-widened all three per call).
+pub struct SmolStatics {
+    /// The hydrated SigLIP tower (`model.vision_model`).
+    pub siglip: vision_siglip::SiglipWeights,
+    /// The `modality_projection` `Linear(12288→960, no bias)` (pre-transposed).
+    pub proj: Linear,
+    /// The widened (untied) `[vocab, hidden]` text embed table.
+    pub embed: Mat,
+}
+
+/// Hydrate a [`SmolStatics`] from the artifact.
+///
+/// # Errors
+/// A missing or mis-shaped tensor.
+pub fn hydrate_statics(weights: &Weights) -> FocrResult<SmolStatics> {
+    let th = std::time::Instant::now();
+    let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
     let proj = weights.mat("model.connector.modality_projection.proj.weight")?;
     if (proj.rows, proj.cols) != (960, ps_cols) {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -142,8 +165,16 @@ pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrRe
             proj.cols
         )));
     }
-    let lin = Linear::from_row_major(&proj.data, Vec::new(), 960, ps_cols)?;
-    lin.apply(&ps)
+    let statics = SmolStatics {
+        siglip: vision_siglip::siglip_weights_from(weights, "model.vision_model")?,
+        proj: Linear::from_row_major(&proj.data, Vec::new(), 960, ps_cols)?,
+        embed: weights.mat("model.text_model.embed_tokens.weight")?,
+    };
+    super::timing_log(&format!(
+        "  smolvlm2.hydrate(cached) {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    Ok(statics)
 }
 
 /// Build the decoder `inputs_embeds`: embed the prompt ids against the
@@ -154,8 +185,12 @@ pub fn vision_rows(weights: &Weights, frames: &[f32], n_frames: usize) -> FocrRe
 /// # Errors
 /// An embed error, or a [`connector::masked_scatter`] mismatch (the number of
 /// `<image>` slots must equal `vision.rows`).
-pub fn build_inputs_embeds(weights: &Weights, vision: &Mat, prompt_ids: &[u32]) -> FocrResult<Mat> {
-    let embed = weights.mat("model.text_model.embed_tokens.weight")?;
+pub fn build_inputs_embeds(
+    statics: &SmolStatics,
+    vision: &Mat,
+    prompt_ids: &[u32],
+) -> FocrResult<Mat> {
+    let embed = &statics.embed;
     let (vocab, hidden) = (embed.rows, embed.cols);
     let mut inputs_embeds = decoder::embed_tokens(&embed.data, vocab, hidden, prompt_ids)?;
     let mask: Vec<bool> = prompt_ids.iter().map(|&id| id == IMAGE_ID).collect();
@@ -173,6 +208,7 @@ pub fn build_inputs_embeds(weights: &Weights, vision: &Mat, prompt_ids: &[u32]) 
 /// A preprocess, vision, decode, or tokenizer error.
 pub fn recognize(
     weights: &Weights,
+    statics: &SmolStatics,
     tk: &Tokenizer,
     img: &DynamicImage,
     question: &str,
@@ -180,9 +216,9 @@ pub fn recognize(
 ) -> FocrResult<String> {
     let tv = std::time::Instant::now();
     let pre = preprocess::preprocess_smolvlm2(img)?;
-    let vision = vision_rows(weights, &pre.frames, pre.n_frames)?;
+    let vision = vision_rows(statics, &pre.frames, pre.n_frames)?;
     let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
-    let inputs_embeds = build_inputs_embeds(weights, &vision, &prompt_ids)?;
+    let inputs_embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
     super::timing_log(&format!(
         "  smolvlm2.vision+splice {:.2}s ({} frames, {} prompt ids)",
         tv.elapsed().as_secs_f64(),
@@ -213,6 +249,7 @@ pub fn recognize(
 /// As [`recognize`].
 pub fn recognize_batch(
     weights: &Weights,
+    statics: &SmolStatics,
     tk: &Tokenizer,
     imgs: &[&DynamicImage],
     question: &str,
@@ -223,9 +260,9 @@ pub fn recognize_batch(
     let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
     for img in imgs {
         let pre = preprocess::preprocess_smolvlm2(img)?;
-        let vision = vision_rows(weights, &pre.frames, pre.n_frames)?;
+        let vision = vision_rows(statics, &pre.frames, pre.n_frames)?;
         let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
-        let embeds = build_inputs_embeds(weights, &vision, &prompt_ids)?;
+        let embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
         caps.push(max_new.min(MAX_POSITION.saturating_sub(embeds.rows)));
         embeds_list.push(embeds);
     }
@@ -390,12 +427,13 @@ mod tests {
         cases: &[(String, String)],
         pre: &preprocess::Smolvlm2Preprocessed,
     ) -> usize {
-        let vision = vision_rows(weights, &pre.frames, pre.n_frames).expect("vision");
+        let statics = hydrate_statics(weights).expect("statics");
+        let vision = vision_rows(&statics, &pre.frames, pre.n_frames).expect("vision");
         let cfg = DecoderConfig::smolvlm2();
         let mut n_match = 0;
         for (q, oracle_answer) in cases {
             let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, q).expect("prompt");
-            let embeds = build_inputs_embeds(weights, &vision, &prompt_ids).expect("splice");
+            let embeds = build_inputs_embeds(&statics, &vision, &prompt_ids).expect("splice");
             let ids = decoder_qwen2::generate_greedy_kvcache(weights, &cfg, &embeds, 24, EOS_ID)
                 .expect("generate");
             let ours = tk
@@ -594,7 +632,8 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let oracle_vision = Mat::from_vec(pre.n_frames * IMG_SLOTS_PER_FRAME, 960, conn);
-        let embeds_ov = build_inputs_embeds(&weights, &oracle_vision, &prompt_ids).expect("splice");
+        let statics = hydrate_statics(&weights).expect("statics");
+        let embeds_ov = build_inputs_embeds(&statics, &oracle_vision, &prompt_ids).expect("splice");
 
         // Leg 0: MEASURE our decoder's logit drift at the prefill seam using
         // the ledger's step-0 anchors (oracle top-2 ids + exact logit values):
@@ -663,8 +702,9 @@ mod tests {
         assert_near_tie_divergence("leg 1 (oracle vision)", &ids_ov, &want, &fx);
 
         // Leg 2: full native pipeline + faithfulness eyeball.
-        let vision = vision_rows(&weights, &pre.frames, pre.n_frames).expect("vision");
-        let inputs_embeds = build_inputs_embeds(&weights, &vision, &prompt_ids).expect("splice");
+        let statics = hydrate_statics(&weights).expect("statics");
+        let vision = vision_rows(&statics, &pre.frames, pre.n_frames).expect("vision");
+        let inputs_embeds = build_inputs_embeds(&statics, &vision, &prompt_ids).expect("splice");
         let ids = decoder_qwen2::generate_greedy_kvcache(
             &weights,
             &cfg,

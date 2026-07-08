@@ -104,6 +104,9 @@ pub struct OcrModel {
     /// Lazily-hydrated OneChart model-constant tensors (same idiom; only
     /// populated for the `onechart` arch).
     onechart_statics: std::sync::OnceLock<onechart::OnechartStatics>,
+    /// Lazily-hydrated SmolVLM2 model-constant tensors (same idiom; only
+    /// populated for the `smolvlm2` arch).
+    smol_statics: std::sync::OnceLock<smolvlm2::SmolStatics>,
     /// Lazily-loaded, then reused BPE tokenizer. The `tokenizer.json` is ~9.9 MB;
     /// parsing it once and caching it on the model amortizes that across every
     /// page of a multi-page document (e.g. a PDF) instead of re-reading and
@@ -1010,6 +1013,7 @@ impl OcrModel {
             clip_cache: std::sync::OnceLock::new(),
             got_statics: std::sync::OnceLock::new(),
             onechart_statics: std::sync::OnceLock::new(),
+            smol_statics: std::sync::OnceLock::new(),
             tokenizer: std::sync::OnceLock::new(),
             got_tokenizer: std::sync::OnceLock::new(),
             tromr_tokenizer: std::sync::OnceLock::new(),
@@ -1158,7 +1162,14 @@ impl OcrModel {
         let tk = self.tokenizer()?;
         let question = smolvlm2_question();
         let max_new = self.decode_params.max_length;
-        let text = smolvlm2::recognize(&self.weights, tk, img, &question, max_new)?;
+        let text = smolvlm2::recognize(
+            &self.weights,
+            self.smol_statics()?,
+            tk,
+            img,
+            &question,
+            max_new,
+        )?;
         timing_log(&format!(
             "smolvlm2 forward {:.2}s",
             t.elapsed().as_secs_f64()
@@ -1881,6 +1892,7 @@ impl OcrModel {
                 )?,
                 "smolvlm2" => smolvlm2::recognize_batch(
                     &self.weights,
+                    self.smol_statics()?,
                     self.tokenizer()?,
                     &refs,
                     &smolvlm2_question(),
@@ -2119,6 +2131,20 @@ impl OcrModel {
             .onechart_statics
             .get()
             .expect("onechart statics just set"))
+    }
+
+    /// The lazily-hydrated SmolVLM2 model-constant tensors — see
+    /// [`Self::got_statics`].
+    ///
+    /// # Errors
+    /// A missing or mis-shaped SmolVLM2 tensor.
+    fn smol_statics(&self) -> FocrResult<&smolvlm2::SmolStatics> {
+        if let Some(c) = self.smol_statics.get() {
+            return Ok(c);
+        }
+        let built = smolvlm2::hydrate_statics(&self.weights)?;
+        let _ = self.smol_statics.set(built);
+        Ok(self.smol_statics.get().expect("smol statics just set"))
     }
 
     /// Connector + int8 prefill for ONE page whose vision features are ALREADY
