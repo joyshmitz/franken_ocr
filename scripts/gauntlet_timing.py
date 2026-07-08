@@ -160,6 +160,35 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "onechart_forward",
         re.compile(r"^onechart forward (?P<s>\d+(?:\.\d+)?)s \(reliable_distance .*\)$"),
     ),
+    # bd-av64.10 vision sub-stage instrumentation (2026-07-06/07): per-tower
+    # hydrate/blocks/forward lines plus per-block detail. Folded as their own
+    # stages (the row consumes the top-level stages; these are drill-down
+    # evidence, and the parser's strictness contract still rejects truly
+    # unknown shapes).
+    (
+        "sam_hydrate",
+        re.compile(r"^sam\.hydrate (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "sam_blocks",
+        re.compile(r"^sam\.blocks (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "sam_forward",
+        re.compile(r"^sam\.forward (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "sam_block_detail",
+        re.compile(r"^sam\.block (?:attn\(win\)|attn\(GLOBAL\)|mlp) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "clip_hydrate",
+        re.compile(r"^clip\.hydrate(?:\(cached\))? (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "clip_blocks",
+        re.compile(r"^clip\.blocks (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
 ]
 
 

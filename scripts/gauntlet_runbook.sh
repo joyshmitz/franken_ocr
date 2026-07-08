@@ -68,7 +68,10 @@ WARMUP=1                       # ... after 1 discarded warm run
 LOAD_MAX="${LOAD_MAX:-2.0}"
 PAGES="${PAGES:-page_0009.png page_0014.png}"
 STAMP="$(date -u +%Y%m%d)"
-OUT="$REPO_ROOT/artifacts/perf/bd-re8.17"
+# OUT_DIR overrides the evidence home (default = the original bd-re8.17 run;
+# a RE-RUN must use a fresh dir — the aggregator refuses mixed sessions, and
+# committed evidence is immutable).
+OUT="${OUT_DIR:-$REPO_ROOT/artifacts/perf/bd-re8.17}"
 ARCH_JSON="$OUT/arch.json"
 
 # Reference-side pool pins — MUST be in the environment BEFORE python starts

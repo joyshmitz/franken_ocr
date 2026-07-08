@@ -307,7 +307,14 @@ def check_discrepancies(path: Path, text: str, failures: list[str]) -> None:
         "- Tests affected:",
         "- Review date:",
     ]
-    src_text = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "src").rglob("*.rs"))
+    # Skip AppleDouble junk: an exFAT working copy (or an exFAT $TMPDIR shadow
+    # repo — the gauntlet_row shadow check) grows binary `._*.rs` resource-fork
+    # siblings beside every real file; reading one as UTF-8 crashes the scan.
+    src_text = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in (ROOT / "src").rglob("*.rs")
+        if not p.name.startswith("._")
+    )
 
     for index, heading in enumerate(headings):
         end = headings[index + 1].start() if index + 1 < len(headings) else len(unfenced)
