@@ -245,7 +245,7 @@ step_row() {
     claim="G2-unlimited-int8-${s#page_}-$STAMP"
     fixture="page=$page sha256=$(page_sha256 "$page"); weights=model-00001-of-000001.safetensors sha256=$SHARD_SHA256 (bf16 shard, runtime int8 quant — no .focrq)"
     cer="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['aggregate']['cer_norm'])" "$OUT/cer_$s/cer.json")"
-    proof="CER_norm=$cer focr-int8 text vs pinned HF bf16 reference text on $page, same prompt/runs as the timings, ref <;det;> grounding spans stripped (scripts/baseline/compare_ocr.py; artifacts/perf/bd-re8.17/cer_$s/cer.json)"
+    proof="CER_norm=$cer focr-int8 text vs pinned HF bf16 reference text on $page, same prompt/runs as the timings, ref <;det;> grounding spans stripped (scripts/baseline/compare_ocr.py; $OUT/cer_$s/cer.json)"
     note "row: $page claim_id=$claim"
     python3 scripts/gauntlet_row.py \
       --focr-stages "$OUT/focr_$s/focr_stages.json" \
