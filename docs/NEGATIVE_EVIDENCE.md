@@ -229,6 +229,23 @@ claims.
   agent: RubyCove
   evidence dir: artifacts/perf/bd-av64.10-rowtile/
 
+2026-07-09 | NEGATIVE(reverted) | SDOT micro-tile dispatch for the DENSE int8 GEMMs on Apple Silicon (`arm::igemm_s8s8`/`igemm_u8s8` preferring `aarch64_impl::igemm_s8s8_sdot`)
+  claim_id: CLAIM-bd-2mo51-sdot-gemv   evidence_id: artifacts/perf/bd-2mo.5.1/ (quiet-window tier microbench logs + README tables)
+  model source commit + fixture hash: baidu/Unlimited-OCR 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5 (shard sha256 2bc48a7a…); page_0009.png (the A11 corpus page)
+  CPU feature string: aarch64+neon+dotprod (Apple M4; i8mm present but half-rate)
+  exact command + env: microbench `FOCR_FORCE_ARCH={sdot,smmla,scalar} cargo bench --bench igemm_tier` (quiet window, error bars 1-10%); e2e `FOCR_DECODE_INT8=1 FOCR_TIMING=1 focr ocr page_0009.png` interleaved A/B pre-lever (FOCR_FORCE_ARCH sdot vs scalar) and post-lever (default vs FOCR_INT8_AUTOVEC=0)
+  fallback / kill-switch state: the REPLACEMENT (LLVM-autovec scalar dispatch via `autovec_preferred()`) ships default-ON on macOS aarch64 with `FOCR_INT8_AUTOVEC=0` restoring SDOT; `FOCR_FORCE_ARCH` overrides still honored; detect_tier()/robot backends still report the hardware truth; int4-packed + offline-SMMLA paths unaffected
+  measured before -> after vs reference:
+    microbench (ns/iter, model shapes): sdot 93,775 / 511,095 / 505,927 (m=1 attn/down/gate_up) vs autovec 21,145 / 114,818 / 114,942 — autovec 4.4-4.5x FASTER at m=1, 2.0x at m=16; SMMLA 2.3-6.2x behind SDOT everywhere (bd-2mo.4.1 verdict)
+    e2e int8 decode (98 tokens, identical output bytes): 1.61s/1.58s (sdot) vs 1.27s/1.26s (autovec) pre-lever; 1.64s vs 1.27s post-lever kill-switch A/B = 22% decode win, decode/tok 16.8ms -> 13ms
+  bit-exact correctness proof: all tiers are proven bit-identical (exact i32 integer accumulation): the simd tier-parity suite (53 tests incl the randomized + constant-extreme oracles at K=6848) holds every route equal, and both e2e A/B arms emitted BYTE-IDENTICAL 98-token output on page_0009 — the lever changes WHICH exact kernel runs, never a bit of the result.
+  WHY (attribution): NE-INH-1's inherited prior finally caught the m=1 GEMV — the hand-written SDOT micro-tile pays per-call setup/blocking the fused autovectorized loop never does, and current LLVM (nightly, 2026) vectorizes the plain i8-dot loop better than the hand kernel at every model shape. The SDOT preference predated this toolchain and was never re-measured at m=1 against autovec.
+  disposition: REVERT (the SDOT preference for the dense igemm entrypoints); the replacement autovec dispatch ships default-ON on macOS aarch64 behind FOCR_INT8_AUTOVEC (=0 restores SDOT).
+  per-lever tally: W 0 / L 1 / N 0 (the SDOT-at-dense-GEMM preference, first honest m=1-vs-autovec measurement)
+  agent: claude (bd-2mo.5.1 / bd-2mo.4.1 quiet-window session, 2026-07-09)
+  evidence dir: artifacts/perf/bd-2mo.5.1/ (tier microbench logs, README tables, SHA256SUMS)
+  do-not-retry: do NOT re-prefer the SDOT micro-tile for the dense igemm entrypoints on Apple Silicon without a fresh quiet-window tier microbench + e2e pair on the CURRENT toolchain showing SDOT >= autovec; re-measure on new silicon (M5+), new LLVM major, or if the GEMV call pattern changes shape (e.g. fused multi-row batching lands).
+
 2026-07-07 | NEGATIVE(reverted) | polynomial-exp softmax in SAM attention (bd-av64.10 remaining-lever list, `FOCR_SAM_FAST_EXP` in `nn::softmax_rows_fast`)
   claim_id: CLAIM-bd-av64.10-simd-exp   evidence_id: artifacts/perf/bd-av64.10-simd-exp/ (pointers; measured tables inline below)
   model source commit + fixture hash: unlimited-ocr.int8.focrq sha256 d8c5fcf2… (published); real page fixture = franken_ocr_work/pages/page_0009.png (the A11 corpus page)

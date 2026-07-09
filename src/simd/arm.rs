@@ -102,6 +102,36 @@ pub enum ArmTier {
 /// `FOCR_FORCE_ARCH=smmla|sdot|scalar` overrides the choice (benchmark/debug only;
 /// a tier whose feature is absent is ignored). Read once and cached.
 #[must_use]
+/// Whether the DENSE int8 GEMM entrypoints should prefer the LLVM-autovec
+/// scalar kernel over the hand-written SDOT micro-tile on Apple Silicon
+/// (bd-2mo.5.1, measured 2026-07-09 in a quiet window): the autovectorized
+/// loop beats the SDOT kernel across every model shape in the tier
+/// microbench (~4x at m=1) and 20.5% on the REAL int8 decode e2e
+/// (page_0009: 1.27s vs 1.59s, interleaved runs, identical 98-token
+/// output). This is NE-INH-1's inherited prior ("hand-written wide-SIMD
+/// int8 dot ~5x slower than autovec") catching up with the m=1 GEMV — the
+/// SDOT tile pays per-call packing/setup the fused autovec loop never does.
+///
+/// SCOPED to `igemm_s8s8`/`igemm_u8s8` ONLY: `detect_tier()` still reports
+/// SDOT (the truthful hardware answer for `robot backends`/selftest), the
+/// int4 packed path keeps its SDOT kernels (its scalar fallback is the
+/// ledgered 5.8x-slower unpack path), and the offline-SMMLA packed-B path
+/// is unaffected. `FOCR_INT8_AUTOVEC=0` restores the SDOT dispatch.
+fn autovec_preferred() -> bool {
+    use std::sync::OnceLock;
+    static PREF: OnceLock<bool> = OnceLock::new();
+    *PREF.get_or_init(|| {
+        cfg!(target_os = "macos")
+            && !matches!(
+                std::env::var("FOCR_INT8_AUTOVEC").ok().as_deref(),
+                Some("0") | Some("off") | Some("false") | Some("no")
+            )
+            // An explicit tier override (bench A/Bs, the selftest sweep)
+            // must keep meaning what it says.
+            && std::env::var_os("FOCR_FORCE_ARCH").is_none()
+    })
+}
+
 pub fn detect_tier() -> ArmTier {
     use std::sync::OnceLock;
     static TIER: OnceLock<ArmTier> = OnceLock::new();
@@ -200,9 +230,13 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
                 return;
             }
             ArmTier::Sdot => {
-                // SAFETY: reached only when `dotprod` was runtime-detected.
-                unsafe { aarch64_impl::igemm_s8s8_sdot(a, b, m, k, n, out) };
-                return;
+                if !autovec_preferred() {
+                    // SAFETY: reached only when `dotprod` was runtime-detected.
+                    unsafe { aarch64_impl::igemm_s8s8_sdot(a, b, m, k, n, out) };
+                    return;
+                }
+                // fall through: the autovec scalar loop wins on this host
+                // (bd-2mo.5.1; bit-identical — integer math, exact).
             }
             ArmTier::None => {}
         }
@@ -308,7 +342,8 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     #[cfg(target_arch = "aarch64")]
     {
         let tier = detect_tier();
-        if matches!(tier, ArmTier::Smmla | ArmTier::Sdot) {
+        if matches!(tier, ArmTier::Smmla) || (matches!(tier, ArmTier::Sdot) && !autovec_preferred())
+        {
             // Shift u8 activations into the signed domain: a_s = a_u - 128 lands
             // in [-128, 127], representable in i8. `wrapping_sub(128) as i8`
             // reinterprets the byte so that e.g. 0u8 -> -128i8, 255u8 -> 127i8.
