@@ -183,9 +183,11 @@ pub struct OcrBatchArgs {
     /// Emit machine-readable JSON (one object per image + a final summary).
     #[arg(long)]
     pub json: bool,
-    /// Use the f32 decoder instead of the default int8 throughput path.
-    #[arg(long = "f32")]
-    pub no_int8: bool,
+    /// Use the experimental all-int8 decoder. This also requires
+    /// `FOCR_INT8_ATTN=1` and `FOCR_INT8_LMHEAD=1`; the default follows the
+    /// conservative recipe and keeps attention plus `lm_head` high precision.
+    #[arg(long)]
+    pub experimental_full_int8: bool,
     /// Treat the images as ONE multi-page document (the Unlimited-OCR
     /// `infer_multi` contract): a single cross-page pass where page N can
     /// reference pages 1..N-1, emitting one markdown with `<PAGE>` separators.
@@ -207,11 +209,11 @@ pub struct PullArgs {
     /// Model id to fetch (e.g. `got-ocr2`). Defaults to the manifest's primary
     /// model (`unlimited-ocr`).
     pub model: Option<String>,
-    /// Quant level to fetch (only `int8` is published today).
+    /// Quant tag to fetch (defaults to `int8`; available tags vary by model).
     #[arg(long, default_value = dist::DEFAULT_QUANT)]
     pub quant: String,
-    /// Manifest source — a local path or an `http(s)` URL. Defaults to
-    /// `$FOCR_MANIFEST_URL`, else the built-in repo manifest.
+    /// Manifest source — a local path or an HTTPS URL. Defaults to
+    /// `$FOCR_MANIFEST_URL`, else the release-bound embedded manifest.
     #[arg(long)]
     pub manifest: Option<String>,
     /// Emit a single JSON result object instead of human progress lines.
@@ -1939,20 +1941,26 @@ fn emit_batch_result(
     }
 }
 
-/// Load-once batch OCR: build the model + int8 decoder cache ONCE (the
-/// [`OcrEngine`] `Arc` cache amortizes the 6.2 GB weight read; the model's int8
-/// `OnceLock` amortizes the ~1.2 s quant), then recognize every image in the same
-/// process. Defaults to the int8 throughput decode path (`--f32` opts out). With
-/// the continuous-batch spine armed (`FOCR_BATCH_SPINE`) all pages decode together
-/// through the scheduler; otherwise the proven sequential per-image loop runs.
-/// Either driver renders the SAME per-image output (bd-1azu.13).
+/// Load-once batch OCR: reuse one model across every image in the process. The
+/// conservative quant recipe is the default. `--experimental-full-int8` arms
+/// the legacy all-int8 cache only when both independent accuracy gates are also
+/// enabled. With the continuous-batch spine armed (`FOCR_BATCH_SPINE`) all pages
+/// decode together through the scheduler; otherwise the proven sequential
+/// per-image loop runs.
 fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
-    if !args.no_int8 {
-        native_engine::force_int8_decode(true);
+    if args.experimental_full_int8 {
+        native_engine::force_int8_decode(true)?;
     }
+    native_engine::validate_experimental_full_int8_decode()?;
+    let experimental_full_int8 = native_engine::experimental_full_int8_decode_requested();
+    let decode_mode = if experimental_full_int8 {
+        "experimental_full_int8"
+    } else {
+        "conservative_recipe"
+    };
     // ocr-batch has no per-flag tuning surface, but the README-documented
     // FOCR_NO_REPEAT_NGRAM mitigation (int8 table-repetition) must work here
     // too (fresh-eyes fix — it previously reached only the clap env fallback
@@ -1991,6 +1999,7 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
                 "command": "batch.multi_page",
                 "pages": count,
                 "seconds": elapsed,
+                "decode_mode": decode_mode,
                 "markdown": markdown,
             }));
         } else {
@@ -2040,27 +2049,26 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "command": "ocr-batch",
             "count": count,
-            "int8": !args.no_int8,
+            "decode_mode": decode_mode,
+            "experimental_full_int8": experimental_full_int8,
             "seconds_total": elapsed,
             "seconds_per_image": per_image,
             "results": results,
         }));
     } else {
         eprintln!(
-            "[focr] batch complete: {count} images in {elapsed:.2}s ({per_image:.2}s/image, int8={})",
-            !args.no_int8
+            "[focr] batch complete: {count} images in {elapsed:.2}s \
+             ({per_image:.2}s/image, decode_mode={decode_mode})"
         );
     }
     Ok(())
 }
 
 /// Offline weight transform: raw bf16 safetensors → a self-contained int8
-/// `.focrq` (plan §5). The int8 decoder tensors are quantized with the SAME
-/// [`native_engine::nn::quantize_int8`] the load-time `FOCR_DECODE_INT8` cache
-/// uses, so the artifact decodes byte-for-byte like that path on the source
-/// shard; everything else (vision, projector, embed_tokens, router gate, norms)
-/// is copied verbatim. `--quant int4` is not yet validated (doctrine #1) and
-/// returns `NotImplemented`.
+/// `.focrq` (plan §5). Unlimited-OCR quantizes only the validated decoder
+/// FFN/expert GEMMs; attention q/k/v/o, `lm_head`, vision, projector,
+/// `embed_tokens`, router, and norms remain high precision. `--quant int4` is
+/// not yet validated (doctrine #1) and returns `NotImplemented`.
 fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     // int4: surface the machine scaffold (so robot callers still see the planned
     // shape) then refuse — BEFORE any file I/O, so the outcome is deterministic
@@ -2106,6 +2114,9 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             args.model_id
         ))
     })?;
+    if arch.id() == native_engine::model_arch::default_arch().id() {
+        native_engine::unlimited_ocr_census::validate_conversion_source_sha256(&source_sha256)?;
+    }
     let omit_lm_head = arch.tie_word_embeddings();
     let quantized = weights
         .names()
@@ -2129,6 +2140,8 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     })?;
 
     let sha_hex = hex_encode32(&source_sha256);
+    let quant_recipe = (arch.id() == native_engine::model_arch::default_arch().id())
+        .then_some(quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID);
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
@@ -2140,6 +2153,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "quant": args.quant.as_str(),
             "arch": args.arch.as_str(),
             "model_id": arch.id(),
+            "quant_recipe": quant_recipe,
             "source_sha256": sha_hex,
             "tensors": tensor_count,
             "tensors_quantized": quantized,
@@ -2149,10 +2163,11 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     } else {
         eprintln!(
             "[focr] convert: wrote {} ({} quant {}: {tensor_count} tensors, {quantized} int8, \
-             {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex}",
+             {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex}{}",
             args.output.display(),
             args.arch.as_str(),
             args.quant.as_str(),
+            quant_recipe.map_or_else(String::new, |id| format!(" quant_recipe={id}")),
         );
     }
     Ok(())
@@ -2289,41 +2304,71 @@ fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Default)]
+struct PullAvailability {
+    in_manifest: bool,
+    compatible: Vec<(String, String)>,
+    blocked: Vec<(String, String)>,
+}
+
+fn pull_availability(manifest: Option<&dist::Manifest>, model_id: &str) -> PullAvailability {
+    let Some(manifest) = manifest else {
+        return PullAvailability::default();
+    };
+    let quants = if manifest.model == model_id {
+        Some(&manifest.quants)
+    } else {
+        manifest.models.get(model_id).map(|entry| &entry.quants)
+    };
+    let Some(quants) = quants else {
+        return PullAvailability::default();
+    };
+
+    let mut availability = PullAvailability {
+        in_manifest: true,
+        ..PullAvailability::default()
+    };
+    for (quant, entry) in quants {
+        let item = (quant.clone(), entry.recipe.clone());
+        if dist::quant_recipe_is_compatible(model_id, quant, &entry.recipe) {
+            availability.compatible.push(item);
+        } else {
+            availability.blocked.push(item);
+        }
+    }
+    availability
+}
+
 /// `focr models` — list the model architectures this build can run (the "model
 /// zoo", epic bd-3jo6). A human table by default; `--json` for a machine-readable
-/// list. Today the registry holds the implemented Baidu Unlimited-OCR model; the
-/// specialized zoo models appear here (as `planned`, then `ready`) once their
-/// descriptors register.
+/// list. Runtime readiness and artifact compatibility are separate fields so a
+/// mismatched external manifest remains visible without being advertised as
+/// pullable.
 fn run_models(args: &ModelsArgs) -> FocrResult<()> {
     let archs = crate::model_arch::registry();
-    // Pull availability from the EMBEDDED committed manifest (offline truth;
-    // bd-av64.7): which quant tags `focr pull <id>` can fetch. A model with a
-    // runtime engine but no manifest entry is honestly "local" (convert your
-    // own artifact) instead of the old README-only caveat.
-    let pull_quants = |id: &str| -> Vec<String> {
-        dist::builtin_manifest()
-            .ok()
-            .map(|m| {
-                if m.model == id {
-                    m.quants.keys().cloned().collect()
-                } else {
-                    m.models
-                        .get(id)
-                        .map(|e| e.quants.keys().cloned().collect())
-                        .unwrap_or_default()
-                }
-            })
-            .unwrap_or_default()
-    };
+    // The embedded manifest supplies offline provenance and exact runtime recipe
+    // compatibility. Keep reporting blocked entries defensively for external or
+    // future manifests that drift from the runtime contract.
+    let manifest = dist::builtin_manifest()?;
     if args.json {
         let models: Vec<serde_json::Value> = archs
             .iter()
             .map(|a| {
                 let mut j = model_arch_json(*a);
-                let quants = pull_quants(a.id());
+                let pull = pull_availability(Some(&manifest), a.id());
                 j["pull"] = serde_json::json!({
-                    "in_manifest": !quants.is_empty(),
-                    "quants": quants,
+                    "in_manifest": pull.in_manifest,
+                    "available": !pull.compatible.is_empty(),
+                    "quants": pull.compatible.iter().map(|(quant, _)| quant).collect::<Vec<_>>(),
+                    "recipes": pull.compatible.iter().map(|(quant, recipe)| serde_json::json!({
+                        "quant": quant,
+                        "recipe": recipe,
+                    })).collect::<Vec<_>>(),
+                    "blocked": pull.blocked.iter().map(|(quant, recipe)| serde_json::json!({
+                        "quant": quant,
+                        "recipe": recipe,
+                        "required_recipe": dist::required_quant_recipe(a.id(), quant),
+                    })).collect::<Vec<_>>(),
                 });
                 j
             })
@@ -2332,7 +2377,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "models": models,
             "guidance": {
-                "unlimited-ocr": "default; FAST plain-text document OCR (general documents & PDFs)",
+                "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
@@ -2351,11 +2396,20 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 .collect::<Vec<_>>()
                 .join(",");
             let status = if a.implemented() { "ready" } else { "planned" };
-            let quants = pull_quants(a.id());
-            let pull = if quants.is_empty() {
-                if a.implemented() { "local" } else { "-" }.to_owned()
+            let availability = pull_availability(Some(&manifest), a.id());
+            let pull = if !availability.compatible.is_empty() {
+                availability
+                    .compatible
+                    .iter()
+                    .map(|(quant, _)| quant.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else if !availability.blocked.is_empty() {
+                "blocked".to_owned()
+            } else if a.implemented() {
+                "local".to_owned()
             } else {
-                quants.join(",")
+                "-".to_owned()
             };
             println!(
                 "{:<14}  {:<8}  {:<12}  {:<22}  {}",
@@ -2368,9 +2422,8 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         }
         println!();
         println!("Choosing a model:");
-        println!(
-            "  unlimited-ocr (default)  FAST plain-text document OCR — general documents & PDFs."
-        );
+        println!("  unlimited-ocr (default)  FAST plain-text OCR. `focr pull` installs the");
+        println!("                           conservative exact-recipe int8 artifact.");
         println!(
             "  got-ocr2                 SPECIALIZED structured output the default can't produce:"
         );
@@ -2636,9 +2689,9 @@ fn robot_triage_payload() -> serde_json::Value {
         ]
     } else {
         vec![
-            "focr pull                           # download the default int8 weights (~3.9 GB)",
-            "focr models                         # see the model zoo + what is already pulled",
-            "focr robot health                   # re-check readiness after the pull",
+            "focr pull                           # install the default conservative Unlimited-OCR model",
+            "FOCR_MODEL_PATH=/path/to/raw-or-compatible-model focr ocr <image-or-pdf> -o out.md",
+            "focr models                         # inspect compatible and blocked model pulls",
         ]
     };
     serde_json::json!({
@@ -2647,8 +2700,8 @@ fn robot_triage_payload() -> serde_json::Value {
         "quick_ref": {
             "ocr": "parse a document image/PDF into markdown (--json for boxes; -o FILE to write)",
             "ocr-batch": "many images in one process (weights load once)",
-            "pull": "download model weights into the cache (verified)",
-            "models": "list the model zoo: id, tasks, pulled status",
+            "pull": "download a manifest-compatible model into the cache; defaults to the conservative Unlimited-OCR artifact",
+            "models": "list model ids, tasks, and compatible or blocked pull status",
             "convert": "offline safetensors -> .focrq quantization",
             "runs": "query run history (--format json|ndjson; empty history = exit 0)",
             "sync": "export/import the append-only run audit JSONL (one-way contract)",
@@ -2686,16 +2739,28 @@ fn is_interactive() -> bool {
 /// Append the actionable acquisition hint to a model-not-found message.
 fn with_pull_hint(msg: &str) -> String {
     format!(
-        "{msg} — run `focr pull` to download the int8 weights (~3.9 GB), or point \
-         FOCR_MODEL_PATH at an existing model"
+        "{msg} — run `focr pull` to install the compatible conservative default, point \
+         FOCR_MODEL_PATH at raw BF16 weights or an exact-recipe local artifact, or inspect \
+         `focr models` for other compatible pulls"
     )
 }
 
-/// Prompt on the TTY; if confirmed, download the default int8 model + tokenizer
-/// and return where they landed (else `Ok(None)` when the user declines).
+/// Prompt on the TTY only when the selected manifest may supply a compatible
+/// default. The embedded source is checked before offering its multi-gigabyte
+/// download; custom sources are checked by [`dist::pull`].
 fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
     use std::io::Write as _;
-    eprint!("focr: model not found. Download the int8 weights now (~3.9 GB)? [y/N] ");
+    let source = dist::resolve_manifest_source(None);
+    if source == dist::DEFAULT_MANIFEST_SOURCE {
+        let manifest = dist::builtin_manifest()?;
+        let availability = pull_availability(Some(&manifest), &manifest.model);
+        if availability.compatible.is_empty() {
+            return Ok(None);
+        }
+    }
+    eprint!(
+        "focr: model not found. Download compatible weights from the configured manifest now? [y/N] "
+    );
     std::io::stderr().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
@@ -2704,7 +2769,6 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return Ok(None);
     }
-    let source = dist::resolve_manifest_source(None);
     let outcome = dist::pull(None, dist::DEFAULT_QUANT, &source, false, |line| {
         eprintln!("focr pull: {line}");
     })?;
@@ -2760,6 +2824,8 @@ fn run_pull(args: &PullArgs) -> FocrResult<()> {
 }
 
 fn robot_backends_payload() -> serde_json::Value {
+    let hardware_selected = simd::detected_tier();
+    let effective_route = simd::effective_dense_route();
     let available: Vec<_> = simd::available_tiers()
         .iter()
         .map(|tier| {
@@ -2773,11 +2839,14 @@ fn robot_backends_payload() -> serde_json::Value {
     serde_json::json!({
         "schema_version": robot::ROBOT_SCHEMA_VERSION,
         "simd_tiers": {
-            "selected": simd::detected_tier().tag(),
-            "selected_feature": simd::tier_string(),
+            "selected": effective_route.tag(),
+            "selected_feature": effective_route.feature_string(),
+            "hardware_selected": hardware_selected.tag(),
+            "hardware_selected_feature": hardware_selected.feature_string(),
             "available": available,
             "override_env": "FOCR_FORCE_ARCH",
-            "status": "runtime detection active"
+            "selection_scope": "ordinary_dense_int8",
+            "status": "runtime capability and effective-route selection active"
         },
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         // The ONE process-wide budget (bd-223.2 addendum: FOCR_THREADS else
@@ -2812,12 +2881,22 @@ fn run_robot_selftest() -> FocrResult<()> {
         })
         .collect();
     let available: Vec<_> = report.available.iter().map(|t| t.tag()).collect();
+    let executed_routes: Vec<_> = report.executed_routes.iter().map(|r| r.tag()).collect();
     let passed = report.cases.iter().filter(|c| c.ok).count();
+    let oracle_independent = !matches!(
+        report.effective_route,
+        simd::EffectiveI8Route::Autovec | simd::EffectiveI8Route::Scalar
+    );
     emit(&serde_json::json!({
         "schema_version": robot::ROBOT_SCHEMA_VERSION,
         "command": "robot.selftest",
-        "selected": report.selected.tag(),
-        "selected_feature": report.selected.feature_string(),
+        "selected": report.effective_route.tag(),
+        "selected_feature": report.effective_route.feature_string(),
+        "hardware_selected": report.hardware_selected.tag(),
+        "hardware_selected_feature": report.hardware_selected.feature_string(),
+        "executed_routes": executed_routes,
+        "route_consistent": report.route_consistent,
+        "oracle_independent": oracle_independent,
         "available": available,
         "override_env": "FOCR_FORCE_ARCH",
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
@@ -2839,10 +2918,17 @@ fn run_robot_selftest() -> FocrResult<()> {
     } else {
         let failed = report.cases.len() - passed;
         Err(FocrError::Other(anyhow::anyhow!(
-            "robot selftest: {failed}/{} int8-kernel parity case(s) diverged from the scalar \
-             oracle on tier {} — this binary's accelerated int8 path is NOT bit-exact on this CPU",
+            "robot selftest: {failed}/{} parity case(s) diverged; route_consistent={} \
+             expected={} observed={:?}, hardware={} — the dense int8 path is not certified on this CPU",
             report.cases.len(),
-            report.selected.feature_string(),
+            report.route_consistent,
+            report.effective_route.tag(),
+            report
+                .executed_routes
+                .iter()
+                .map(|r| r.tag())
+                .collect::<Vec<_>>(),
+            report.hardware_selected.feature_string(),
         )))
     }
 }
@@ -3048,14 +3134,14 @@ mod tests {
             let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", flag, "result.json"])
                 .expect("ocr -o/--output parses");
             let Command::Ocr(args) = cli.command else {
-                panic!("expected ocr command");
+                unreachable!("expected ocr command");
             };
             assert_eq!(args.output.as_deref(), Some(Path::new("result.json")));
         }
         // No `-o` => None, i.e. the legacy stdout path.
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         assert!(args.output.is_none());
     }
@@ -3067,12 +3153,12 @@ mod tests {
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--format"])
             .expect("ocr --format parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         assert!(args.to_request().expect("request builds").format);
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         assert!(!args.to_request().expect("request builds").format);
     }
@@ -3082,7 +3168,7 @@ mod tests {
         let full: Vec<&str> = ["focr", "ocr"].iter().chain(argv).copied().collect();
         let cli = Cli::try_parse_from(full).expect("ocr argv parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         args.to_request()
     }
@@ -3265,7 +3351,7 @@ mod tests {
             cmd: RobotCmd::Run(args),
         } = cli.command
         else {
-            panic!("expected robot run");
+            unreachable!("expected robot run");
         };
         assert!(args.request.to_request().expect("request builds").format);
     }
@@ -3275,7 +3361,7 @@ mod tests {
         // Defaults ⇒ NO overrides: the engine keeps its certified Base-1024.
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let req = args.to_request().expect("request builds");
         assert_eq!(
@@ -3298,7 +3384,7 @@ mod tests {
         ])
         .expect("ocr with preprocess flags parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let o = preprocess_overrides_from(&args.to_request().expect("request builds"));
         assert_eq!(o.base_size, Some(512));
@@ -3308,7 +3394,7 @@ mod tests {
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--crop-mode", "base"])
             .expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let o = preprocess_overrides_from(&args.to_request().expect("request builds"));
         assert_eq!(o.gundam, None);
@@ -3320,7 +3406,7 @@ mod tests {
         // stay in force.
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let req = args.to_request().expect("request builds");
         assert_eq!(
@@ -3344,7 +3430,7 @@ mod tests {
         ])
         .expect("ocr with tuning flags parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let o = decode_overrides_from(&args.to_request().expect("request builds"));
         assert_eq!(o.max_length, Some(700));
@@ -3357,7 +3443,7 @@ mod tests {
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--max-length", "32768"])
             .expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         let o = decode_overrides_from(&args.to_request().expect("request builds"));
         assert_eq!(o.max_length, None);
@@ -3560,13 +3646,13 @@ mod tests {
         ])
         .expect("--extract-figures parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         assert!(args.extract_figures);
         let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--figures-dir", "assets"])
             .expect("--figures-dir parses");
         let Command::Ocr(args) = cli.command else {
-            panic!("expected ocr command");
+            unreachable!("expected ocr command");
         };
         assert_eq!(args.figures_dir.as_deref(), Some(Path::new("assets")));
     }
@@ -3714,25 +3800,30 @@ mod tests {
         assert!(j["license"].as_str().unwrap_or_default().contains("Baidu"));
     }
 
-    /// bd-av64.7: every runtime-ready arch is pullable per the COMMITTED
-    /// manifest; planned archs are never published. A sixth engine landing
-    /// without a manifest entry (the old smolvlm2/onechart/tromr gap, where
-    /// README caveats stood in for distribution) trips this immediately.
+    /// Every runtime-ready arch has committed distribution provenance and at
+    /// least one exact-recipe pull. Recipe mismatches remain independently
+    /// fail-closed in the distribution layer.
     #[test]
-    fn ready_archs_are_pullable_per_the_committed_manifest() {
+    fn ready_archs_have_honest_committed_pull_status() {
         let m = crate::dist::builtin_manifest().expect("embedded manifest parses");
         for a in crate::model_arch::registry() {
-            let in_manifest = m.model == a.id() || m.models.contains_key(a.id());
+            let pull = pull_availability(Some(&m), a.id());
             if a.implemented() {
                 assert!(
-                    in_manifest,
+                    pull.in_manifest,
                     "{} is runtime-ready but has no manifest entry — publish its \
                      artifacts (bd-av64.7 pattern) or record why not",
                     a.id()
                 );
+                assert!(
+                    !pull.compatible.is_empty(),
+                    "{} must retain at least one compatible pull",
+                    a.id()
+                );
+                assert!(pull.blocked.is_empty());
             } else {
                 assert!(
-                    !in_manifest,
+                    !pull.in_manifest,
                     "{} is planned-only but published in the manifest",
                     a.id()
                 );
@@ -3755,7 +3846,7 @@ mod tests {
         assert!(matches!(cli.command, Command::Models(_)));
         let cli = Cli::try_parse_from(["focr", "models", "--json"]).expect("--json parses");
         let Command::Models(args) = cli.command else {
-            panic!("expected models");
+            unreachable!("expected models");
         };
         assert!(args.json);
     }
@@ -3792,9 +3883,16 @@ mod tests {
     fn robot_backends_reflects_simd_dispatch_snapshot() {
         let payload = robot_backends_payload();
         let tiers = &payload["simd_tiers"];
+        let effective = simd::effective_dense_route();
+        let hardware = simd::detected_tier();
         assert_eq!(payload["schema_version"], robot::ROBOT_SCHEMA_VERSION);
-        assert_eq!(tiers["selected"], simd::detected_tier().tag());
-        assert_eq!(tiers["selected_feature"], simd::tier_string());
+        assert_eq!(tiers["selected"], effective.tag());
+        assert_eq!(tiers["selected_feature"], effective.feature_string());
+        assert_eq!(tiers["hardware_selected"], hardware.tag());
+        assert_eq!(
+            tiers["hardware_selected_feature"],
+            hardware.feature_string()
+        );
         assert_eq!(tiers["override_env"], "FOCR_FORCE_ARCH");
 
         assert!(

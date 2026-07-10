@@ -22,24 +22,51 @@ stages.
 Usage:
   gauntlet_timing.py aggregate --run-dir DIR --out FILE [--threads N]
                                [--precision P] [--allocator A] [--synthetic]
+  gauntlet_timing.py aggregate-ab --run-dir DIR --out FILE --ab-env FOCR_VAR
+                                  --a-label L --a-value V --b-label L --b-value V
   gauntlet_timing.py --self-test
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import statistics
 import sys
 import time
 
 SCHEMA_STAGE = "focr-gauntlet-stage/v1"
 SCHEMA_DOC = "focr-gauntlet-stages/v1"
+SCHEMA_RAW_TIMING = "focr-gauntlet-raw-timing/v1"
+SCHEMA_AB = "focr-gauntlet-ab/v1"
+MAX_MEASURED_RUNS = 256
+MAX_TIMING_FILE_BYTES = 64 * 1024 * 1024
+MAX_TIMING_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_RAW_DIRECTORY_ENTRIES = 2048
+MIN_AB_RUNS_PER_ARM = 5
+
+PRECISION_MIXED_FFN_INT8 = "focr-mixed-ffn-int8"
+PRECISION_FULL_INT8 = "focr-full-int8"
+UNLIMITED_PRECISIONS = frozenset((PRECISION_MIXED_FFN_INT8, PRECISION_FULL_INT8))
+DECODE_MODE_BY_PRECISION = {
+    PRECISION_MIXED_FFN_INT8: "mixed-ffn-int8",
+    PRECISION_FULL_INT8: "full-int8",
+}
+UNLIMITED_QUANT_RECIPE = "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1"
+PRECISION_GATE_VARS = (
+    "FOCR_DECODE_INT8",
+    "FOCR_INT8_ATTN",
+    "FOCR_INT8_LMHEAD",
+    "FOCR_ATTN_GEMM",
+    "FOCR_INT8_KV",
+    "FOCR_SPEC_DECODE",
+    "FOCR_DECODE_STATELESS",
+)
 
 LEDGER_STAGES = ("preprocess", "vision_encode", "prefill", "decode_per_token", "end_to_end")
 
@@ -49,6 +76,10 @@ PREFIX = "[focr-timing]"
 # pipeline; the GOT decode line must be tried before the Unlimited decode line
 # because both start with "decode").
 _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "precision",
+        re.compile(r"^precision (?P<precision>focr-(?:mixed-ffn-int8|full-int8))$"),
+    ),
     ("preprocess", re.compile(r"^preprocess (?P<s>\d+(?:\.\d+)?)s$")),
     ("vision_sam", re.compile(r"^vision\.sam (?P<s>\d+(?:\.\d+)?)s$")),
     ("vision_clip", re.compile(r"^vision\.clip (?P<s>\d+(?:\.\d+)?)s$")),
@@ -236,6 +267,19 @@ def parse_run(stderr_text: str) -> dict:
 
 def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
     groups = m.groupdict()
+    if name == "precision":
+        identity = groups["precision"]
+        entry = stages.get(name)
+        if entry is not None and entry.get("identity") != identity:
+            raise TimingParseError(
+                f"one run emitted conflicting precision identities: "
+                f"{entry.get('identity')!r} vs {identity!r}"
+            )
+        if entry is None:
+            stages[name] = {"identity": identity, "occurrences": 1}
+        else:
+            entry["occurrences"] += 1
+        return
     if name == "decode_phases":
         entry = stages.setdefault(name, {"occurrences": 0})
         for key in ("head", "attn", "experts", "route"):
@@ -284,36 +328,125 @@ def _add(stages: dict[str, dict], name: str, secs: float, tokens: int | None) ->
 
 
 def infer_precision(runs: list[dict]) -> str | None:
-    """`focr-int8` / `focr-f32` when the timing lines themselves prove it.
+    """Return the runtime-declared Unlimited-OCR precision identity.
 
-    The Unlimited-OCR path suffixes its prefill/decode lines with `_i8`; the
-    GOT path's lines carry no precision marker, so `None` is returned and the
-    caller must supply `--precision` (refusing beats guessing).
+    The marker is emitted by the branch that actually owns the decoder cache;
+    filenames, operator flags, and `_i8` suffixes are only consistency proofs.
+    Dense zoo lanes have no Unlimited marker and continue to require an explicit
+    caller precision. Missing or contradictory Unlimited markers fail closed.
     """
-    saw_marked = False
-    saw_int8 = False
+    identities: list[str] = []
+    saw_unlimited = False
     for run in runs:
-        if any(
+        is_zoo = any(
             k in run
             for k in ("got_forward", "smolvlm2_forward", "onechart_forward", "tromr_forward")
-        ):
-            # Zoo-lane timing lines carry no `_i8` marker; their shared-engine
-            # `prefill` fan-out would otherwise read as an UNMARKED f32 claim.
+        )
+        relevant = [run.get(name) for name in ("weight_cache_build", "prefill", "decode_total")]
+        saw_runtime_stage = any(entry is not None for entry in relevant)
+        marker = run.get("precision")
+        if is_zoo and marker is not None:
+            raise TimingParseError("a dense zoo run emitted an Unlimited-OCR precision marker")
+        if is_zoo:
             continue
-        for name in ("prefill", "decode_total", "weight_cache_build"):
-            entry = run.get(name)
-            if entry is None:
-                continue
-            saw_marked = True
-            saw_int8 = saw_int8 or bool(entry.get("int8"))
-    if not saw_marked:
+        if not saw_runtime_stage and marker is None:
+            continue
+        saw_unlimited = True
+        if marker is None:
+            raise TimingParseError(
+                "Unlimited-OCR timing lines lack the runtime precision marker"
+            )
+        identity = marker.get("identity")
+        if identity not in UNLIMITED_PRECISIONS:
+            raise TimingParseError(f"unsupported Unlimited-OCR precision {identity!r}")
+        if any(entry is None for entry in relevant):
+            raise TimingParseError(
+                "Unlimited-OCR precision proof requires cache-build, prefill, and decode timing lines"
+            )
+        marked = [bool(entry.get("int8")) for entry in relevant]
+        if identity == PRECISION_FULL_INT8 and not all(marked):
+            raise TimingParseError(
+                "runtime declared focr-full-int8 but an all-int8 timing suffix is missing"
+            )
+        if identity == PRECISION_MIXED_FFN_INT8 and any(marked):
+            raise TimingParseError(
+                "runtime declared focr-mixed-ffn-int8 but an all-int8 timing suffix is present"
+            )
+        identities.append(identity)
+    if not saw_unlimited:
         return None
-    return "focr-int8" if saw_int8 else "focr-f32"
+    if len(identities) != len(runs) or len(set(identities)) != 1:
+        raise TimingParseError(
+            f"measured runs disagree on runtime precision identity: {identities!r}"
+        )
+    return identities[0]
+
+
+def _truthy(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _validate_unlimited_contract(precision: str, meta: dict) -> None:
+    """Bind a canonical runtime marker to artifact and gate evidence."""
+    if precision not in UNLIMITED_PRECISIONS:
+        return
+    model = meta.get("model")
+    if (
+        not isinstance(model, str)
+        or not model.endswith(".focrq")
+        or meta.get("model_kind") != "file"
+        or not re.fullmatch(r"[0-9a-f]{64}", str(meta.get("model_sha256", "")))
+        or not isinstance(meta.get("model_size"), int)
+        or isinstance(meta.get("model_size"), bool)
+        or meta["model_size"] <= 0
+    ):
+        raise TimingParseError(
+            "canonical Unlimited-OCR evidence requires a hashed regular .focrq subject artifact"
+        )
+    identity = meta.get("model_identity")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"dev", "ino", "size", "mtime_ns", "ctime_ns"}
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in identity.values())
+        or identity["size"] != meta["model_size"]
+    ):
+        raise TimingParseError(
+            "canonical Unlimited-OCR evidence requires a per-run stable model inode receipt"
+        )
+    if meta.get("quant_recipe") != UNLIMITED_QUANT_RECIPE:
+        raise TimingParseError(
+            "canonical Unlimited-OCR evidence requires exact artifact recipe "
+            f"{UNLIMITED_QUANT_RECIPE!r}, got {meta.get('quant_recipe')!r}"
+        )
+    gates = meta.get("precision_gate_states")
+    if not isinstance(gates, dict) or set(gates) != set(PRECISION_GATE_VARS):
+        raise TimingParseError("precision gate evidence is missing or incomplete")
+    risky_presence = ("FOCR_ATTN_GEMM", "FOCR_INT8_KV", "FOCR_SPEC_DECODE", "FOCR_DECODE_STATELESS")
+    armed_risky = [name for name in risky_presence if gates.get(name) != "<unset>"]
+    if armed_risky:
+        raise TimingParseError(
+            "canonical precision evidence forbids presence-gated alternate paths: "
+            + ", ".join(armed_risky)
+        )
+    master = _truthy(gates.get("FOCR_DECODE_INT8"))
+    attn = _truthy(gates.get("FOCR_INT8_ATTN"))
+    lmhead = _truthy(gates.get("FOCR_INT8_LMHEAD"))
+    expected = (False, False, False) if precision == PRECISION_MIXED_FFN_INT8 else (True, True, True)
+    if (master, attn, lmhead) != expected:
+        raise TimingParseError(
+            f"{precision} contradicts recipe gates: "
+            f"FOCR_DECODE_INT8={gates.get('FOCR_DECODE_INT8')!r}, "
+            f"FOCR_INT8_ATTN={gates.get('FOCR_INT8_ATTN')!r}, "
+            f"FOCR_INT8_LMHEAD={gates.get('FOCR_INT8_LMHEAD')!r}"
+        )
 
 
 def _stats(samples_ms: list[float]) -> dict:
     best = min(samples_ms)
     mean = statistics.fmean(samples_ms)
+    ordered = sorted(samples_ms)
+    p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+    p99 = ordered[max(0, math.ceil(0.99 * len(ordered)) - 1)]
     cv_pct = None
     if len(samples_ms) > 1 and mean > 0:
         cv_pct = statistics.stdev(samples_ms) / mean * 100.0
@@ -321,10 +454,206 @@ def _stats(samples_ms: list[float]) -> dict:
         "samples_ms": [round(v, 6) for v in samples_ms],
         "best_ms": round(best, 6),
         "p50_ms": round(statistics.median(samples_ms), 6),
+        "p95_ms": round(p95, 6),
+        "p99_ms": round(p99, 6),
         "mean_ms": round(mean, 6),
         "cv_pct": None if cv_pct is None else round(cv_pct, 3),
         "n": len(samples_ms),
     }
+
+
+def parse_resource_usage(stderr_text: str) -> dict[str, int]:
+    """Parse `/usr/bin/time` RSS output without confusing it with focr timings."""
+    mac_rss = re.search(
+        r"^\s*(?P<value>\d+)\s+maximum resident set size\s*$",
+        stderr_text,
+        re.MULTILINE,
+    )
+    linux_rss = re.search(
+        r"^\s*Maximum resident set size \(kbytes\):\s*(?P<value>\d+)\s*$",
+        stderr_text,
+        re.MULTILINE,
+    )
+    peak_footprint = re.search(
+        r"^\s*(?P<value>\d+)\s+peak memory footprint\s*$",
+        stderr_text,
+        re.MULTILINE,
+    )
+    result: dict[str, int] = {}
+    if mac_rss:
+        result["maximum_resident_set_size_bytes"] = int(mac_rss.group("value"))
+    elif linux_rss:
+        result["maximum_resident_set_size_bytes"] = int(linux_rss.group("value")) * 1024
+    if peak_footprint:
+        result["peak_memory_footprint_bytes"] = int(peak_footprint.group("value"))
+    return result
+
+
+def _byte_stats(samples: list[int]) -> dict:
+    if not samples:
+        raise TimingParseError("no RSS samples to aggregate")
+    ordered = sorted(samples)
+    mean = statistics.fmean(samples)
+    cv_pct = None
+    if len(samples) > 1 and mean > 0:
+        cv_pct = statistics.stdev(samples) / mean * 100.0
+    return {
+        "samples_bytes": samples,
+        "best_bytes": min(samples),
+        "p50_bytes": round(statistics.median(samples), 3),
+        "p95_bytes": ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)],
+        "p99_bytes": ordered[max(0, math.ceil(0.99 * len(ordered)) - 1)],
+        "mean_bytes": round(mean, 3),
+        "cv_pct": None if cv_pct is None else round(cv_pct, 3),
+        "n": len(samples),
+    }
+
+
+def raw_observation(
+    run: dict,
+    wall_ms: float,
+    *,
+    run_id: str,
+    resources: dict[str, int] | None = None,
+) -> dict:
+    """Preserve one measured run before any best/median/CV aggregation."""
+    stages: dict[str, dict] = {}
+    for name, entry in run.items():
+        if name in {"decode_phases", "precision"} or "s" not in entry:
+            continue
+        sample = {"ms": round(float(entry["s"]) * 1000.0, 6)}
+        if entry.get("tokens") is not None:
+            sample["tokens"] = int(entry["tokens"])
+        stages[name] = sample
+    decode = run.get("decode_total")
+    if decode is not None and decode.get("tokens"):
+        stages["decode_per_token"] = {
+            "ms": round(float(decode["s"]) * 1000.0 / int(decode["tokens"]), 6),
+            "tokens": int(decode["tokens"]),
+        }
+    stages["end_to_end"] = {"ms": round(float(wall_ms), 6)}
+    observation = {"run_id": run_id, "stages": stages}
+    if resources:
+        observation["resources"] = resources
+    return observation
+
+
+def _read_bounded(path: str, max_bytes: int = MAX_TIMING_FILE_BYTES) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise TimingParseError(f"timing input is not a regular file: {path}")
+        if before.st_size > max_bytes:
+            raise TimingParseError(
+                f"timing input exceeds {max_bytes} bytes: {path}"
+            )
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > max_bytes:
+                raise TimingParseError(
+                    f"timing input exceeds {max_bytes} bytes while reading: {path}"
+                )
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise TimingParseError(f"timing input changed while being read: {path}")
+        content = b"".join(chunks)
+        if len(content) != before.st_size:
+            raise TimingParseError(f"timing input changed length while reading: {path}")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _bounded_json_bytes(content: bytes, path: str) -> dict:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TimingParseError(f"malformed timing metadata {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise TimingParseError(f"timing metadata is not an object: {path}")
+    return payload
+
+
+def _bounded_meta_names(names, *, prefix: str = "") -> list[str]:
+    measured: list[str] = []
+    pattern = re.compile(re.escape(prefix) + r"run_\d{3}\.meta\.json")
+    for observed, name in enumerate(names, start=1):
+        if observed > MAX_RAW_DIRECTORY_ENTRIES:
+            raise TimingParseError(
+                f"raw directory exceeds {MAX_RAW_DIRECTORY_ENTRIES} entries"
+            )
+        if pattern.fullmatch(name):
+            measured.append(name)
+            if len(measured) > MAX_MEASURED_RUNS:
+                raise TimingParseError(
+                    f"measured run count exceeds {MAX_MEASURED_RUNS}"
+                )
+    return sorted(measured)
+
+
+def _measured_meta_paths(run_dir: str, *, prefix: str = "") -> list[str]:
+    try:
+        with os.scandir(run_dir) as entries:
+            names = _bounded_meta_names(
+                (entry.name for entry in entries), prefix=prefix
+            )
+    except OSError as error:
+        raise TimingParseError(f"cannot enumerate raw timing directory: {error}") from error
+    return [os.path.join(run_dir, name) for name in names]
+
+
+def _checked_evidence_total(current: int, added: int) -> int:
+    total = current + added
+    if added < 0 or total > MAX_TIMING_TOTAL_BYTES:
+        raise TimingParseError(
+            f"raw timing evidence exceeds {MAX_TIMING_TOTAL_BYTES} bytes"
+        )
+    return total
+
+
+def _resolve_threads(requested: int | None, meta_threads: object) -> int:
+    if (
+        not isinstance(meta_threads, int)
+        or isinstance(meta_threads, bool)
+        or meta_threads <= 0
+    ):
+        raise TimingParseError("raw metadata lacks a positive thread count")
+    if requested is not None and requested != meta_threads:
+        raise TimingParseError(
+            f"--threads {requested} contradicts raw metadata threads {meta_threads}"
+        )
+    return meta_threads
+
+
+def _raw_member(run_dir: str, value: object, suffix: str, *, tag: str | None = None) -> str:
+    expected = re.escape(tag) if tag is not None else r"run_\d{3}"
+    if (
+        not isinstance(value, str)
+        or os.path.basename(value) != value
+        or not re.fullmatch(expected + re.escape(suffix), value)
+    ):
+        raise TimingParseError(f"noncanonical raw timing member: {value!r}")
+    return os.path.join(run_dir, value)
 
 
 def aggregate_runs(
@@ -359,7 +688,7 @@ def aggregate_runs(
 
     records: list[dict] = []
     for name in names:
-        if name == "decode_phases":
+        if name in ("decode_phases", "precision"):
             continue
         present = [run[name] for run in runs if name in run]
         if len(present) != len(runs):
@@ -441,70 +770,182 @@ def aggregate_runs(
 
 
 def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return hashlib.sha256(_read_bounded(path)).hexdigest()
 
 
-def _cmd_aggregate(args: argparse.Namespace) -> int:
-    metas = sorted(glob.glob(os.path.join(args.run_dir, "run_*.meta.json")))
+_CAPTURE_INVARIANT_KEYS = (
+    "command",
+    "env_pins",
+    "focr_env",
+    "precision_gate_states",
+    "performance_switch_states",
+    "binary",
+    "binary_sha256",
+    "binary_size",
+    "binary_origin",
+    "build_receipt",
+    "build_receipt_sha256",
+    "page",
+    "page_sha256",
+    "pages",
+    "workload",
+    "model",
+    "model_kind",
+    "model_sha256",
+    "model_size",
+    "model_identity",
+    "quant_recipe",
+    "threads",
+    "warmup",
+    "ab",
+)
+
+
+def _invariant_meta_value(meta: dict, key: str) -> object:
+    value = meta.get(key)
+    if key == "ab" and isinstance(value, dict):
+        return {k: v for k, v in value.items() if k not in ("schedule_index", "arm_run")}
+    return value
+
+
+def _load_capture(run_dir: str, *, prefix: str = "") -> dict:
+    metas = _measured_meta_paths(run_dir, prefix=prefix)
     if not metas:
-        print(f"ERROR: no run_*.meta.json under {args.run_dir}", file=sys.stderr)
-        return 2
+        raise TimingParseError(f"no {prefix}run_*.meta.json under {run_dir}")
 
     runs: list[dict] = []
     wall_ms: list[float] = []
     stdout_hashes: set[str] = set()
-    raw_files: list[str] = []
+    raw_records: list[dict] = []
+    metadata: list[dict] = []
+    rss_bytes: list[int] = []
     meta0: dict = {}
-    for meta_path in metas:
-        with open(meta_path, encoding="utf-8") as f:
-            meta = json.load(f)
+    evidence_bytes = 0
+    for index, meta_path in enumerate(metas, start=1):
+        expected_tag = f"{prefix}run_{index:03d}"
+        if os.path.basename(meta_path) != f"{expected_tag}.meta.json":
+            raise TimingParseError(
+                "measured run metadata must be contiguous: "
+                f"expected {expected_tag}.meta.json"
+            )
+        meta_bytes = _read_bounded(meta_path)
+        meta = _bounded_json_bytes(meta_bytes, meta_path)
+        if meta.get("tag") != expected_tag:
+            raise TimingParseError(
+                f"metadata tag {meta.get('tag')!r} does not match {expected_tag!r}"
+            )
+        stderr_path = _raw_member(
+            run_dir, meta.get("stderr"), ".stderr", tag=expected_tag
+        )
+        stdout_path = _raw_member(
+            run_dir, meta.get("stdout"), ".stdout", tag=expected_tag
+        )
+        stderr_bytes = _read_bounded(stderr_path)
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        stdout_bytes = _read_bounded(stdout_path)
+        evidence_bytes = _checked_evidence_total(
+            evidence_bytes,
+            len(meta_bytes) + len(stderr_bytes) + len(stdout_bytes),
+        )
         if not meta0:
             meta0 = meta
-        stderr_path = os.path.join(args.run_dir, meta["stderr"])
-        with open(stderr_path, encoding="utf-8", errors="replace") as f:
-            stderr_text = f.read()
+        else:
+            drift = [
+                key
+                for key in _CAPTURE_INVARIANT_KEYS
+                if _invariant_meta_value(meta, key)
+                != _invariant_meta_value(meta0, key)
+            ]
+            if drift:
+                raise TimingParseError(
+                    f"{meta_path}: measured-run identity drifted: {', '.join(drift)}"
+                )
         if meta.get("exit_code", 0) != 0:
-            print(
-                f"ERROR: {meta_path}: run exited {meta['exit_code']} — a failed run "
-                "is not perf evidence",
-                file=sys.stderr,
+            raise TimingParseError(
+                f"{meta_path}: run exited {meta['exit_code']} -- a failed run "
+                "is not perf evidence"
             )
-            return 1
+        parsed = parse_run(stderr_text)
         try:
-            runs.append(parse_run(stderr_text))
-        except TimingParseError as err:
-            print(f"ERROR: {stderr_path}: {err}", file=sys.stderr)
-            return 1
-        wall_ms.append(float(meta["wall_ms"]))
-        stdout_path = os.path.join(args.run_dir, meta["stdout"])
-        stdout_hashes.add(sha256_file(stdout_path))
-        raw_files += [meta_path, stderr_path, stdout_path]
-
-    precision = infer_precision(runs)
-    if args.precision:
-        if precision is not None and precision != args.precision:
-            print(
-                f"ERROR: --precision {args.precision} contradicts the timing lines "
-                f"({precision})",
-                file=sys.stderr,
-            )
-            return 1
-        precision = args.precision
-    if precision is None:
-        print(
-            "ERROR: precision not inferable from the timing lines (GOT path) — "
-            "pass --precision focr-int8|focr-f32",
-            file=sys.stderr,
+            wall = float(meta["wall_ms"])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise TimingParseError(f"{meta_path}: invalid wall_ms: {error}") from error
+        if not math.isfinite(wall) or wall <= 0.0:
+            raise TimingParseError(f"{meta_path}: wall_ms must be positive and finite")
+        resources = parse_resource_usage(stderr_text)
+        if "maximum_resident_set_size_bytes" in resources:
+            rss_bytes.append(resources["maximum_resident_set_size_bytes"])
+        runs.append(parsed)
+        wall_ms.append(wall)
+        metadata.append(meta)
+        stdout_hashes.add(hashlib.sha256(stdout_bytes).hexdigest())
+        observation = raw_observation(
+            parsed,
+            wall,
+            run_id=expected_tag,
+            resources=resources,
         )
+        observation["raw_files"] = {
+            "meta": {
+                "path": os.path.basename(meta_path),
+                "sha256": hashlib.sha256(meta_bytes).hexdigest(),
+            },
+            "stderr": {
+                "path": os.path.basename(stderr_path),
+                "sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+            },
+            "stdout": {
+                "path": os.path.basename(stdout_path),
+                "sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+            },
+        }
+        raw_records.append(observation)
+    return {
+        "runs": runs,
+        "wall_ms": wall_ms,
+        "stdout_hashes": stdout_hashes,
+        "raw_records": raw_records,
+        "metadata": metadata,
+        "meta0": meta0,
+        "rss_bytes": rss_bytes,
+        "evidence_bytes": evidence_bytes,
+    }
+
+
+def _resolve_capture_precision(capture: dict, requested: str | None) -> str:
+    precision = infer_precision(capture["runs"])
+    if requested:
+        if precision is not None and precision != requested:
+            raise TimingParseError(
+                f"--precision {requested} contradicts the timing lines ({precision})"
+            )
+        precision = requested
+    if precision is None:
+        raise TimingParseError(
+            "precision not inferable from the timing lines (GOT path) -- "
+            "pass an explicit zoo-lane --precision"
+        )
+    _validate_unlimited_contract(precision, capture["meta0"])
+    return precision
+
+
+def _cmd_aggregate(args: argparse.Namespace) -> int:
+    try:
+        capture = _load_capture(args.run_dir)
+        precision = _resolve_capture_precision(capture, args.precision)
+    except (OSError, TimingParseError) as err:
+        print(f"ERROR: precision contract: {err}", file=sys.stderr)
         return 1
 
-    threads = args.threads if args.threads is not None else meta0.get("threads")
-    if not isinstance(threads, int) or threads <= 0:
-        print("ERROR: positive --threads (or meta threads) required", file=sys.stderr)
+    runs = capture["runs"]
+    wall_ms = capture["wall_ms"]
+    stdout_hashes = capture["stdout_hashes"]
+    raw_records = capture["raw_records"]
+    meta0 = capture["meta0"]
+    try:
+        threads = _resolve_threads(args.threads, meta0.get("threads"))
+    except TimingParseError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
     records = aggregate_runs(
@@ -524,17 +965,43 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
         "command": meta0.get("command"),
         "env_pins": meta0.get("env_pins", {}),
         "focr_env": meta0.get("focr_env", {}),
+        "precision_gate_states": meta0.get("precision_gate_states", {}),
+        "performance_switch_states": meta0.get("performance_switch_states", {}),
         "binary": meta0.get("binary"),
         "binary_sha256": meta0.get("binary_sha256"),
+        "binary_size": meta0.get("binary_size"),
+        "binary_origin": meta0.get("binary_origin"),
+        "build_receipt": meta0.get("build_receipt"),
+        "build_receipt_sha256": meta0.get("build_receipt_sha256"),
         "page": meta0.get("page"),
         "page_sha256": meta0.get("page_sha256"),
+        "pages": meta0.get("pages", []),
+        "workload": meta0.get("workload"),
         "model": meta0.get("model"),
+        "model_kind": meta0.get("model_kind"),
+        "model_sha256": meta0.get("model_sha256"),
+        "model_size": meta0.get("model_size"),
+        "model_identity": meta0.get("model_identity"),
+        "quant_recipe": meta0.get("quant_recipe"),
         "threads": threads,
         "precision": precision,
+        "decode_mode": DECODE_MODE_BY_PRECISION.get(precision),
         "allocator": args.allocator,
         "runs": len(runs),
         "warmup": int(meta0.get("warmup", 0)),
         "stdout_identical_across_runs": len(stdout_hashes) == 1,
+        "resources": {
+            "maximum_resident_set_size": _byte_stats(capture["rss_bytes"])
+        }
+        if len(capture["rss_bytes"]) == len(runs)
+        else None,
+        "raw_timing": {
+            "schema": SCHEMA_RAW_TIMING,
+            "source": "focr",
+            "unit": "ms",
+            "measured_runs": len(raw_records),
+            "records": raw_records,
+        },
         "stages": records,
         "synthetic": args.synthetic,
     }
@@ -556,9 +1023,304 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _balanced_ab_schedule(runs_per_arm: int) -> list[str]:
+    counts = {"a": 0, "b": 0}
+    schedule: list[str] = []
+    block = 0
+    while counts["a"] < runs_per_arm or counts["b"] < runs_per_arm:
+        pattern = ("a", "b", "b", "a") if block % 2 == 0 else ("b", "a", "a", "b")
+        for arm in pattern:
+            if counts[arm] >= runs_per_arm:
+                continue
+            counts[arm] += 1
+            schedule.append(arm)
+        block += 1
+    return schedule
+
+
+def _validate_ab_capture(
+    arm_a: dict,
+    arm_b: dict,
+    *,
+    ab_env: str,
+    a_label: str,
+    a_value: str,
+    b_label: str,
+    b_value: str,
+) -> list[dict]:
+    if len(arm_a["runs"]) != len(arm_b["runs"]):
+        raise TimingParseError("A/B arms have unequal measured-run counts")
+    runs_per_arm = len(arm_a["runs"])
+    if runs_per_arm < MIN_AB_RUNS_PER_ARM:
+        raise TimingParseError(
+            f"A/B capture requires at least {MIN_AB_RUNS_PER_ARM} measured runs per arm, "
+            f"got {runs_per_arm}"
+        )
+
+    expected_identity = {
+        "a": {"label": a_label, "value": a_value},
+        "b": {"label": b_label, "value": b_value},
+    }
+    schedule_rows: list[dict] = []
+    for arm, capture in (("a", arm_a), ("b", arm_b)):
+        for arm_run, meta in enumerate(capture["metadata"], start=1):
+            ab = meta.get("ab")
+            if not isinstance(ab, dict):
+                raise TimingParseError(f"{arm} run {arm_run} lacks an A/B receipt")
+            expected = expected_identity[arm]
+            if (
+                ab.get("env") != ab_env
+                or ab.get("arm") != arm
+                or ab.get("label") != expected["label"]
+                or ab.get("value") != expected["value"]
+                or ab.get("arm_run") != arm_run
+            ):
+                raise TimingParseError(f"{arm} run {arm_run} has contradictory A/B identity")
+            schedule_index = ab.get("schedule_index")
+            if not isinstance(schedule_index, int) or isinstance(schedule_index, bool):
+                raise TimingParseError(f"{arm} run {arm_run} has invalid schedule index")
+            schedule_rows.append(
+                {
+                    "schedule_index": schedule_index,
+                    "arm": arm,
+                    "arm_run": arm_run,
+                    "label": expected["label"],
+                }
+            )
+
+    schedule_rows.sort(key=lambda row: row["schedule_index"])
+    expected_schedule = _balanced_ab_schedule(runs_per_arm)
+    if [row["schedule_index"] for row in schedule_rows] != list(
+        range(1, 2 * runs_per_arm + 1)
+    ):
+        raise TimingParseError("A/B schedule indices are not contiguous")
+    if [row["arm"] for row in schedule_rows] != expected_schedule:
+        raise TimingParseError("A/B run order does not match the balanced interleave")
+
+    varying_keys = {"focr_env", "performance_switch_states", "ab"}
+    common_keys = [key for key in _CAPTURE_INVARIANT_KEYS if key not in varying_keys]
+    drift = [
+        key
+        for key in common_keys
+        if _invariant_meta_value(arm_a["meta0"], key)
+        != _invariant_meta_value(arm_b["meta0"], key)
+    ]
+    if drift:
+        raise TimingParseError(f"cross-arm subject identity drifted: {', '.join(drift)}")
+
+    for map_key in ("focr_env", "performance_switch_states"):
+        maps = []
+        for arm, capture, expected_value in (
+            ("a", arm_a, a_value),
+            ("b", arm_b, b_value),
+        ):
+            value = capture["meta0"].get(map_key)
+            if not isinstance(value, dict):
+                raise TimingParseError(f"{arm} arm lacks {map_key} receipt")
+            observed = value.get(ab_env, "<unset>")
+            if observed != expected_value:
+                raise TimingParseError(
+                    f"{arm} arm {map_key} records {ab_env}={observed!r}, "
+                    f"expected {expected_value!r}"
+                )
+            maps.append({k: v for k, v in value.items() if k != ab_env})
+        if maps[0] != maps[1]:
+            raise TimingParseError(
+                f"cross-arm {map_key} differs outside selected switch {ab_env}"
+            )
+
+    if len(arm_a["rss_bytes"]) != runs_per_arm or len(arm_b["rss_bytes"]) != runs_per_arm:
+        raise TimingParseError("every A/B observation must carry maximum RSS evidence")
+    if len(arm_a["stdout_hashes"]) != 1 or len(arm_b["stdout_hashes"]) != 1:
+        raise TimingParseError("stdout is nondeterministic within an A/B arm")
+    if arm_a["stdout_hashes"] != arm_b["stdout_hashes"]:
+        raise TimingParseError("A/B stdout differs byte-for-byte")
+    return schedule_rows
+
+
+def _ab_arm_document(
+    capture: dict,
+    *,
+    arm: str,
+    label: str,
+    value: str,
+    threads: int,
+    precision: str,
+    allocator: str,
+    synthetic: bool,
+) -> dict:
+    meta = capture["meta0"]
+    stages = aggregate_runs(
+        capture["runs"],
+        capture["wall_ms"],
+        threads=threads,
+        precision=precision,
+        allocator=allocator,
+        warmup_discarded=int(meta.get("warmup", 0)),
+        synthetic=synthetic,
+    )
+    return {
+        "arm": arm,
+        "label": label,
+        "value": value,
+        "runs": len(capture["runs"]),
+        "focr_env": meta.get("focr_env", {}),
+        "performance_switch_states": meta.get("performance_switch_states", {}),
+        "stdout_sha256": next(iter(capture["stdout_hashes"])),
+        "resources": {
+            "maximum_resident_set_size": _byte_stats(capture["rss_bytes"]),
+        },
+        "raw_timing": {
+            "schema": SCHEMA_RAW_TIMING,
+            "source": "focr",
+            "unit": "ms",
+            "measured_runs": len(capture["raw_records"]),
+            "records": capture["raw_records"],
+        },
+        "stages": stages,
+    }
+
+
+def _ab_stage_comparisons(arm_a: dict, arm_b: dict) -> list[dict]:
+    a_by_stage = {record["stage"]: record for record in arm_a["stages"]}
+    b_by_stage = {record["stage"]: record for record in arm_b["stages"]}
+    if set(a_by_stage) != set(b_by_stage):
+        raise TimingParseError("A/B stage sets differ")
+    comparisons = []
+    for stage in a_by_stage:
+        a_p50 = float(a_by_stage[stage]["p50_ms"])
+        b_p50 = float(b_by_stage[stage]["p50_ms"])
+        comparisons.append(
+            {
+                "stage": stage,
+                "a_p50_ms": a_p50,
+                "a_p95_ms": float(a_by_stage[stage]["p95_ms"]),
+                "a_p99_ms": float(a_by_stage[stage]["p99_ms"]),
+                "b_p50_ms": b_p50,
+                "b_p95_ms": float(b_by_stage[stage]["p95_ms"]),
+                "b_p99_ms": float(b_by_stage[stage]["p99_ms"]),
+                "b_minus_a_p50_ms": round(b_p50 - a_p50, 6),
+                "b_vs_a_p50_pct": round((b_p50 - a_p50) / a_p50 * 100.0, 6)
+                if a_p50 > 0.0
+                else None,
+                "a_over_b_speedup": round(a_p50 / b_p50, 6)
+                if b_p50 > 0.0
+                else None,
+            }
+        )
+    return comparisons
+
+
+def _cmd_aggregate_ab(args: argparse.Namespace) -> int:
+    try:
+        if not re.fullmatch(r"FOCR_[A-Z0-9_]+", args.ab_env):
+            raise TimingParseError("--ab-env must be a FOCR_* variable")
+        arm_a = _load_capture(args.run_dir, prefix="a_")
+        arm_b = _load_capture(args.run_dir, prefix="b_")
+        if _checked_evidence_total(
+            arm_a["evidence_bytes"], arm_b["evidence_bytes"]
+        ) < 1:
+            raise TimingParseError("empty A/B evidence")
+        precision_a = _resolve_capture_precision(arm_a, args.precision)
+        precision_b = _resolve_capture_precision(arm_b, args.precision)
+        if precision_a != precision_b:
+            raise TimingParseError("A/B precision labels differ")
+        threads_a = _resolve_threads(args.threads, arm_a["meta0"].get("threads"))
+        threads_b = _resolve_threads(args.threads, arm_b["meta0"].get("threads"))
+        if threads_a != threads_b:
+            raise TimingParseError("A/B thread budgets differ")
+        schedule = _validate_ab_capture(
+            arm_a,
+            arm_b,
+            ab_env=args.ab_env,
+            a_label=args.a_label,
+            a_value=args.a_value,
+            b_label=args.b_label,
+            b_value=args.b_value,
+        )
+        a_doc = _ab_arm_document(
+            arm_a,
+            arm="a",
+            label=args.a_label,
+            value=args.a_value,
+            threads=threads_a,
+            precision=precision_a,
+            allocator=args.allocator,
+            synthetic=args.synthetic,
+        )
+        b_doc = _ab_arm_document(
+            arm_b,
+            arm="b",
+            label=args.b_label,
+            value=args.b_value,
+            threads=threads_b,
+            precision=precision_b,
+            allocator=args.allocator,
+            synthetic=args.synthetic,
+        )
+        comparisons = _ab_stage_comparisons(a_doc, b_doc)
+    except (OSError, TimingParseError, TypeError, ValueError) as error:
+        print(f"ERROR: A/B evidence refused: {error}", file=sys.stderr)
+        return 1
+
+    meta = arm_a["meta0"]
+    doc = {
+        "schema": SCHEMA_AB,
+        "source": "focr",
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run_dir": os.path.abspath(args.run_dir),
+        "workload": meta.get("workload"),
+        "command": meta.get("command"),
+        "pages": meta.get("pages", []),
+        "binary": meta.get("binary"),
+        "binary_sha256": meta.get("binary_sha256"),
+        "binary_size": meta.get("binary_size"),
+        "binary_origin": meta.get("binary_origin"),
+        "build_receipt": meta.get("build_receipt"),
+        "build_receipt_sha256": meta.get("build_receipt_sha256"),
+        "model": meta.get("model"),
+        "model_kind": meta.get("model_kind"),
+        "model_sha256": meta.get("model_sha256"),
+        "model_size": meta.get("model_size"),
+        "model_identity": meta.get("model_identity"),
+        "quant_recipe": meta.get("quant_recipe"),
+        "threads": threads_a,
+        "precision": precision_a,
+        "decode_mode": DECODE_MODE_BY_PRECISION.get(precision_a),
+        "allocator": args.allocator,
+        "warmup": int(meta.get("warmup", 0)),
+        "ab_env": args.ab_env,
+        "schedule": schedule,
+        "cross_arm_output": {
+            "byte_identical": True,
+            "sha256": a_doc["stdout_sha256"],
+        },
+        "arms": {"a": a_doc, "b": b_doc},
+        "comparisons": comparisons,
+        "synthetic": args.synthetic,
+    }
+    with open(args.out, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle, indent=2, sort_keys=False)
+        handle.write("\n")
+    print(
+        json.dumps(
+            {
+                "event": "focr_ab_written",
+                "out": args.out,
+                "workload": meta.get("workload"),
+                "runs_per_arm": len(arm_a["runs"]),
+                "output_byte_identical": True,
+                "synthetic": args.synthetic,
+            }
+        )
+    )
+    return 0
+
+
 # ── self-test ────────────────────────────────────────────────────────────────
 
 _SYNTHETIC_UNLIMITED = """\
+[focr-timing] precision focr-full-int8
 [focr-timing] preprocess 0.12s
 [focr-timing]   vision.sam 1.20s
 [focr-timing]   vision.clip 0.40s
@@ -569,6 +1331,18 @@ _SYNTHETIC_UNLIMITED = """\
 [focr-timing] decode_i8 9.00s (750 tokens, 0.012s/tok)
 [focr-timing] decode_i8 phases (ms): lm_head 1200  attn 2400  experts 4300  route 100
 noise line the parser must ignore
+"""
+
+_SYNTHETIC_UNLIMITED_MIXED = """\
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] preprocess 0.12s
+[focr-timing]   vision.sam 1.20s
+[focr-timing]   vision.clip 0.40s
+[focr-timing]   vision.bridge 0.05s
+[focr-timing] vision_tower 1.65s
+[focr-timing] weight_cache_build 6.10s
+[focr-timing] prefill 2.80s (289 tokens)
+[focr-timing] decode 12.00s (750 tokens, 0.016s/tok)
 """
 
 _SYNTHETIC_GOT = """\
@@ -599,7 +1373,8 @@ def _self_test() -> int:
         if not ok:
             failures.append(name)
 
-    # Unlimited-OCR int8 line set parses stage-for-stage.
+    # Unlimited-OCR full-int8 line set parses stage-for-stage and the runtime
+    # marker agrees with every structural `_i8` suffix.
     run = parse_run(_SYNTHETIC_UNLIMITED)
     check("unlimited-preprocess", math.isclose(run["preprocess"]["s"], 0.12))
     check("unlimited-vision", math.isclose(run["vision_encode"]["s"], 1.65))
@@ -607,7 +1382,41 @@ def _self_test() -> int:
     check("unlimited-decode-tokens", run["decode_total"]["tokens"] == 750)
     check("unlimited-int8-marker", run["decode_total"].get("int8") is True)
     check("unlimited-phases", math.isclose(run["decode_phases"]["experts_ms"], 4300.0))
-    check("unlimited-precision", infer_precision([run]) == "focr-int8")
+    check("unlimited-full-int8-precision", infer_precision([run]) == PRECISION_FULL_INT8)
+
+    mixed_run = parse_run(_SYNTHETIC_UNLIMITED_MIXED)
+    check(
+        "unlimited-mixed-precision",
+        infer_precision([mixed_run]) == PRECISION_MIXED_FFN_INT8,
+    )
+    for name, text in (
+        (
+            "refuses-missing-runtime-precision",
+            _SYNTHETIC_UNLIMITED.replace(
+                "[focr-timing] precision focr-full-int8\n", ""
+            ),
+        ),
+        (
+            "refuses-full-label-on-mixed-lines",
+            _SYNTHETIC_UNLIMITED_MIXED.replace(
+                "focr-mixed-ffn-int8", "focr-full-int8"
+            ),
+        ),
+        (
+            "refuses-mixed-label-on-full-lines",
+            _SYNTHETIC_UNLIMITED.replace("focr-full-int8", "focr-mixed-ffn-int8"),
+        ),
+    ):
+        try:
+            infer_precision([parse_run(text)])
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
+    try:
+        infer_precision([run, mixed_run])
+        check("refuses-cross-run-precision-drift", False)
+    except TimingParseError:
+        check("refuses-cross-run-precision-drift", True)
 
     # GOT line set: the one-line decode breakdown fans out to shared stages.
     got = parse_run(_SYNTHETIC_GOT)
@@ -654,7 +1463,7 @@ def _self_test() -> int:
         [run_a, run_b],
         [15000.0, 15400.0],
         threads=8,
-        precision="focr-int8",
+        precision=PRECISION_FULL_INT8,
         allocator="system",
         warmup_discarded=1,
         synthetic=True,
@@ -667,14 +1476,59 @@ def _self_test() -> int:
     expected_cv = statistics.stdev([12.0, 12.8]) / statistics.fmean([12.0, 12.8]) * 100
     check("agg-per-token-cv", math.isclose(per_tok["cv_pct"], round(expected_cv, 3)))
     check("agg-e2e-best", math.isclose(by_stage["end_to_end"]["best_ms"], 15000.0))
+    check("agg-p95-nearest-rank", _stats([float(v) for v in range(1, 21)])["p95_ms"] == 19.0)
+    check("agg-p99-nearest-rank", _stats([float(v) for v in range(1, 101)])["p99_ms"] == 99.0)
+    check("rss-p99-nearest-rank", _byte_stats(list(range(1, 101)))["p99_bytes"] == 99)
+    try:
+        _validate_ab_capture(
+            {"runs": [run_a] * (MIN_AB_RUNS_PER_ARM - 1)},
+            {"runs": [run_a] * (MIN_AB_RUNS_PER_ARM - 1)},
+            ab_env="FOCR_TEST",
+            a_label="a",
+            a_value="0",
+            b_label="b",
+            b_value="1",
+        )
+        check("refuses-under-sampled-ab", False)
+    except TimingParseError:
+        check("refuses-under-sampled-ab", True)
     check("agg-synthetic-stamp", all(r["synthetic"] for r in records))
+    raw = raw_observation(run_a, 15000.0, run_id="run_001")
+    check(
+        "raw-observation-recomputes-decode-sample",
+        raw["stages"]["decode_per_token"]
+        == {"ms": 12.0, "tokens": 750},
+    )
+    check(
+        "raw-observation-preserves-wall-sample",
+        raw["stages"]["end_to_end"] == {"ms": 15000.0},
+    )
+    mac_resources = parse_resource_usage(
+        "  11677941760  maximum resident set size\n"
+        "   7519610024  peak memory footprint\n"
+    )
+    check(
+        "resource-parser-macos-rss-bytes",
+        mac_resources.get("maximum_resident_set_size_bytes") == 11677941760,
+    )
+    linux_resources = parse_resource_usage(
+        "Maximum resident set size (kbytes): 2048\n"
+    )
+    check(
+        "resource-parser-linux-rss-kib",
+        linux_resources.get("maximum_resident_set_size_bytes") == 2 * 1024 * 1024,
+    )
+    check(
+        "balanced-ab-schedule",
+        _balanced_ab_schedule(5) == ["a", "b", "b", "a", "b", "a", "a", "b", "a", "b"],
+    )
 
     run_drift = parse_run(_SYNTHETIC_UNLIMITED.replace("(750 tokens", "(751 tokens"))
     drift = aggregate_runs(
         [run_a, run_drift],
         [1.0, 1.0],
         threads=8,
-        precision="focr-int8",
+        precision=PRECISION_FULL_INT8,
         allocator="system",
         synthetic=True,
     )
@@ -687,13 +1541,116 @@ def _self_test() -> int:
             [run_a, {"preprocess": {"s": 0.1, "occurrences": 1}}],
             [1.0, 1.0],
             threads=8,
-            precision="focr-int8",
+            precision=PRECISION_FULL_INT8,
             allocator="system",
             synthetic=True,
         )
         check("agg-missing-stage-refused", False)
     except TimingParseError:
         check("agg-missing-stage-refused", True)
+
+    base_meta = {
+        "model": "/models/unlimited-ocr.conservative.focrq",
+        "model_kind": "file",
+        "model_sha256": "a" * 64,
+        "model_size": 4_157_448_783,
+        "model_identity": {
+            "dev": 1,
+            "ino": 2,
+            "size": 4_157_448_783,
+            "mtime_ns": 3,
+            "ctime_ns": 4,
+        },
+        "quant_recipe": UNLIMITED_QUANT_RECIPE,
+        "precision_gate_states": {
+            name: "<unset>" for name in PRECISION_GATE_VARS
+        },
+    }
+    base_meta["precision_gate_states"].update(
+        {
+            "FOCR_DECODE_INT8": "0",
+            "FOCR_INT8_ATTN": "false",
+            "FOCR_INT8_LMHEAD": "off",
+        }
+    )
+    try:
+        _validate_unlimited_contract(PRECISION_MIXED_FFN_INT8, base_meta)
+        check("mixed-contract-accepts-falsy-gates", True)
+    except TimingParseError as err:
+        check("mixed-contract-accepts-falsy-gates", False, error=str(err))
+
+    full_meta = json.loads(json.dumps(base_meta))
+    full_meta["precision_gate_states"].update(
+        {
+            "FOCR_DECODE_INT8": "yes",
+            "FOCR_INT8_ATTN": "1",
+            "FOCR_INT8_LMHEAD": "true",
+        }
+    )
+    try:
+        _validate_unlimited_contract(PRECISION_FULL_INT8, full_meta)
+        check("full-contract-requires-three-truthy-gates", True)
+    except TimingParseError as err:
+        check("full-contract-requires-three-truthy-gates", False, error=str(err))
+
+    for name, mutate in (
+        (
+            "refuses-mixed-truthy-attention-gate",
+            lambda meta: meta["precision_gate_states"].update(FOCR_INT8_ATTN="1"),
+        ),
+        (
+            "refuses-presence-gated-int8-kv",
+            lambda meta: meta["precision_gate_states"].update(FOCR_INT8_KV="0"),
+        ),
+        ("refuses-unhashed-model", lambda meta: meta.update(model_sha256=None)),
+        ("refuses-model-directory", lambda meta: meta.update(model_kind="directory")),
+        ("refuses-missing-quant-recipe", lambda meta: meta.update(quant_recipe=None)),
+        (
+            "refuses-wrong-quant-recipe",
+            lambda meta: meta.update(
+                quant_recipe="unlimited-ocr-full-int8-attn-int8-lmhead-int8-v1"
+            ),
+        ),
+    ):
+        bad = json.loads(json.dumps(base_meta))
+        mutate(bad)
+        try:
+            _validate_unlimited_contract(PRECISION_MIXED_FFN_INT8, bad)
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
+
+    check(
+        "runtime-precision-maps-to-short-decode-mode",
+        DECODE_MODE_BY_PRECISION[PRECISION_MIXED_FFN_INT8] == "mixed-ffn-int8"
+        and DECODE_MODE_BY_PRECISION[PRECISION_FULL_INT8] == "full-int8",
+    )
+    check("raw-thread-label-from-meta", _resolve_threads(None, 8) == 8)
+    try:
+        _resolve_threads(16, 8)
+        check("refuses-thread-override-contradicting-meta", False)
+    except TimingParseError:
+        check("refuses-thread-override-contradicting-meta", True)
+    try:
+        _checked_evidence_total(MAX_TIMING_TOTAL_BYTES, 1)
+        check("refuses-total-evidence-byte-overflow", False)
+    except TimingParseError:
+        check("refuses-total-evidence-byte-overflow", True)
+    try:
+        _bounded_meta_names(
+            f"noise_{index}" for index in range(MAX_RAW_DIRECTORY_ENTRIES + 1)
+        )
+        check("refuses-unbounded-raw-directory-enumeration", False)
+    except TimingParseError:
+        check("refuses-unbounded-raw-directory-enumeration", True)
+    try:
+        _bounded_meta_names(
+            f"run_{index:03d}.meta.json"
+            for index in range(1, MAX_MEASURED_RUNS + 2)
+        )
+        check("refuses-too-many-measured-meta-files", False)
+    except TimingParseError:
+        check("refuses-too-many-measured-meta-files", True)
 
     if failures:
         print(f"SELF-TEST FAILED: {failures}", file=sys.stderr)
@@ -710,18 +1667,41 @@ def main() -> int:
     agg.add_argument("--run-dir", required=True)
     agg.add_argument("--out", required=True)
     agg.add_argument("--threads", type=int, default=None)
-    agg.add_argument("--precision", default=None, help="focr-int8|focr-f32 (GOT path only)")
+    agg.add_argument(
+        "--precision",
+        default=None,
+        help=(
+            "caller identity for marker-less zoo lanes; Unlimited-OCR must emit "
+            "focr-mixed-ffn-int8 or focr-full-int8 at runtime"
+        ),
+    )
     agg.add_argument("--allocator", default="system")
     agg.add_argument(
         "--synthetic",
         action="store_true",
         help="stamp records synthetic (self-test stubs; gauntlet_row.py refuses them)",
     )
+    ab = sub.add_parser(
+        "aggregate-ab", help="aggregate a strict interleaved A/B gauntlet run dir"
+    )
+    ab.add_argument("--run-dir", required=True)
+    ab.add_argument("--out", required=True)
+    ab.add_argument("--threads", type=int, default=None)
+    ab.add_argument("--precision", default=None)
+    ab.add_argument("--allocator", default="system")
+    ab.add_argument("--ab-env", required=True)
+    ab.add_argument("--a-label", required=True)
+    ab.add_argument("--a-value", required=True)
+    ab.add_argument("--b-label", required=True)
+    ab.add_argument("--b-value", required=True)
+    ab.add_argument("--synthetic", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
     if args.cmd == "aggregate":
         return _cmd_aggregate(args)
+    if args.cmd == "aggregate-ab":
+        return _cmd_aggregate_ab(args)
     parser.print_help()
     return 2
 

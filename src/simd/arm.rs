@@ -87,6 +87,18 @@ pub enum ArmTier {
     None,
 }
 
+/// The implementation actually executed by the dense int8 GEMM entrypoints.
+/// This is deliberately separate from [`ArmTier`], which describes hardware
+/// capability: Apple hosts can expose SDOT while the measured winner is the
+/// LLVM-autovectorized scalar loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DenseI8Route {
+    Autovec,
+    Scalar,
+    Sdot,
+    Smmla,
+}
+
 /// Detect the int8 tier this CPU should dispatch to (cached after first call).
 ///
 /// On non-AArch64 builds this is always [`ArmTier::None`].
@@ -113,8 +125,8 @@ pub enum ArmTier {
 /// SDOT tile pays per-call packing/setup the fused autovec loop never does.
 ///
 /// SCOPED to `igemm_s8s8`/`igemm_u8s8` ONLY: `detect_tier()` still reports
-/// SDOT (the truthful hardware answer for `robot backends`/selftest), the
-/// int4 packed path keeps its SDOT kernels (its scalar fallback is the
+/// SDOT as the hardware tier while the effective route is reported separately,
+/// the int4 packed path keeps its SDOT kernels (its scalar fallback is the
 /// ledgered 5.8x-slower unpack path), and the offline-SMMLA packed-B path
 /// is unaffected. `FOCR_INT8_AUTOVEC=0` restores the SDOT dispatch.
 fn autovec_preferred() -> bool {
@@ -126,10 +138,34 @@ fn autovec_preferred() -> bool {
                 std::env::var("FOCR_INT8_AUTOVEC").ok().as_deref(),
                 Some("0") | Some("off") | Some("false") | Some("no")
             )
-            // An explicit tier override (bench A/Bs, the selftest sweep)
-            // must keep meaning what it says.
-            && std::env::var_os("FOCR_FORCE_ARCH").is_none()
+            // An honored tier override (bench A/Bs, the selftest sweep) must
+            // keep meaning what it says. Unknown or unavailable tags are
+            // ignored without silently switching autovec off.
+            && !force_arch_honored()
     })
+}
+
+fn force_arch_honored() -> bool {
+    let Ok(force) = std::env::var("FOCR_FORCE_ARCH") else {
+        return false;
+    };
+    matches!(
+        (force.trim().to_ascii_lowercase().as_str(), detect_tier()),
+        ("smmla", ArmTier::Smmla) | ("sdot", ArmTier::Sdot) | ("scalar", ArmTier::None)
+    )
+}
+
+/// Effective implementation selected for ordinary row-major dense int8 GEMM.
+/// Packed int4 and offline-SMMLA-panel entrypoints have separate dispatch and
+/// must not use this label.
+#[must_use]
+pub(crate) fn effective_dense_route() -> DenseI8Route {
+    match detect_tier() {
+        ArmTier::Smmla => DenseI8Route::Smmla,
+        ArmTier::Sdot if autovec_preferred() => DenseI8Route::Autovec,
+        ArmTier::Sdot => DenseI8Route::Sdot,
+        ArmTier::None => DenseI8Route::Scalar,
+    }
 }
 
 pub fn detect_tier() -> ArmTier {
@@ -195,6 +231,19 @@ fn detect_tier_uncached() -> ArmTier {
 /// shape/contract violation is a programming error, caught early — matches the
 /// scalar reference's asserts).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let _ = igemm_s8s8_with_route(a, b, m, k, n, out);
+}
+
+/// [`igemm_s8s8`] plus the implementation branch that actually produced the
+/// result. Used by `robot selftest` so route evidence is execution-derived.
+pub(crate) fn igemm_s8s8_with_route(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) -> DenseI8Route {
     let a_len = scalar::checked_len("igemm_s8s8", m, k, "m*k");
     let b_len = scalar::checked_len("igemm_s8s8", n, k, "n*k");
     let out_len = scalar::checked_len("igemm_s8s8", m, n, "m*n");
@@ -227,13 +276,13 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
                 // SAFETY: reached only when `is_aarch64_feature_detected!("i8mm")`
                 // returned true in `detect_tier`, so SMMLA/i8mm is present.
                 unsafe { aarch64_impl::igemm_s8s8_smmla(a, b, m, k, n, out) };
-                return;
+                return DenseI8Route::Smmla;
             }
             ArmTier::Sdot => {
                 if !autovec_preferred() {
                     // SAFETY: reached only when `dotprod` was runtime-detected.
                     unsafe { aarch64_impl::igemm_s8s8_sdot(a, b, m, k, n, out) };
-                    return;
+                    return DenseI8Route::Sdot;
                 }
                 // fall through: the autovec scalar loop wins on this host
                 // (bd-2mo.5.1; bit-identical — integer math, exact).
@@ -243,6 +292,13 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
     }
 
     scalar::igemm_s8s8(a, b, m, k, n, out);
+    match detect_tier() {
+        // The SDOT branch returned above unless autovec was selected, so this
+        // fallthrough itself is the execution evidence.
+        ArmTier::Sdot => DenseI8Route::Autovec,
+        ArmTier::None => DenseI8Route::Scalar,
+        ArmTier::Smmla => unreachable!("SMMLA branch must return before scalar fallback"),
+    }
 }
 
 /// S8S8 GEMM whose B is an OFFLINE SMMLA panel stream (`focr convert --arch
@@ -314,6 +370,19 @@ pub fn igemm_s8s8_packed_b(
 /// # Panics
 /// As [`igemm_s8s8`].
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let _ = igemm_u8s8_with_route(a, b, m, k, n, out);
+}
+
+/// [`igemm_u8s8`] plus the implementation branch that actually produced the
+/// result. Used by `robot selftest` alongside the signed-domain trace.
+pub(crate) fn igemm_u8s8_with_route(
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) -> DenseI8Route {
     let a_len = scalar::checked_len("igemm_u8s8", m, k, "m*k");
     let b_len = scalar::checked_len("igemm_u8s8", n, k, "n*k");
     let out_len = scalar::checked_len("igemm_u8s8", m, n, "m*n");
@@ -377,11 +446,21 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
                     *cell += 128 * rowsum[c];
                 }
             }
-            return;
+            return match tier {
+                ArmTier::Smmla => DenseI8Route::Smmla,
+                ArmTier::Sdot => DenseI8Route::Sdot,
+                ArmTier::None => unreachable!(),
+            };
         }
     }
 
     scalar::igemm_u8s8(a, b, m, k, n, out);
+    match detect_tier() {
+        // The intrinsic branch returned above unless autovec was selected.
+        ArmTier::Sdot => DenseI8Route::Autovec,
+        ArmTier::None => DenseI8Route::Scalar,
+        ArmTier::Smmla => unreachable!("SMMLA branch must return before scalar fallback"),
+    }
 }
 
 /// Native packed-int4 GEMM (bd-1azu.22) — the ARM tier dispatch.

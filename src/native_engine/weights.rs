@@ -13,8 +13,8 @@
 //!   with the `franken_whisper` ggml/safetensors parser pattern: keep one
 //!   backing blob, validate the magic, parse the header, then index the payload
 //!   by byte range — no per-tensor copies until an accessor asks. The backing is
-//!   a read-only mmap by default and an owned `Vec<u8>` when `FOCR_NO_MMAP=1` is
-//!   set or mapping fails.
+//!   an owned `Vec<u8>` by default. `FOCR_MMAP=1` explicitly opts into a read-only
+//!   mmap for immutable, trusted artifacts.
 //!
 //! * The **safetensors fallback**: the upstream 6.67 GB bf16 shard, so weights
 //!   can load before the quantizer/converter exists. Standard safetensors
@@ -35,12 +35,14 @@
 //! checkpoint is rejected at load time with [`FocrError::FormatMismatch`], not
 //! surfaced later as garbage OCR output.
 //!
-//! Memory mapping note: `Weights::load` uses a read-only `memmap2` mapping by
-//! default, so large artifacts page in lazily and can reuse the OS page cache
-//! across runs. The owned `Vec<u8>` path remains the parser core for tests,
-//! converters, `FOCR_NO_MMAP=1`, and filesystems where mapping fails.
+//! Memory mapping note: `Weights::load` defaults to owned bytes because a mapped
+//! file that another process truncates can fault the process. `FOCR_MMAP=1` opts
+//! into `memmap2` only for deployment envelopes where the artifact inode is
+//! immutable for the lifetime of the process. Mapping failures still fall back
+//! to owned bytes.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use half::bf16;
@@ -143,6 +145,19 @@ pub const FOCRQ_MAGIC: &[u8; 6] = b"FOCRQ\0";
 /// layout than this binary understands), per the plan's
 /// "loader refuses version > binary's".
 pub const FOCRQ_FORMAT_VERSION: u32 = 1;
+
+/// Highest defined `.focrq` architecture-target byte in format v1.
+const MAX_ARCH_TARGET: u8 = 3;
+
+/// Validate that an on-disk architecture target is one of the closed v1 enum.
+pub(super) fn validate_arch_target(arch_target: u8) -> FocrResult<()> {
+    if arch_target <= MAX_ARCH_TARGET {
+        return Ok(());
+    }
+    Err(FocrError::FormatMismatch(format!(
+        ".focrq arch_target {arch_target} is unsupported; format v1 defines only 0..={MAX_ARCH_TARGET}"
+    )))
+}
 
 /// On-disk element dtype of a stored tensor ([SPEC §7] dtype set).
 ///
@@ -350,8 +365,8 @@ impl TensorView<'_> {
 /// The loaded weight set for one model: the whole backing blob plus the tensor
 /// directory indexing it by byte range (PROPOSED_ARCHITECTURE.md §6.12).
 ///
-/// `bytes` holds one backing blob: a read-only mmap by default, or an owned
-/// buffer for tests, converters, `FOCR_NO_MMAP=1`, and mmap-failure fallback.
+/// `bytes` holds one backing blob: an owned buffer by default, or an explicitly
+/// opted-in read-only mmap for trusted immutable artifacts.
 /// For `.focrq` the directory's byte offsets are payload-relative, so
 /// `payload_base` records where the payload begins inside `bytes`; for
 /// safetensors the same field points just past the header. Every accessor
@@ -378,12 +393,9 @@ pub struct Weights {
     is_focrq: bool,
 }
 
-/// The weight blob's storage: an owned buffer (tests, converters, the
-/// `FOCR_NO_MMAP=1` kill-switch / mmap-failure fallback) or a read-only
-/// memory map (the default load path, bd-2mo.22) — 3.6 GB artifacts page in
-/// lazily instead of being fully read per CLI invocation, and the OS page
-/// cache is shared across runs. Both deref to `&[u8]`; every reader below is
-/// backing-agnostic.
+/// The weight blob's storage: an owned buffer (the safe default) or a read-only
+/// memory map explicitly requested with `FOCR_MMAP=1`. Both deref to `&[u8]`;
+/// every reader below is backing-agnostic.
 enum Backing {
     /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
     Owned(Vec<u8>),
@@ -419,17 +431,25 @@ mod mmap_island {
     ///
     /// # Safety argument
     /// `Mmap::map` is `unsafe` because another process truncating the file
-    /// mid-use is UB. The supported envelope makes that unreachable in
-    /// practice: model artifacts are immutable-once-written by the pull /
-    /// convert contract (writers create a fresh file and rename), the map is
-    /// read-only, and the same concurrent-mutation caveat already applied to
-    /// the read-to-Vec path as data corruption. `FOCR_NO_MMAP=1` restores the
-    /// owned-bytes path for hosts/filesystems outside that envelope.
+    /// mid-use can fault later accesses. Production does not enter this island
+    /// by default. `FOCR_MMAP=1` is an explicit operator assertion that the
+    /// already-open artifact inode is trusted and immutable for the process
+    /// lifetime (for example, a read-only image layer). Mapping is read-only and
+    /// callers retain the descriptor-backed mapping for its full use.
     pub(super) fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
-        // SAFETY: read-only mapping of an immutable-by-contract artifact; see
-        // the function doc for the envelope.
+        // SAFETY: the explicit opt-in asserts an immutable artifact inode; see
+        // the function doc for the complete deployment envelope.
         unsafe { memmap2::Mmap::map(file) }
     }
+}
+
+pub(super) fn mmap_requested() -> bool {
+    std::env::var("FOCR_MMAP").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        )
+    })
 }
 
 impl Default for Weights {
@@ -457,8 +477,9 @@ impl Weights {
     /// Load a `.focrq` blob, or fall back to a raw safetensors shard, from
     /// `path`.
     ///
-    /// A read-only mmap is attempted first unless `FOCR_NO_MMAP=1` is set; any
-    /// mmap failure falls back to an owned `Vec<u8>`. The magic decides the
+    /// The safe default reads an owned `Vec<u8>`. `FOCR_MMAP=1` attempts a
+    /// read-only mmap for a trusted immutable artifact; any mmap failure still
+    /// falls back to owned bytes. The magic decides the
     /// format (`b"FOCRQ\0"` → `.focrq`, the safetensors `u64`
     /// header-length prefix otherwise). The census is NOT run here (the caller
     /// supplies the expected name set via [`Weights::load_with_census`]); a
@@ -470,19 +491,47 @@ impl Weights {
     ///   version newer than this binary, or a directory that overruns the
     ///   payload.
     pub fn load(path: &Path) -> FocrResult<Self> {
-        // Default: read-only mmap (bd-2mo.22) — lazy page-in + cross-run page
-        // cache instead of a full multi-GB read per invocation. Kill-switch
-        // `FOCR_NO_MMAP=1` (or any mmap failure) restores the owned read.
-        if std::env::var_os("FOCR_NO_MMAP").is_none()
-            && let Ok(file) = std::fs::File::open(path)
-            && let Ok(map) = mmap_island::map_readonly(&file)
-        {
-            return Self::from_backing(Backing::Mapped(map));
-        }
-        let bytes = std::fs::read(path).map_err(|e| {
+        let file = std::fs::File::open(path).map_err(|e| {
             FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
         })?;
-        Self::from_bytes(bytes)
+        Self::load_opened(file, path)
+    }
+
+    /// Load from an already-open model file without consulting `path` again.
+    ///
+    /// Production model loading uses this after validating the same descriptor's
+    /// bounded header. Keeping the descriptor pinned across validation and mmap /
+    /// owned fallback prevents a path or symlink swap from substituting different
+    /// bytes between those two steps.
+    pub(super) fn load_opened(file: std::fs::File, path: &Path) -> FocrResult<Self> {
+        Self::load_opened_with_mmap_policy(file, path, mmap_requested())
+    }
+
+    fn load_opened_with_mmap_policy(
+        mut file: std::fs::File,
+        path: &Path,
+        mmap_requested: bool,
+    ) -> FocrResult<Self> {
+        if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
+            return Self::from_backing(Backing::Mapped(map));
+        }
+
+        // Header validation advances the descriptor offset. Rewind this SAME
+        // open file before the owned fallback; reopening `path` here would
+        // reintroduce the validation/load TOCTOU that this API exists to close.
+        file.seek(SeekFrom::Start(0)).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        let capacity = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        Self::from_backing(Backing::Owned(bytes))
     }
 
     /// Load and immediately run the WeightsManifest census against
@@ -515,7 +564,7 @@ impl Weights {
 
     /// Test-only probe: did this load take the mmap backing?
     #[cfg(test)]
-    fn is_mapped(&self) -> bool {
+    pub(super) fn is_mapped(&self) -> bool {
         matches!(self.bytes, Backing::Mapped(_))
     }
 
@@ -597,6 +646,7 @@ impl Weights {
         } else {
             preamble_arch
         };
+        validate_arch_target(arch_target)?;
         validate_directory(&header.tensors, payload_len, arch_target)?;
         let source_sha256 = if header.source_sha256.is_empty() {
             preamble_sha
@@ -1121,6 +1171,61 @@ fn validate_directory(
             )));
         }
     }
+    validate_non_overlapping_ranges(directory)?;
+    Ok(())
+}
+
+/// Reject aliased tensor-data and quantization-scale intervals.
+///
+/// The v1 format has no `alias_of` field, so every non-empty payload range must
+/// be disjoint. Keeping this check shared ensures the bounded production header
+/// probe and the full mmap/owned parser enforce the same structural contract.
+pub(super) fn validate_non_overlapping_ranges(
+    directory: &BTreeMap<String, TensorRecord>,
+) -> FocrResult<()> {
+    let mut ranges = Vec::with_capacity(directory.len().saturating_mul(2));
+    for (name, record) in directory {
+        let data_end = record
+            .byte_offset
+            .checked_add(record.byte_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
+            })?;
+        if record.byte_len != 0 {
+            ranges.push((record.byte_offset, data_end, name.as_str(), "data"));
+        }
+
+        let scales_end = record
+            .scales_offset
+            .checked_add(record.scales_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} scales range overflows"))
+            })?;
+        if record.scales_len != 0 {
+            ranges.push((record.scales_offset, scales_end, name.as_str(), "scales"));
+        }
+    }
+
+    ranges.sort_unstable_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    for pair in ranges.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        if current.0 < previous.1 {
+            return Err(FocrError::FormatMismatch(format!(
+                "payload ranges overlap: tensor {:?} {} [{}, {}) overlaps tensor {:?} {} [{}, {})",
+                previous.2,
+                previous.3,
+                previous.0,
+                previous.1,
+                current.2,
+                current.3,
+                current.0,
+                current.1,
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1154,7 +1259,9 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 )));
             }
             Ok(data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect())
         }
@@ -1168,7 +1275,9 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
             // half::bf16 -> f32 is exact (bf16 is the high 16 bits of f32);
             // PROPOSED_ARCHITECTURE.md §6.12: widen BF16→f32, never narrow.
             Ok(data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect())
         }
@@ -1187,7 +1296,9 @@ fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
         )));
     }
     Ok(data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
@@ -1862,6 +1973,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_arch_target() {
+        let payload = bf16_le_bytes(&[1.0]);
+        let dir = format!(
+            "{{\"x\":{{\"dtype\":\"BF16\",\"shape\":[1],\"byte_offset\":0,\"byte_len\":{}}}}}",
+            payload.len()
+        );
+        let blob = build_focrq(1, MAX_ARCH_TARGET + 1, [0u8; 32], &dir, &payload);
+        let err = Weights::from_bytes(blob).expect_err("unknown arch target must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(err.to_string().contains("arch_target 4 is unsupported"));
+    }
+
+    #[test]
     fn rejects_directory_overrunning_payload() {
         // byte_len claims 100 bytes but payload only has 4.
         let payload = bf16_le_bytes(&[1.0, 2.0]); // 4 bytes
@@ -1879,6 +2003,32 @@ mod tests {
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let err = Weights::from_bytes(blob).unwrap_err();
         assert!(format!("{err}").contains("shape×dtype") || format!("{err}").contains("overruns"));
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_data_ranges_at_load_time() {
+        let dir = "{\"a\":{\"dtype\":\"BF16\",\"shape\":[2],\"byte_offset\":0,\"byte_len\":4},\
+             \"b\":{\"dtype\":\"BF16\",\"shape\":[2],\"byte_offset\":0,\"byte_len\":4}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &[0u8; 4]);
+        let err = Weights::from_bytes(blob).expect_err("aliased tensor data must fail");
+        let text = err.to_string();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(text.contains("payload ranges overlap"), "{text}");
+        assert!(text.contains("\"a\" data"), "{text}");
+        assert!(text.contains("\"b\" data"), "{text}");
+    }
+
+    #[test]
+    fn rejects_tensor_data_and_scale_alias_at_load_time() {
+        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[1,4],\
+             \"byte_offset\":0,\"byte_len\":4,\"scales_offset\":0,\"scales_len\":4}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &[0u8; 4]);
+        let err = Weights::from_bytes(blob).expect_err("aliased data/scales must fail");
+        let text = err.to_string();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(text.contains("payload ranges overlap"), "{text}");
+        assert!(text.contains("\"q\" data"), "{text}");
+        assert!(text.contains("\"q\" scales"), "{text}");
     }
 
     #[test]
@@ -2087,10 +2237,8 @@ mod tests {
         );
     }
 
-    /// bd-2mo.22: the default load path memory-maps the artifact, and the
-    /// mapped view is BYTE-IDENTICAL to the owned read — every tensor, every
-    /// scale, the whole directory. (The `FOCR_NO_MMAP=1` kill-switch and the
-    /// mmap-failure fallback share the owned path this compares against.)
+    /// bd-2mo.22: the explicitly opted-in mapped view is BYTE-IDENTICAL to the
+    /// safe default owned read — every tensor, every scale, the whole directory.
     #[test]
     fn mmap_load_is_byte_identical_to_owned_read() {
         let (n, k) = (3usize, 5usize);
@@ -2110,11 +2258,15 @@ mod tests {
         tmp.push(format!("focr_mmap_eq_{}.focrq", std::process::id()));
         std::fs::write(&tmp, &blob).expect("write temp artifact");
 
-        let mapped = Weights::load(&tmp).expect("mmap load");
+        let owned_default = Weights::load(&tmp).expect("default owned load");
         assert!(
-            mapped.is_mapped() || std::env::var_os("FOCR_NO_MMAP").is_some(),
-            "default load must take the mmap backing"
+            !owned_default.is_mapped() || mmap_requested(),
+            "load may map only after explicit opt-in"
         );
+        let file = std::fs::File::open(&tmp).expect("reopen temp artifact");
+        let mapped =
+            Weights::load_opened_with_mmap_policy(file, &tmp, true).expect("explicit mmap load");
+        assert!(mapped.is_mapped(), "explicit mmap policy must map");
         let owned = Weights::from_bytes(blob).expect("owned parse");
 
         let a: Vec<&str> = mapped.names().collect();

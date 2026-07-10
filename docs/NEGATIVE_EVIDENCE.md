@@ -545,6 +545,326 @@ claims.
   agent: opus-4.8 (decode-attention lever sweep)
   evidence dir: artifacts/perf/bd-1waa/
 
+2026-07-09 | NEGATIVE(reverted) | on-the-fly BF16 widening for conservative decode q/k/v/o projections and `lm_head` (`src/native_engine/decoder.rs`)
+  claim_id: CLAIM-bd-2mo30-bf16-streaming-decode   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-bf16-stream/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592 (4,157,448,783 bytes; 2,148 FFN/expert QInt8 tensors; attention and lm_head BF16)
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2 (495 generated tokens)
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe worktree
+  CPU feature string: Apple M4 arm64, 10 physical cores; high-precision GEMV uses the scalar eight-lane reduction that LLVM autovectorizes (no FOCR_FORCE_ARCH override)
+  exact command + env:
+    six adjacent runs in order `FOCR_BF16_STREAM=0,1,1,0,0,1`, each:
+    `FOCR_BF16_STREAM=<mode> FOCR_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: `FOCR_BF16_STREAM=0` eagerly widens high-precision decoder weights once into the mixed cache; `=1` retains source BF16 words and widens exactly during each dot product. FOCR_DECODE_INT8/FOCR_INT8_ATTN/FOCR_INT8_LMHEAD unset; allocator=system; conservative FFN-only int8 recipe active.
+  measured before -> after vs reference:
+    local focr-only interleaved A/B (no pinned torch CPU reference ratio): eager-f32 decode 14.05/13.94/13.89 s, median 13.94 s -> streamed-BF16 14.47/14.61/14.58 s, median 14.58 s = 4.59% slower (0.956x throughput). Median lm_head phase 4,783 -> 5,139 ms (+7.44%); attention phase 5,592 -> 5,876 ms (+5.08%). Untouched expert/route phases remained stable. Whole-page real time median 19.69 -> 20.34 s (+3.30%). Score is negative despite reducing the high-precision cache by about 156 MB.
+  bit-exact correctness proof:
+    the experimental unit gate compared every f32 output bit against eager widening under the same eight-lane reduction; all six end-to-end Markdown outputs are byte-identical, sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a. Correctness passed, performance failed.
+  disposition: REVERT (implementation and kill switch removed; evidence retained)
+  do-not-retry: "do not stream BF16 through scalar per-element widening in decode GEMVs. Retry only with a native BF16 matrix/dot kernel that consumes packed BF16 and amortizes conversion while preserving the accepted decode accuracy contract; a memory-only argument is insufficient."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-bf16-stream/
+
+2026-07-10 | WIN | bit-exact parallel independent-head scheduling in scalar R-SWA decode attention (`src/native_engine/rswa.rs::decode_attention_scalar_parallel`)
+  claim_id: CLAIM-bd-2mo30-rswa-parallel-heads   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-rswa-par-heads/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2; page_0590.png sha256 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe worktree
+  CPU feature string: Apple M4 arm64, `RAYON_NUM_THREADS=8`; R-SWA kernel is f32 scalar/autovectorized math, parallelized only across ten independent heads
+  exact command + env:
+    normal-page runs in order `FOCR_RSWA_PARALLEL_ATTN=0,1,1,0,0,1`, each:
+    `FOCR_RSWA_PARALLEL_ATTN=<mode> FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+    sentinel command is identical except `page_0590.png`, one complete run per mode.
+  fallback / kill-switch state: default `FOCR_RSWA_PARALLEL_ATTN=1` schedules the ten disjoint heads across Rayon; `=0|off|false|no` restores the serial oracle. `FOCR_ATTN_GEMM` and `FOCR_INT8_KV` unset throughout; system allocator.
+  measured before -> after vs reference:
+    local focr-only interleaved A/B (no pinned torch CPU reference ratio): normal-page median decode 15.11 -> 14.19 s (-6.09%, 1.065x); median profiled attention 6,080 -> 5,254 ms (-13.59%, 1.157x). All three adjacent comparisons favored parallel: decode -6.28%, -1.52%, -6.34%. On the full 32,768-token sentinel, decode 928.81 -> 884.20 s (-4.80%, 1.050x) and attention 364,725 -> 317,677 ms (-12.90%, 1.148x). The sentinel's shared max-length runaway is an independent baseline release blocker (`bd-2mo.30.12`), not an optimization divergence.
+  bit-exact correctness proof:
+    serial and parallel call the same extracted per-head body; every within-head `dot`, reference-then-ring online-softmax fold, accumulator update, and normalization retains its original order, and heads write disjoint 128-float lanes. Focused unit gate `parallel_heads_are_bit_identical_to_serial` passed. All six page_0014 outputs are byte-identical (sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a), and both complete 32,768-token page_0590 outputs are byte-identical (92,028 bytes, sha256 23d9e8b353ac2b2884943019a031eb91f00a39f0610fc1082a94af98ba7b7123).
+  disposition: KEEP (parallel default; serial deterministic fallback retained)
+  do-not-retry: "do not parallelize inside a head or reorder its online-softmax fold. Further R-SWA work may tile or prefetch only if it preserves the per-key reduction order and independently clears the page_0590 byte-identity sentinel."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-rswa-par-heads/
+
+2026-07-10 | NEGATIVE(reverted) | scalar adjacent-row interleave for the high-precision `lm_head` (`src/native_engine/decoder.rs` experiment)
+  claim_id: CLAIM-bd-2mo30-lmhead-row-interleave   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-lmhead-row-interleave/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2 (495 generated tokens)
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe and parallel-R-SWA worktree
+  CPU feature string: Apple M4 arm64, `RAYON_NUM_THREADS=8`; high-precision head uses LLVM-autovectorized f32 math
+  exact command + env:
+    six runs in order `FOCR_LMHEAD_ROW_INTERLEAVE=1,2,4,4,2,1`, each:
+    `FOCR_LMHEAD_ROW_INTERLEAVE=<rows> FOCR_RSWA_PARALLEL_ATTN=1 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: experimental `rows=1` selected the original one-row-at-a-time `gemv`; rows 2/4 walked each activation lane once while maintaining independent eight-lane accumulators. FOCR_LMHEAD_SHARD unset; system allocator.
+  measured before -> after vs reference:
+    local focr-only reverse-order A/B (two samples/mode; no pinned torch CPU ratio): baseline rows=1 median decode 12.715 s and lm_head 4,905.5 ms. Rows=2: 14.34 s/+12.78% decode and 6,329 ms/+29.02% lm_head. Rows=4: 14.60 s/+14.82% decode and 6,829 ms/+39.21% lm_head. Whole-page real-time medians regressed 18.71 -> 20.22/20.38 s. Both experimental widths lost in both order directions.
+  bit-exact correctness proof:
+    focused `lmhead_interleaved_rows_are_byte_identical_to_monolithic` covered scalar tails, partial row groups, and the 64-row Rayon boundary; all six Markdown outputs are byte-identical (530 bytes, sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a). Correctness passed, performance failed.
+  disposition: REVERT (kernel, environment switch, and focused experiment test removed; evidence retained)
+  do-not-retry: "do not retry the scalar nested-row loop. Reconsider adjacent-row reuse only as a native microkernel after inspecting generated vector code and proving that activation-load reduction exceeds accumulator pressure."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-lmhead-row-interleave/
+
+2026-07-10 | NEGATIVE(reverted) | sequential contiguous vocabulary tiling for the high-precision `lm_head` (`FOCR_LMHEAD_SHARD`)
+  claim_id: CLAIM-bd-2mo30-lmhead-vocab-tiles   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-lmhead-vocab-tiles/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2 (495 generated tokens)
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe and parallel-R-SWA worktree
+  CPU feature string: Apple M4 arm64, `RAYON_NUM_THREADS=8`; each tile retains the same LLVM-autovectorized f32 per-row dot
+  exact command + env:
+    five runs in order `monolithic,tiles=2,tiles=8,tiles=32,monolithic`, each:
+    `FOCR_LMHEAD_SHARD=<unset|1> FOCR_LMHEAD_SHARD_TILES=<2|8|32> FOCR_RSWA_PARALLEL_ATTN=1 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: `FOCR_LMHEAD_SHARD` unset selects the monolithic 64-row Rayon schedule; setting it enables sequential contiguous tiles. `FOCR_RSWA_PARALLEL_ATTN=1`; system allocator.
+  measured before -> after vs reference:
+    local focr-only bracketed sweep (one sample per tile count, two monolithic brackets; no pinned torch CPU ratio): monolithic median decode 12.965 s/lm_head 5,035.5 ms/real 18.93 s. Tiles=2: 13.13 s/+1.27%, 5,163 ms/+2.53%, real 19.02 s. Tiles=8: 13.68 s/+5.52%, 5,680 ms/+12.80%, real 19.57 s. Tiles=32: 14.62 s/+12.77%, 6,623 ms/+31.53%, real 20.49 s. Cost worsened monotonically with tile count.
+  bit-exact correctness proof:
+    existing focused `lmhead_shard_f32_is_byte_identical_to_monolithic` covers non-dividing tile counts; all five Markdown outputs are byte-identical (sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a).
+  disposition: REVERT TO DEFAULT OFF (no source change; the pre-existing experimental switch remains available but unset)
+  do-not-retry: "do not retry sequential vocabulary tiling on this M4. Reconsider only with concurrent NUMA/CCD-local tiles on a multi-CCD host or a fused head+argmax design that avoids materializing the complete logits table."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-lmhead-vocab-tiles/
+
+2026-07-10 | NEGATIVE(reverted) | change the Apple M4 whole-forward worker count away from eight
+  claim_id: CLAIM-bd-2mo30-worker-count-sweep   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-thread-count/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2 (495 generated tokens)
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe and parallel-R-SWA worktree
+  CPU feature string: Apple M4 arm64, 10 physical cores; native Rayon worker counts 6/8/10 with no architecture override
+  exact command + env:
+    six runs in order `workers=8,6,10,10,6,8`, each:
+    `FOCR_THREADS=<workers> RAYON_NUM_THREADS=<workers> OMP_NUM_THREADS=<workers> FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: eight workers are the frozen fair-comparison setting; `FOCR_LMHEAD_SHARD` unset, parallel R-SWA enabled, system allocator.
+  measured before -> after vs reference:
+    local focr-only reverse-order sweep (two samples/count; no pinned torch CPU ratio): eight-worker median decode 13.00 s, lm_head 5,035 ms, attention 4,654.5 ms, experts 2,795 ms, real 18.885 s. Six workers: decode 14.05 s/+8.08%, lm_head +17.73%, attention +5.52%, experts -3.81%, real +8.08%. Ten workers: decode 13.32 s/+2.46%, lm_head -2.46%, attention +6.38%, experts +5.31%, real +1.22%. Eight is the best balanced setting on this workload.
+  bit-exact correctness proof:
+    worker scheduling never changes a per-output reduction; all six Markdown outputs are byte-identical (sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a).
+  disposition: REVERT TO EIGHT WORKERS (runtime sweep only; no source change)
+  do-not-retry: "do not select workers from core count alone. Refit with the same mixed attention/expert/head workload when the kernel mix or CPU topology changes; retain eight as the deterministic M4 fallback."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-thread-count/
+
+2026-07-10 | WIN | mmap-capable production `.focrq` loading (`OcrModel::load` -> `Weights::load`)
+  claim_id: CLAIM-bd-2mo30-mmap-production-load   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592 (4,157,448,783 bytes)
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 `OcrModel::load`/recipe worktree
+  CPU feature string: Apple M4 arm64; storage is `/Volumes/USBNVME16TB`; warm filesystem cache; eight compute workers
+  exact command + env:
+    four runs in order `mmap,buffered,buffered,mmap`, each:
+    `FOCR_NO_MMAP=<unset|1> FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: at measurement time mmap was the default through `Weights::load`; `FOCR_NO_MMAP=1` forced the buffered owned reader; system allocator. Fresh-eyes review later proved that a same-inode truncate remains possible despite descriptor pinning, so current source defaults to owned bytes and requires explicit `FOCR_MMAP=1` for trusted immutable inodes.
+  measured before -> after vs reference:
+    local focr-only reverse-order warm-cache A/B (two samples/mode; no pinned torch CPU ratio): buffered median wall 7.005 s and system CPU 3.255 s -> mmap 6.63 s/-5.35% wall and 2.635 s/-19.05% system CPU. User CPU stayed 31.745 vs 31.85 s, while vision, prefill, and 32-token decode timings remained stable, isolating the benefit to artifact ingestion/ownership.
+  bit-exact correctness proof:
+    mmap and buffered readers expose the same validated records; all four capped-decode Markdown outputs are byte-identical (sha256 88c668f6a8bed89c014f52ccac478abcccde0e296e483b27c385dafc9570bab4).
+  disposition: KEEP CAPABILITY, REJECT AS DEFAULT. The 5.35% warm-cache win is real but cannot outrank the process-fault risk from concurrent same-inode truncation. Owned bytes are the shipping default; mmap is an explicit immutable-inode deployment opt-in.
+  do-not-retry: "do not restore mmap as the general default from throughput evidence alone. A future default requires an enforceable immutability mechanism, not a path/rename convention; re-measure only after that safety proof exists."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
+
+2026-07-10 | NEGATIVE(reverted) | split the 277-token reference prefill into smaller sequential chunks (`FOCR_PREFILL_CHUNK`)
+  claim_id: CLAIM-bd-2mo30-prefill-chunk-sweep   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-prefill-chunk/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 worktree
+  CPU feature string: Apple M4 arm64, eight workers; conservative mixed decoder; parallel R-SWA
+  exact command + env:
+    five runs in order `monolithic,C=256,C=128,C=64,monolithic`, each:
+    `FOCR_PREFILL_CHUNK=<unset|256|128|64> FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: `FOCR_PREFILL_CHUNK` unset selects monolithic prefill; values 256/128/64 produce 2/3/5 ascending chunks. Mmap default, system allocator.
+  measured before -> after vs reference:
+    local focr-only bracketed sweep (one sample/chunk size, two monolithic brackets; no pinned torch CPU ratio): monolithic median prefill 0.625 s and real 6.735 s. C=256 prefill 0.83 s/+32.8%, real 7.31 s/+8.54%; C=128 0.98 s/+56.8%, real 7.05 s/+4.68%; C=64 1.24 s/+98.4%, real 7.31 s/+8.54%. Decode was fixed at 32 tokens and stable except one noisy C=256 sample.
+  bit-exact correctness proof:
+    existing focused `chunked_attention_is_byte_identical_to_monolithic` and contiguous-coverage tests pass; all five Markdown outputs are byte-identical (sha256 88c668f6a8bed89c014f52ccac478abcccde0e296e483b27c385dafc9570bab4).
+  disposition: REVERT TO MONOLITHIC (runtime sweep only; pre-existing chunk switch remains default-off)
+  do-not-retry: "do not chunk short single-page prefills. Reconsider only for substantially longer multi-page references or when chunking enables true overlap with independent decode streams; require a length-stratified crossover curve."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-prefill-chunk/
+
+2026-07-10 | WIN | transfer ownership of the kernel softmax result instead of copying it (`nn::softmax_rows`)
+  claim_id: CLAIM-bd-2mo30-softmax-ownership   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-softmax-ownership/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+    before binary sha256 2d6b54bed1d828d82d6164570833764a85e1593e616341fdac341497e8352c17; after binary sha256 888490fce9b7cb3c6d00f42f9f74041b6b93ed4348d4949c1aff31f370fe7af8
+  CPU feature string: Apple M4 arm64, eight workers; SAM softmax uses `ft_kernel_cpu::softmax_dim_tensor_contiguous_f32`
+  exact command + env:
+    three pre-change binary runs followed by three post-change binary runs, each:
+    `FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: no runtime numeric switch; the source fallback is the prior `x.data.copy_from_slice(&out)`. Mmap default, system allocator.
+  measured before -> after vs reference:
+    local focr-only three-sample binary A/B (no pinned torch CPU ratio): median SAM blocks 3.36 -> 3.25 s (-3.27%); SAM forward 3.44 -> 3.34 s (-2.91%); vision.sam 3.55 -> 3.45 s (-2.82%); vision tower 4.56 -> 4.44 s (-2.63%); user CPU 32.20 -> 31.39 s (-2.52%). Wall medians 6.66 -> 6.65 s were startup-noise limited. The removed SAM payload copy is about 3.34 GiB per 1024 view (about 6.7 GiB read+write traffic).
+  bit-exact correctness proof:
+    the exact `Vec<f32>` returned by the kernel is assigned rather than copied, so no element is recomputed or reordered. Focused `softmax_rows_*` tests passed; all six Markdown outputs are byte-identical (sha256 88c668f6a8bed89c014f52ccac478abcccde0e296e483b27c385dafc9570bab4).
+  disposition: KEEP
+  do-not-retry: "do not reintroduce an output copy for an in-place-looking API when the owned kernel result already has the required shape. If allocator reuse matters later, benchmark a true caller-provided-output kernel instead."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-softmax-ownership/
+
+2026-07-10 | WIN | cache Unlimited-OCR SAM weights and the pretransposed bridge projector across pages
+  claim_id: CLAIM-bd-2mo30-unlimited-vision-statics   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-unlimited-vision-cache/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2, repeated five times in one load-once batch
+    final switch-bearing binary sha256 recorded in `final-binary.sha256`
+  CPU feature string: Apple M4 arm64, eight workers; sequential batch oracle (`FOCR_BATCH_SPINE` unset)
+  exact command + env:
+    same-binary runs with `FOCR_UNLIMITED_VISION_CACHE=0` then `=1`, each:
+    `FOCR_UNLIMITED_VISION_CACHE=<0|1> FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -lp /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr-batch page_0014.png page_0014.png page_0014.png page_0014.png page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq --json`
+  fallback / kill-switch state: default cache-on stores immutable SAM plus pretransposed projector on `OcrModel`; `FOCR_UNLIMITED_VISION_CACHE=0|off|false|no` executes the original per-page `vision_sam::forward` and `vision_bridge::forward` wrappers. CLIP/decoder caches stay enabled in both modes; system allocator.
+  measured before -> after vs reference:
+    same-binary five-page A/B (one quiet run/mode, corroborated by a separately hashed before/after-binary run): real 29.29 -> 28.19 s (-3.76%); JSON batch time 28.908 -> 28.110 s (-2.76%); median pages 2-5 5.619 -> 5.402 s (-3.86%); median pages 2-5 vision tower 4.095 -> 3.930 s (-4.03%); system CPU 11.46 -> 10.86 s (-5.24%). Maximum RSS 11,677,941,760 -> 11,571,773,440 bytes (-106.2 MB, -0.91%) and peak footprint -105.3 MB, so retained statics reduce the repeated-allocation high-water mark rather than increasing it.
+  bit-exact correctness proof:
+    cached SAM is the exact bundle the wrapper rebuilt; cached projector applies the same pretranspose and GEMM. Focused `project_matches_linear_semantics` compares cached/uncached output bits. After removing timing-only JSON fields, all five per-page results are byte-identical in both the old/new-binary and same-binary comparisons (sha256 682e386b8e868bb0403ea15149a6a8b163a90adfdbe955509574834462801c9e).
+  disposition: KEEP (default-on cache; original wrapper fallback retained)
+  do-not-retry: "do not duplicate caches per page or per batch. Extend the model-owned immutable bundle only for tensors whose retained-RSS and multi-page payoff are measured together."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-unlimited-vision-cache/
+
+2026-07-10 | WIN | select LLVM-autovectorized scalar dense-int8 contraction over hand-written SDOT on Apple (`src/simd/arm.rs::igemm_{s8s8,u8s8}`)
+  claim_id: CLAIM-bd-2mo30-apple-int8-autovec   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-apple-int8-autovec/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+  CPU feature string: Apple M4 arm64 exposes `aarch64+neon+dotprod`; effective ordinary dense route is `aarch64+llvm-autovec`; eight workers
+  exact command + env:
+    valid runs in order `autovec,sdot,sdot,autovec`, each using:
+    `FOCR_INT8_AUTOVEC=<unset|0> FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+    The hash manifest also preserves one excluded operator-error attempt (`02-sdot.stderr`: `env: -u: No such file or directory`); its empty output and timing are not samples.
+  fallback / kill-switch state: Apple ordinary dense int8 defaults to LLVM autovec; `FOCR_INT8_AUTOVEC=0|off|false|no` restores SDOT when no valid `FOCR_FORCE_ARCH` override is active. Packed-int4 and offline-SMMLA-panel entrypoints are unaffected.
+  measured before -> after vs reference:
+    local focr-only interleaved A/B (two valid samples/mode; no pinned torch CPU ratio): forced SDOT median decode 0.915 s -> autovec 0.830 s (-9.29%, 1.102x); median expert phase 269.5 -> 180.0 ms (-33.21%, 1.497x). Non-expert phases were stable. Whole-page wall was startup-dominated, so no end-to-end speed claim is made from these four samples.
+  bit-exact correctness proof:
+    all four valid Markdown outputs are byte-identical (sha256 88c668f6a8bed89c014f52ccac478abcccde0e296e483b27c385dafc9570bab4). Runtime selftest now separates hardware selection from the effective dense route and records the branch executed by every S8S8/U8S8 case.
+  disposition: KEEP (autovec default; SDOT deterministic fallback and forced-route proof retained)
+  do-not-retry: "do not make a hand-written SDOT micro-tile the Apple dense-GEMV default without a new real-decode A/B that beats LLVM autovec and remains byte-identical."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-apple-int8-autovec/
+
+2026-07-10 | NEGATIVE(retained-for-proof) | force every Apple dense-int8 ISA tier (`FOCR_FORCE_ARCH=scalar|sdot|smmla`)
+  claim_id: CLAIM-bd-2mo30-arm-tier-force   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-arm-tier-force/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+  CPU feature string: Apple M4 arm64 with dotprod+i8mm; `FOCR_FORCE_ARCH` selects the branch in a fresh process; eight workers
+  exact command + env:
+    six runs in order `sdot,smmla,scalar,scalar,smmla,sdot`, each using:
+    `FOCR_FORCE_ARCH=<sdot|smmla|scalar> FOCR_MAX_NEW_TOKENS=32 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
+  fallback / kill-switch state: environment unset restores the measured Apple autovec default. Valid forced tiers override autovec; unknown or unavailable tags are ignored. Each intrinsic/scalar path remains available for parity diagnosis.
+  measured before -> after vs reference:
+    local focr-only reverse-order sweep (two samples/tier; no pinned torch CPU ratio): scalar/autovec-equivalent decode median 0.830 s and experts 180.5 ms. SDOT was 0.920 s/+10.84% and 268.5 ms/+48.75%. SMMLA was 1.420 s/+71.08% and 771.5 ms/+327.42%. One SDOT wall sample had unrelated 7.75 s startup noise; phase timers, not wall time, determine this disposition.
+  bit-exact correctness proof:
+    all six Markdown outputs are byte-identical (sha256 88c668f6a8bed89c014f52ccac478abcccde0e296e483b27c385dafc9570bab4). Forced-route subprocess tests require `selected`, `hardware_selected`, and the branch-derived singleton `executed_routes` to name the forced implementation.
+  disposition: KEEP ROUTES, REJECT AS APPLE DEFAULTS (scalar/autovec remains fastest; routes retained for portability and proof)
+  do-not-retry: "do not promote SDOT or SMMLA from instruction-count intuition. Retry only after changing the kernel's measured load/packing cost, then repeat the exact real-decode tier sweep."
+  per-lever tally: W 0 / L 2 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-arm-tier-force/
+
+2026-07-10 | NEGATIVE(reverted) | whole-program LLVM PGO over a representative decode corpus
+  claim_id: CLAIM-bd-2mo30-pgo-whole-program   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass12-pgo-20260710T073736Z/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592 (4,157,448,783 bytes)
+    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 worktree
+    plain binary sha256 68990f7361e8763b19e0135e55e61a0ac54e7942b887162b0dfe6bf7dc78cfe8
+    PGO-use binary sha256 8498596b31e0c62465a56d7dba13413d3237c8e5c651d3a953d45d67969adb09
+  CPU feature string: Apple M4 arm64; eight compute workers; conservative mixed decoder; Homebrew LLVM 22.1.4 profile tools
+  exact command + env:
+    plain build: `CARGO_TARGET_DIR=/Volumes/USBNVME16TB/temp_agent_space/pgo-base-20260710T073736Z cargo build --profile release-perf --bin focr`
+    instrumented build: `CARGO_TARGET_DIR=/Volumes/USBNVME16TB/temp_agent_space/pgo-gen-20260710T073736Z RUSTFLAGS='-Cprofile-generate=<raw-dir>' cargo build --profile release-perf --bin focr`
+    training corpus: full page_0009, full page_0014, and a capped ten-page batch at 128 generated tokens per page with `FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1`
+    merge: `llvm-profdata merge -sparse raw/focr-*.profraw -o focr.profdata` (only the three runtime focr profiles, excluding build-script profiles)
+    PGO build: `CARGO_TARGET_DIR=/Volumes/USBNVME16TB/temp_agent_space/pgo-use-20260710T073736Z RUSTFLAGS='-Cprofile-use=<focr.profdata> -Cllvm-args=-pgo-warn-missing-function' cargo build --profile release-perf --bin focr`
+    page A/B: five measured samples per binary after warmup, order `base,pgo,pgo,base,base,pgo,pgo,base,pgo,base`, on page_0014
+    batch A/B: three measured samples per binary after warmup, order `base,pgo,pgo,base,pgo,base`, on the pinned ten-page corpus with 128 generated tokens per page
+  fallback / kill-switch state: no runtime switch and no source change; retain the ordinary non-PGO `release-perf` build. Attention/lm-head int8 gates unset; system allocator.
+  measured before -> after vs reference:
+    page p50: decode 12.670 -> 10.830 s (-14.52%), wall 18.370 -> 16.900 s (-8.00%), but prefill 0.590 -> 0.930 s (+57.63%).
+    capped ten-page p50: decode 31.880 -> 27.250 s (-14.52%), wall 78.110 -> 77.220 s (-1.14%), while prefill 5.880 -> 9.180 s (+56.12%). All reported wall/decode CVs were <=1.50%.
+  bit-exact correctness proof: all page Markdown outputs were byte-identical (sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a); recursively removing timing-only fields made every capped ten-page JSON output identical (sha256 c48524d0df0959b12486463d544820e5ccff56b1e9ed517c408bcb82e0085e4d).
+  disposition: REVERT. The precommitted gate required >=2% wins on both dense decode and capped ten-page wall with no >2% vision/e2e regression; the batch wall gain was only 1.14%.
+  do-not-retry: "do not ship whole-program PGO from a decode-heavy corpus. Retry only with a final-tree phase-selective or prefill-weighted profile that removes the ~56% prefill regression while preserving decode, then rerun this exact two-workload gate."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass12-pgo-20260710T073736Z/
+
+2026-07-10 | NEGATIVE(reverted) | experimental full-int8 attention/lm-head on page_0590
+  claim_id: CLAIM-bd-2mo30-page0590-full-int8-rejection   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass13-page0590-precision-20260710T082044Z/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592 (4,157,448,783 bytes)
+    page_0590.png sha256 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
+    pinned BF16 Markdown sha256 6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd
+    plain binary sha256 68990f7361e8763b19e0135e55e61a0ac54e7942b887162b0dfe6bf7dc78cfe8
+  CPU feature string: Apple M4 arm64; eight compute workers; same binary, page, model, and 12,000-token cap
+  exact command + env:
+    conservative: `env -u FOCR_DECODE_INT8 -u FOCR_INT8_ATTN -u FOCR_INT8_LMHEAD -u FOCR_INT8_KV -u FOCR_FORCE_ARCH -u FOCR_NO_MMAP -u FOCR_PREFILL_CHUNK FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 650 /usr/bin/time -p <focr> ocr <page_0590> --model <recipe.focrq> --max-length 12000 -o conservative.md`
+    full-int8: `env -u FOCR_INT8_KV -u FOCR_FORCE_ARCH -u FOCR_NO_MMAP -u FOCR_PREFILL_CHUNK FOCR_DECODE_INT8=1 FOCR_INT8_ATTN=1 FOCR_INT8_LMHEAD=1 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 650 /usr/bin/time -p <focr> ocr <page_0590> --model <recipe.focrq> --max-length 12000 -o full-int8.md`
+    score: `python3 scripts/baseline/compare_ocr.py --ref <single-page-reference-dir> --hyp <single-page-output-dir> --json <comparison.json>`
+  fallback / kill-switch state: conservative run has `FOCR_DECODE_INT8`, `FOCR_INT8_ATTN`, and `FOCR_INT8_LMHEAD` unset; full-int8 sets all three to `1`. Default remains conservative, and unsetting the gates is the deterministic fallback.
+  measured before -> after vs reference:
+    conservative: CER_raw 1.25622, CER_norm 1.24286, 32,694 output characters, 12,000 tokens without EOS, decode 318.23 s, wall 323.92 s.
+    full-int8: CER_raw 1.63878, CER_norm 1.63831, 41,531 output characters, 12,000 tokens without EOS, decode 144.63 s, wall 151.28 s. Full-int8 is 2.20x faster but regresses normalized CER by 0.39545 absolute (+31.82%).
+  bit-exact correctness proof: neither output is exact or release-eligible. `compare_ocr.py` scored both against the pinned BF16 reference; its exact bit-parallel Levenshtein replacement matched the former DP over 16,129 exhaustive and 10,000 randomized Unicode pairs.
+  disposition: REVERT. Keep experimental attention/lm-head int8 gates off; retain conservative execution while `bd-2mo.30.12` remains an open P0 release blocker.
+  do-not-retry: "do not promote full-int8 for its speed. Retry only after a deterministic repetition/EOS fallback clears the page_0590 BF16 CER, tail, and loss-matrix gates without relying on unvalidated attention or lm-head quantization."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: BrownFox
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass13-page0590-precision-20260710T082044Z/
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a

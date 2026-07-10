@@ -21,6 +21,7 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | `robot_schema_v1.json` | [C] | The frozen robot NDJSON contract (bd-zc1o) | Never regenerated — versioned by hand with the schema |
 | `runs_schema.json` | [C] | The frozen `focr runs`/`sync` record + one-way-audit contract (bd-wp8.11) | Never regenerated — versioned by hand |
 | `test_log_schema.json` | [C] | The TestLog line contract (bd-n68o) | Never regenerated — versioned by hand |
+| `moe_torch_2_10_cpu.json` | [R→C] | Pinned macOS arm64 Torch 2.10 CPU `topk(sorted=False)` and `[N,6,1280]` reduction oracle; file SHA256 `84fa230a314ee2722a256b07504f9b319c470e246cb50729d1f49db78a3d01a2` | `uv run --python 3.12 --with torch==2.10.0 python scripts/gen_moe_torch_2_10_cpu_fixture.py --check tests/fixtures/moe_torch_2_10_cpu.json`; use `--write` only for reviewed regeneration on the pinned host |
 | `tokenizer/corpus.txt` | [C] | Hand-curated conformance corpus (OQ-16) | Hand-edited only |
 | `tokenizer_baidu/expected.json` | [R→C] | `scripts/gen_token_id_fixtures.py` (pinned `LlamaTokenizerFast`, truth-pack commit) | Rerun the script; commit is a reviewed change |
 | `tokenizer_got/` | [R→C] | `scripts/gen_got_token_id_fixtures.py` (pinned Qwen tiktoken) | Same |

@@ -508,7 +508,7 @@ mod tests {
 
     /// A weights-free [`BatchStep`] that exercises the scheduler's lifecycle.
     /// Each stream's `last_hidden` encodes `[stream_tag, eos_after]`; the mock
-    /// emits `token = history_len` (so a stream emits 0,1,2,…) and signals EOS on
+    /// emits `token_id = history_len` (so a stream emits 0,1,2,…) and signals EOS on
     /// the `eos_after`-th emitted token. `eos_after == 0` ⇒ never EOS (so the
     /// scheduler's `max_length` cap is what retires it).
     struct MockStep {
@@ -533,10 +533,10 @@ mod tests {
                     let tag = s.hidden.data[0];
                     let eos_after = s.hidden.data[1] as usize;
                     let emitted_before = s.history.len(); // prompt is empty in tests
-                    let token = emitted_before as u32;
+                    let token_id = emitted_before as u32;
                     let is_eos = eos_after != 0 && emitted_before + 1 >= eos_after;
                     StreamOut {
-                        token,
+                        token: token_id,
                         is_eos,
                         // carry the [tag, eos_after] identity forward
                         new_hidden: Mat::from_vec(1, 2, vec![tag, eos_after as f32]),

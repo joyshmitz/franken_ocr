@@ -790,28 +790,25 @@ fn token_major_to_head_major(
     Ok((kh, vh))
 }
 
-// ── Dequant-once decoder weight cache (decode-throughput lever) ──────────────
+// ── Conservative mixed-precision decoder cache ──────────────────────────────
 //
-// The `&Weights` decode path re-dequantized ~10 GB of bf16 expert weights from
-// the payload EVERY token: `moe::forward` loads ALL 64 routed experts per MoE
-// layer (x11 layers) even though only 6 of 64 are used per token, plus the
-// attention projections and the [vocab, hidden] lm_head — the dominant decode
-// cost (memory-bandwidth bound). This cache dequantizes every decoder tensor
-// ONCE into an owned f32 image (~10.5 GB) that the (unchanged) kernels borrow by
-// reference, so each subsequent step is pure GEMM. No math changes — only the
-// weight source — so the cached output is identical to the `&Weights` path.
+// Doctrine #2 quantizes only the dense/FFN/expert GEMMs. Attention q/k/v/o and
+// `lm_head` stay high precision. This cache mirrors that recipe exactly: it
+// widens the relatively small gated/high-precision set once and keeps the 2,148
+// FFN/expert matrices in their per-channel int8 form. It therefore avoids the
+// former ~10.5 GB all-f32 cache without silently opting gated tensors into int8.
 
-/// Owned, pre-dequantized decoder weights — built ONCE, borrowed by every prefill
-/// and decode step. See module note above; this is the decode-throughput lever.
+/// Owned conservative-recipe decoder weights, built once and borrowed by every
+/// prefill/decode step.
 pub struct DecoderWeightCache {
     layers: Vec<CachedLayer>,
     /// Final `model.norm.weight` (RMSNorm before the head).
     final_norm: Vec<f32>,
-    /// `lm_head.weight`, row-major `[vocab, hidden]`.
+    /// `lm_head.weight`, widened once to row-major f32 `[vocab, hidden]`.
     lm_head: Vec<f32>,
 }
 
-/// One decoder layer's dequantized weights.
+/// One decoder layer's mixed-precision weights.
 struct CachedLayer {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
@@ -819,30 +816,12 @@ struct CachedLayer {
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
     o_proj: Vec<f32>,
-    mlp: CachedMlp,
-}
-
-/// A layer's dequantized MLP weights — dense (layer 0) or MoE (layers 1..11).
-enum CachedMlp {
-    Dense {
-        gate: Vec<f32>,
-        up: Vec<f32>,
-        down: Vec<f32>,
-    },
-    Moe {
-        /// Router gate `[N_ROUTED_EXPERTS, HIDDEN]`.
-        gate: Vec<f32>,
-        /// 64 routed experts, each `[gate_proj, up_proj, down_proj]`.
-        experts: Vec<[Vec<f32>; 3]>,
-        /// Fused shared expert `[gate_proj, up_proj, down_proj]`.
-        shared: [Vec<f32>; 3],
-    },
+    mlp: CachedMlpI8,
 }
 
 impl DecoderWeightCache {
-    /// Dequantize every decoder tensor ONCE from [`Weights`]. Allocates ~10.5 GB
-    /// of f32 for the 12-layer DeepSeek-V2 MoE decoder (64 experts/layer); the
-    /// prefill + decode loop then run entirely off these owned buffers.
+    /// Build the fixed validated recipe from [`Weights`]: attention and
+    /// `lm_head` high precision, FFN/expert projections int8, router/norms f32.
     ///
     /// # Errors
     /// [`FocrError::FormatMismatch`] if any expected tensor is absent/mis-shaped.
@@ -866,40 +845,59 @@ impl DecoderWeightCache {
                 .data;
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
-                CachedMlp::Dense {
-                    gate: weights.mat(&format!("{p}.gate_proj.weight"))?.data,
-                    up: weights.mat(&format!("{p}.up_proj.weight"))?.data,
-                    down: weights.mat(&format!("{p}.down_proj.weight"))?.data,
+                let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
+                CachedMlpI8::Dense {
+                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_oc_loaded(
+                        weights,
+                        &format!("{p}.down_proj.weight"),
+                        config::HIDDEN_SIZE,
+                    )?,
                 }
             } else {
                 let p = format!("{prefix}.mlp");
                 let gate = weights.mat(&format!("{p}.gate.weight"))?.data;
+                let inter = moe::config::MOE_INTERMEDIATE_SIZE;
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        weights
-                            .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
-                            .data,
-                        weights
-                            .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
-                            .data,
-                        weights
-                            .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
-                            .data,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.gate_proj.weight"),
+                            inter,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.up_proj.weight"),
+                            inter,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.down_proj.weight"),
+                            config::HIDDEN_SIZE,
+                        )?,
                     ]);
                 }
+                let shared_inter = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    weights
-                        .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
-                        .data,
-                    weights
-                        .mat(&format!("{p}.shared_experts.up_proj.weight"))?
-                        .data,
-                    weights
-                        .mat(&format!("{p}.shared_experts.down_proj.weight"))?
-                        .data,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.gate_proj.weight"),
+                        shared_inter,
+                    )?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.up_proj.weight"),
+                        shared_inter,
+                    )?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.down_proj.weight"),
+                        config::HIDDEN_SIZE,
+                    )?,
                 ];
-                CachedMlp::Moe {
+                CachedMlpI8::Moe {
                     gate,
                     experts,
                     shared,
@@ -941,46 +939,9 @@ fn cached_layer_weights(cl: &CachedLayer) -> LayerWeights<'_> {
     }
 }
 
-/// Run one cached layer's MLP — dense (layer 0) or MoE — over the
-/// `post_attention_layernorm`'d hidden, borrowing the dequantized weights (the
-/// MoE router still selects top-k; only the GEMM runs, no dequant).
-fn cached_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Mat> {
-    match mlp {
-        CachedMlp::Dense { gate, up, down } => {
-            let w = moe::MlpWeights {
-                gate_proj: gate,
-                up_proj: up,
-                down_proj: down,
-                hidden: moe::config::HIDDEN_SIZE,
-                intermediate: moe::config::DENSE_INTERMEDIATE_SIZE,
-            };
-            moe::dense_mlp(normed, &w)
-        }
-        CachedMlp::Moe {
-            gate,
-            experts,
-            shared,
-        } => {
-            let exp: Vec<moe::MlpWeights<'_>> = experts
-                .iter()
-                .map(|e| moe::MlpWeights {
-                    gate_proj: &e[0],
-                    up_proj: &e[1],
-                    down_proj: &e[2],
-                    hidden: moe::config::HIDDEN_SIZE,
-                    intermediate: moe::config::MOE_INTERMEDIATE_SIZE,
-                })
-                .collect();
-            let sh = moe::MlpWeights {
-                gate_proj: &shared[0],
-                up_proj: &shared[1],
-                down_proj: &shared[2],
-                hidden: moe::config::HIDDEN_SIZE,
-                intermediate: moe::config::SHARED_INTERMEDIATE_SIZE,
-            };
-            moe::moe_block_default(normed, gate, &exp, &sh)
-        }
-    }
+/// Run the recipe-approved int8 MLP/MoE for one prefill activation block.
+fn cached_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
+    prefill_mlp_i8(mlp, normed)
 }
 
 // ── Decode phase profiler (FOCR_PROFILE_DECODE) ──────────────────────────────
@@ -1082,79 +1043,9 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// One SwiGLU expert over a single decode row `x[hidden]`, off cached weights:
-/// `down( silu(gate·x) * (up·x) )`. `inter` is the expert's intermediate width.
-fn expert_gemv(
-    x: &[f32],
-    gate_w: &[f32],
-    up_w: &[f32],
-    down_w: &[f32],
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    let g = gemv(x, gate_w, inter, hidden);
-    let u = gemv(x, up_w, inter, hidden);
-    let mut act = vec![0.0f32; inter];
-    for i in 0..inter {
-        act[i] = silu(g[i]) * u[i];
-    }
-    gemv(&act, down_w, hidden, inter)
-}
-
-/// Decode MoE/MLP over a single `post_attention_layernorm`'d row, off the cached
-/// weights — mirrors [`moe::moe_block_default`] (route top-k, weighted expert
-/// sum, + shared expert) but specialized to `m == 1` with [`gemv`]. Bit-parity
-/// with the GEMM path is gated by the cached-vs-stateless decode check.
-fn decode_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Vec<f32>> {
-    let hidden = config::HIDDEN_SIZE;
-    let row = normed.row(0);
-    match mlp {
-        CachedMlp::Dense { gate, up, down } => Ok(expert_gemv(
-            row,
-            gate,
-            up,
-            down,
-            hidden,
-            moe::config::DENSE_INTERMEDIATE_SIZE,
-        )),
-        CachedMlp::Moe {
-            gate,
-            experts,
-            shared,
-        } => {
-            let routing = moe::route_default(normed, gate)?;
-            let inter = moe::config::MOE_INTERMEDIATE_SIZE;
-            let mut out = vec![0.0f32; hidden];
-            for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
-                let e = routing.indices[0][j];
-                let w = routing.weights[0][j];
-                let y = expert_gemv(
-                    row,
-                    &experts[e][0],
-                    &experts[e][1],
-                    &experts[e][2],
-                    hidden,
-                    inter,
-                );
-                for c in 0..hidden {
-                    out[c] += w * y[c];
-                }
-            }
-            // Shared expert (weight 1.0 over every token).
-            let s = expert_gemv(
-                row,
-                &shared[0],
-                &shared[1],
-                &shared[2],
-                hidden,
-                moe::config::SHARED_INTERMEDIATE_SIZE,
-            );
-            for c in 0..hidden {
-                out[c] += s[c];
-            }
-            Ok(out)
-        }
-    }
+/// Decode the recipe-approved int8 MLP/MoE for one normalized token row.
+fn decode_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
+    decode_mlp_i8(mlp, normed)
 }
 
 /// Final RMSNorm + `lm_head` over the decode hidden (`[1, hidden]`), off the
@@ -1170,6 +1061,7 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
             hidden.rows
         )));
     }
+    let t = prof::enabled().then(std::time::Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let row = normed.row(0);
     // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv`).
@@ -1185,6 +1077,9 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
     } else {
         gemv(row, &wc.lm_head, config::VOCAB_SIZE, config::HIDDEN_SIZE)
     };
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
 }
 
@@ -1529,9 +1424,11 @@ pub fn decode_step_with_cache(
     // RoPE at the single TRUE absolute position (one row, one shared table).
     let rope = RopeTable::build(&[position], config::HEAD_DIM, config::ROPE_THETA);
 
+    let profiling = prof::enabled();
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
+        let t_attn = profiling.then(std::time::Instant::now);
 
         // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k at the true
         // `position`, push K/V into the ring (the query attends to itself as the
@@ -1549,6 +1446,9 @@ pub fn decode_step_with_cache(
         let context = rswa::decode_attention(&caches[layer], &q.data)?;
         let attn_out = Mat::from_vec(1, hidden, gemv(&context.data, &cl.o_proj, hidden, qkv_dim));
         let h = add_residual(&x, &attn_out)?;
+        if let Some(t) = t_attn {
+            prof::add(&prof::ATTN_NS, t.elapsed().as_nanos() as u64);
+        }
 
         // MLP / MoE via the bespoke GEMV (routed top-k experts + shared).
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
@@ -1559,15 +1459,15 @@ pub fn decode_step_with_cache(
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  INT8 DECODE ENGINE — per-output-channel symmetric S8S8, NEON SDOT / VNNI  ║
+// ║  INT8 DECODE ENGINE — per-output-channel symmetric S8S8 dense contractions  ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 //
 // The f32 cache above dequantizes the whole 12-layer MoE decoder to ~10.5 GB of
 // f32 and reads ~1.9 GB/token at decode — memory-bound on the ~120 GB/s M4 bus.
 // This int8 engine stores the SAME weights as per-output-channel symmetric int8
 // (~2.8 GB, 4x less traffic) and runs the hot GEMV/GEMM through the bespoke
-// `simd::igemm_s8s8` backend (NEON `vdotq_s32` SDOT on Apple Silicon; AVX-512 /
-// AVX-VNNI / AVX2 on x86 — the exact "fastest per-ISA" doctrine for THIS model).
+// `simd::igemm_s8s8` backend (measured LLVM autovec by default on Apple, with
+// forced SDOT/SMMLA routes; AVX-512 / AVX-VNNI / AVX2 on x86).
 //
 // Precision: weights quantize as `w_scale[o] = max|W[o,:]|/127` (symmetric, the
 // proven `nn::quantize_int8` / `ft_kernel_cpu::quantize_per_output_channel_i8`
@@ -1578,7 +1478,7 @@ pub fn decode_step_with_cache(
 // Accuracy is VERIFIED end-to-end against the f32-stateless oracle + baidu CER.
 
 /// Block of int8 GEMV output rows fanned to one rayon task (each a single
-/// `simd::igemm_s8s8` SDOT call). Matches the f32 `gemv`'s 64-row blocking.
+/// `simd::igemm_s8s8` dense contraction). Matches the f32 `gemv`'s 64-row blocking.
 const I8_GEMV_BLOCK: usize = 64;
 
 /// Dynamically quantize a single activation row `x[k]` to symmetric int8
@@ -1588,10 +1488,9 @@ const I8_GEMV_BLOCK: usize = 64;
 fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
     let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let a_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-    let inv = 1.0 / a_scale;
     let xq: Vec<i8> = x
         .iter()
-        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| (v / a_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
         .collect();
     (xq, a_scale)
 }
@@ -1602,7 +1501,7 @@ fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
 /// activation `x[k]` dynamically int8-quantized once, and the pre-quantized
 /// weight `qw` in `[n,k]` output-channel-major int8 (the native `[out,in]`
 /// checkpoint layout — no transpose). The `n` output rows fan across the rayon
-/// pool in `I8_GEMV_BLOCK` chunks, each a single `simd::igemm_s8s8` SDOT/VNNI
+/// pool in `I8_GEMV_BLOCK` chunks, each a single dispatched `simd::igemm_s8s8`
 /// call; i32 accumulation is exact (proven `K ≤ 6848 < i32::MAX`, `src/simd`).
 fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
     debug_assert_eq!(x.len(), qw.k);
@@ -1615,7 +1514,7 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
 /// caller that already produced `(xq, a_scale)` (the fused norm->quant epilogue,
 /// [`FUSE_NORM_QUANT_ENV`]) can feed the SAME int8 row to several weights without
 /// re-quantizing. BYTE-FOR-BYTE identical to [`gemv_i8`]: each of the `n` output
-/// channels is an independent i32 SDOT dequantized by `a_scale · scale[o]`, so the
+/// channels is an independent i32 dot dequantized by `a_scale · scale[o]`, so the
 /// rayon row-chunking never changes a per-channel value (the same N-independence
 /// the 64-row blocking and `fuse_qkv` already rely on).
 /// Layout-aware channel-block int8 GEMM: contract `xq [m, k]` against weight
@@ -1728,20 +1627,12 @@ pub(crate) fn gemm_i8_bias_prequant_batched(
     out
 }
 
-/// Ties-to-even twin of [`quantize_row_i8`] — matches the prefill's
-/// `nn::linear_int8_dynamic` (which quantizes activations ties-to-even), so a decode
-/// m=1 GEMV built on it is numerically consistent with the certified prefill. Same
-/// `scale = max|x|/127`. (GOT decode throughput, bead B9.)
+/// Shared dynamic activation quantizer for the dense-model decode paths. Uses
+/// true division plus ties-to-even, matching [`quantize_row_i8`], the prefill's
+/// `nn::linear_int8_dynamic`, and the frozen `.focrq` numeric contract.
 #[inline]
 pub(crate) fn quantize_row_i8_te(x: &[f32]) -> (Vec<i8>, f32) {
-    let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let a_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-    let inv = 1.0 / a_scale;
-    let xq: Vec<i8> = x
-        .iter()
-        .map(|&v| (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8)
-        .collect();
-    (xq, a_scale)
+    quantize_row_i8(x)
 }
 
 /// n-parallel m=1 int8 GEMV from a PRE-QUANTIZED activation `(xq, a_scale)`, adding
@@ -1809,11 +1700,11 @@ fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32>
 }
 
 /// SERIAL int8 GEMV from a pre-quantized activation — a single `simd::igemm_s8s8`
-/// SDOT/VNNI call over all `n` rows, NO rayon. Used inside the per-expert rayon
+/// dense-int8 call over all `n` rows, NO rayon. Used inside the per-expert rayon
 /// tasks below, where parallelism is ACROSS experts (one task each) rather than
 /// within: 6 routed experts is the right granularity to saturate the pool with
 /// ONE dispatch, vs the 18 tiny internally-parallel GEMVs the per-row `gemv_i8`
-/// would spawn (measured: MoE experts were 56% of decode, ~10% of SDOT peak —
+/// would spawn (measured: MoE experts were 56% of decode and dispatch-bound —
 /// dispatch-bound, not compute-bound).
 fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let k = qw.k;
@@ -1843,10 +1734,21 @@ fn expert_gemv_i8_serial(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> V
     gemv_i8_serial(&aq, a_scale2, down)
 }
 
-/// Quantize a `[out, in]` row-major f32 weight to per-output-channel symmetric
-/// int8 (`in` inferred from `w.len()/out`). Thin wrapper over [`nn::quantize_int8`].
-fn quant_oc(w: &[f32], out: usize) -> QInt8 {
-    nn::quantize_int8(w, out, w.len() / out)
+/// Quantize an exact `[out, in_]` row-major f32 weight to per-output-channel
+/// symmetric int8.
+fn quant_oc(w: &[f32], out: usize, in_: usize, name: &str) -> FocrResult<QInt8> {
+    let expected = out.checked_mul(in_).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "tensor {name:?}: output/input shape [{out}, {in_}] overflows usize"
+        ))
+    })?;
+    if w.len() != expected {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?}: {} elements != expected output/input shape [{out}, {in_}] ({expected})",
+            w.len()
+        )));
+    }
+    Ok(nn::quantize_int8(w, out, in_))
 }
 
 /// Resolve `name` to a per-output-channel int8 weight, from EITHER source:
@@ -1856,10 +1758,10 @@ fn quant_oc(w: &[f32], out: usize) -> QInt8 {
 /// * a pre-quantized `.focrq` record (`QInt8PerChan`, produced by `focr convert`)
 ///   → read it back verbatim via [`Weights::qint8`], skipping the re-quantize.
 ///
-/// The two are byte-identical: `focr convert` quantizes with the SAME
-/// [`nn::quantize_int8`] this `quant_oc` calls, on the SAME widened weight, so a
-/// converted artifact decodes bit-for-bit like the load-time `FOCR_DECODE_INT8`
-/// path. This is the consume side of the convert↔decode contract.
+/// For recipe-approved FFN/expert tensors the two are byte-identical: `focr
+/// convert` uses the same [`nn::quantize_int8`] as this fallback. Attention and
+/// `lm_head` remain high precision in the default artifact and reach this helper
+/// only when the separately gated experimental all-int8 cache is requested.
 ///
 /// # Errors
 /// [`FocrError::FormatMismatch`] if `name` is absent or mis-shaped.
@@ -1868,10 +1770,32 @@ pub(crate) fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> Focr
         weights.record(name).map(|rec| rec.dtype),
         Some(DType::QInt8PerChan)
     ) {
-        weights.qint8(name)
-    } else {
-        Ok(quant_oc(&weights.mat(name)?.data, out))
+        let q = weights.qint8(name)?;
+        if q.n != out {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt8 tensor {name:?} has {} output rows; expected {out}",
+                q.n
+            )));
+        }
+        return Ok(q);
     }
+
+    let record = weights.record(name).ok_or_else(|| {
+        FocrError::FormatMismatch(format!("tensor {name:?} not found in weights directory"))
+    })?;
+    let [rows, in_] = record.shape.as_slice() else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 2 ([out, in])",
+            record.shape.len()
+        )));
+    };
+    if *rows != out {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has {rows} output rows; expected {out}"
+        )));
+    }
+    let mat = weights.mat(name)?;
+    quant_oc(&mat.data, out, *in_, name)
 }
 
 // ── CCD-sharded / L3-tiled lm_head (FOCR_LMHEAD_SHARD, bd-1azu.25) ────────────
@@ -2047,7 +1971,7 @@ fn qkv_fused_enabled() -> bool {
 /// block-parallel [`gemv_i8`] yields output rows `[0,n)`, `[n,2n)`, `[2n,3n)`
 /// that are BYTE-IDENTICAL to three separate `gemv_i8(x, {q,k,v})` calls: the
 /// activation is quantized once to the same `(xq, a_scale)`, and each output row
-/// `o` is an independent i32 SDOT of the SAME `xq` against the SAME `w[o,:]`
+/// `o` is an independent i32 dot of the SAME `xq` against the SAME `w[o,:]`
 /// dequantized by the SAME `scales[o]` — the rayon row-chunking only changes
 /// which rows share a task, never a per-row reduction.
 fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
@@ -2269,10 +2193,20 @@ fn moe_block_i8(
     let h = hidden.cols;
     let routing = moe::route_default(hidden, gate)?;
     let mut out = Mat::zeros(n_tok, h);
-    let mut per_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); moe::config::N_ROUTED_EXPERTS];
+    let contribution_len = n_tok
+        .checked_mul(moe::config::NUM_EXPERTS_PER_TOK)
+        .and_then(|rows| rows.checked_mul(h))
+        .ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "decoder::moe_block_i8: n_tok*top_k*hidden overflow"
+            ))
+        })?;
+    let mut contributions = vec![0.0f32; contribution_len];
+    let mut per_expert: Vec<Vec<(usize, usize, f32)>> =
+        vec![Vec::new(); moe::config::N_ROUTED_EXPERTS];
     for t in 0..n_tok {
         for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
-            per_expert[routing.indices[t][j]].push((t, routing.weights[t][j]));
+            per_expert[routing.indices[t][j]].push((t, j, routing.weights[t][j]));
         }
     }
     for (e, members) in per_expert.iter().enumerate() {
@@ -2281,17 +2215,26 @@ fn moe_block_i8(
         }
         let m = members.len();
         let mut sub = Mat::zeros(m, h);
-        for (r, &(t, _w)) in members.iter().enumerate() {
+        for (r, &(t, _slot, _w)) in members.iter().enumerate() {
             sub.row_mut(r).copy_from_slice(hidden.row(t));
         }
         let y = expert_mlp_i8(&sub, &experts[e][0], &experts[e][1], &experts[e][2])?;
-        for (r, &(t, w)) in members.iter().enumerate() {
+        for (r, &(t, slot, w)) in members.iter().enumerate() {
             let yr = y.row(r);
-            let outr = out.row_mut(t);
-            for c in 0..h {
-                outr[c] += w * yr[c];
+            let base = (t * moe::config::NUM_EXPERTS_PER_TOK + slot) * h;
+            let dst = &mut contributions[base..base + h];
+            for (value, &expert_value) in dst.iter_mut().zip(yr.iter()) {
+                *value = w * expert_value;
             }
         }
+    }
+    for t in 0..n_tok {
+        let token_base = t * moe::config::NUM_EXPERTS_PER_TOK * h;
+        let rows: [&[f32]; moe::config::NUM_EXPERTS_PER_TOK] = std::array::from_fn(|slot| {
+            let base = token_base + slot * h;
+            &contributions[base..base + h]
+        });
+        moe::combine_routed_rows(rows, &routing.indices[t], out.row_mut(t))?;
     }
     let shared_out = expert_mlp_i8(hidden, &shared[0], &shared[1], &shared[2])?;
     for (o, &s) in out.data.iter_mut().zip(shared_out.data.iter()) {
@@ -2371,11 +2314,9 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
                 || expert_gemv_i8(row, &shared[0], &shared[1], &shared[2]),
             );
             let mut out = vec![0.0f32; hidden];
-            for p in &partials {
-                for c in 0..hidden {
-                    out[c] += p[c];
-                }
-            }
+            let rows: [&[f32]; moe::config::NUM_EXPERTS_PER_TOK] =
+                std::array::from_fn(|slot| partials[slot].as_slice());
+            moe::combine_routed_rows(rows, &idx, &mut out)?;
             for c in 0..hidden {
                 out[c] += s[c];
             }
@@ -2520,7 +2461,7 @@ pub fn lm_head_cached_i8_ngram_masked(
 }
 
 /// Int8 prefill: the [`prefill_with_cache`] structure with the GEMMs routed through
-/// [`nn::linear_int8_dynamic`] (threaded SDOT/VNNI). Captures each layer's RoPE'd
+/// [`nn::linear_int8_dynamic`] (threaded dense-int8 dispatch). Captures each layer's RoPE'd
 /// K/V into the R-SWA ring just like the f32 path. Returns the final
 /// `model.norm`-ready hidden `[seq, hidden]` + the 12 populated caches.
 ///
@@ -2655,7 +2596,7 @@ pub fn prefill_with_cache_i8_chunked(
 
 /// One int8 incremental decode step over the per-layer [`RingCache`]s. Int8 twin
 /// of [`decode_step_with_cache`] — every projection via the bespoke m=1 [`gemv_i8`]
-/// (NEON SDOT / x86 VNNI), R-SWA attention and ring contract identical.
+/// (Apple autovec or forced NEON routes / x86 VNNI), with identical R-SWA and ring contracts.
 ///
 /// # Errors
 /// As [`decode_step_with_cache`].
@@ -3354,6 +3295,261 @@ pub(crate) fn verify_forward_i8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MOE_POLICY_CHILD_ENV: &str = "FOCR_MOE_POLICY_TEST_CASE";
+
+    fn moe_policy_child_case() -> Option<(&'static str, bool)> {
+        match std::env::var(MOE_POLICY_CHILD_ENV).ok().as_deref() {
+            None => None,
+            Some("unset") => Some(("unset", false)),
+            Some("zero") => Some(("zero", false)),
+            Some("one") => Some(("one", true)),
+            Some(other) => {
+                eprintln!("unknown MoE policy subprocess case {other:?}");
+                None
+            }
+        }
+    }
+
+    fn int8_moe_policy_fixture(
+        rollback: bool,
+    ) -> (Mat, Vec<f32>, Vec<[QInt8; 3]>, [QInt8; 3], moe::Routing) {
+        const TARGETS: [f32; moe::config::NUM_EXPERTS_PER_TOK] =
+            [16_777_216.0, 1.0, -16_777_216.0, 1.0, 1.0, 1.0];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/moe_torch_2_10_cpu.json"))
+                .expect("valid pinned torch MoE oracle fixture");
+        let unique = &fixture["cases"][0];
+        let scores = unique["scores_f32_bits"]
+            .as_array()
+            .expect("fixture score bits")
+            .iter()
+            .map(|bits| f32::from_bits(bits.as_u64().expect("fixture f32 bits") as u32))
+            .collect::<Vec<_>>();
+
+        let hidden_size = moe::config::HIDDEN_SIZE;
+        let mut hidden_data = vec![0.0f32; hidden_size];
+        hidden_data[0] = 1.0;
+        let hidden = Mat::from_vec(1, hidden_size, hidden_data);
+        let mut gate = vec![0.0f32; moe::config::N_ROUTED_EXPERTS * hidden_size];
+        for (expert, score) in scores.into_iter().enumerate() {
+            gate[expert * hidden_size] = score;
+        }
+        let routing = moe::route_default(&hidden, &gate).expect("public route_default succeeds");
+        let expected_field = if rollback {
+            "torch_sorted_indices"
+        } else {
+            "torch_unsorted_indices"
+        };
+        let expected = unique[expected_field]
+            .as_array()
+            .expect("fixture route indices")
+            .iter()
+            .map(|item| item.as_u64().expect("fixture expert index") as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(routing.indices[0].as_slice(), expected.as_slice());
+
+        let mut unit_weights = vec![0i8; hidden_size];
+        unit_weights[0] = 127;
+        let unit = QInt8::new(unit_weights, vec![1.0 / 127.0], 1, hidden_size);
+        let zero = QInt8::new(vec![0; hidden_size], vec![1.0], 1, hidden_size);
+        let silu_one = 1.0f32 / (1.0 + (-1.0f32).exp());
+        let mut expert_outputs = vec![0.0f32; moe::config::N_ROUTED_EXPERTS];
+        for (slot, &expert) in routing.indices[0].iter().enumerate() {
+            expert_outputs[expert] = TARGETS[slot] / routing.weights[0][slot];
+        }
+        let experts = expert_outputs
+            .into_iter()
+            .map(|expert_output| {
+                let down = if expert_output == 0.0 {
+                    QInt8::new(vec![0; hidden_size], vec![1.0; hidden_size], hidden_size, 1)
+                } else {
+                    QInt8::new(
+                        vec![127; hidden_size],
+                        vec![expert_output / (127.0 * silu_one); hidden_size],
+                        hidden_size,
+                        1,
+                    )
+                };
+                [unit.clone(), unit.clone(), down]
+            })
+            .collect::<Vec<_>>();
+        let shared = [
+            zero.clone(),
+            zero,
+            QInt8::new(vec![0; hidden_size], vec![1.0; hidden_size], hidden_size, 1),
+        ];
+        (hidden, gate, experts, shared, routing)
+    }
+
+    fn fold_int8_moe_contributions(
+        contributions: &[Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK],
+        indices: &[usize; moe::config::NUM_EXPERTS_PER_TOK],
+        ascending_expert: bool,
+    ) -> Vec<f32> {
+        let mut slots: [usize; moe::config::NUM_EXPERTS_PER_TOK] = std::array::from_fn(|slot| slot);
+        if ascending_expert {
+            slots.sort_unstable_by_key(|&slot| indices[slot]);
+        }
+        let mut out = vec![0.0f32; moe::config::HIDDEN_SIZE];
+        for slot in slots {
+            for (dst, &value) in out.iter_mut().zip(contributions[slot].iter()) {
+                *dst += value;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn moe_policy_subprocess_probe_int8() -> FocrResult<()> {
+        let Some((case, rollback)) = moe_policy_child_case() else {
+            return Ok(());
+        };
+        let (hidden, gate, experts, shared, routing) = int8_moe_policy_fixture(rollback);
+        let indices = routing.indices[0];
+        let weights = routing.weights[0];
+
+        let mut prefill_contributions: [Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK] =
+            std::array::from_fn(|_| vec![0.0; moe::config::HIDDEN_SIZE]);
+        let mut decode_contributions: [Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK] =
+            std::array::from_fn(|_| vec![0.0; moe::config::HIDDEN_SIZE]);
+        for slot in 0..moe::config::NUM_EXPERTS_PER_TOK {
+            let expert = indices[slot];
+            let prefill = expert_mlp_i8(
+                &hidden,
+                &experts[expert][0],
+                &experts[expert][1],
+                &experts[expert][2],
+            )?;
+            let decode = expert_gemv_i8_serial(
+                hidden.row(0),
+                &experts[expert][0],
+                &experts[expert][1],
+                &experts[expert][2],
+            );
+            for channel in 0..moe::config::HIDDEN_SIZE {
+                prefill_contributions[slot][channel] = weights[slot] * prefill.data[channel];
+                decode_contributions[slot][channel] = weights[slot] * decode[channel];
+            }
+        }
+        let expected_prefill =
+            fold_int8_moe_contributions(&prefill_contributions, &indices, rollback);
+        let alternate_prefill =
+            fold_int8_moe_contributions(&prefill_contributions, &indices, !rollback);
+        let expected_decode =
+            fold_int8_moe_contributions(&decode_contributions, &indices, rollback);
+        let alternate_decode =
+            fold_int8_moe_contributions(&decode_contributions, &indices, !rollback);
+        assert_ne!(
+            expected_prefill[0].to_bits(),
+            alternate_prefill[0].to_bits()
+        );
+        assert_ne!(expected_decode[0].to_bits(), alternate_decode[0].to_bits());
+
+        let mut batched_data = hidden.data.clone();
+        batched_data.extend_from_slice(&hidden.data);
+        let batched_hidden = Mat::from_vec(2, moe::config::HIDDEN_SIZE, batched_data);
+        let prefill = moe_block_i8(&batched_hidden, &gate, &experts, &shared)?;
+        assert_eq!(prefill.row(0), expected_prefill.as_slice());
+        assert_eq!(prefill.row(1), expected_prefill.as_slice());
+
+        let mlp = CachedMlpI8::Moe {
+            gate,
+            experts,
+            shared,
+        };
+        let decode = decode_mlp_i8(&mlp, &hidden)?;
+        assert_eq!(decode, expected_decode);
+        eprintln!("FOCR_MOE_POLICY_PROBE_INT8={case}");
+        Ok(())
+    }
+
+    fn quant_oc_fixture_builder() -> crate::quant::focrq::FocrqBuilder {
+        let arch = crate::native_engine::model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 test architecture must be registered");
+        crate::quant::focrq::FocrqBuilder::new()
+            .with_model_id(arch.id())
+            .with_license_notice(arch.license_notice())
+    }
+
+    #[test]
+    fn quant_oc_loaded_rejects_prequantized_output_row_mismatch() {
+        let mut builder = quant_oc_fixture_builder();
+        builder
+            .add_quantized(
+                "w",
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![3, 2],
+                vec![0; 6],
+                vec![0; 3 * std::mem::size_of::<f32>()],
+                0,
+                0,
+            )
+            .expect("valid synthetic QInt8 record");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let q = quant_oc_loaded(&weights, "w", 3).expect("matching output rows load");
+        assert_eq!((q.n, q.k), (3, 2), "input/K dimension must be preserved");
+
+        let err = quant_oc_loaded(&weights, "w", 2).expect_err("row mismatch must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("3 output rows; expected 2"));
+    }
+
+    #[test]
+    fn quant_oc_loaded_rejects_high_precision_output_row_mismatch_and_wrong_rank() {
+        let mut builder = quant_oc_fixture_builder();
+        builder
+            .add_tensor(
+                "matrix",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![3, 2],
+                vec![0; 3 * 2 * std::mem::size_of::<u16>()],
+            )
+            .expect("valid synthetic BF16 matrix");
+        builder
+            .add_tensor(
+                "vector",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![6],
+                vec![0; 6 * std::mem::size_of::<u16>()],
+            )
+            .expect("valid synthetic BF16 vector");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let q = quant_oc_loaded(&weights, "matrix", 3).expect("matching matrix loads");
+        assert_eq!((q.n, q.k), (3, 2), "input/K dimension must be preserved");
+
+        let err = quant_oc_loaded(&weights, "matrix", 2).expect_err("row mismatch must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("3 output rows; expected 2"));
+
+        let err = quant_oc_loaded(&weights, "vector", 1)
+            .expect_err("a rank-1 vector is not an [out, in] weight");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("rank 1; expected 2"));
+    }
+
+    #[test]
+    fn activation_quantization_uses_true_division_and_ties_to_even() {
+        let ties = [127.0, 0.5, 2.5, -0.5, -2.5];
+        let (q, scale) = quantize_row_i8(&ties);
+        assert_eq!(scale, 1.0);
+        assert_eq!(q, [127, 0, 2, 0, -2]);
+
+        // This f32 pair sits on a boundary where true division yields
+        // -125.49999 while reciprocal multiplication yields exactly -125.5.
+        // The contract requires the former, so this keeps the division rule live.
+        let boundary = [f32::from_bits(0x3cdd_67c9), f32::from_bits(0xbcda_ca56)];
+        let (q, scale) = quantize_row_i8(&boundary);
+        assert_eq!(scale.to_bits(), 0x395f_2615);
+        assert_eq!(q, [127, -125]);
+        let reciprocal = (boundary[1] * (1.0 / scale)).round_ties_even() as i8;
+        assert_eq!(
+            reciprocal, -126,
+            "test vector must distinguish the two formulas"
+        );
+    }
 
     // ── Fused q/k/v GEMV bit-identity (FOCR_QKV_FUSED, bd-241s) ──────────────────
 

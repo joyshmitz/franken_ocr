@@ -2480,7 +2480,9 @@ mod tests {
         let bytes = std::fs::read(path).expect("oracle blob");
         assert_eq!(bytes.len() % 4, 0, "not a whole f32 count");
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }

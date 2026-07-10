@@ -13,11 +13,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 #
 # Options:
-#   --version vX.Y.Z   Install a specific version (default: latest, falls back to v0.4.0)
+#   --version vX.Y.Z   Install a specific version (default: latest release)
 #   --dir DIR          Install the binary into DIR (default: ~/.local/bin)
 #   --easy-mode        Add the install directory to PATH in your shell rc files
 #   --verify           Run "focr robot selftest" after install
-#   --no-pull          Do not offer to download the model after install
+#   --no-pull          Suppress the post-install model download prompt/guidance
 #   --no-verify        Skip SHA256 checksum verification (not recommended)
 #   --offline          Skip the network reachability preflight check
 #   --quiet            Suppress non-error output
@@ -32,15 +32,15 @@
 #   HTTP_PROXY             HTTP proxy for downloads
 #   FOCR_INSTALL_BASE_URL  Override the release base (corporate mirror / airgap
 #                          cache / the e2e installer test). The asset and its
-#                          .sha256 sidecar are fetched from directly under it.
+#                          .sha256 sidecar are fetched from directly under it;
+#                          --version or VERSION is required with this override.
 #
 # WINDOWS
-#   v0.2.0+ ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
-#   proven end-to-end on Windows 10. This POSIX installer cannot install it from a
-#   Git-Bash/MSYS/Cygwin shell, so there it points you at the PowerShell installer:
+#   Native x86_64 and ARM64 Windows binaries use the MSVC target names consumed by
+#   install.ps1. This POSIX installer cannot install them from a Git-Bash/MSYS/
+#   Cygwin shell, so there it points you at the PowerShell installer:
 #     irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
-#   Under WSL this installer proceeds as Linux. ARM64 Windows is not published yet
-#   (tracked as epic bd-3u97).
+#   Under WSL this installer proceeds as Linux.
 #
 # BUILD REALITY
 #   franken_ocr path-depends on sibling repos that are not published to
@@ -60,7 +60,6 @@ shopt -s lastpipe 2>/dev/null || true
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-franken_ocr}"
 BINARY_NAME="focr"
-FALLBACK_VERSION="v0.4.0"
 VERSION="${VERSION:-}"
 
 # Install directory: --dir wins, then PREFIX/bin, then ~/.local/bin.
@@ -78,14 +77,12 @@ NO_GUM=0
 NO_PULL=0
 NO_VERIFY=0
 OFFLINE=0
-# Per-user, $TMPDIR-aware lock so a second user's installer on a shared host does
-# not collide with (and cannot clear, under the /tmp sticky bit) another user's lock.
-LOCK_FILE="${TMPDIR:-/tmp}/focr-install.$(id -u 2>/dev/null || echo 0).lock"
-
 # Runtime globals (initialized so set -u never trips before they are assigned).
 TMP=""
-LOCKED=0
 LOCK_DIR=""
+LOCK_HOLDER_PID=""
+LOCK_READY_DIR=""
+STAGED_PATH=""
 PROXY_ARGS=()
 OS=""
 ARCH=""
@@ -230,11 +227,11 @@ Usage:
   curl -fsSL .../install.sh | bash -s -- [OPTIONS]
 
 Options:
-  --version vX.Y.Z   Install a specific version (default: latest, falls back to ${FALLBACK_VERSION})
+  --version vX.Y.Z   Install a specific version (default: latest release)
   --dir DIR          Install the binary into DIR (default: ~/.local/bin)
   --easy-mode        Add the install directory to PATH in your shell rc files
   --verify           Run "focr robot selftest" after install
-  --no-pull          Do not offer to download the model after install
+  --no-pull          Suppress the post-install model download prompt/guidance
   --no-verify        Skip SHA256 checksum verification (not recommended)
   --offline          Skip the network reachability preflight check
   --quiet            Suppress non-error output
@@ -247,15 +244,15 @@ Environment:
   VERSION                Same as --version
   HTTPS_PROXY            HTTPS proxy for downloads (preferred)
   HTTP_PROXY             HTTP proxy for downloads
-  FOCR_INSTALL_BASE_URL  Override the release base URL (mirror / airgap / tests)
+  FOCR_INSTALL_BASE_URL  Override the release base URL (requires --version / VERSION)
 
 Platforms with prebuilt binaries:
   macOS Apple Silicon, macOS Intel, Linux x86-64 (glibc), Linux ARM64 (glibc)
-  Windows x86-64: native focr.exe via the PowerShell installer (install.ps1), or
-  run this script inside WSL2. ARM64 Windows is not published yet (epic bd-3u97).
+  Windows x86-64 and ARM64: native focr.exe via the PowerShell installer
+  (install.ps1), or run this script inside WSL2.
 
-After install, download the model once with:  focr pull
-Then parse a page with:                       focr ocr page.png
+After install, download the default model once (about 4.2 GB):  focr pull
+Then parse a page with:                                  focr ocr page.png
 EOF
 }
 
@@ -323,7 +320,7 @@ print_windows_note() {
       --margin "1 0" \
       "$(gum style --foreground 214 --bold 'Native Windows is supported')" \
       "" \
-      "$(gum style --foreground 252 "focr ${FALLBACK_VERSION} publishes a native x86_64 Windows binary.")" \
+      "$(gum style --foreground 252 'install.ps1 supports native x86_64 and ARM64 release assets.')" \
       "$(gum style --foreground 252 'This shell (Git-Bash/MSYS/Cygwin) cannot install it; use PowerShell.')" \
       "" \
       "$(gum style --foreground 42 'In a PowerShell window, run:')" \
@@ -336,7 +333,7 @@ print_windows_note() {
     draw_box "1;33" \
       "Native Windows is supported" \
       "" \
-      "focr ${FALLBACK_VERSION} publishes a native x86_64 Windows binary." \
+      "install.ps1 supports native x86_64 and ARM64 release assets." \
       "This shell (Git-Bash/MSYS/Cygwin) cannot install it; use PowerShell." \
       "" \
       "In a PowerShell window, run:" \
@@ -409,12 +406,11 @@ detect_platform() {
 # ============================================================================
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
-  # With a custom base URL (mirror/airgap/e2e test) there is no GitHub API to
-  # query; pin the fallback version rather than reaching out to the network.
+  # A custom base has no discovery contract. Require an explicit version so a
+  # mirror/airgap install cannot silently select an unrelated historical build.
   if [ -n "${FOCR_INSTALL_BASE_URL:-}" ]; then
-    VERSION="$FALLBACK_VERSION"
-    info "Using $VERSION (custom FOCR_INSTALL_BASE_URL)"
-    return 0
+    err "FOCR_INSTALL_BASE_URL requires --version (or VERSION) because latest-release discovery is unavailable."
+    exit 1
   fi
 
   info "Resolving the latest release..."
@@ -426,23 +422,13 @@ resolve_version() {
     --connect-timeout 10 --max-time 30 "$api" 2>/dev/null \
     | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -1) || tag=""
 
-  if [ -z "$tag" ]; then
-    # Redirect-based resolution when the API is rate-limited.
-    local redirect="https://github.com/${OWNER}/${REPO}/releases/latest"
-    tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null \
-      -w '%{url_effective}' "$redirect" 2>/dev/null | sed -E 's|.*/tag/||') || tag=""
-    case "$tag" in
-      v[0-9]*) : ;;
-      *) tag="" ;;
-    esac
-  fi
-
   if [ -n "$tag" ]; then
     VERSION="$tag"
     info "Latest release: $VERSION"
   else
-    VERSION="$FALLBACK_VERSION"
-    warn "Could not resolve the latest release; using $VERSION"
+    err "Could not resolve the latest release from the GitHub API."
+    err "Re-run with --version vX.Y.Z to pin a known release."
+    exit 1
   fi
 }
 
@@ -451,6 +437,11 @@ normalize_version() {
   case "$VERSION" in
     [0-9]*) VERSION="v$VERSION" ;;
   esac
+  local semver_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  if [[ ! "$VERSION" =~ $semver_re ]]; then
+    err "Invalid version '$VERSION'; expected vX.Y.Z (or a valid semver prerelease)."
+    exit 2
+  fi
 }
 
 set_urls() {
@@ -466,18 +457,32 @@ set_urls() {
 # ============================================================================
 # Installed-version probe (for the already-installed short-circuit)
 # ============================================================================
-run_focr_version() {
-  local bin="$DEST/$BINARY_NAME"
+run_focr_version_path() {
+  local bin="$1"
   [ -x "$bin" ] || return 1
   local out=""
   if command -v timeout >/dev/null 2>&1; then
-    out=$(timeout 5 "$bin" --version 2>/dev/null) || out=""
+    out=$(timeout 30 "$bin" --version 2>/dev/null) || out=""
   elif command -v gtimeout >/dev/null 2>&1; then
-    out=$(gtimeout 5 "$bin" --version 2>/dev/null) || out=""
+    out=$(gtimeout 30 "$bin" --version 2>/dev/null) || out=""
   else
     out=$("$bin" --version 2>/dev/null) || out=""
   fi
   printf '%s\n' "${out%%$'\n'*}"
+}
+
+run_focr_version() {
+  run_focr_version_path "$DEST/$BINARY_NAME"
+}
+
+reported_focr_semver() {
+  local line="$1"
+  local report_re='^focr[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$'
+  if [[ "$line" =~ $report_re ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
 }
 
 check_installed_version() {
@@ -485,7 +490,7 @@ check_installed_version() {
   [ -x "$DEST/$BINARY_NAME" ] || return 1
   local out installed
   out=$(run_focr_version) || return 1
-  installed=$(printf '%s\n' "$out" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || installed=""
+  installed=$(reported_focr_semver "$out") || installed=""
   [ -n "$installed" ] || return 1
   [ "${target#v}" = "${installed#v}" ]
 }
@@ -557,40 +562,106 @@ preflight_checks() {
 }
 
 # ============================================================================
-# Locking (mkdir is atomic on every POSIX system, including macOS)
+# Destination-scoped kernel locking. The helper process owns the advisory lock
+# while this shell performs the install. If this shell crashes, the helper sees
+# its owner PID disappear and exits, so no stale lock can survive or be raced.
 # ============================================================================
+release_lock() {
+  if [ -n "${LOCK_READY_DIR:-}" ]; then
+    : > "$LOCK_READY_DIR/release" 2>/dev/null || true
+  fi
+  if [ -n "${LOCK_HOLDER_PID:-}" ]; then
+    wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+    LOCK_HOLDER_PID=""
+  fi
+  if [ -n "${LOCK_READY_DIR:-}" ]; then
+    rm -f "$LOCK_READY_DIR/acquired" "$LOCK_READY_DIR/release"
+    rmdir "$LOCK_READY_DIR" 2>/dev/null || true
+    LOCK_READY_DIR=""
+  fi
+}
+
 acquire_lock() {
-  LOCK_DIR="${LOCK_FILE}.d"
-  if mkdir "$LOCK_DIR" 2>/dev/null; then
-    LOCKED=1
-    printf '%s\n' "$$" > "$LOCK_DIR/pid"
-    return 0
-  fi
-
-  if [ -f "$LOCK_DIR/pid" ]; then
-    local old_pid
-    old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-      warn "Removing a stale lock (PID $old_pid is not running)."
-      rm -rf "$LOCK_DIR"
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        printf '%s\n' "$$" > "$LOCK_DIR/pid"
-        return 0
+  # The lock follows the destination, not TMPDIR, so concurrent installers with
+  # different environments and path aliases serialize the same executable.
+  local holder_script owner_pid platform
+  LOCK_DIR="$DEST/.focr-install.lock"
+  LOCK_READY_DIR=$(mktemp -d "$DEST/.focr-install.ready.XXXXXX") || {
+    err "Could not create installer lock state in $DEST."
+    exit 1
+  }
+  # Main runs in the top-level installer process. BASHPID also keeps direct
+  # function-level tests correct on modern Bash; macOS Bash 3.2 falls back to $$.
+  owner_pid="${BASHPID:-$$}"
+  # shellcheck disable=SC2016
+  holder_script='
+ready=$1
+owner=$2
+cleanup() {
+  rm -f "$ready/acquired" "$ready/release"
+  rmdir "$ready" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap "exit 0" HUP INT TERM
+: > "$ready/acquired" || exit 1
+while kill -0 "$owner" 2>/dev/null && [ ! -f "$ready/release" ]; do
+  sleep 1
+done
+'
+  platform=$(uname -s)
+  case "$platform" in
+    Darwin)
+      if ! command -v lockf >/dev/null 2>&1; then
+        release_lock
+        err "lockf is required to serialize installation on macOS."
+        exit 1
       fi
-    fi
-  fi
+      lockf -t 0 "$LOCK_DIR" sh -c "$holder_script" sh "$LOCK_READY_DIR" "$owner_pid" &
+      ;;
+    Linux)
+      if ! command -v flock >/dev/null 2>&1; then
+        release_lock
+        err "flock is required to serialize installation on Linux."
+        exit 1
+      fi
+      flock -n "$LOCK_DIR" sh -c "$holder_script" sh "$LOCK_READY_DIR" "$owner_pid" &
+      ;;
+    *)
+      release_lock
+      err "No supported process-lock backend is available for $platform."
+      exit 1
+      ;;
+  esac
+  LOCK_HOLDER_PID=$!
 
+  for _ in {1..50}; do
+    if [ -f "$LOCK_READY_DIR/acquired" ]; then
+      return 0
+    fi
+    if ! kill -0 "$LOCK_HOLDER_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  : > "$LOCK_READY_DIR/release" 2>/dev/null || true
+  wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+  LOCK_HOLDER_PID=""
+  rm -f "$LOCK_READY_DIR/acquired" "$LOCK_READY_DIR/release"
+  rmdir "$LOCK_READY_DIR" 2>/dev/null || true
+  LOCK_READY_DIR=""
   err "Another focr installer is running (lock: $LOCK_DIR)."
-  err "If that is wrong, remove it: rm -rf $LOCK_DIR"
   exit 1
 }
 
 cleanup() {
-  [ -n "${TMP:-}" ] && rm -rf "$TMP"
-  if [ "${LOCKED:-0}" -eq 1 ] && [ -n "${LOCK_DIR:-}" ]; then
-    rm -rf "$LOCK_DIR"
+  [ -n "${STAGED_PATH:-}" ] && rm -f "$STAGED_PATH"
+  if [ "${FOCR_PRESERVE_TMP:-0}" = "1" ]; then
+    warn "Preserving installer temporary state because FOCR_PRESERVE_TMP=1: ${TMP:-<none>}"
+  else
+    [ -n "${TMP:-}" ] && rm -rf "$TMP"
   fi
+  release_lock
 }
 
 # ============================================================================
@@ -612,6 +683,16 @@ download_binary() {
 
 is_valid_sha256() {
   [[ "${1:-}" =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
 }
 
 verify_download() {
@@ -640,11 +721,8 @@ verify_download() {
   # `|| actual=""` keeps a hashing-tool failure (rare: tmpfs/ENOMEM) from aborting
   # the script under `set -e`; an empty digest then falls into the mismatch check
   # below and produces a clean error instead of a silent exit.
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}') || actual=""
-  elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}') || actual=""
-  else
+  actual=$(file_sha256 "$TMP/$ASSET") || actual=""
+  if [ -z "$actual" ]; then
     err "No SHA256 tool found (need sha256sum or shasum)."
     err "Install one, or re-run with --no-verify to skip verification."
     exit 1
@@ -662,14 +740,39 @@ verify_download() {
 }
 
 install_binary() {
-  # A reinstall while focr is running can fail with ETXTBSY ("Text file busy")
-  # on Linux; catch it so the user gets a clear error instead of a bare `set -e`
-  # abort with no message.
-  if ! install -m 0755 "$TMP/$ASSET" "$DEST/$BINARY_NAME"; then
-    err "Failed to install focr to $DEST/$BINARY_NAME"
+  local staged_version reported expected
+  STAGED_PATH=$(mktemp "$DEST/.focr.install.XXXXXX") || {
+    err "Could not create a same-directory staging file in $DEST"
+    exit 1
+  }
+  if ! install -m 0755 "$TMP/$ASSET" "$STAGED_PATH"; then
+    err "Failed to stage focr in $DEST"
+    exit 1
+  fi
+  if ! cmp -s "$TMP/$ASSET" "$STAGED_PATH"; then
+    err "Same-directory staged binary does not match the verified download."
+    exit 1
+  fi
+  staged_version=$(run_focr_version_path "$STAGED_PATH") || staged_version=""
+  reported=$(reported_focr_semver "$staged_version") || reported=""
+  expected="${VERSION#v}"
+  if [ -z "$reported" ] || [ "$reported" != "$expected" ]; then
+    err "Staged binary failed the version check before replacement (expected $expected, reported ${reported:-<none>})."
+    exit 1
+  fi
+  if [ "${FOCR_INSTALL_TEST_MODE:-0}" = "1" ] &&
+    [ "${FOCR_INSTALL_TEST_FAILPOINT:-}" = "before-replace" ]; then
+    err "Injected installer failure before atomic replacement."
+    exit 1
+  fi
+  # STAGED_PATH is on the destination filesystem. POSIX rename therefore swaps
+  # the directory entry atomically; if it fails, the prior executable remains.
+  if ! mv -f "$STAGED_PATH" "$DEST/$BINARY_NAME"; then
+    err "Failed to atomically replace focr at $DEST/$BINARY_NAME"
     err "If focr is currently running, stop it and re-run the installer."
     exit 1
   fi
+  STAGED_PATH=""
   ok "Installed focr to $DEST/$BINARY_NAME"
 }
 
@@ -717,15 +820,24 @@ maybe_add_path() {
 # Post-install: version check, optional self-test, optional model pull
 # ============================================================================
 verify_install() {
-  local v
+  local v reported expected
   v=$(run_focr_version) || v=""
-  if [ -n "$v" ]; then
-    INSTALLED_VERSION_STR="$v"
-    ok "focr is working: $v"
-  else
-    warn "Installed the binary, but 'focr --version' returned no output."
-    warn "If $DEST is not on PATH yet, that is expected until you reload your shell."
+  if [ -z "$v" ]; then
+    err "Installed binary failed its mandatory execution check: $DEST/$BINARY_NAME --version"
+    exit 1
   fi
+  reported=$(reported_focr_semver "$v") || reported=""
+  expected="${VERSION#v}"
+  if [ -z "$reported" ]; then
+    err "Installed binary returned an invalid version report: '$v'"
+    exit 1
+  fi
+  if [ "$reported" != "$expected" ]; then
+    err "Installed binary version mismatch: expected $expected, reported $reported"
+    exit 1
+  fi
+  INSTALLED_VERSION_STR="$v"
+  ok "focr is working: $v"
 }
 
 run_selftest() {
@@ -733,7 +845,8 @@ run_selftest() {
   if "$DEST/$BINARY_NAME" robot selftest; then
     ok "Self-test passed: the int8 kernel matches the scalar oracle on this host."
   else
-    warn "Self-test reported a divergence (see the JSON verdict above)."
+    err "Self-test reported a divergence (see the JSON verdict above)."
+    exit 1
   fi
 }
 
@@ -747,8 +860,7 @@ maybe_offer_pull() {
   [ "$NO_PULL" -eq 1 ] && return 0
   local bin="$DEST/$BINARY_NAME"
 
-  # The model is about 3.9 GB. Never auto-download in quiet or non-TTY runs
-  # (CI, cron, piped scripts); just leave a clear hint.
+  # Never auto-download multi-gigabyte weights in quiet or non-interactive runs.
   if [ "$QUIET" -eq 1 ] || ! interactive_tty; then
     info "Model weights are not bundled. Download them later with: focr pull"
     return 0
@@ -756,7 +868,7 @@ maybe_offer_pull() {
 
   echo ""
   info "focr needs the OCR model before it can parse a page."
-  info "The download is about 3.9 GB into ~/.cache/franken_ocr/models."
+  info "The download is about 4.2 GB into ~/.cache/franken_ocr/models."
   local ans=""
   printf 'Download the model now with focr pull? (y/N): '
   if ( : </dev/tty ) 2>/dev/null; then
@@ -802,7 +914,7 @@ print_summary() {
     lines+=("")
   fi
   lines+=("First steps:")
-  lines+=("  focr pull                 download the model (about 3.9 GB)")
+  lines+=("  focr pull                 download the default model (about 4.2 GB)")
   lines+=("  focr ocr page.png         parse an image into markdown")
   lines+=("  focr ocr page.png --json  emit structured JSON (with bounding boxes)")
   lines+=("  focr ocr page.png -o out.md    write markdown to a file")
@@ -857,18 +969,29 @@ main() {
 
   preflight_checks
 
-  # Already-installed short-circuit (still offers PATH help and a pull hint).
+  acquire_lock
+  trap cleanup EXIT
+  if [ "${FOCR_INSTALL_TEST_MODE:-0}" = "1" ] &&
+    [[ "${FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS:-}" =~ ^[0-9]+$ ]] &&
+    [ "${FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS}" -gt 0 ]; then
+    sleep "$FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS"
+  fi
+
+  # Serialize the version decision with replacement, then honor an explicit
+  # verification request even when no download is necessary.
   if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
     ok "focr ${VERSION} is already installed at $DEST/$BINARY_NAME"
     info "Use --force to reinstall."
     maybe_add_path
+    verify_install
+    if [ "$VERIFY" -eq 1 ]; then
+      run_selftest
+    fi
     info "Model weights are not bundled; fetch them with: focr pull"
     exit 0
   fi
 
-  acquire_lock
   TMP=$(mktemp -d)
-  trap cleanup EXIT
 
   download_binary
   verify_download

@@ -44,6 +44,49 @@ pub const NGRAM_WINDOW_MULTI: usize = 1024;
 /// `modeling_unlimitedocr.py:787/1011/1139/1249`).
 pub const DEFAULT_MAX_LENGTH: usize = 32_768;
 
+/// Opt-in diagnostic guard for deterministic low-novelty periodic decode
+/// trajectories (bd-2mo.30.12). Unset and `0` are OFF; only `1` arms it.
+///
+/// The guard remains default-off until its false-positive posterior and corpus
+/// tail impact have been calibrated. When armed, a trigger is a typed timeout,
+/// never a synthetic EOS or a successful truncated result.
+pub const RUNAWAY_GUARD_ENV: &str = "FOCR_RUNAWAY_GUARD";
+
+/// Do not inspect ordinary short outputs. This provisional threshold has not
+/// yet been calibrated against the pinned BF16 token stream and cannot become a
+/// default until that evidence exists.
+pub const RUNAWAY_GUARD_MIN_TOKENS: usize = 8_192;
+
+/// Inspect one fixed suffix every 256 emitted tokens. Sparse checkpoints bound
+/// detector work without making the decision depend on caller polling cadence.
+pub const RUNAWAY_GUARD_CHECK_INTERVAL: usize = 256;
+
+/// Token suffix used by the periodicity and novelty statistics.
+pub const RUNAWAY_GUARD_WINDOW_TOKENS: usize = 2_048;
+
+/// Longest candidate token period. Together with the 2,048-token window this
+/// guarantees at least eight observed cycles for every candidate.
+pub const RUNAWAY_GUARD_MAX_PERIOD: usize = 256;
+
+/// Minimum complete cycles represented by a candidate period.
+pub const RUNAWAY_GUARD_MIN_PERIOD_CYCLES: usize = 8;
+
+/// A candidate period must agree with its lagged copy on at least 15/16 token
+/// positions. Integer ratios keep the trigger bit-deterministic.
+pub const RUNAWAY_GUARD_MATCH_NUMERATOR: usize = 15;
+pub const RUNAWAY_GUARD_MATCH_DENOMINATOR: usize = 16;
+
+/// Exact token 4-gram novelty must be no more than 1/4. This catches a repeated
+/// table-row template whose small numeric fields change while avoiding string,
+/// markup, or language-specific heuristics.
+pub const RUNAWAY_GUARD_NGRAM_ORDER: usize = 4;
+pub const RUNAWAY_GUARD_NOVELTY_NUMERATOR: usize = 1;
+pub const RUNAWAY_GUARD_NOVELTY_DENOMINATOR: usize = 4;
+
+/// Hysteresis: three consecutive suspicious checkpoints are required before a
+/// request fails. One anomalous 2,048-token suffix cannot terminate a decode.
+pub const RUNAWAY_GUARD_REQUIRED_HITS: usize = 3;
+
 /// Decode-time sampling parameters (the frozen contract). Greedy when
 /// `temperature == 0.0`.
 #[derive(Debug, Clone)]
@@ -126,6 +169,286 @@ impl DecodeParams {
     }
 }
 
+/// Pure token-stream statistics from one runaway-guard checkpoint.
+///
+/// These fields are deliberately public so calibration/evidence harnesses can
+/// record the exact integer witness. No decoded strings or model precision
+/// choices participate in the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunawayMetrics {
+    /// Number of emitted tokens at this checkpoint.
+    pub emitted_tokens: usize,
+    /// Fixed suffix length analyzed.
+    pub window_tokens: usize,
+    /// Candidate lag with the greatest exact token agreement.
+    pub best_period: usize,
+    /// Equal token positions at `i` and `i - best_period`.
+    pub period_matches: usize,
+    /// Total lagged token comparisons.
+    pub period_comparisons: usize,
+    /// Distinct exact token 4-grams in the suffix.
+    pub unique_ngrams: usize,
+    /// Total (overlapping) token 4-grams in the suffix.
+    pub total_ngrams: usize,
+}
+
+impl RunawayMetrics {
+    /// Exact period-match ratio in parts per million for evidence logs.
+    #[must_use]
+    pub fn period_match_ppm(self) -> u32 {
+        ratio_ppm(self.period_matches, self.period_comparisons)
+    }
+
+    /// Exact token 4-gram novelty ratio in parts per million for evidence logs.
+    #[must_use]
+    pub fn ngram_novelty_ppm(self) -> u32 {
+        ratio_ppm(self.unique_ngrams, self.total_ngrams)
+    }
+
+    /// Whether this checkpoint crosses both fixed integer thresholds.
+    #[must_use]
+    pub fn is_suspicious(self) -> bool {
+        (self.period_matches as u128) * (RUNAWAY_GUARD_MATCH_DENOMINATOR as u128)
+            >= (self.period_comparisons as u128) * (RUNAWAY_GUARD_MATCH_NUMERATOR as u128)
+            && (self.unique_ngrams as u128) * (RUNAWAY_GUARD_NOVELTY_DENOMINATOR as u128)
+                <= (self.total_ngrams as u128) * (RUNAWAY_GUARD_NOVELTY_NUMERATOR as u128)
+    }
+}
+
+/// Auditable witness carried by the typed timeout when hysteresis fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunawayEvidence {
+    /// Metrics at the checkpoint that completed the trigger.
+    pub metrics: RunawayMetrics,
+    /// Consecutive suspicious checkpoints observed.
+    pub consecutive_hits: usize,
+}
+
+impl RunawayEvidence {
+    /// Convert a trigger into the stable budget/timeout error class (exit 5).
+    ///
+    /// This intentionally does not return generated tokens or synthesize EOS:
+    /// the caller must reject the run rather than silently bless truncation.
+    #[must_use]
+    pub fn timeout_error(self) -> FocrError {
+        FocrError::Timeout(format!(
+            "runaway token guard triggered at {} emitted tokens after {} consecutive \
+             checkpoints: period={} match={}/{} ({} ppm), token-4gram novelty={}/{} \
+             ({} ppm); output rejected rather than silently truncated",
+            self.metrics.emitted_tokens,
+            self.consecutive_hits,
+            self.metrics.best_period,
+            self.metrics.period_matches,
+            self.metrics.period_comparisons,
+            self.metrics.period_match_ppm(),
+            self.metrics.unique_ngrams,
+            self.metrics.total_ngrams,
+            self.metrics.ngram_novelty_ppm(),
+        ))
+    }
+}
+
+/// Deterministic action selected by [`RunawayGuard::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunawayDecision {
+    /// Preserve the ordinary decode path unchanged.
+    Continue,
+    /// Reject the run with [`RunawayEvidence::timeout_error`].
+    Abort(RunawayEvidence),
+}
+
+/// Opt-in finite-state detector for sustained periodic, low-novelty token tails.
+///
+/// State is only the next fixed checkpoint, consecutive suspicious-hit count,
+/// last metrics, and an optional terminal evidence witness. Abort is sticky:
+/// once selected, every later observation returns the identical evidence. The
+/// token stream is caller-owned and read-only, so an armed guard cannot change
+/// sampling, token order, or EOS behavior before selecting Abort.
+#[derive(Debug, Clone)]
+pub struct RunawayGuard {
+    enabled: bool,
+    next_checkpoint: Option<usize>,
+    consecutive_hits: usize,
+    last_metrics: Option<RunawayMetrics>,
+    terminal_evidence: Option<RunawayEvidence>,
+}
+
+impl RunawayGuard {
+    /// Construct an explicitly enabled or disabled guard.
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_checkpoint: Some(RUNAWAY_GUARD_MIN_TOKENS),
+            consecutive_hits: 0,
+            last_metrics: None,
+            terminal_evidence: None,
+        }
+    }
+
+    /// Parse the strict public environment contract.
+    ///
+    /// `None` and `Some("0")` preserve today's exact token stream. Only
+    /// `Some("1")` arms the uncalibrated diagnostic controller; every other
+    /// value is a usage error rather than a silently guessed policy.
+    pub fn from_env_value(raw: Option<&str>) -> FocrResult<Self> {
+        let enabled = match raw {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(other) => {
+                return Err(FocrError::Usage(format!(
+                    "{RUNAWAY_GUARD_ENV} must be exactly 0 or 1, got {other:?}"
+                )));
+            }
+        };
+        Ok(Self::new(enabled))
+    }
+
+    /// Read [`RUNAWAY_GUARD_ENV`] once for one decode invocation.
+    pub fn from_env() -> FocrResult<Self> {
+        match std::env::var(RUNAWAY_GUARD_ENV) {
+            Ok(raw) => Self::from_env_value(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(FocrError::Usage(format!(
+                "{RUNAWAY_GUARD_ENV} must be valid UTF-8 containing exactly 0 or 1"
+            ))),
+        }
+    }
+
+    /// Whether this invocation is armed.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Metrics from the most recent analyzed checkpoint, if any.
+    #[must_use]
+    pub fn last_metrics(&self) -> Option<RunawayMetrics> {
+        self.last_metrics
+    }
+
+    /// Observe an append-only emitted-token history.
+    ///
+    /// Checkpoints are analyzed at their exact prefix even if a caller commits
+    /// several tokens between calls. The decision is therefore invariant to
+    /// polling cadence. Disabled guards do not inspect or allocate.
+    #[must_use]
+    pub fn observe(&mut self, emitted: &[u32]) -> RunawayDecision {
+        if !self.enabled {
+            return RunawayDecision::Continue;
+        }
+        if let Some(evidence) = self.terminal_evidence {
+            return RunawayDecision::Abort(evidence);
+        }
+
+        while let Some(checkpoint) = self.next_checkpoint {
+            if emitted.len() < checkpoint {
+                break;
+            }
+            self.next_checkpoint = checkpoint.checked_add(RUNAWAY_GUARD_CHECK_INTERVAL);
+
+            let Some(metrics) = analyze_runaway_suffix(&emitted[..checkpoint]) else {
+                continue;
+            };
+            self.last_metrics = Some(metrics);
+            if metrics.is_suspicious() {
+                self.consecutive_hits += 1;
+                if self.consecutive_hits >= RUNAWAY_GUARD_REQUIRED_HITS {
+                    let evidence = RunawayEvidence {
+                        metrics,
+                        consecutive_hits: self.consecutive_hits,
+                    };
+                    self.terminal_evidence = Some(evidence);
+                    return RunawayDecision::Abort(evidence);
+                }
+            } else {
+                self.consecutive_hits = 0;
+            }
+        }
+
+        RunawayDecision::Continue
+    }
+
+    /// Shared production commit hook: check one just-appended token and
+    /// propagate a terminal trigger as a typed timeout.
+    ///
+    /// A real EOS observed before a terminal trigger bypasses analysis; the
+    /// guard exists only for sustained **no-EOS** trajectories. Once selected,
+    /// Abort remains sticky. Every production AR loop calls this after appending
+    /// its token and before committing more decoder state.
+    pub fn check_after_emit(&mut self, emitted: &[u32], is_eos: bool) -> FocrResult<()> {
+        if let Some(evidence) = self.terminal_evidence {
+            return Err(evidence.timeout_error());
+        }
+        if is_eos {
+            return Ok(());
+        }
+        match self.observe(emitted) {
+            RunawayDecision::Continue => Ok(()),
+            RunawayDecision::Abort(evidence) => Err(evidence.timeout_error()),
+        }
+    }
+}
+
+impl Default for RunawayGuard {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Analyze the fixed token suffix used by the runaway guard.
+///
+/// This pure API exposes the exact integer witness for offline calibration and
+/// replay. It returns `None` until a full 2,048-token window exists.
+#[must_use]
+pub fn analyze_runaway_suffix(emitted: &[u32]) -> Option<RunawayMetrics> {
+    if emitted.len() < RUNAWAY_GUARD_WINDOW_TOKENS {
+        return None;
+    }
+    let window = &emitted[emitted.len() - RUNAWAY_GUARD_WINDOW_TOKENS..];
+    let max_period = RUNAWAY_GUARD_MAX_PERIOD.min(window.len() / RUNAWAY_GUARD_MIN_PERIOD_CYCLES);
+
+    let mut best_period = 1usize;
+    let mut best_matches = 0usize;
+    let mut best_comparisons = window.len() - 1;
+    for period in 1..=max_period {
+        let comparisons = window.len() - period;
+        let matches = (period..window.len())
+            .filter(|&i| window[i] == window[i - period])
+            .count();
+        let lhs = (matches as u128) * (best_comparisons as u128);
+        let rhs = (best_matches as u128) * (comparisons as u128);
+        if lhs > rhs || (lhs == rhs && period < best_period) {
+            best_period = period;
+            best_matches = matches;
+            best_comparisons = comparisons;
+        }
+    }
+
+    let total_ngrams = window.len() - RUNAWAY_GUARD_NGRAM_ORDER + 1;
+    let mut unique = std::collections::BTreeSet::new();
+    for ngram in window.windows(RUNAWAY_GUARD_NGRAM_ORDER) {
+        unique.insert(ngram);
+    }
+
+    Some(RunawayMetrics {
+        emitted_tokens: emitted.len(),
+        window_tokens: window.len(),
+        best_period,
+        period_matches: best_matches,
+        period_comparisons: best_comparisons,
+        unique_ngrams: unique.len(),
+        total_ngrams,
+    })
+}
+
+fn ratio_ppm(numerator: usize, denominator: usize) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    u32::try_from(((numerator as u128) * 1_000_000) / (denominator as u128)).unwrap_or(u32::MAX)
+}
+
 /// One step's decode result (the frozen output contract).
 ///
 /// `is_eos` is `true` when `token_id == eos_token_id`; the AR loop uses it to halt
@@ -154,10 +477,10 @@ impl DecodeOutput {
 /// Greedy argmax over a single `[1, vocab]` logits row, returning the
 /// lowest-index maximal token id.
 ///
-/// This matches `torch.argmax` semantics used by HF greedy decode: on ties the
-/// **first** (lowest-index) maximum wins. `NaN` logits never compare greater, so
-/// a token banned to `-inf` (or any finite value) is preferred over `NaN`; an
-/// all-`NaN` row falls back to id 0.
+/// This matches the pinned `torch.argmax` semantics used by HF greedy decode:
+/// on ties the **first** (lowest-index) maximum wins, and the first `NaN` wins
+/// as soon as one is present. Banned tokens are set to `-inf` before this scan,
+/// so a banned `NaN` no longer participates.
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the row is empty (`vocab == 0`).
@@ -174,7 +497,7 @@ pub(crate) fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
     let mut best: Option<(usize, f32)> = None;
     for (i, &v) in logits.iter().enumerate() {
         if v.is_nan() {
-            continue;
+            return Ok(i as u32);
         }
         match best {
             Some((_, best_val)) if v <= best_val => {}
@@ -588,6 +911,22 @@ mod tests {
         }
     }
 
+    fn periodic_tokens(len: usize, period: usize) -> Vec<u32> {
+        (0..len).map(|i| (i % period) as u32).collect()
+    }
+
+    fn near_periodic_tokens(len: usize, period: usize) -> Vec<u32> {
+        (0..len)
+            .map(|i| {
+                if i % period == 0 {
+                    10_000 + (i / period) as u32
+                } else {
+                    (i % period) as u32
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn defaults_match_frozen_contract() {
         let p = DecodeParams::default();
@@ -598,6 +937,207 @@ mod tests {
         assert_eq!(p.ngram_window, 128);
         assert!(p.is_greedy());
         assert!(p.sliding_ngram_active());
+    }
+
+    #[test]
+    fn runaway_guard_is_default_off_and_strictly_opt_in() {
+        let default_guard = RunawayGuard::default();
+        assert!(!default_guard.enabled());
+        assert!(!RunawayGuard::from_env_value(None).unwrap().enabled());
+        assert!(!RunawayGuard::from_env_value(Some("0")).unwrap().enabled());
+        assert!(RunawayGuard::from_env_value(Some("1")).unwrap().enabled());
+
+        for invalid in ["", "true", "on", "2", " 1 "] {
+            assert!(matches!(
+                RunawayGuard::from_env_value(Some(invalid)),
+                Err(FocrError::Usage(message))
+                    if message.contains("must be exactly 0 or 1")
+            ));
+        }
+    }
+
+    #[test]
+    fn runaway_metrics_are_exact_token_level_witnesses() {
+        let tokens = periodic_tokens(RUNAWAY_GUARD_WINDOW_TOKENS, 32);
+        let metrics = analyze_runaway_suffix(&tokens).expect("full analysis window");
+        assert_eq!(metrics.emitted_tokens, RUNAWAY_GUARD_WINDOW_TOKENS);
+        assert_eq!(metrics.window_tokens, RUNAWAY_GUARD_WINDOW_TOKENS);
+        assert_eq!(metrics.best_period, 32);
+        assert_eq!(metrics.period_matches, RUNAWAY_GUARD_WINDOW_TOKENS - 32);
+        assert_eq!(metrics.period_comparisons, RUNAWAY_GUARD_WINDOW_TOKENS - 32);
+        assert_eq!(metrics.period_match_ppm(), 1_000_000);
+        assert_eq!(metrics.unique_ngrams, 32);
+        assert_eq!(metrics.total_ngrams, RUNAWAY_GUARD_WINDOW_TOKENS - 3);
+        assert_eq!(metrics.ngram_novelty_ppm(), 15_647);
+        assert!(metrics.is_suspicious());
+    }
+
+    #[test]
+    fn runaway_guard_requires_three_consecutive_checkpoints() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            32,
+        );
+        let mut guard = RunawayGuard::new(true);
+
+        assert_eq!(
+            guard.observe(&tokens[..RUNAWAY_GUARD_MIN_TOKENS]),
+            RunawayDecision::Continue
+        );
+        assert_eq!(
+            guard.observe(&tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL]),
+            RunawayDecision::Continue
+        );
+        let RunawayDecision::Abort(evidence) = guard.observe(&tokens) else {
+            unreachable!("third suspicious checkpoint must abort");
+        };
+        assert_eq!(evidence.consecutive_hits, RUNAWAY_GUARD_REQUIRED_HITS);
+        assert_eq!(evidence.metrics.emitted_tokens, tokens.len());
+        assert!(evidence.metrics.is_suspicious());
+    }
+
+    #[test]
+    fn runaway_guard_catches_repeated_template_with_changing_field() {
+        let tokens = near_periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            32,
+        );
+        let metrics = analyze_runaway_suffix(&tokens).expect("full analysis window");
+        assert_eq!(metrics.best_period, 32);
+        assert!(metrics.period_match_ppm() >= 968_000);
+        assert!(metrics.ngram_novelty_ppm() < 250_000);
+        assert!(metrics.is_suspicious());
+
+        let mut guard = RunawayGuard::new(true);
+        assert!(matches!(guard.observe(&tokens), RunawayDecision::Abort(_)));
+    }
+
+    #[test]
+    fn runaway_guard_rejects_with_typed_timeout_not_synthetic_eos() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            19,
+        );
+        let mut guard = RunawayGuard::new(true);
+        let RunawayDecision::Abort(evidence) = guard.observe(&tokens) else {
+            unreachable!("periodic stream must produce an evidence witness");
+        };
+        let error = evidence.timeout_error();
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        let message = error.to_string();
+        assert!(message.contains("output rejected rather than silently truncated"));
+        assert!(message.contains("period=19"));
+        assert!(message.contains("token-4gram novelty"));
+    }
+
+    #[test]
+    fn shared_commit_hook_propagates_timeout_but_never_overrides_real_eos() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            29,
+        );
+
+        let mut eos_guard = RunawayGuard::new(true);
+        assert!(
+            eos_guard
+                .check_after_emit(&tokens[..RUNAWAY_GUARD_MIN_TOKENS], false)
+                .is_ok()
+        );
+        assert!(
+            eos_guard
+                .check_after_emit(
+                    &tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL],
+                    false,
+                )
+                .is_ok()
+        );
+        assert!(eos_guard.check_after_emit(&tokens, true).is_ok());
+
+        let mut runaway_guard = RunawayGuard::new(true);
+        let error = runaway_guard
+            .check_after_emit(&tokens, false)
+            .expect_err("third no-EOS checkpoint must fail");
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+    }
+
+    #[test]
+    fn runaway_abort_is_terminal_and_preserves_its_first_witness() {
+        let mut tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            23,
+        );
+        let mut guard = RunawayGuard::new(true);
+        let first = guard.observe(&tokens);
+        let RunawayDecision::Abort(first_evidence) = first else {
+            unreachable!("periodic stream must abort");
+        };
+
+        assert_eq!(guard.observe(&tokens), first);
+        tokens.extend(periodic_tokens(RUNAWAY_GUARD_CHECK_INTERVAL, 23));
+        assert_eq!(
+            guard.observe(&tokens),
+            RunawayDecision::Abort(first_evidence)
+        );
+        let sticky_error = guard
+            .check_after_emit(&tokens, true)
+            .expect_err("a terminal Abort cannot transition back to Continue on later EOS");
+        let first_error = first_evidence.timeout_error();
+        assert_eq!(sticky_error.kind(), first_error.kind());
+        assert_eq!(sticky_error.to_string(), first_error.to_string());
+    }
+
+    #[test]
+    fn runaway_guard_does_not_fire_on_high_novelty_tokens() {
+        let tokens: Vec<u32> = (0..DEFAULT_MAX_LENGTH as u32).collect();
+        let mut guard = RunawayGuard::new(true);
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        let metrics = guard.last_metrics().expect("long stream was analyzed");
+        assert_eq!(metrics.ngram_novelty_ppm(), 1_000_000);
+        assert!(!metrics.is_suspicious());
+    }
+
+    #[test]
+    fn one_suspicious_checkpoint_cannot_survive_a_normal_checkpoint() {
+        let mut tokens = periodic_tokens(RUNAWAY_GUARD_MIN_TOKENS, 32);
+        let mut guard = RunawayGuard::new(true);
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(guard.last_metrics().unwrap().is_suspicious());
+
+        tokens.extend((0..RUNAWAY_GUARD_CHECK_INTERVAL).map(|i| 1_000_000 + i as u32));
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(!guard.last_metrics().unwrap().is_suspicious());
+    }
+
+    #[test]
+    fn runaway_decision_is_invariant_to_observer_polling_cadence() {
+        let tokens = near_periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            47,
+        );
+        let mut one_shot = RunawayGuard::new(true);
+        let one_shot_decision = one_shot.observe(&tokens);
+
+        let mut incremental = RunawayGuard::new(true);
+        let mut incremental_decision = RunawayDecision::Continue;
+        for end in 1..=tokens.len() {
+            incremental_decision = incremental.observe(&tokens[..end]);
+            if matches!(incremental_decision, RunawayDecision::Abort(_)) {
+                break;
+            }
+        }
+        assert_eq!(incremental_decision, one_shot_decision);
+    }
+
+    #[test]
+    fn disabled_runaway_guard_never_inspects_or_changes_tokens() {
+        let tokens = periodic_tokens(DEFAULT_MAX_LENGTH, 7);
+        let original = tokens.clone();
+        let mut guard = RunawayGuard::default();
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(guard.last_metrics().is_none());
+        assert_eq!(tokens, original);
     }
 
     #[test]
@@ -634,18 +1174,18 @@ mod tests {
     }
 
     #[test]
-    fn argmax_skips_nan_and_neg_inf() {
-        let r = row(vec![f32::NAN, f32::NEG_INFINITY, 2.0, 1.0]);
+    fn argmax_selects_first_nan_like_pinned_torch() {
+        let r = row(vec![7.0, f32::NAN, f32::NEG_INFINITY, f32::NAN, 9.0]);
         let p = DecodeParams {
             no_repeat_ngram_size: 0,
             ngram_window: 0,
             ..DecodeParams::default()
         };
-        assert_eq!(sample(&r, &[], &p).unwrap(), 2);
+        assert_eq!(sample(&r, &[], &p).unwrap(), 1);
     }
 
     #[test]
-    fn argmax_all_nan_falls_back_to_zero() {
+    fn argmax_all_nan_selects_first_index() {
         let r = row(vec![f32::NAN, f32::NAN, f32::NAN]);
         let p = DecodeParams {
             no_repeat_ngram_size: 0,

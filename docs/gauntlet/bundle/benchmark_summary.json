@@ -88,5 +88,39 @@
     "warmup_discarded": 1
    }
   }
- }
+ },
+ "generated_at_utc": "2026-07-10T04:13:11.822559Z",
+ "pass_over_pass_gates": {
+  "category_geomean": {
+   "minimum_pct": -10.0,
+   "passed": false,
+   "reason": "no current strict pass-over-pass proof was supplied",
+   "regression_pct": null
+  },
+  "geomean": {
+   "minimum_pct": -5.0,
+   "passed": false,
+   "reason": "no current strict pass-over-pass proof was supplied",
+   "regression_pct": null
+  },
+  "p90": {
+   "minimum_pct": -15.0,
+   "passed": false,
+   "reason": "no current strict pass-over-pass proof was supplied",
+   "regression_pct": null
+  },
+  "primary_score": {
+   "minimum_pct": -3.0,
+   "passed": false,
+   "reason": "no current strict pass-over-pass proof was supplied",
+   "regression_pct": null
+  },
+  "throughput_drop": {
+   "minimum_pct": -5.0,
+   "passed": false,
+   "reason": "no current strict pass-over-pass proof was supplied",
+   "regression_pct": null
+  }
+ },
+ "schema_version": "gauntlet.benchmark_summary.v1"
 }

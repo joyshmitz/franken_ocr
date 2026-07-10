@@ -74,6 +74,124 @@ since exact-token OCR fails in the tail.
 
 ---
 
+## DISC-006: MoE routing reproduces pinned torch-2.10 CPU `topk(sorted=False)` and production-width reduction
+
+- claim_id / evidence_id: CLAIM-bd-2mo30-moe-route-order ->
+    `tests/fixtures/moe_torch_2_10_cpu.json` +
+    `moe::tests::{torch_2_10_topk_fixture_matches_exact_slot_permutation,
+    torch_2_10_topk_matches_2048_case_oracle_corpus,
+    production_six_term_combine_matches_256_case_torch_oracle,
+    production_combine_fixture_pins_scalar_tree_difference_and_rollback,
+    moe_policy_env_subprocess_matrix}` +
+    `decoder::tests::moe_policy_subprocess_probe_int8` +
+    `artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass15-exact-torch-corpus-20260710T182636Z/`.
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR
+    `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5`; pinned
+    `modeling_deepseekv2.py` sha256
+    `74e36e6bd0ba7bc565ef76464a99baa8e6bccb710ae9c1007b54ac30b855fa4c`
+    lines 449-453 and 631-703; oracle fixture sha256
+    `84fa230a314ee2722a256b07504f9b319c470e246cb50729d1f49db78a3d01a2`;
+    fixture generator `scripts/gen_moe_torch_2_10_cpu_fixture.py` sha256
+    `580c3751753b813cbba99076858e0f5f978c68292a316eaaf3f49113292fde2e`;
+    `torch==2.10.0` commit
+    `449b1768410104d3ed79d3bcfe4ba1d65c7f22c0`; PyTorch
+    `TopKImpl.h` sha256 `dddf5fc982e7d25f9ba38fe1ebd6645fb8851485f25fd5e975822ae90828635a`;
+    LLVM `llvmorg-15.0.7` libc++ `nth_element.h` sha256
+    `e0152c1647c275c112fea5fb477b6859a2b2f213d905d28183159731d77ffdd9`
+    and `sort.h` sha256
+    `33f739d139c79d5467aa69083e696b157c3d73e72711ff7552e6cd66e87d3f36`.
+- CPU feature string: Apple M4, arm64+neon+dotprod+i8mm; torch reports its
+    wheel was compiled as C++17 with clang 15.0.0 and `NDEBUG`; oracle and Rust
+    fixture executed on macOS 26.5 arm64.
+- Exact command + env:
+    `uv run --python 3.12 --with torch==2.10.0 python scripts/gen_moe_torch_2_10_cpu_fixture.py --check tests/fixtures/moe_torch_2_10_cpu.json`;
+    Rust: `rch exec -- cargo test --lib moe_policy -- --nocapture`. The Python
+    checker is model-free, uses the fixture's byte-exact SplitMix64 corpus
+    specifications, calls `torch.topk(scores, 6, sorted=False)` and contiguous
+    `x.view(cases,6,1280).sum(dim=1)`, checks thread counts 1/2/4/8, and hashes
+    the resulting bytes. `--check` hashes the fixture before and after and never
+    writes it. The Rust tests independently regenerate the same inputs and bind
+    the frozen receipts to public f32/batched and private int8 prefill/decode
+    paths at hidden width 1280.
+- Reference behavior: at `n=64,k=6`, PyTorch 2.10 CPU takes the
+    `k*64 > n` branch and calls libc++
+    `nth_element(begin, begin + k - 1, end)` with a NaN-first, score-descending
+    comparator, then returns queue slots `0..6` without sorting. Exact ties,
+    signed zero, and multiple NaNs are comparator-equivalent, so their selected
+    ids and permutation expose the libc++ partition algorithm. The model then
+    restores those six slots and runs `sum(dim=1)` at hidden width 1280.
+- Our impl: safe Rust transcribes the pinned libc++ median-of-three, guard,
+    partition, and small-range selection-sort algorithm; it uses no `unsafe` and
+    never delegates to the host standard library. f32 and int8 grouped prefill
+    retain expert GEMM grouping but restore every result to its original route
+    slot. Prefill, batched execution, and single-token decode all call the same
+    `moe::combine_routed_rows` primitive. At the production
+    `[tokens,6,1280]` geometry torch's reduction is bit-identical to the
+    slot-ordered f32 left fold used by that primitive. Runtime routing rejects a
+    non-finite softmax row instead of propagating NaNs; the lower-level oracle
+    corpus still pins PyTorch's exact NaN ordering semantics.
+- Fallback / kill-switch state: default reproduces the pinned torch CPU slot
+    permutation and production-width reduction. `FOCR_MOE_SCORE_ORDER=1`
+    process-wide restores the immediately preceding deterministic policy:
+    descending score with lower expert id for ties, followed by ascending-expert
+    reduction. The rollback applies uniformly to f32/int8 prefill, batched, and
+    decode paths; it is no longer a decode-only fork. Only trimmed,
+    case-insensitive `1`/`true`/`on`/`yes` enable it; unset, empty, falsy,
+    unknown, and non-Unicode values fail closed to the pinned default. Fresh
+    subprocess tests cover unset, `0`, and `1` so the process-wide cache cannot
+    hide an environment parsing regression.
+- Measured impact: the safe Rust partition matches all 2,048 torch oracle cases
+    exactly (unique values, tie cardinalities 1/2/3/7, monotone permutations,
+    signed zero, infinities, and NaNs), producing 12,288 index bytes with SHA-256
+    `f39d18c1ef6fad5971b01268acd959bb8b559e2f68b0004386daf759a32d8898`.
+    The 256-case x 1,280-channel reduction corpus matches torch bit-for-bit over
+    1,310,720 result bytes (SHA-256
+    `2a0c796a7940c865bfdf9a8d50830467de87e2818697293ac7120c9422a44e2d`)
+    and was invariant at torch thread counts 1/2/4/8. The cancellation probe
+    `[2^24,1,-2^24,1,1,1]` is deliberately shape-sensitive: scalar
+    `[1,6,1]` torch reduction returns `5.0`, production-width `[1,6,1280]`
+    returns the slot left-fold result `3.0`, and rollback ascending-expert order
+    returns `4.0`. The port pins the model geometry, not the unrelated scalar
+    reduction kernel. Restoring six route rows costs `tokens * 6 * 1280 * 4`
+    scratch bytes (about 8 MiB for the 273-token base prefix); profile this cost
+    after the correctness A/B rather than weakening route-order parity. The
+    current-tree conservative-model receipt then emitted EOS on `page_0590` at
+    4,033 generated tokens with normalized CER `0.6164885983`, and the complete
+    20-page batch succeeded 20/20 with aggregate normalized CER
+    `0.1930792459 <= 0.25`. This accepts the routing correction and clears the
+    local termination/corpus budget; it does not describe the hard-page tail as
+    exact or release-certified.
+- End-to-end receipt identity: binary sha256
+    `6a401be3bfd6bfb0a9766e2ff333489a5e02b2a5f0641376b6ab5fc6885e6953`;
+    model sha256
+    `573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592`;
+    `page_0590.png` sha256
+    `6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3`;
+    BF16 page reference sha256
+    `6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd`;
+    page output sha256
+    `57d9b5a6686e4c8f877b42390c74b85f77ef789036351cfbd0f373194d10997a`;
+    page comparison sha256
+    `49d0b7e9074348f6e38e44d843c7f3f2e7091de643f0ba331dd874ae61f930bb`;
+    20-page batch sha256
+    `7d6e1f5d7823c4a297b5fcc07f7ade44a0ce36f0cd89a14f4d6a424345db572c`;
+    corpus comparison sha256
+    `38680e64677ab30f4842aa53fa98eb9c1ef0caefca3e293163f1e34b501d9f43`;
+    summary sha256
+    `1b43e4d0bc35054e1b0068a65bcb9a7724ed548e3afb70c0b42da56f263e9bcc`.
+- Resolution: ACCEPTED - the pinned CPU primitive is exact across the local
+    f32/int8 execution paths and the hash-bound conservative-model page/corpus
+    gate passes. The accepted result remains a local candidate receipt: the
+    high `page_0590` tail is documented, and distribution, regenerated gauntlet
+    bundle, signing, and release publication remain pending.
+- Tests affected: the four primitive fixture tests, the fresh-process policy
+    matrix and its f32/int8 path probes, plus `tests/batched_moe_parity.rs`; no
+    XFAIL or SKIP.
+- Review date: 2026-07-10; next review is due when the exact-recipe candidate is
+    published and the final release bundle is regenerated.
+
+---
+
 ## DISC-005: TrOMR int8 weight storage diverges the token stream on ONE tier-2 degraded page (spohr_p100)
 
 - claim_id / evidence_id: CLAIM-tromr-int8-p100 → bd-av64.12 (measurement log in

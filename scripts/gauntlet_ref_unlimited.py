@@ -42,11 +42,9 @@ Honesty: every number is a wall-clock reading of the real pinned model; a call
 log that cannot be decomposed (no prefill forward, vision exceeding its parent
 forward, zero decoded tokens) REFUSES rather than guesses.
 
-Env knobs (read here, recorded by the harness):
-  FOCR_REF_MAX_LENGTH  — generate max_length (default 8192, the baseline's
-                         value; the smoke run caps it to stay quick);
-  FOCR_REF_TEXT_DIR    — when set, the decoded text is written there as
-                         `<page-stem>.md` (feeds the correctness-proof CER).
+Inference-affecting and evidence-output settings are explicit harness argv:
+`--max-length 8192` and `--text-dir DIR`. Ambient `FOCR_REF_*` variables are
+rejected by the citable harness so inherited shell state cannot change work.
 
 Self-test (no torch, pure decomposition logic):  gauntlet_ref_unlimited.py --self-test
 """
@@ -190,13 +188,32 @@ def _q_len(args, kwargs) -> int:
     return int(tensor.shape[1])
 
 
-def setup(stage: str, page: str, model_dir: str):
+def setup(
+    stage: str,
+    page: str,
+    model_dir: str,
+    *,
+    max_length: int,
+    text_dir: str | None,
+):
     """Load the pinned CPU-patched baseline ONCE (unclocked) and hook timers."""
     del stage  # one shared setup serves every stage
     if not page or not os.path.isfile(page):
         raise ReferenceEntryError(f"page fixture missing: {page!r}")
     if not model_dir or not os.path.isdir(model_dir):
         raise ReferenceEntryError(f"model dir missing: {model_dir!r}")
+    if (
+        not isinstance(max_length, int)
+        or isinstance(max_length, bool)
+        or max_length != DEFAULT_MAX_LENGTH
+    ):
+        raise ReferenceEntryError(
+            f"Unlimited-OCR citable max_length must be {DEFAULT_MAX_LENGTH}"
+        )
+    if text_dir is not None and (
+        not isinstance(text_dir, str) or not text_dir or not os.path.isabs(text_dir)
+    ):
+        raise ReferenceEntryError("reference text output directory must be absolute")
 
     sys.path.insert(0, BASELINE_DIR)
     import run_baidu_reference as baseline  # scripts/baseline — the truth-pack runner
@@ -205,14 +222,18 @@ def setup(stage: str, page: str, model_dir: str):
     import torch
     from transformers import AutoModel, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(
+        model_dir, trust_remote_code=True, local_files_only=True
+    )
     model = AutoModel.from_pretrained(
         model_dir,
         trust_remote_code=True,
+        local_files_only=True,
         use_safetensors=True,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-    ).eval()
+    )
+    model.train(False)
 
     timers: dict = {"calls": [], "vision_ns": 0}
 
@@ -239,8 +260,8 @@ def setup(stage: str, page: str, model_dir: str):
         "timers": timers,
         "vision_hooked": vision_hooked,
         "scratch": scratch,
-        "max_length": int(os.environ.get("FOCR_REF_MAX_LENGTH", str(DEFAULT_MAX_LENGTH))),
-        "text_dir": os.environ.get("FOCR_REF_TEXT_DIR") or None,
+        "max_length": max_length,
+        "text_dir": text_dir,
     }
 
 

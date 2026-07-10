@@ -210,9 +210,9 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | # | Op | §6.6 tier | Req | Status | Parity | Module | Bead | Notes |
 |---|----|-----------|-----|--------|--------|--------|------|-------|
-| 106 | Runtime ISA dispatch (OnceLock<IsaTier>) | all | SHOULD | present | L3 | nn.rs | bd-2mo.1 | OnceLock IsaTier dispatch (dispatch.rs:108,143); selftest + FOCR_FORCE_ARCH sweep |
+| 106 | Runtime ISA capability + effective dense-route dispatch | all | SHOULD | present | L3 | nn.rs | bd-2mo.1 | OnceLock IsaTier capability; effective route + branch-derived selftest trace; all-tier FOCR_FORCE_ARCH subprocess sweep |
 | 107 | aarch64 SMMLA/i8mm prefill GEMM (the wedge) | A1 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.4 | aarch64 SMMLA 8×8 prefill GEMM (arm.rs:199); batched_igemm_parity smmla + selftest |
-| 108 | aarch64 SDOT decode GEMV | A2 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.5 | aarch64 SDOT decode GEMV (arm.rs:204); batched_igemm_parity sdot + selftest |
+| 108 | aarch64 SDOT decode GEMV | A2 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.5 | forced SDOT route remains exact; measured-faster LLVM autovec is default for ordinary Apple dense GEMV; packed routes separate |
 | 109 | x86 AVX-512-VNNI GEMM/GEMV (U8S8 +128) | X1 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.6 | x86 AVX-512-VNNI (x86.rs:122); vs-scalar gate, arch-gated on x86 hosts |
 | 110 | x86 AVX-VNNI (256-bit) | X2 | SHOULD | present | L3 | nn.rs (island) | bd-2mo.7 | x86 AVX-VNNI 256-bit (x86.rs:129); same gate |
 | 111 | x86 AMX-int8 prefill (_tile_dpbssd, feature) | X3 | MAY | missing | L3 | nn.rs (island) | bd-2mo.8 | no AMX kernel (dispatch.rs:19-21 states x86.rs implements no AMX; MAY tier) |
@@ -234,8 +234,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | 122 | Tensor remap (HF dotted → internal) | §5.3 | MUST | present | SURF | weights.rs | bd-1es.4 | HF-dotted key census/classification (convert.rs:655 tests; canonical-key policy) |
 | 123 | Per-output-channel int8 quantizer (zp 0) | §5.1 | MUST | present | L3 | weights.rs | bd-1es.5 | per-out-channel symmetric int8 zp0 clamp±127 (int8.rs:145,47 + tests) |
 | 124 | Per-row dynamic int8 activation quant (S8S8/U8S8) | §6.3 | MUST | present | L3 | nn.rs | bd-1es.8 | per-row dynamic activation quant S8S8/U8S8 (nn.rs:151 + igemm parity + selftest u8s8) |
-| 125 | int8 attention q/k/v/o (FOCR_INT8_ATTN kill-switch) | §5/§6 | MAY | present | L3 | weights.rs | bd-1es.10 | FOCR_INT8_ATTN kill-switch recipe gating (recipe.rs:43,70 + env-gating tests) |
-| 126 | int8 lm_head (FOCR_INT8_LMHEAD kill-switch) | §5/§6 | MAY | present | L3 | weights.rs | bd-1es.11 | FOCR_INT8_LMHEAD kill-switch (recipe.rs:72); lmhead_shard_parity bit-identity |
+| 125 | int8 attention q/k/v/o (FOCR_INT8_ATTN kill-switch) | §5/§6 | MAY | partial | L3 | weights.rs | bd-1es.10 / bd-2mo.30.5 | Static recipe gate and experimental runtime exist, but the default artifact now keeps q/k/v/o BF16 and the all-int8 cache requires all three explicit switches; measured CER acceptance is still outstanding. |
+| 126 | int8 lm_head (FOCR_INT8_LMHEAD kill-switch) | §5/§6 | MAY | partial | L3 | weights.rs | bd-1es.11 / bd-2mo.30.5 | Kernel parity exists, but quality certification is not complete. The default artifact keeps `lm_head` BF16 and the legacy all-int8 cache fails closed unless both independent gates are armed. |
 | 127 | int4 per-group quantizer (16–32, tier discipline) | §6.3 | SHOULD | present | L3 | weights.rs | bd-lsu3 | int4 group 16/32 tier discipline (int4.rs:49); int4_packed_parity + focrq qint4 roundtrip |
 | 128 | High-precision set kept BF16 (vision/proj/embed/router/norms) | §5.1 | MUST | present | SURF | weights.rs | bd-1es.6 | KeepBf16 high-precision set (recipe.rs:15-20,58 + policy tests) |
 
@@ -262,7 +262,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr models` (zoo discovery: id, tasks, status) | §7.2 | MUST | present | SURF | bd-3jo6.1.13 | CLI shipped + goldens; A13 docs/runbook half still open |
 | `focr robot schema` (self-describing contract) | §7.2 | MUST | present | SURF | bd-wp8.2 | versioned; frozen fixture |
 | `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
-| `focr robot backends` (SIMD tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | reflects IsaTier; goldens |
+| `focr robot backends` (effective dense route + hardware tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | separates effective ordinary-dense route from hardware IsaTier; goldens |
 | `focr robot selftest` (runtime int8 kernel parity on host silicon) | §7.2 | MUST | present | SURF | bd-223.13 | 24/24 on native Win10; AVX2 ceiling proven on 5995WX |
 | `focr robot triage` (one-round-trip agent mega-command) | §7.2 | SHOULD | present | SURF | bd-wp8.7 | quick_ref + health + state-aware recommendations + exit codes in ONE JSON; pinned by agent_ergonomics_regression |
 | `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |

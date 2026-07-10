@@ -38,6 +38,8 @@
 
 use super::tensor::Mat;
 use crate::error::{FocrError, FocrResult};
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Query heads (== KV heads; plain MHA, `num_key_value_groups = 1`). [SPEC-090]
 pub const NUM_HEADS: usize = 10;
@@ -45,6 +47,28 @@ pub const NUM_HEADS: usize = 10;
 pub const HEAD_DIM: usize = 128;
 /// Ring window `W` — slots reserved for the generated tail. [SPEC-094]
 pub const RING_WINDOW: usize = 128;
+
+/// Process-unique cache identity allocator. Checkpoints are cache-instance
+/// capabilities, not portable cursor tuples; `0` is never issued.
+static NEXT_RING_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_ring_cache_id() -> u64 {
+    let mut current = NEXT_RING_CACHE_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("rswa: exhausted all u64 RingCache identities");
+        match NEXT_RING_CACHE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Attention scale `1/sqrt(head_dim)`. [SPEC-090]
 #[inline]
@@ -65,9 +89,15 @@ const ATTN_GEMM_ENV: &str = "FOCR_ATTN_GEMM";
 
 /// Env kill-switch (ACCURACY-RISKY, needs a measured-CER gate): additionally
 /// store the reference/ring K/V as per-row symmetric int8 and run the `QK` dot
-/// in int8 (`simd::igemm_s8s8` / SDOT), dequantizing `V` per row in the `PV`
+/// through the effective int8 `simd::igemm_s8s8` route, dequantizing `V` per row in the `PV`
 /// pass. Implies (and overrides) the f32 GEMM path. Default keeps f32.
 const INT8_KV_ENV: &str = "FOCR_INT8_KV";
+
+/// Kill-switch for fanning the ten independent scalar R-SWA heads across Rayon.
+/// The measured default is parallel; a falsy value restores the serial oracle.
+/// The per-head kernel is shared, so this changes only outer scheduling, never a
+/// dot or online-softmax reduction.
+const PARALLEL_HEADS_ENV: &str = "FOCR_RSWA_PARALLEL_ATTN";
 
 /// Read `FOCR_ATTN_GEMM` ONCE into a process-global bool (doctrine: not per
 /// token). The int8-KV path subsumes the GEMM path, so it is dispatched ahead of
@@ -85,6 +115,24 @@ fn int8_kv_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os(INT8_KV_ENV).is_some())
+}
+
+/// Read [`PARALLEL_HEADS_ENV`] once. Unknown/unset values use the measured
+/// parallel default; explicit falsy values restore the serial oracle.
+fn parallel_heads_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var(PARALLEL_HEADS_ENV)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("0" | "off" | "false" | "no") => false,
+            Some("1" | "on" | "true" | "yes") => true,
+            _ => true,
+        }
+    })
 }
 
 fn checked_cache_region_elems(rows: usize) -> usize {
@@ -117,8 +165,11 @@ fn checked_head_major_layout(seq: usize, label: &str) -> FocrResult<(usize, usiz
 /// Both are pre-allocated for the worst case at [`RingCache::new`] so the decode
 /// hot loop never reallocates. A K/V row for head `h` at row `r` lives at
 /// `region[h][r * HEAD_DIM .. (r + 1) * HEAD_DIM]`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RingCache {
+    /// Process-unique identity proving which cache instance issued a checkpoint.
+    /// A clone receives a fresh identity even though its K/V initially match.
+    cache_id: u64,
     /// Worst-case reference rows this cache can hold (e.g. `32768 - 128`).
     ref_capacity: usize,
     /// Reference K, one `Vec` per head (each `ref_capacity * HEAD_DIM`).
@@ -138,17 +189,41 @@ pub struct RingCache {
     /// Next ring slot to write (`0..RING_WINDOW`). Only advances modulo `W` at
     /// steady state; during warm-up it tracks `ring_len`.
     ring_pos: usize,
-    /// Monotonic count of [`RingCache::write_decode_step`] calls since the last
-    /// [`RingCache::record_prefill`] (reset to `0` there). Not part of the
-    /// attention math — it exists so [`RingCache::checkpoint`] /
-    /// [`RingCache::rollback_to`] (bd-1azu.31) can count the discarded
-    /// speculative steps and enforce the lossless roll-back contract.
+    /// Logical count of [`RingCache::write_decode_step`] calls since the last
+    /// [`RingCache::record_prefill`] (reset there and rewound by a successful
+    /// rollback). Not part of the attention math — it lets
+    /// [`RingCache::rollback_to`] count discarded speculative steps. The separate
+    /// `lineage_epoch` prevents this rewindable counter from creating an ABA.
     decode_writes: usize,
+    /// Monotonic branch generation for checkpoint lineage. A state-changing
+    /// rollback advances it instead of rewinding it with [`RingCache::decode_writes`],
+    /// so checkpoints captured on the abandoned branch cannot pass later after
+    /// new writes recreate the same cursor values. Re-prefill also advances it.
+    lineage_epoch: u64,
     /// Per-row symmetric int8 mirror of the K/V regions — `Some` iff
     /// [`FOCR_INT8_KV`](INT8_KV_ENV) was set when this cache was built (so the
     /// default path allocates nothing). Populated in lock-step with the f32 K/V
     /// by [`RingCache::record_prefill`] / [`RingCache::write_decode_step`].
     int8: Option<Int8Kv>,
+}
+
+impl Clone for RingCache {
+    fn clone(&self) -> Self {
+        Self {
+            cache_id: next_ring_cache_id(),
+            ref_capacity: self.ref_capacity,
+            ref_k: self.ref_k.clone(),
+            ref_v: self.ref_v.clone(),
+            ring_k: self.ring_k.clone(),
+            ring_v: self.ring_v.clone(),
+            prefill_len: self.prefill_len,
+            ring_len: self.ring_len,
+            ring_pos: self.ring_pos,
+            decode_writes: self.decode_writes,
+            lineage_epoch: self.lineage_epoch,
+            int8: self.int8.clone(),
+        }
+    }
 }
 
 /// Per-row symmetric int8 mirror of one layer's K/V regions (built only under
@@ -202,16 +277,16 @@ impl Int8Kv {
 /// Per-row symmetric int8 quantization of a `HEAD_DIM`-length f32 row into `q`,
 /// returning the row scale `max(|row|)/127` (or `1.0` for an all-zero row).
 ///
-/// Values are rounded then clamped to `[-127, 127]`, so the int8 `QK` dot
-/// accumulates at most `127 * 127 * HEAD_DIM = 2_064_512` in i32 — three orders
-/// of magnitude under `i32::MAX`, regardless of head_dim/key count (the
-/// contraction is fixed at `HEAD_DIM`). See `int8_qk_i32_accumulation_cannot_overflow`.
+/// Values are divided by the stored scale, rounded to nearest with ties to even,
+/// then clamped to `[-127, 127]`. The int8 `QK` dot therefore accumulates at most
+/// `127 * 127 * HEAD_DIM = 2_064_512` in i32 — three orders of magnitude under
+/// `i32::MAX`, regardless of head_dim/key count (the contraction is fixed at
+/// `HEAD_DIM`). See `int8_qk_i32_accumulation_cannot_overflow`.
 fn quantize_row_i8(row: &[f32], q: &mut [i8]) -> f32 {
     let maxabs = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let scale = if maxabs > 0.0 { maxabs / 127.0 } else { 1.0 };
-    let inv = 1.0 / scale;
     for (qd, &x) in q.iter_mut().zip(row.iter()) {
-        *qd = (x * inv).round().clamp(-127.0, 127.0) as i8;
+        *qd = (x / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
     }
     scale
 }
@@ -225,9 +300,10 @@ fn quantize_row_i8(row: &[f32], q: &mut [i8]) -> f32 {
 /// rejected suffix of a speculative-decoding draft block): checkpoint before the
 /// draft, write the draft tokens, then roll back to erase the rejected ones. Only
 /// the generated tail moves — the reference (prefill) block is frozen and never
-/// rolls back — so the snapshot is just the prefill boundary (recorded as a
-/// provenance guard), the ring `len`/`pos` cursors, and the monotonic
-/// decode-write count.
+/// rolls back — so the snapshot is the prefill boundary (recorded as a provenance
+/// guard), the issuing cache's identity, the ring `len`/`pos` cursors, the
+/// decode-write count, and a branch lineage epoch that cannot be rewound with
+/// those cursors.
 ///
 /// ## LOSSLESS contract
 /// Rollback restores the EXACT byte-for-byte readable ring state — the discarded
@@ -238,10 +314,13 @@ fn quantize_row_i8(row: &[f32], q: &mut [i8]) -> f32 {
 /// speculative-decode regime (a short draft block appended to the generated
 /// tail). If a discarded write evicted a checkpoint-live slot (a steady-state
 /// in-place overwrite), that slot's prior K/V is physically gone and cannot be
-/// reconstructed from cursors alone; [`RingCache::rollback_to`] `debug_assert`s
-/// against exactly that case rather than silently returning a corrupted cache.
+/// reconstructed from cursors alone; [`RingCache::rollback_to`] returns an error
+/// in every build against exactly that case rather than silently returning a
+/// corrupted cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingCheckpoint {
+    /// Identity of the exact cache instance that issued this checkpoint.
+    cache_id: u64,
     /// Reference-block boundary at checkpoint time (frozen; a provenance guard so
     /// a checkpoint can't be replayed onto a differently-prefilled cache).
     prefill_len: Option<usize>,
@@ -253,6 +332,9 @@ pub struct RingCheckpoint {
     /// [`RingCache::rollback_to`] tally the discarded steps and enforce the
     /// lossless contract.
     decode_writes: usize,
+    /// Branch generation at checkpoint time. A mismatch means this checkpoint
+    /// belongs to history abandoned by an earlier rollback or re-prefill.
+    lineage_epoch: u64,
 }
 
 impl RingCheckpoint {
@@ -301,6 +383,7 @@ impl RingCache {
         let ref_elems = checked_cache_region_elems(prefill_capacity);
         let ring_elems = checked_cache_region_elems(RING_WINDOW);
         Self {
+            cache_id: next_ring_cache_id(),
             ref_capacity: prefill_capacity,
             ref_k: (0..NUM_HEADS).map(|_| vec![0.0f32; ref_elems]).collect(),
             ref_v: (0..NUM_HEADS).map(|_| vec![0.0f32; ref_elems]).collect(),
@@ -310,6 +393,7 @@ impl RingCache {
             ring_len: 0,
             ring_pos: 0,
             decode_writes: 0,
+            lineage_epoch: 0,
             int8: with_int8.then(|| Int8Kv::new(prefill_capacity)),
         }
     }
@@ -402,6 +486,13 @@ impl RingCache {
                 expect
             )));
         }
+        // Allocate the new prefill lineage before touching K/V so even the
+        // theoretical epoch-exhaustion refusal is atomic.
+        let next_lineage_epoch = self.lineage_epoch.checked_add(1).ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "rswa: checkpoint lineage epoch exhausted during record_prefill"
+            ))
+        })?;
         for h in 0..NUM_HEADS {
             let src = &k[h * stride..(h + 1) * stride];
             self.ref_k[h][..stride].copy_from_slice(src);
@@ -429,6 +520,7 @@ impl RingCache {
         self.ring_len = 0;
         self.ring_pos = 0;
         self.decode_writes = 0;
+        self.lineage_epoch = next_lineage_epoch;
         Ok(())
     }
 
@@ -463,6 +555,14 @@ impl RingCache {
                 expect
             )));
         }
+        // The write counter is part of the rollback proof. Refuse before
+        // touching K/V rather than letting a release build wrap it and recreate
+        // an old checkpoint watermark.
+        let next_decode_writes = self.decode_writes.checked_add(1).ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "rswa: decode-write counter exhausted before ring mutation"
+            ))
+        })?;
 
         let slot = if self.ring_len < RING_WINDOW {
             // Warm-up: append, no eviction.
@@ -508,25 +608,27 @@ impl RingCache {
         }
         // Count this write so checkpoint/rollback (bd-1azu.31) can tally the
         // discarded speculative steps; not used by the attention math.
-        self.decode_writes += 1;
+        self.decode_writes = next_decode_writes;
         Ok(slot)
     }
 
     /// Capture the current generated-tail write cursors as a [`RingCheckpoint`]
     /// for a later [`RingCache::rollback_to`] (bd-1azu.31 — speculative-decode
     /// roll-back). `O(1)`, copies NO K/V buffer: only the ring `len`/`pos`, the
-    /// (frozen) prefill boundary, and the decode-write counter. Take this BEFORE
-    /// writing speculative decode steps; if they are rejected, [`rollback_to`]
-    /// erases them so they leave no trace.
+    /// (frozen) prefill boundary, decode-write counter, and branch epoch. Take this
+    /// BEFORE writing speculative decode steps; if they are rejected,
+    /// [`rollback_to`] erases them so they leave no trace.
     ///
     /// [`rollback_to`]: RingCache::rollback_to
     #[must_use]
     pub fn checkpoint(&self) -> RingCheckpoint {
         RingCheckpoint {
+            cache_id: self.cache_id,
             prefill_len: self.prefill_len,
             ring_len: self.ring_len,
             ring_pos: self.ring_pos,
             decode_writes: self.decode_writes,
+            lineage_epoch: self.lineage_epoch,
         }
     }
 
@@ -539,43 +641,70 @@ impl RingCache {
     /// paths scan exactly `0..ring_len` — so no buffer needs clearing or copying,
     /// which is what makes the roll-back both `O(1)` and byte-for-byte lossless.
     ///
-    /// # Panics (debug only)
-    /// `debug_assert`s the [LOSSLESS contract](RingCheckpoint): the checkpoint
-    /// must belong to this cache (same `prefill_len`), must not be from the future
-    /// (its `decode_writes` not above the cache's), and the discarded steps must
-    /// not have wrapped the ring past the checkpoint's live rows
-    /// (`checkpoint.ring_len + discarded <= RING_WINDOW`) — otherwise an evicted
-    /// slot's prior K/V is physically gone and the roll-back would NOT be lossless.
-    pub fn rollback_to(&mut self, cp: &RingCheckpoint) {
-        // Contract guard (debug builds only — compiled out of release, where the
-        // local would otherwise be unused). `discarded` lives entirely inside the
-        // gated block so there is no release-build dead-code/unused-var warning.
-        #[cfg(debug_assertions)]
-        {
-            assert_eq!(
-                cp.prefill_len, self.prefill_len,
+    /// # Errors
+    /// Returns [`FocrError::Other`] without mutating the cache when the checkpoint
+    /// was issued by a different cache instance, has a different prefill boundary
+    /// or branch lineage, is from the future, or the discarded writes overwrote
+    /// any row that was live at the checkpoint. The last condition is equivalent to
+    /// `checkpoint.ring_len + discarded <= RING_WINDOW`; enforcing it in every
+    /// build is essential because cursor restoration cannot resurrect overwritten
+    /// K/V bytes.
+    pub fn rollback_to(&mut self, cp: &RingCheckpoint) -> FocrResult<()> {
+        if cp.cache_id != self.cache_id {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rswa: rollback_to checkpoint belongs to a different cache instance (cp.cache_id={} != cache.id={})",
+                cp.cache_id,
+                self.cache_id
+            )));
+        }
+        if cp.prefill_len != self.prefill_len {
+            return Err(FocrError::Other(anyhow::anyhow!(
                 "rswa: rollback_to checkpoint prefill_len {:?} != cache {:?}",
-                cp.prefill_len, self.prefill_len
-            );
-            assert!(
-                cp.decode_writes <= self.decode_writes,
+                cp.prefill_len,
+                self.prefill_len
+            )));
+        }
+        if cp.lineage_epoch != self.lineage_epoch {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rswa: rollback_to stale checkpoint lineage (cp.epoch={} != cache.epoch={}); the checkpoint belongs to an abandoned rollback branch or an earlier prefill",
+                cp.lineage_epoch,
+                self.lineage_epoch
+            )));
+        }
+        if cp.decode_writes > self.decode_writes {
+            return Err(FocrError::Other(anyhow::anyhow!(
                 "rswa: rollback_to checkpoint is from the future \
                  (cp.decode_writes={} > cache={})",
                 cp.decode_writes,
                 self.decode_writes
-            );
-            let discarded = self.decode_writes - cp.decode_writes;
-            assert!(
-                cp.ring_len + discarded <= RING_WINDOW,
+            )));
+        }
+        let discarded = self.decode_writes - cp.decode_writes;
+        if cp.ring_len > RING_WINDOW || discarded > RING_WINDOW - cp.ring_len {
+            return Err(FocrError::Other(anyhow::anyhow!(
                 "rswa: rollback_to is not lossless — {discarded} discarded steps \
                  wrapped the ring past checkpoint.ring_len={} (W={RING_WINDOW}); an \
                  evicted slot's prior K/V cannot be restored from cursors alone",
                 cp.ring_len
-            );
+            )));
         }
+        // A rollback that discards writes creates a new branch even though its
+        // public cursors rewind. Reserve that epoch before mutation so any
+        // overflow refusal leaves both cursors and K/V untouched.
+        let next_lineage_epoch = if discarded == 0 {
+            self.lineage_epoch
+        } else {
+            self.lineage_epoch.checked_add(1).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!(
+                    "rswa: checkpoint lineage epoch exhausted before rollback"
+                ))
+            })?
+        };
         self.ring_len = cp.ring_len;
         self.ring_pos = cp.ring_pos;
         self.decode_writes = cp.decode_writes;
+        self.lineage_epoch = next_lineage_epoch;
+        Ok(())
     }
 
     /// Reference-K row `r` for head `h` (`r < prefill_len`).
@@ -793,15 +922,15 @@ impl BatchedRingCache {
     /// discarding the speculative decode steps written into THAT stream's ring so
     /// it behaves as if they never happened. Per-stream independent (a roll-back
     /// on one stream never touches another); delegates to
-    /// [`RingCache::rollback_to`] under the identical lossless contract / debug
-    /// asserts.
+    /// [`RingCache::rollback_to`] under the identical lossless contract.
     ///
     /// # Panics
-    /// Panics if `s >= num_streams()` or `layer >= num_layers()`; in debug builds
-    /// also on a checkpoint that violates the lossless contract (see
-    /// [`RingCache::rollback_to`]).
-    pub fn rollback_to(&mut self, s: usize, layer: usize, cp: &RingCheckpoint) {
-        self.streams[s][layer].rollback_to(cp);
+    /// Panics if `s >= num_streams()` or `layer >= num_layers()`.
+    ///
+    /// # Errors
+    /// Propagates [`RingCache::rollback_to`]'s all-build contract errors.
+    pub fn rollback_to(&mut self, s: usize, layer: usize, cp: &RingCheckpoint) -> FocrResult<()> {
+        self.streams[s][layer].rollback_to(cp)
     }
 
     /// Total default-path (f32) KV working-set bytes across all streams/layers —
@@ -841,8 +970,9 @@ impl BatchedRingCache {
 /// ```
 ///
 /// Dispatch (env read ONCE into a bool — doctrine):
-///  * default — [`decode_attention_scalar`], the bit-exact online-softmax fold;
-///  * [`FOCR_INT8_KV`](INT8_KV_ENV) — [`decode_attention_int8`] (int8 `QK` SDOT +
+///  * default — the bit-exact per-head scalar kernel scheduled across Rayon;
+///  * `FOCR_RSWA_PARALLEL_ATTN=0` — [`decode_attention_scalar`], its serial oracle;
+///  * [`FOCR_INT8_KV`](INT8_KV_ENV) — [`decode_attention_int8`] (int8 `QK` dot +
 ///    int8 `V` dequant), overriding the f32 GEMM path;
 ///  * [`FOCR_ATTN_GEMM`](ATTN_GEMM_ENV) — [`decode_attention_gemm`], the f32
 ///    batched-GEMV path (`exp` lifted out of the dot loop).
@@ -858,6 +988,8 @@ pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
         decode_attention_int8(cache, q)
     } else if attn_gemm_enabled() {
         decode_attention_gemm(cache, q)
+    } else if parallel_heads_enabled() {
+        decode_attention_scalar_parallel(cache, q)
     } else {
         decode_attention_scalar(cache, q)
     }
@@ -898,44 +1030,77 @@ fn decode_attention_scalar(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
 
     for h in 0..NUM_HEADS {
         let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
-
-        // Online softmax accumulators over the union (reference ++ ring).
-        let mut run_max = f32::NEG_INFINITY;
-        let mut run_den = 0.0f32;
-        let mut acc = [0.0f32; HEAD_DIM];
-
-        // --- streaming fold of the (large) reference block ---
-        for r in 0..prefill_len {
-            let score = dot(qh, cache.ref_k_row(h, r)) * s;
-            fold(
-                &mut run_max,
-                &mut run_den,
-                &mut acc,
-                score,
-                cache.ref_v_row(h, r),
-            );
-        }
-        // --- fold of the ring tail (<= W keys) ---
-        for r in 0..ring_len {
-            let score = dot(qh, cache.ring_k_row(h, r)) * s;
-            fold(
-                &mut run_max,
-                &mut run_den,
-                &mut acc,
-                score,
-                cache.ring_v_row(h, r),
-            );
-        }
-
-        // Normalize: out_h = acc / run_den.
-        let inv = if run_den > 0.0 { 1.0 / run_den } else { 0.0 };
         let dst = &mut out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
-        for i in 0..HEAD_DIM {
-            dst[i] = acc[i] * inv;
-        }
+        decode_attention_scalar_head(cache, h, qh, prefill_len, ring_len, s, dst);
     }
 
     Ok(Mat::from_vec(1, NUM_HEADS * HEAD_DIM, out))
+}
+
+/// Bit-exact twin of [`decode_attention_scalar`] that schedules only the outer
+/// independent-head dimension in parallel. Each worker calls the same per-head
+/// kernel and writes a disjoint output lane.
+fn decode_attention_scalar_parallel(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
+    let (prefill_len, ring_len) = decode_dims(cache, q)?;
+    let s = scale();
+    let mut out = vec![0.0f32; NUM_HEADS * HEAD_DIM];
+    out.par_chunks_mut(HEAD_DIM)
+        .enumerate()
+        .for_each(|(h, dst)| {
+            let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            decode_attention_scalar_head(cache, h, qh, prefill_len, ring_len, s, dst);
+        });
+    Ok(Mat::from_vec(1, NUM_HEADS * HEAD_DIM, out))
+}
+
+/// One head of the scalar online-softmax oracle. Both serial and parallel outer
+/// schedulers call this exact body, preserving every operation and fold order.
+#[inline]
+fn decode_attention_scalar_head(
+    cache: &RingCache,
+    h: usize,
+    qh: &[f32],
+    prefill_len: usize,
+    ring_len: usize,
+    s: f32,
+    dst: &mut [f32],
+) {
+    debug_assert_eq!(qh.len(), HEAD_DIM);
+    debug_assert_eq!(dst.len(), HEAD_DIM);
+
+    // Online softmax accumulators over the union (reference ++ ring).
+    let mut run_max = f32::NEG_INFINITY;
+    let mut run_den = 0.0f32;
+    let mut acc = [0.0f32; HEAD_DIM];
+
+    // --- streaming fold of the (large) reference block ---
+    for r in 0..prefill_len {
+        let score = dot(qh, cache.ref_k_row(h, r)) * s;
+        fold(
+            &mut run_max,
+            &mut run_den,
+            &mut acc,
+            score,
+            cache.ref_v_row(h, r),
+        );
+    }
+    // --- fold of the ring tail (<= W keys) ---
+    for r in 0..ring_len {
+        let score = dot(qh, cache.ring_k_row(h, r)) * s;
+        fold(
+            &mut run_max,
+            &mut run_den,
+            &mut acc,
+            score,
+            cache.ring_v_row(h, r),
+        );
+    }
+
+    // Normalize: out_h = acc / run_den.
+    let inv = if run_den > 0.0 { 1.0 / run_den } else { 0.0 };
+    for i in 0..HEAD_DIM {
+        dst[i] = acc[i] * inv;
+    }
 }
 
 /// `scores[r] = scale * (q · keys[r])` for `r in 0..rows`, where `keys` is the
@@ -1052,7 +1217,7 @@ fn decode_attention_gemm(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
 
 /// int8-KV decode attention (`FOCR_INT8_KV`, ACCURACY-RISKY — needs a measured
 /// CER gate). The query is dynamically quantized per head; the `QK` dot runs in
-/// int8 (`simd::igemm_s8s8` / SDOT) over the int8 K mirror with an i32
+/// int8 through `simd::igemm_s8s8` over the int8 K mirror with an i32
 /// accumulator (worst case `127*127*HEAD_DIM = 2_064_512`, far under `i32::MAX`),
 /// dequantized by `qscale * k_scale[r]`. Softmax is identical f32. `PV` reads the
 /// int8 V mirror (4× less bandwidth) and dequantizes per row. R-SWA semantics
@@ -1760,6 +1925,113 @@ mod tests {
         cache
     }
 
+    #[test]
+    fn int8_row_quantization_uses_ties_to_even() {
+        let mut row = vec![0.0f32; HEAD_DIM];
+        row[..9].copy_from_slice(&[127.0, 0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5]);
+        let mut quantized = [0i8; HEAD_DIM];
+
+        let scale = quantize_row_i8(&row, &mut quantized);
+
+        assert_eq!(scale.to_bits(), 1.0f32.to_bits());
+        assert_eq!(&quantized[..9], &[127, 0, 2, 2, 4, 0, -2, -2, -4]);
+    }
+
+    #[test]
+    fn int8_row_quantization_divides_instead_of_multiplying_by_reciprocal() {
+        let mut row = vec![0.0f32; HEAD_DIM];
+        row[0] = f32::from_bits(0x1e2a_010a);
+        row[1] = f32::from_bits(0x9e26_a853);
+        let mut quantized = [0i8; HEAD_DIM];
+
+        let scale = quantize_row_i8(&row, &mut quantized);
+        let reciprocal_result = (row[1] * (1.0 / scale)).round().clamp(-127.0, 127.0) as i8;
+
+        assert_eq!(quantized[0], 127);
+        assert_eq!(quantized[1], -124);
+        assert_eq!(
+            reciprocal_result, -125,
+            "fixture must distinguish the two formulas"
+        );
+    }
+
+    #[test]
+    fn int8_row_quantization_matches_scalar_contract() {
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        for case in 0..256 {
+            let mut row = vec![0.0f32; HEAD_DIM];
+            let magnitude = 2.0f32.powi((case % 41) - 20);
+            for x in &mut row {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let unit = ((state >> 40) as u32) as f32 / ((1u32 << 24) - 1) as f32;
+                *x = (unit * 2.0 - 1.0) * magnitude;
+            }
+            if case == 0 {
+                row.fill(0.0);
+            }
+
+            let expected_scale = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let expected_scale = if expected_scale > 0.0 {
+                expected_scale / 127.0
+            } else {
+                1.0
+            };
+            let expected = row
+                .iter()
+                .map(|&x| (x / expected_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
+                .collect::<Vec<_>>();
+            let mut actual = [0i8; HEAD_DIM];
+
+            let actual_scale = quantize_row_i8(&row, &mut actual);
+
+            assert_eq!(
+                actual_scale.to_bits(),
+                expected_scale.to_bits(),
+                "case {case}"
+            );
+            assert_eq!(actual.as_slice(), expected.as_slice(), "case {case}");
+        }
+    }
+
+    /// Parallelism changes only the outer head schedule. Every bit must match
+    /// the serial oracle because both schedulers call the same per-head body.
+    #[test]
+    fn parallel_heads_are_bit_identical_to_serial() {
+        let cache = build_cache(
+            23,
+            RING_WINDOW + 3,
+            false,
+            |r, d| ((r * 29 + d * 11) % 37) as f32 * 0.03125 - 0.5,
+            |r, d| ((r * 17 + d * 7) % 31) as f32 * 0.046875 - 0.7,
+            |s, h, d| ((s * 13 + h * 5 + d * 3) % 41) as f32 * 0.0234375 - 0.4,
+            |s, h, d| ((s * 19 + h * 7 + d * 2) % 43) as f32 * 0.01953125 - 0.3,
+        );
+        let q = one_token(|h, d| ((h * 23 + d * 13) % 47) as f32 * 0.02734375 - 0.6);
+
+        let serial = decode_attention_scalar(&cache, &q).unwrap();
+        let serial_bits = serial.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for threads in [1, 2, 8, 10] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel = pool
+                .install(|| decode_attention_scalar_parallel(&cache, &q))
+                .unwrap();
+            assert_eq!(
+                serial_bits,
+                parallel
+                    .data
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                "parallel result changed with {threads} worker threads"
+            );
+        }
+    }
+
     /// The f32 batched-GEMV path (`FOCR_ATTN_GEMM`) tracks the scalar online-
     /// softmax oracle within the SAM-style `2e-6` reorder tolerance over a
     /// reference block + ring tail with non-uniform, non-degenerate scores.
@@ -1828,7 +2100,7 @@ mod tests {
 
     /// With **lossless-quantizable** K/V/q (integer entries, per-row max-abs
     /// pinned to 127 so `scale == 1`), the int8-KV path reproduces the f32 GEMM
-    /// path to f32 precision — isolating the int8 QK-SDOT + V-dequant *kernel*
+    /// path to f32 precision — isolating the int8 QK-dot + V-dequant *kernel*
     /// correctness from the quantization error itself (which the 20-page CER gate
     /// measures). The d=0 anchor (127) pins the scale; the small d>=1 integers
     /// keep the softmax non-degenerate.
@@ -1963,7 +2235,7 @@ mod tests {
             test.write_decode_step(&kt, &kt).unwrap();
         }
         assert_eq!(test.ring_len(), accept + 6);
-        test.rollback_to(&cp);
+        test.rollback_to(&cp).unwrap();
 
         // Cursors (including the private decode-write counter) restored exactly.
         assert_eq!(test.ring_len(), accept);
@@ -2014,12 +2286,11 @@ mod tests {
         assert_eq!(test.ring_len(), accept + 1);
     }
 
-    /// The contract guard refuses a roll-back that would have to resurrect an
-    /// evicted (steady-state-overwritten) slot — indices alone cannot restore it.
-    #[cfg(debug_assertions)]
+    /// The all-build contract guard refuses a roll-back that would have to
+    /// resurrect an evicted (steady-state-overwritten) slot. Refusal is atomic:
+    /// the already-written current cache state remains byte-for-byte unchanged.
     #[test]
-    #[should_panic(expected = "not lossless")]
-    fn rollback_rejects_eviction_in_steady_state() {
+    fn rollback_rejects_eviction_in_steady_state_without_mutation() {
         let mut c = RingCache::new(8);
         let k = fill_head_major(3, |_, _| 0.25);
         c.record_prefill(&k, &k, 3).unwrap();
@@ -2032,7 +2303,97 @@ mod tests {
         // One steady-state write overwrites slot 0 (live at the checkpoint).
         let t = one_token(|_, _| 1.0);
         c.write_decode_step(&t, &t).unwrap();
-        c.rollback_to(&cp); // must panic: not lossless.
+        let current = c.checkpoint();
+        let ring_k = c.ring_k.clone();
+        let ring_v = c.ring_v.clone();
+        let error = c
+            .rollback_to(&cp)
+            .expect_err("steady-state overwrite cannot be restored from cursors");
+        assert!(error.to_string().contains("not lossless"));
+        assert_eq!(c.checkpoint(), current, "failed rollback changed cursors");
+        assert_eq!(c.ring_k, ring_k, "failed rollback changed ring K");
+        assert_eq!(c.ring_v, ring_v, "failed rollback changed ring V");
+    }
+
+    /// Cursor values and decode-write counts can repeat after rollback plus new
+    /// writes. The lineage epoch must reject a checkpoint from the abandoned
+    /// branch before it can restore cursors over the replacement branch's K/V.
+    #[test]
+    fn rollback_rejects_abandoned_branch_checkpoint_without_mutation() {
+        let mut c = RingCache::new(16);
+        let prefill = fill_head_major(4, |r, d| ((r * 7 + d) % 13) as f32 * 0.1);
+        c.record_prefill(&prefill, &prefill, 4).unwrap();
+        let accepted = one_token(|_, _| 0.25);
+        c.write_decode_step(&accepted, &accepted).unwrap();
+
+        let branch_point = c.checkpoint();
+        let abandoned = one_token(|_, _| 1.0);
+        c.write_decode_step(&abandoned, &abandoned).unwrap();
+        let stale = c.checkpoint();
+        let abandoned_ring_k = c.ring_k.clone();
+
+        c.rollback_to(&branch_point).unwrap();
+        let replacement = one_token(|_, _| -2.0);
+        c.write_decode_step(&replacement, &replacement).unwrap();
+
+        // ABA teeth: every old cursor/counter value has been recreated, while
+        // the physical K/V at the re-used slot belongs to the new branch.
+        assert_eq!(stale.ring_len, c.ring_len);
+        assert_eq!(stale.ring_pos, c.ring_pos);
+        assert_eq!(stale.decode_writes, c.decode_writes);
+        assert_ne!(stale.lineage_epoch, c.lineage_epoch);
+        assert_ne!(abandoned_ring_k, c.ring_k);
+
+        let current = c.checkpoint();
+        let ring_k = c.ring_k.clone();
+        let ring_v = c.ring_v.clone();
+        let error = c
+            .rollback_to(&stale)
+            .expect_err("checkpoint from abandoned branch must be stale");
+        assert!(error.to_string().contains("stale checkpoint lineage"));
+        assert_eq!(c.checkpoint(), current, "refusal changed cursors");
+        assert_eq!(c.ring_k, ring_k, "refusal changed replacement ring K");
+        assert_eq!(c.ring_v, ring_v, "refusal changed replacement ring V");
+    }
+
+    /// Matching prefill/cursors/epochs do not make checkpoints portable across
+    /// independent caches. Without the instance guard this would truncate the
+    /// target cache over unrelated K/V from its own decode history.
+    #[test]
+    fn rollback_rejects_different_cache_checkpoint_without_mutation() {
+        let prefill = fill_head_major(4, |r, d| ((r * 5 + d) % 17) as f32 * 0.1);
+        let mut issuer = RingCache::new(16);
+        let mut target = RingCache::new(16);
+        issuer.record_prefill(&prefill, &prefill, 4).unwrap();
+        target.record_prefill(&prefill, &prefill, 4).unwrap();
+
+        for value in [1.0, 2.0] {
+            let step = one_token(|_, _| value);
+            issuer.write_decode_step(&step, &step).unwrap();
+        }
+        let foreign = issuer.checkpoint();
+        for value in [-1.0, -2.0, -3.0] {
+            let step = one_token(|_, _| value);
+            target.write_decode_step(&step, &step).unwrap();
+        }
+
+        // Teeth: every legacy provenance field would permit a one-step
+        // lossless-looking truncation; only the issuing cache identity differs.
+        assert_ne!(foreign.cache_id, target.cache_id);
+        assert_eq!(foreign.prefill_len, target.prefill_len);
+        assert_eq!(foreign.lineage_epoch, target.lineage_epoch);
+        assert!(foreign.decode_writes < target.decode_writes);
+
+        let current = target.checkpoint();
+        let ring_k = target.ring_k.clone();
+        let ring_v = target.ring_v.clone();
+        let error = target
+            .rollback_to(&foreign)
+            .expect_err("checkpoint from independent cache must be refused");
+        assert!(error.to_string().contains("different cache instance"));
+        assert_eq!(target.checkpoint(), current, "refusal changed cursors");
+        assert_eq!(target.ring_k, ring_k, "refusal changed target ring K");
+        assert_eq!(target.ring_v, ring_v, "refusal changed target ring V");
     }
 
     /// A no-op roll-back to a fresh checkpoint (no writes in between) leaves the
@@ -2045,7 +2406,7 @@ mod tests {
         let t = one_token(|_, _| 0.3);
         c.write_decode_step(&t, &t).unwrap();
         let cp = c.checkpoint();
-        c.rollback_to(&cp);
+        c.rollback_to(&cp).unwrap();
         assert_eq!(c.ring_len(), 1);
         assert_eq!(c.ring_pos(), 1);
         assert_eq!(c.decode_writes, 1);

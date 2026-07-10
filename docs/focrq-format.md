@@ -133,7 +133,7 @@ Forward-compatible optional fields:
 | `format_version` | integer | Writer emits the prefix version for traceability. |
 | `model_id` | string | The architecture id (`ModelArch::id`) the loader selects from the model registry. **Absent ⇒ the default `unlimited-ocr`** (so every v1 artifact loads unchanged); a non-empty id not in this binary's registry is **refused** (forward-incompatible artifact). The writer omits it for the default arch so re-converting Unlimited-OCR stays byte-identical to v1. |
 | `provenance` | object | Contains pinned commits and source hashes when attached. |
-| `model_config` | object | Frozen relevant config fields from truth-pack `config.json` when attached. |
+| `model_config` | object | Forward-compatible config metadata when attached. Format-v1 readers do not treat it as validated or authoritative; see below. |
 | `packing_manifest` | object | Converter/packing metadata and optional bit-allocation table when attached. |
 
 ### Payload
@@ -337,11 +337,21 @@ Rules:
 - `scales_len == scale_count * 4`.
 - Logical dequantization is `f32(q4) * scale[row, group]`.
 
-## Frozen `model_config`
+## Deferred `model_config` contract
 
-`model_config` is the minimal frozen subset of truth-pack `config.json` needed to
-validate shape compatibility and reject stale artifacts. It must include at
-least:
+There is not yet one canonical, versioned `model_config` object embedded in the
+runtime. Format-v1 writers may attach this field for forward-compatible
+provenance, but current readers ignore it. They do **not** claim that an attached
+object was checked or use it to reinterpret payload bytes.
+
+Unlimited-OCR v1 acceptance instead uses the compiled exact 2,710-tensor
+name/shape/dtype manifest, the pinned declared source hash, the exact quant
+recipe, and runtime constants compiled from the truth pack. This avoids creating
+a second, drifting config schema merely to validate an optional header field.
+
+A future format version may promote `model_config` to a validated contract after
+one canonical serialized schema is generated from the truth pack and shared by
+the writer and reader. That schema is expected to include at least:
 
 - `model_type`
 - `torch_dtype`
@@ -365,8 +375,10 @@ least:
 - `source_hashes.model_index_sha256`
 - `source_hashes.tokenizer_json_sha256`
 
-Readers must compare these values against their compiled model census before
-loading tensor bytes. A mismatch is `FormatMismatch`, not a warning.
+Until that canonical object exists, tooling must not describe `model_config` as
+validated. Once promoted, readers must compare the complete versioned object
+against the compiled truth-pack representation and report a mismatch as
+`FormatMismatch`, not a warning.
 
 ## `packing_manifest`
 
@@ -376,7 +388,7 @@ loading tensor bytes. A mismatch is `FormatMismatch`, not a warning.
 {
   "converter_version": "franken_ocr 0.1.0",
   "created_utc": "2026-06-25T00:00:00Z",
-  "quant_recipe": "decoder-ffn-int8-v1",
+  "quant_recipe": "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1",
   "activation_quant": "dynamic-per-row",
   "bit_allocation_table": null,
   "rounding": "round_ties_to_even",
@@ -399,10 +411,13 @@ measured, kill-switched exception:
 - `embed_tokens`
 - MoE router gates
 - all norms
+- decoder attention `q/k/v/o`
+- `lm_head`
 
-The default validated quantized set is decoder FFN/expert/dense GEMMs. Attention
-`q/k/v/o` and `lm_head` int8 are separate measured levers behind kill switches,
-not baseline assumptions.
+The default validated quantized set is exactly the 2,148 decoder
+FFN/expert/dense matrices. The 48 attention projections and `lm_head` are
+separate measured levers behind independent kill switches, not baseline
+assumptions.
 
 ## Loader Algorithm
 
@@ -414,18 +429,53 @@ not baseline assumptions.
 6. Check `51 + header_len <= file_len` with checked arithmetic.
 7. Parse header JSON.
 8. Resolve `arch_target` and `source_sha256` from the header when present, or
-   from the fixed prefix otherwise.
+   from the fixed prefix otherwise. Reject `arch_target` outside the closed v1
+   enum `0..=3`; the bounded production probe also requires the mirrored header
+   and prefix values to agree.
 9. Resolve `model_id` against the model registry: absent ⇒ the default
    `unlimited-ocr`; a non-empty id the registry lacks ⇒ refuse (forward-incompatible).
 10. Check `license_notice` against the resolved arch: the Baidu MIT attribution for
     `unlimited-ocr`, else exact equality with that arch's `ModelArch::license_notice`.
-11. Validate `model_config` against the compiled truth-pack census.
-12. Validate every tensor record and byte range in the `tensors` map.
-13. Build an immutable map `name -> TensorRange`.
-14. Warn on compatible arch mismatch; error on incompatible packing.
+11. For an Unlimited-OCR `.focrq`, validate every present tensor dtype against
+    `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`: recipe FFNs must be
+    `QInt8PerChan`; every other tensor must be BF16 or F32. Reject legacy
+    full-int8 artifacts before any forward.
+12. Treat optional v1 `model_config` as unvalidated provenance; use the compiled
+    exact tensor manifest and runtime constants as the active model contract.
+13. Validate every tensor record and byte range in the `tensors` map, including
+    scale cardinality, bounds, and global non-overlap of every non-empty data and
+    scale interval.
+14. Build an immutable map `name -> TensorRange`.
+15. Warn on compatible arch mismatch; error on incompatible packing.
 
-No tensor dequantization is required during header sniffing. `native_model_available`
-may stop after step 13.
+No tensor dequantization is required during header sniffing.
+`native_model_available` performs the bounded structural, recipe, provenance-
+header, and exact schema checks. It does not read or hash the full payload and
+therefore does not claim whole-file identity.
+
+## Local-file integrity boundary
+
+`source_sha256` is converter provenance: the CLI hashes the exact source bytes it
+read and records that digest in the artifact. At load time the reader validates
+the field's syntax, its fixed-prefix/header agreement, and (for Unlimited-OCR)
+its equality to the pinned source digest. It does not recompute the source digest
+from a file that is no longer present, nor does it hash every local `.focrq`
+payload on each load.
+
+Whole-file integrity belongs to these boundaries:
+
+- `focr pull` verifies every part plus the reassembled artifact against the
+  committed download manifest before installation.
+- Model-gated release tests hash the pinned raw shard and conservative artifact
+  before exercising their exact schemas.
+- A direct `FOCR_MODEL_PATH` or an already-mutated cache file is trusted local
+  input after structural/schema validation. Operators requiring tamper detection
+  must verify its whole-file SHA-256 against a trusted manifest before loading.
+
+The owned-buffer default prevents a concurrent truncate from faulting through a
+memory map; it does not turn a concurrently modified local file into an atomic or
+cryptographically authenticated snapshot. `FOCR_MMAP=1` additionally requires
+an inode guaranteed immutable for the process lifetime.
 
 ## Writer Determinism
 
@@ -453,10 +503,12 @@ The writer test must assert:
 | Missing file | model-not-found / exit 3 |
 | Bad magic | `FormatMismatch` / exit 7 |
 | Unsupported `format_version` | `FormatMismatch` / exit 7 |
+| Unknown `arch_target` outside `0..=3` | `FormatMismatch` / exit 7 |
 | Invalid JSON header | `FormatMismatch` / exit 7 |
 | Missing license notice | `FormatMismatch` / exit 7 |
-| Source/config/census mismatch | `FormatMismatch` / exit 7 |
+| Declared source / recipe / exact census mismatch | `FormatMismatch` / exit 7 |
 | Out-of-range tensor byte range | `FormatMismatch` / exit 7 |
+| Overlapping tensor data/scale ranges | `FormatMismatch` / exit 7 |
 | Incompatible arch packing | `FormatMismatch` / exit 7 |
 
 Warnings are allowed only for compatible arch fallback, and must name both the

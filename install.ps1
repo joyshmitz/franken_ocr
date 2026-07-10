@@ -21,10 +21,11 @@
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1))) -Verify
 
   Options:
-    -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.4.0)
+    -Version <vX.Y.Z>  Install a specific version (default: latest release)
     -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
+    -OfflineAssetDir   Read the asset and .sha256 from a local directory (requires -Version)
     -Verify            Run "focr robot selftest" after install and report the verdict
-    -NoPull            Do not offer to download the model after install (focr pull)
+    -NoPull            Suppress the post-install model download prompt/guidance
     -Quiet             Suppress non-error output
     -Force             Reinstall even when the same version is present
     -Help              Show usage and exit
@@ -33,13 +34,14 @@
     HTTPS_PROXY        HTTPS proxy for downloads (preferred)
     HTTP_PROXY         HTTP proxy for downloads
 
-  Platform: only x86-64 Windows (AMD64) has a published binary since v0.2.0.
-  Windows on ARM64 is not published yet; this installer says so and stops.
+  Platform: this installer supports native release assets for x86-64 Windows
+  (AMD64) and Windows on ARM64, selecting the matching MSVC target.
 #>
 [CmdletBinding()]
 param(
     [string]$Version,
     [string]$Dir,
+    [string]$OfflineAssetDir,
     [switch]$Verify,
     [switch]$NoPull,
     [switch]$Quiet,
@@ -55,8 +57,8 @@ $ErrorActionPreference = 'Stop'
 # ============================================================================
 $script:Owner           = 'Dicklesworthstone'
 $script:Repo            = 'franken_ocr'
-$script:Asset           = 'focr-x86_64-pc-windows-msvc.exe'
-$script:FallbackVersion = 'v0.4.0'
+$script:Asset           = ''
+$script:Target          = ''
 
 $script:Quiet               = [bool]$Quiet
 $script:Esc                 = [char]27
@@ -65,6 +67,7 @@ $script:WebArgs             = @{ UseBasicParsing = $true }
 $script:OnPath              = $false
 $script:PathPersisted       = $false
 $script:InstalledVersionStr = ''
+$script:InstallLockStream   = $null
 
 # Negotiate TLS up front. Tls12 is the floor; add Tls13 when the runtime knows
 # the value (older .NET on PowerShell 5.1 does not).
@@ -207,10 +210,11 @@ Usage (with options): load the script into a scriptblock, then pass flags:
   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$($script:Owner)/$($script:Repo)/main/install.ps1))) -Verify -Dir 'C:\Tools\focr'
 
 Options:
-  -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to $($script:FallbackVersion))
+  -Version <vX.Y.Z>  Install a specific version (default: latest release)
   -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
+  -OfflineAssetDir   Read the exact asset + .sha256 from a local directory (requires -Version)
   -Verify            Run "focr robot selftest" after install and report the verdict
-  -NoPull            Do not offer to download the model after install (focr pull)
+  -NoPull            Suppress the post-install model download prompt/guidance
   -Quiet             Suppress non-error output
   -Force             Reinstall even when the same version is present
   -Help              Show this help and exit
@@ -220,12 +224,11 @@ Environment:
   HTTP_PROXY         HTTP proxy for downloads
 
 Platform:
-  Only x86-64 Windows (AMD64) has a published binary in $($script:FallbackVersion).
-  Windows on ARM64 is not published yet; this installer reports that and stops.
+  Supports native release assets for Windows x86-64 (AMD64) and ARM64.
   On macOS or Linux, use the shell installer (install.sh) instead.
 
-After install, download the model once (about 3.9 GB):  focr pull
-Then parse a page with:                                 focr ocr page.png
+After install, download the default model once (about 4.2 GB):  focr pull
+Then parse a page with:                                  focr ocr page.png
 "@
     Write-Host $u
 }
@@ -262,23 +265,25 @@ function Get-MachineArch {
     }
 }
 
-function Write-Arm64Note {
-    if ($script:Quiet) {
-        Err "Windows on ARM64 is not a published target for focr $($script:FallbackVersion)."
-        return
+function Resolve-WindowsPlatform {
+    param([string]$Arch)
+    switch ($Arch) {
+        'x86_64' {
+            return [pscustomobject]@{
+                Arch   = 'x86_64'
+                Target = 'x86_64-pc-windows-msvc'
+                Asset  = 'focr-x86_64-pc-windows-msvc.exe'
+            }
+        }
+        'arm64' {
+            return [pscustomobject]@{
+                Arch   = 'arm64'
+                Target = 'aarch64-pc-windows-msvc'
+                Asset  = 'focr-aarch64-pc-windows-msvc.exe'
+            }
+        }
+        default { return $null }
     }
-    $lines = @(
-        'Windows on ARM64 is not a published target yet.',
-        '',
-        "focr $($script:FallbackVersion) ships one Windows binary, built for x86-64 (AMD64).",
-        'Windows 11 on ARM can run x64 binaries through emulation, but that',
-        'asset is not published, so this installer will not guess for you.',
-        '',
-        "Track native ARM64 support: https://github.com/$($script:Owner)/$($script:Repo)/issues"
-    )
-    Write-Host ''
-    Write-Colored 'Windows ARM64 is not supported yet' '1;33' Yellow
-    Write-Box -Lines $lines -AnsiCode '0;33' -Color Yellow
 }
 
 # ============================================================================
@@ -286,6 +291,9 @@ function Write-Arm64Note {
 # ============================================================================
 function Resolve-Version {
     if (-not [string]::IsNullOrEmpty($Version)) { return $Version }
+    if (-not [string]::IsNullOrEmpty($OfflineAssetDir)) {
+        throw '-OfflineAssetDir requires -Version because release discovery is disabled offline.'
+    }
 
     Info 'Resolving the latest release...'
     $api = "https://api.github.com/repos/$($script:Owner)/$($script:Repo)/releases/latest"
@@ -306,17 +314,21 @@ function Resolve-Version {
             Info "Latest release: $tag"
             return $tag
         }
-    } catch { }
+    } catch {
+        throw "Could not resolve the latest release from the GitHub API. Re-run with -Version vX.Y.Z to pin a known release. ($($_.Exception.Message))"
+    }
 
-    Warn "Could not resolve the latest release; using $($script:FallbackVersion)"
-    return $script:FallbackVersion
+    throw 'The GitHub latest-release API returned no tag. Re-run with -Version vX.Y.Z to pin a known release.'
 }
 
 # Release tags are v-prefixed; accept a bare semver from -Version too.
 function ConvertTo-NormalizedVersion {
     param([string]$Value)
-    if ([string]::IsNullOrEmpty($Value)) { return $script:FallbackVersion }
-    if ($Value -match '^[0-9]') { return "v$Value" }
+    if ([string]::IsNullOrEmpty($Value)) { throw 'A release version is required.' }
+    if ($Value -cmatch '^[0-9]') { $Value = "v$Value" }
+    if ($Value -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+        throw "Invalid version '$Value'; expected vX.Y.Z (or a valid semver prerelease)."
+    }
     return $Value
 }
 
@@ -344,6 +356,8 @@ function Get-FocrVersionString {
     $ErrorActionPreference = 'Continue'
     try {
         $out = & $Exe --version 2>$null
+        $code = $LASTEXITCODE
+        if ($code -ne 0) { return $null }
         $line = $out | Select-Object -First 1
         if ($line) { return ([string]$line).Trim() }
         return $null
@@ -354,16 +368,51 @@ function Get-FocrVersionString {
     }
 }
 
+function Get-FocrReportedSemVer {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return $null }
+    $m = [regex]::Match($Value, '^focr\s+([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$')
+    if (-not $m.Success) { return $null }
+    return $m.Groups[1].Value
+}
+
 function Test-AlreadyInstalled {
     param([string]$Target)
     $exe = Join-Path $script:InstallDir 'focr.exe'
     if (-not (Test-Path $exe)) { return $false }
     $v = Get-FocrVersionString -Exe $exe
     if ([string]::IsNullOrEmpty($v)) { return $false }
-    $m = [regex]::Match($v, '[0-9]+\.[0-9]+\.[0-9]+')
-    if (-not $m.Success) { return $false }
-    $want = $Target -replace '^v', ''
-    return ($m.Value -eq $want)
+    $reported = Get-FocrReportedSemVer -Value $v
+    if ([string]::IsNullOrEmpty($reported)) { return $false }
+    $want = $Target -creplace '^v', ''
+    return ($reported -ceq $want)
+}
+
+# ============================================================================
+# Cross-process install lock. The handle is opened with FileShare.None in the
+# destination directory, so aliases of the same directory and different login
+# sessions contend on the same filesystem object. Windows releases the handle
+# automatically if the installer exits or crashes; the sentinel file remains.
+# ============================================================================
+function Enter-InstallLock {
+    $lockPath = Join-Path $script:InstallDir '.focr-install.lock'
+    try {
+        $script:InstallLockStream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+    } catch [System.IO.IOException] {
+        throw "Another focr installer is already replacing $($script:InstallDir)\focr.exe."
+    }
+}
+
+function Exit-InstallLock {
+    if ($script:InstallLockStream) {
+        $script:InstallLockStream.Dispose()
+        $script:InstallLockStream = $null
+    }
 }
 
 # ============================================================================
@@ -418,15 +467,21 @@ function Update-Path {
 # Post-install: version check, optional self-test, model-placement instructions
 # ============================================================================
 function Confirm-Install {
-    param([string]$Exe)
+    param([string]$Exe, [string]$Version)
     $v = Get-FocrVersionString -Exe $Exe
-    if (-not [string]::IsNullOrEmpty($v)) {
-        $script:InstalledVersionStr = $v
-        Ok "focr is working: $v"
-    } else {
-        Warn "Installed the binary, but 'focr --version' returned no output."
-        Warn "If $($script:InstallDir) is not on PATH in this shell yet, open a new terminal."
+    if ([string]::IsNullOrEmpty($v)) {
+        throw "Installed binary failed its mandatory execution check: $Exe --version"
     }
+    $reported = Get-FocrReportedSemVer -Value $v
+    $expected = $Version -creplace '^v', ''
+    if ([string]::IsNullOrEmpty($reported)) {
+        throw "Installed binary returned an invalid version report: '$v'"
+    }
+    if ($reported -cne $expected) {
+        throw "Installed binary version mismatch: expected $expected, reported $reported"
+    }
+    $script:InstalledVersionStr = $v
+    Ok "focr is working: $v"
 }
 
 function Invoke-SelfTest {
@@ -439,30 +494,23 @@ function Invoke-SelfTest {
         & $Exe robot selftest | Out-Host
         $code = $LASTEXITCODE
     } catch {
-        Warn "Self-test could not run: $($_.Exception.Message)"
-        return
+        throw "Self-test could not run: $($_.Exception.Message)"
     } finally {
         $ErrorActionPreference = $prev
     }
     if ($code -eq 0) {
         Ok 'Self-test passed: the int8 kernel matches the scalar oracle on this host.'
     } else {
-        Warn 'Self-test reported a divergence (see the verdict above).'
+        throw 'Self-test reported a divergence (see the verdict above).'
     }
 }
 
-# Model acquisition. `focr pull` downloads the ~3.9 GB int8 weights + tokenizer
-# into the model cache. This is verified working on native Windows: the async
-# HTTP/TLS send-path that previously surfaced WSAENOTCONN (os error 10057) was
-# fixed (bd-15ow). Mirrors the shell installer's maybe_offer_pull: never
-# auto-downloads in quiet or non-interactive runs (CI, piped scripts); offers an
-# interactive y/N prompt otherwise so the large download is always a choice.
+# Model acquisition. Never auto-download multi-gigabyte weights in quiet or
+# non-interactive runs; offer an explicit y/N choice otherwise.
 function Invoke-ModelPull {
     param([string]$Exe)
     if ($NoPull) { return }
 
-    # The model is about 3.9 GB. Never auto-download in quiet or non-interactive
-    # runs (CI, cron, piped scripts); just leave a clear hint.
     $interactive = $false
     try {
         $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
@@ -476,7 +524,7 @@ function Invoke-ModelPull {
 
     Write-Host ''
     Info 'focr needs the OCR model before it can parse a page.'
-    Info "The download is about 3.9 GB into $($script:ModelCache)."
+    Info "The download is about 4.2 GB into $($script:ModelCache)."
     $ans = Read-Host 'Download the model now with focr pull? (y/N)'
     if ($ans -match '^(y|yes)$') {
         Info 'Running: focr pull'
@@ -527,7 +575,7 @@ function Write-Summary {
         $lines.Add('')
     }
     $lines.Add('First steps:')
-    $lines.Add('  focr pull                 download the model (about 3.9 GB)')
+    $lines.Add('  focr pull                 download the default model (about 4.2 GB)')
     $lines.Add('  focr ocr page.png         parse an image into markdown')
     $lines.Add('  focr ocr page.png --json  emit structured JSON (with bounding boxes)')
     $lines.Add('  focr ocr page.png -o out.md    write markdown to a file')
@@ -566,16 +614,15 @@ function Main {
     }
 
     $arch = Get-MachineArch
-    if ($arch -eq 'arm64') {
-        Write-Arm64Note
-        return 1
-    }
-    if ($arch -ne 'x86_64') {
+    $platform = Resolve-WindowsPlatform -Arch $arch
+    if ($null -eq $platform) {
         Err "No prebuilt focr binary is available for Windows on '$arch'."
-        Err "focr $($script:FallbackVersion) publishes a single Windows binary, built for x86-64 (AMD64)."
+        Err 'Supported Windows architectures: x86-64 (AMD64) and ARM64.'
         Err "Questions: https://github.com/$($script:Owner)/$($script:Repo)/issues"
         return 1
     }
+    $script:Asset = $platform.Asset
+    $script:Target = $platform.Target
 
     Initialize-Proxy
 
@@ -584,20 +631,41 @@ function Main {
         $version = ConvertTo-NormalizedVersion $version
 
         $base     = "https://github.com/$($script:Owner)/$($script:Repo)/releases/download/$version"
+        if (-not [string]::IsNullOrEmpty($OfflineAssetDir)) {
+            $base = [System.IO.Path]::GetFullPath($OfflineAssetDir)
+        }
         $assetUrl = "$base/$($script:Asset)"
         $shaUrl   = "$assetUrl.sha256"
         $target   = Join-Path $script:InstallDir 'focr.exe'
 
-        Info 'Platform:    windows/x86_64 (x86_64-pc-windows-msvc)'
+        Info "Platform:    windows/$($platform.Arch) ($($script:Target))"
         Info "Asset:       $($script:Asset)"
         Info "Version:     $version"
         Info "Install dir: $($script:InstallDir)"
 
-        # Already-installed short-circuit (still offers PATH help and a model hint).
+        if (-not (Test-Path $script:InstallDir)) {
+            New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+        }
+        Enter-InstallLock
+
+        if ($env:FOCR_INSTALL_TEST_MODE -eq '1') {
+            if (-not [string]::IsNullOrEmpty($env:FOCR_INSTALL_TEST_LOCK_READY_PATH)) {
+                [System.IO.File]::WriteAllText($env:FOCR_INSTALL_TEST_LOCK_READY_PATH, 'locked')
+            }
+            if ($env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS -match '^[0-9]+$' -and
+                [int]$env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS -gt 0) {
+                Start-Sleep -Seconds ([int]$env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS)
+            }
+        }
+
+        # Keep the version decision under the destination lock, and honor an
+        # explicit verification request even when no download is necessary.
         if (-not $Force -and (Test-AlreadyInstalled -Target $version)) {
             Ok "focr $version is already installed at $target"
             Info 'Use -Force to reinstall.'
             Update-Path
+            Confirm-Install -Exe $target -Version $version
+            if ($Verify) { Invoke-SelfTest -Exe $target }
             Info 'Model weights are not bundled; download them with: focr pull'
             return 0
         }
@@ -617,20 +685,33 @@ function Main {
             $wa = $script:WebArgs
 
             Info "Downloading $($script:Asset) ($version)..."
-            try {
-                Invoke-WebRequest -Uri $assetUrl -OutFile $assetPath -TimeoutSec 600 @wa
-            } catch {
-                throw "Failed to download $assetUrl ($($_.Exception.Message)). Verify the version exists, or pass -Version to pin a known release."
+            if (-not [string]::IsNullOrEmpty($OfflineAssetDir)) {
+                $offlineAsset = Join-Path $base $script:Asset
+                $offlineSha = "$offlineAsset.sha256"
+                if (-not (Test-Path -LiteralPath $offlineAsset -PathType Leaf) -or
+                    -not (Test-Path -LiteralPath $offlineSha -PathType Leaf)) {
+                    throw "Offline asset directory must contain $($script:Asset) and $($script:Asset).sha256."
+                }
+                Copy-Item -LiteralPath $offlineAsset -Destination $assetPath
+                Copy-Item -LiteralPath $offlineSha -Destination $shaPath
+            } else {
+                try {
+                    Invoke-WebRequest -Uri $assetUrl -OutFile $assetPath -TimeoutSec 600 @wa
+                } catch {
+                    throw "Failed to download $assetUrl ($($_.Exception.Message)). Verify the version exists, or pass -Version to pin a known release."
+                }
             }
             if (-not (Test-Path $assetPath) -or ((Get-Item $assetPath).Length -eq 0)) {
                 throw "Downloaded file is empty: $($script:Asset)"
             }
 
-            Info 'Fetching checksum sidecar'
-            try {
-                Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -TimeoutSec 60 @wa
-            } catch {
-                throw "Could not fetch the checksum sidecar $shaUrl ($($_.Exception.Message))."
+            if ([string]::IsNullOrEmpty($OfflineAssetDir)) {
+                Info 'Fetching checksum sidecar'
+                try {
+                    Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -TimeoutSec 60 @wa
+                } catch {
+                    throw "Could not fetch the checksum sidecar $shaUrl ($($_.Exception.Message))."
+                }
             }
 
             $expected = Read-ExpectedHash -Path $shaPath
@@ -640,10 +721,88 @@ function Main {
             }
             Ok "Checksum verified ($($actual.Substring(0, 16).ToLowerInvariant())...)"
 
-            if (-not (Test-Path $script:InstallDir)) {
-                New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+            $staged = Join-Path $script:InstallDir ('.focr.install.' + [System.Guid]::NewGuid().ToString('N') + '.exe')
+            $backup = Join-Path $script:InstallDir ('.focr.backup.' + [System.Guid]::NewGuid().ToString('N') + '.exe')
+            try {
+                Copy-Item -LiteralPath $assetPath -Destination $staged
+                $stagedHash = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash
+                if (-not ($stagedHash -ieq $actual)) {
+                    throw 'Same-directory staged binary does not match the verified download.'
+                }
+                $stagedVersion = Get-FocrVersionString -Exe $staged
+                $stagedSemVer = Get-FocrReportedSemVer -Value $stagedVersion
+                $expectedVersion = $version -creplace '^v', ''
+                if ([string]::IsNullOrEmpty($stagedSemVer) -or $stagedSemVer -cne $expectedVersion) {
+                    throw "Staged binary failed the version check before replacement: expected $expectedVersion, reported $stagedSemVer."
+                }
+                if ($env:FOCR_INSTALL_TEST_MODE -eq '1' -and
+                    $env:FOCR_INSTALL_TEST_FAILPOINT -eq 'before-replace') {
+                    throw 'Injected installer failure before atomic replacement.'
+                }
+                $hadExistingTarget = Test-Path -LiteralPath $target -PathType Leaf
+                if ($hadExistingTarget) {
+                    try {
+                        if ($env:FOCR_INSTALL_TEST_MODE -eq '1' -and
+                            $env:FOCR_INSTALL_TEST_FAILPOINT -eq 'replace-target-missing') {
+                            # Model ReplaceFileW error 1177: the old destination
+                            # has moved to backup but the replacement did not land.
+                            [System.IO.File]::Move($target, $backup)
+                            throw 'Injected replacement failure after the target moved to backup.'
+                        }
+                        [System.IO.File]::Replace($staged, $target, $backup)
+                        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                            throw 'Atomic replacement returned without installing focr.exe.'
+                        }
+                        $installedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                        if (-not ($installedHash -ieq $actual)) {
+                            throw 'Installed focr.exe does not match the verified staged binary.'
+                        }
+                    } catch {
+                        $replacementError = $_.Exception
+                        if (Test-Path -LiteralPath $backup -PathType Leaf) {
+                            $failedReplacement = Join-Path $script:InstallDir ('.focr.failed.' + [System.Guid]::NewGuid().ToString('N') + '.exe')
+                            try {
+                                if (Test-Path -LiteralPath $target -PathType Leaf) {
+                                    [System.IO.File]::Replace($backup, $target, $failedReplacement)
+                                } else {
+                                    [System.IO.File]::Move($backup, $target)
+                                }
+                            } catch {
+                                $recoveryError = $_.Exception
+                                if (-not (Test-Path -LiteralPath $target) -and
+                                    (Test-Path -LiteralPath $backup -PathType Leaf)) {
+                                    try { [System.IO.File]::Move($backup, $target) } catch { }
+                                }
+                                if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                                    throw "Atomic replacement failed and the previous focr.exe could not be restored from $backup ($($recoveryError.Message))."
+                                }
+                            } finally {
+                                if (Test-Path -LiteralPath $failedReplacement -PathType Leaf) {
+                                    Remove-Item -LiteralPath $failedReplacement -Force -ErrorAction SilentlyContinue
+                                }
+                            }
+                        }
+                        throw $replacementError
+                    }
+                } else {
+                    [System.IO.File]::Move($staged, $target)
+                    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                        throw 'Atomic install returned without installing focr.exe.'
+                    }
+                    $installedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                    if (-not ($installedHash -ieq $actual)) {
+                        throw 'Installed focr.exe does not match the verified staged binary.'
+                    }
+                }
+                $staged = $null
+                if (Test-Path -LiteralPath $backup -PathType Leaf) {
+                    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+                }
+            } finally {
+                if ($staged -and (Test-Path -LiteralPath $staged)) {
+                    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+                }
             }
-            Copy-Item -Path $assetPath -Destination $target -Force
             Ok "Installed focr to $target"
         } finally {
             $ProgressPreference = $prevProgress
@@ -653,7 +812,7 @@ function Main {
         }
 
         Update-Path
-        Confirm-Install -Exe $target
+        Confirm-Install -Exe $target -Version $version
 
         if ($Verify) { Invoke-SelfTest -Exe $target }
 
@@ -663,6 +822,8 @@ function Main {
     } catch {
         Err $_.Exception.Message
         return 1
+    } finally {
+        Exit-InstallLock
     }
 }
 
@@ -670,12 +831,16 @@ $exitCode = Main
 
 # When run as a script file, set the process exit code so CI sees failures.
 # When fetched via "irm | iex" there is no command path, so do not call exit
-# (that would close the user's interactive shell); record LASTEXITCODE instead.
+# (that would close the user's interactive shell). Set LASTEXITCODE explicitly
+# and throw on failure so automation observes a failing pipeline/catchable error.
 $runningAsFile = $false
 try { $runningAsFile = -not [string]::IsNullOrEmpty($PSCommandPath) } catch { $runningAsFile = $false }
 
 if ($runningAsFile) {
     exit $exitCode
-} elseif ($exitCode -ne 0) {
+} else {
     $global:LASTEXITCODE = $exitCode
+    if ($exitCode -ne 0) {
+        throw "focr installer failed with exit code $exitCode."
+    }
 }

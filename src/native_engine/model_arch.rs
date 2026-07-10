@@ -195,13 +195,11 @@ pub trait ModelArch: Send + Sync {
         "model.layers."
     }
     /// When `lm_head.weight` is stored (i.e. NOT tied/omitted): does the
-    /// converter quantize it int8? Default `true` — the Unlimited-OCR byte image
-    /// (`DecoderWeightCacheI8::build` quantizes `lm_head` unconditionally, and
-    /// the shipped artifact matches it byte-for-byte). SmolVLM2 says `false`:
-    /// its UNTIED head stays high-precision per doctrine #2 (int8-lm_head only
-    /// behind a measured quality kill-switch later — spec §11 / OQ-6).
+    /// converter quantize it int8? Default `false`: Unlimited-OCR and SmolVLM2
+    /// keep their untied heads high precision per doctrine #2. An architecture
+    /// may opt in only after its independent quality gate is certified.
     fn lm_head_stored_int8(&self) -> bool {
-        true
+        false
     }
     /// The token-embedding tensor name — the untied-`lm_head` convert-time
     /// verification compares `lm_head.weight` bytes against this tensor.
@@ -290,8 +288,8 @@ pub struct PlannedArch {
     /// The AR-decoder transformer-layers tensor-name prefix (the int8 GEMM
     /// subtree); see [`ModelArch::decoder_layers_prefix`].
     decoder_layers_prefix: &'static str,
-    /// Whether a STORED (untied) `lm_head.weight` joins the converter's int8
-    /// set; see [`ModelArch::lm_head_stored_int8`].
+    /// Whether a STORED (untied) `lm_head.weight` joins this architecture's
+    /// separately certified int8 set; see [`ModelArch::lm_head_stored_int8`].
     lm_head_stored_int8: bool,
     /// The token-embedding tensor name; see [`ModelArch::embed_tokens_name`].
     embed_tokens_name: &'static str,
@@ -599,7 +597,7 @@ mod tests {
         );
         // The remaining zoo models are present but NOT yet implemented (descriptors).
         for id in ["trocr", "pix2tex"] {
-            let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
+            let a = arch_by_id(id).unwrap_or_else(|| unreachable!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
         // Every registered id is unique (a registry invariant the zoo relies on).
@@ -645,6 +643,10 @@ mod tests {
     fn lookup_and_default_resolve() {
         assert_eq!(default_arch().id(), "unlimited-ocr");
         assert!(default_arch().implemented());
+        assert!(
+            !default_arch().lm_head_stored_int8(),
+            "Unlimited-OCR keeps its untied lm_head high precision by default"
+        );
         assert_eq!(
             arch_by_id("unlimited-ocr").map(ModelArch::id),
             Some("unlimited-ocr")
@@ -697,8 +699,8 @@ mod tests {
         assert_eq!(c.eos_token_id, 49_279);
         assert_eq!(c.no_repeat_ngram_size, 0);
         assert_eq!(c.ngram_window, 0);
-        // UNTIED lm_head (byte-verified, spec §12): stored AND high-precision —
-        // the opposite of GOT's tie/omit AND of Unlimited-OCR's int8 lm_head.
+        // UNTIED lm_head (byte-verified, spec §12): stored AND high-precision,
+        // matching Unlimited-OCR's conservative default; GOT ties and omits it.
         assert!(!a.tie_word_embeddings());
         assert!(!a.lm_head_stored_int8());
         // Idefics3-nested tensor namespaces (spec §12) — the arch-aware convert
@@ -713,13 +715,13 @@ mod tests {
         assert_eq!(a.quant_policy(), QuantPolicy::DOCTRINE);
     }
 
-    /// The new arch-namespace accessors default to the Unlimited-OCR/GOT layout,
-    /// so every pre-existing arch is untouched by the SmolVLM2 additions.
-    /// (OneChart left this list at its D1 census, TrOMR at its E2 census —
-    /// see their dedicated tests.)
+    /// The historical Qwen-shaped architectures share the original namespace
+    /// layout and explicitly retain their certified int8 stored-head policy.
+    /// Unlimited-OCR shares the namespace but its conservative high-precision
+    /// head is pinned separately in `lookup_and_default_resolve`.
     #[test]
     fn arch_namespace_defaults_are_the_historical_layout() {
-        for id in ["unlimited-ocr", "got-ocr2", "trocr", "pix2tex"] {
+        for id in ["got-ocr2", "trocr", "pix2tex"] {
             let a = arch_by_id(id).expect("registered");
             assert_eq!(a.decoder_layers_prefix(), "model.layers.", "{id}");
             assert!(a.lm_head_stored_int8(), "{id}");

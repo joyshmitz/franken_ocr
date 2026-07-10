@@ -7,10 +7,10 @@
 # the gate sequence ever changes, it changes in ONE place — the script — and CI
 # follows automatically.
 #
-# Toolchain: `rust-toolchain.toml` selects the nightly channel (nightly is
+# Toolchain: `rust-toolchain.toml` selects an exact nightly (nightly is
 # REQUIRED for stdarch i8mm/dotprod intrinsics + portable_simd — Toolchain note).
-# The `dtolnay/rust-toolchain@nightly` action installs that same channel plus the
-# needed components/targets, so CI and local builds stay aligned.
+# CI installs that same dated toolchain plus the needed components/targets, so a
+# later nightly cannot silently change lint, codegen, or intrinsic behavior.
 #
 # Path dependencies: franken_ocr currently consumes sibling checkouts at
 # `../frankentorch`, `../frankensqlite`, and a host-local `/dp/asupersync`.
@@ -46,6 +46,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: nightly-2026-07-09
+  # Path dependencies are build inputs. Keep these immutable revisions aligned
+  # with the package versions recorded in Cargo.lock; update them deliberately
+  # and together, never by floating each job on sibling `main`.
+  FRANKENTORCH_REV: f00c3ce79737ffd0e7c7e2f2e81540907ce26562
+  FRANKENSQLITE_REV: 14c5781680833c248ed18d84914312e233d145df
+  ASUPERSYNC_REV: e7e96829632d89815248a0809499332ab0beabcb
   # Surface full backtraces if a test panics, so failures are self-diagnosing.
   RUST_BACKTRACE: 1
 
@@ -63,16 +70,31 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Provision sibling path dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
+            }
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
+          }
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
 
           function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
             $text = Get-Content -Raw -Path $cargoToml
@@ -95,19 +117,20 @@ jobs:
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       # Install the repo's nightly channel plus the components declared for the
       # local gate.
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Distinct cache per OS so the aarch64 and x86_64 artifacts never mix.
           key: ${{ matrix.os }}
@@ -128,12 +151,24 @@ jobs:
       - name: Run the gate (scripts/check.sh)
         run: ./scripts/check.sh 2>&1 | tee gate-log-${{ matrix.os }}.txt
 
+      - name: Bind successful gate evidence
+        run: |
+          python3 scripts/gauntlet_cert.py \
+            --ci-gate-evidence "gate (${{ matrix.os }})" \
+            --ci-gate-log "gate-log-${{ matrix.os }}.txt" \
+            --workflow-artifact-name "gate-log-${{ matrix.os }}"
+
       - name: Upload gate log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gate-log-${{ matrix.os }}
-          path: gate-log-${{ matrix.os }}.txt
+          path: |
+            gate-log-${{ matrix.os }}.txt
+            .gauntlet-output/ci-gate-${{ matrix.os }}-workflow-evidence.json
+            .gauntlet-output/bundle/ci/**
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
 
   # Advisory bench-guardrail (bd-4yks item 5, non-blocking by design): compares
@@ -149,10 +184,10 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -199,10 +234,9 @@ jobs:
             runnable: true
             skip: false
             skip_reason: ""
-          # arm64 Windows checks natively on the hosted windows-11-arm runner
-          # (available to public repos); advisory only — continue-on-error above
-          # keeps the not-yet-proven arm64 stack (bd-3u97/bd-1aj1) from blocking
-          # the gate while dist.yml ships its artifact.
+          # arm64 Windows checks natively on the hosted windows-11-arm runner.
+          # The binary build/no-weights smoke passed in dist run 29048523156;
+          # this remains advisory until full model OCR is proven on that host.
           - name: windows-msvc-aarch64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -212,7 +246,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Explain advisory skip
         if: ${{ matrix.skip }}
@@ -227,9 +261,24 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
+            }
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
+          }
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
 
           function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
             $text = Get-Content -Raw -Path $cargoToml
@@ -249,28 +298,29 @@ jobs:
           Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
           Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
-      - name: Install nightly toolchain
+      - name: Install pinned nightly toolchain
         if: ${{ !matrix.skip }}
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
         if: ${{ !matrix.skip }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: advisory-${{ matrix.name }}-${{ matrix.target }}
           cache-all-crates: true
 
       - name: Cargo check target
         if: ${{ !matrix.skip }}
-        run: cargo check --target ${{ matrix.target }} --all-targets
+        run: cargo check --locked --target ${{ matrix.target }} --all-targets
 
       - name: Build focr target
         if: ${{ !matrix.skip }}
-        run: cargo build --target ${{ matrix.target }} --bin focr
+        run: cargo build --locked --target ${{ matrix.target }} --bin focr
 
       - name: Run target lib tests where executable
         if: ${{ !matrix.skip && matrix.runnable }}
-        run: cargo test --target ${{ matrix.target }} --lib
+        run: cargo test --locked --target ${{ matrix.target }} --lib

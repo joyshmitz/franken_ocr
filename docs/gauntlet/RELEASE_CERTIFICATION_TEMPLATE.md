@@ -1,9 +1,10 @@
 # RELEASE CERTIFICATION TEMPLATE — strict-conformant-release.v1 (bd-wp8.9)
 
-The contract `scripts/gauntlet_cert.py --bundle` certifies against. A release
-is CERTIFIED only when every predicate below holds at generation time; a
-single red cell blocks certification (the bundle is still written, honestly
-marked `certified: false` with the refusal reasons).
+The contract enforced by `scripts/gauntlet_cert.py --bundle` and
+`--finalize-bundle`. A release is CERTIFIED only when every predicate below
+holds at finalization time. `--bundle` only writes an honestly red provisional
+bundle and exits 1; no manual JSON edit or detached signature copy can promote
+it.
 
 ## Required-pass constants
 
@@ -44,11 +45,66 @@ marked `certified: false` with the refusal reasons).
 ## Certification flow
 
 ```
-bash scripts/check.sh                                  # 100% suite pass
-python3 scripts/gauntlet_cert.py --release-readiness   # all cells green
-python3 scripts/gauntlet_cert.py --bundle              # writes docs/gauntlet/bundle/, exit 0 = CERTIFIED
+bash scripts/check.sh
+# Commit and push the final source/evidence inputs. Work from clean main.
+python3 scripts/gauntlet_cert.py --bundle .gauntlet-output/bundle
+
+# Produce one fresh exact-HEAD run of each canonical workflow:
+#   CI (both gate jobs), dist (all six portable jobs), Model Parity, and
+#   Performance Gauntlet. Download all ten workflow artifacts locally.
+
+python3 scripts/gauntlet_cert.py \
+  --finalize-bundle .gauntlet-output/bundle \
+  --workflow-evidence /evidence/ci-macos/.gauntlet-output/ci-gate-macos-15-workflow-evidence.json \
+  --workflow-evidence /evidence/ci-linux/.gauntlet-output/ci-gate-ubuntu-latest-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-apple-arm/.gauntlet-output/dist-aarch64-apple-darwin-neon-sdot-i8mm-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-apple-x86/.gauntlet-output/dist-x86_64-apple-darwin-baseline-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-linux-arm/.gauntlet-output/dist-aarch64-linux-baseline-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-linux-x86/.gauntlet-output/dist-x86_64-linux-baseline-runtime-dispatch-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-win-x86/.gauntlet-output/dist-x86_64-pc-windows-msvc-baseline-workflow-evidence.json \
+  --workflow-evidence /evidence/dist-win-arm/.gauntlet-output/dist-aarch64-pc-windows-msvc-baseline-workflow-evidence.json \
+  --workflow-evidence /evidence/model-parity/.gauntlet-output/model-parity-workflow-evidence.json \
+  --workflow-evidence /evidence/performance/.gauntlet-output/performance-workflow-evidence.json \
+  --trusted-signer producer:PRODUCER_ID:FULL_OPENPGP_FINGERPRINT \
+  --trusted-signer independent-reviewer:REVIEWER_ID:FULL_OPENPGP_FINGERPRINT \
+  --trusted-signer release-authorizer:AUTHORIZER_ID:FULL_OPENPGP_FINGERPRINT
+
+python3 scripts/gauntlet_cert.py --release-readiness \
+  --readiness-out .gauntlet-output/release_readiness.json
 ```
 
-The signed record is `docs/gauntlet/bundle/release_certificate.json`
-(git head + describe + constants + verdicts); the human-readable twin is
-`FINAL_GAUNTLET_REPORT.md` beside it.
+The manifest paths above are examples; use the paths emitted by the downloaded
+artifacts. Every manifest is hash-checked locally and replayed against the live
+GitHub run. All files must come from exactly one run per workflow, all runs must
+name the same final HEAD, and no run may be skipped or stale. The three signer
+identities and full fingerprints must already be active in
+`docs/gauntlet/TRUSTED_SIGNERS.json`, their public keys must be in the tracked
+keyring, and their existing secret keys must be available to `gpg`. The
+finalizer never generates a key or invents a receipt.
+
+The provisional bundle must also contain fresh production-generated
+`audit_receipts/{security,correctness,concurrency,numerics,release}_audit_receipt.json`
+files and every raw tool output they name. The finalizer replays their exact
+commands, hashes, findings, HEAD, and timestamps; a generic green CI log is not
+a substitute for an omitted named tool. There is currently no production audit
+receipt producer in this repository, so current `main` remains blocked until
+one runs and packages those receipts. Do not hand-author them.
+
+The six dist jobs are four portable runtime-dispatch binaries plus native
+Windows x86-64 and ARM64. Linux is linked for glibc 2.17 and independently
+audited with `readelf`; Windows runs `install.ps1` offline against the exact
+staged asset, including a failed-replacement preservation check. Tag builds
+also fail before compilation unless `GITHUB_REF_NAME` is exactly
+`v$(Cargo.toml package.version)` and the commit is reachable from `origin/main`.
+
+The finalizer derives the strict documents from the downloaded physical
+evidence, creates signatures with the three existing trusted keys, verifies the
+candidate entirely in memory, and writes `certified:true` only after
+`certificate_bundle_verdict` succeeds. The final readiness command then checks
+the persisted bytes without dirtying the worktree.
+
+The signed record is `.gauntlet-output/bundle/release_certificate.json` (git
+head + describe + constants + verdicts); the human-readable twin is
+`FINAL_GAUNTLET_REPORT.md` beside it. The tracked `docs/gauntlet/bundle/` tree is
+a historical snapshot and is not a valid output directory for current
+certification.

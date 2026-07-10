@@ -454,8 +454,8 @@ pub fn layer_norm(
 /// (`softmax_dim_tensor_contiguous_f32`, dim = 1).
 ///
 /// Each row is softmaxed independently (max-subtract for overflow safety). The
-/// kernel returns a fresh buffer; we copy it back into `x` so call sites can
-/// keep operating in place over their `Mat`.
+/// The kernel returns a fresh final buffer; transfer that allocation into `x`
+/// so call sites keep their in-place API without copying the full payload.
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the kernel rejects the shape.
@@ -474,7 +474,7 @@ pub fn softmax_rows(x: &mut Mat) -> FocrResult<()> {
             x.data.len()
         )));
     }
-    x.data.copy_from_slice(&out);
+    x.data = out;
     Ok(())
 }
 

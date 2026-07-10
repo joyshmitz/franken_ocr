@@ -14,7 +14,155 @@ sections as they land.
 
 ## [Unreleased]
 
-(nothing yet)
+No changes yet.
+
+## [0.7.0] - 2026-07-10
+
+This release hardens the native Unlimited-OCR path around exact reference
+semantics, artifact identity, rollback safety, and reproducible distribution.
+
+### Added
+
+- An embedded 2,710-tensor Unlimited-OCR census with exact name, shape, dtype,
+  source-size, recipe, and provenance validation for both full loads and bounded
+  availability probes.
+- A reproducible Torch 2.10 CPU MoE fixture generator covering 2,048 unsorted
+  top-k cases and 256 production-width routed-reduction cases.
+- Strict source-root and evidence-path binding for gauntlet rows and release
+  certificates, plus committed evidence from a 14-pass optimization campaign.
+- Native release matrices for Apple Silicon, Intel macOS, Linux x86-64/ARM64,
+  and Windows x86-64/ARM64, with no-weights execution smoke tests for every
+  staged binary.
+- An embedded schema-v2 model manifest that pins the versioned 4.16 GB
+  conservative Unlimited-OCR artifact and its three GitHub release parts while
+  preserving the schema-v1 endpoint consumed by v0.6 binaries.
+- Fail-closed CI, model-parity, performance, and distribution evidence
+  producers plus a strict finalizer that refuses certification without fresh
+  workflow receipts and three registry-pinned OpenPGP signers.
+
+### Changed
+
+- MoE routing now reproduces pinned Torch 2.10 CPU `topk(sorted=False)` slot
+  order and the model's `[tokens, 6, 1280]` reduction order across f32, int8,
+  batched prefill, and decode. `FOCR_MOE_SCORE_ORDER=1` retains the prior
+  deterministic score-order policy as a truthy-only rollback.
+- R-SWA checkpoints now bind cache identity and lineage epoch, rejecting
+  cross-cache, cloned-cache, abandoned-branch, overflow, and ABA rollbacks
+  before mutation.
+- Model files load into owned bytes by default. `FOCR_MMAP=1` is an explicit
+  capability opt-in, and both paths retain the same descriptor through
+  validation and load.
+- Installer version discovery fails closed, and post-install execution must
+  report the exact requested semver. Unix and PowerShell installers now use
+  destination-scoped locks, staged verification, atomic replacement, and crash
+  recovery without clobbering an existing binary.
+
+### Fixed
+
+- Reject overlapping `.focrq` data/scale ranges and unknown architecture IDs in
+  both full and bounded parsers.
+- Pin CI and distribution actions to real commit objects and align clean-runner
+  sibling revisions with `Cargo.lock` package versions.
+- Restore clean termination on the adversarial `page_0590` table: the exact
+  Torch route emits EOS at 4,033 tokens instead of exhausting the 12,000-token
+  diagnostic cap.
+- Reject source checkpoints that do not match the pinned Unlimited-OCR shard
+  identity before conversion can emit an artifact the production loader would
+  refuse.
+- Make pull locks process-scoped and reusable after crashes, preserve the
+  working model on failed replacement, and distinguish live staging downloads
+  from orphaned partial files in `focr doctor`.
+
+### Verification
+
+- The conservative exact-recipe artifact completed all 20 pinned pages with no
+  missing results and normalized aggregate CER `0.19307925` against the `0.25`
+  budget. The known `page_0590` tail remains documented at CER `0.61648860` and
+  is not represented as individually exact.
+- The full 6.67 GB source shard and 4.16 GB conservative artifact independently
+  matched all 2,710 embedded tensor entries and their pinned whole-file hashes.
+- SIMD self-test passed 44/44 model-shape and worst-case-overflow cases on Apple
+  M4; exact MoE policy subprocess tests and batched parity passed on the final
+  implementation.
+
+## [0.6.0] - 2026-07-08
+
+The first evidence-bundled performance release. It promoted only the rows that
+survived the pinned-reference gauntlet and made the certification bundle itself a
+release input.
+
+### Added
+
+- A reproducible release-certification bundle with scorecards, source evidence,
+  convergence rounds, and a fail-closed 13-cell ship gate.
+- A formal Unlimited-OCR head-to-head lane against pinned Torch BF16 CPU with
+  thread, allocator, precision, and workload receipts.
+
+### Performance
+
+- Certified SmolVLM2's int8/refined `lm_head`, reducing head time by about 6x and
+  decode time by about 40% on the measured fixture.
+- Recorded the accepted Unlimited-OCR head-to-head rows: 3.41x and 2.81x
+  end-to-end speedups on the two pinned workloads at matched thread counts.
+
+### Fixed
+
+- Hardened the first real gauntlet runbook against three evidence-linkage and
+  aggregation defects before certification was allowed to pass.
+
+## [0.5.2] - 2026-07-08
+
+### Performance
+
+- Added a read-only mmap weight-loading capability and measured its warm-cache
+  startup benefit. This was the default in `0.5.2`; current main has since made
+  owned bytes the safe default and retained mmap as an explicit immutable-inode
+  opt-in.
+- Cached OneChart and SmolVLM2 model statics across page runs, eliminating
+  repeated vision/projector/embed hydration.
+
+## [0.5.1] - 2026-07-07
+
+### Added
+
+- CI gate-log artifacts, advisory benchmark guardrails, deep fuzz/property
+  coverage, and the first generated release-certification bundle.
+- Frame-batched SmolVLM2 vision execution and model-level GOT-OCR2 statics reuse.
+
+### Fixed
+
+- Corrected layout-aware parity for offline SMMLA panels after the aarch64 CI
+  lane caught a false comparison.
+- Rejected and reverted SAM row tiling after every interleaved pair favored the
+  untiled kernel; the loss remains recorded as negative evidence.
+
+## [0.5.0] - 2026-07-07
+
+The multi-page, hardening, and model-throughput release.
+
+### Added
+
+- Reference-faithful cross-page `infer_multi` orchestration for image batches and
+  PDFs, including `--multi-page`, streamed page events, 10/20-page fixtures, and
+  the 640px squash preprocessing contract.
+- TrOMR staff-level robot observability, musical-sanity warnings, residual-skew
+  refinement, a measured int8 artifact, and experimental barline splitting behind
+  `FOCR_TROMR_SPLIT`.
+- Offline SMMLA panel packing and zero-shuffle consumption, plus per-model SIMD
+  self-test verdicts.
+- Property-based and fuzz infrastructure; its first campaign found and fixed a
+  parser denial-of-service class.
+
+### Performance
+
+- Enabled fused QKV GEMV by default after byte-identity proof.
+- Hoisted GOT-OCR2 batch hydration and cached/pre-transposed CLIP and SAM weights.
+- Extended the continuous-batch spine across the dense model zoo.
+
+### Fixed
+
+- Preserved fittable TrOMR staff crops and enforced the model position budget.
+- Repaired CI provisioning after the `frankensqlite` asupersync dependency change.
 
 ## [0.4.0] - 2026-07-07
 
@@ -480,7 +628,13 @@ results above. The `.focrq` byte-parity, the SHA256 manifest verification in
 `focr pull`, and the 24/24 `robot selftest` (including the K=6848 overflow case) were
 all verified on real hardware on Apple Silicon and on a real x86 AVX2 host.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.1.0

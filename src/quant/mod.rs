@@ -25,10 +25,9 @@
 //!   int8 GEMM consumes (AGENTS.md doctrine #4 — the int4 *bandwidth* win).
 //! * [`convert`] — the `focr convert` driver: enumerate every tensor of a raw
 //!   bf16 safetensors [`crate::native_engine::weights::Weights`], int8-quantize
-//!   the decoder GEMM set with the SAME [`crate::native_engine::nn::quantize_int8`]
-//!   the load-time cache uses, copy everything else verbatim, and serialize via
-//!   [`focrq::FocrqBuilder`] — a self-contained int8 `.focrq` byte-identical at
-//!   decode to the `FOCR_DECODE_INT8` load-time path on the source shard.
+//!   the recipe-approved decoder FFN/expert set with
+//!   [`crate::native_engine::nn::quantize_int8`], copy everything else verbatim,
+//!   and serialize via [`focrq::FocrqBuilder`].
 //! * `recipe` / `bit_allocator` — the per-tensor quant policy + rate-distortion
 //!   bit allocator, authored by a sibling agent. Declared here so the module
 //!   tree is whole; their contents are owned elsewhere.

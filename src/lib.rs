@@ -803,18 +803,17 @@ mod tests {
                 Ok(0u64)
             });
         reset_shutdown();
-        match out {
-            Err(FocrError::Cancelled) => {
-                assert_eq!(FocrError::Cancelled.exit_code(), 6, "exit code contract");
-                log_line(
-                    "cancellation_token_into_closure_aborts",
-                    "aborted",
-                    "pass",
-                    "",
-                );
-            }
-            other => panic!("expected Cancelled, got {other:?}"),
-        }
+        assert!(
+            matches!(out, Err(FocrError::Cancelled)),
+            "expected Cancelled, got {out:?}"
+        );
+        assert_eq!(FocrError::Cancelled.exit_code(), 6, "exit code contract");
+        log_line(
+            "cancellation_token_into_closure_aborts",
+            "aborted",
+            "pass",
+            "",
+        );
     }
 
     /// bd-223.2: the bounded channel BLOCKS the producer when the consumer

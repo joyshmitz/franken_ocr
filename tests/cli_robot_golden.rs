@@ -60,7 +60,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use franken_ocr::FOCR_MODEL_LICENSE_NOTICE;
+use franken_ocr::native_engine::model_arch::arch_by_id;
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
+use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
 
 const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
@@ -135,6 +137,7 @@ fn run_focr(args: &[&str]) -> Output {
         .env("LOCALAPPDATA", hermetic_home())
         .env("USERPROFILE", hermetic_home())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -147,6 +150,7 @@ fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
         .env_remove(MODEL_DIR_ENV)
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -159,6 +163,7 @@ fn run_focr_with_model_dir(args: &[&str], model_dir: &Path) -> Output {
         .env(MODEL_DIR_ENV, model_dir.as_os_str())
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -171,6 +176,7 @@ fn run_focr_with_forced_error(args: &[&str], forced_error: &str) -> Output {
         .env_remove(MODEL_DIR_ENV)
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env(FORCE_TEST_ERROR_ENV, forced_error);
     run_focr_command(command, args)
 }
@@ -224,6 +230,56 @@ fn write_future_focrq_in_temp_model_dir(file_name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create model dir fixture");
     std::fs::write(dir.join(file_name), future_focrq_preamble())
         .expect("write future .focrq fixture in model dir");
+    dir
+}
+
+fn compatible_focrq_blob() -> Vec<u8> {
+    // The health tests exercise path resolution + bounded header compatibility,
+    // not the 2,710-entry Unlimited-OCR production census. Use a registered
+    // non-default model id so the tiny fixture remains truthful instead of
+    // impersonating a complete Unlimited-OCR artifact.
+    let arch = arch_by_id("got-ocr2").expect("GOT-OCR2 test arch is registered");
+    let mut builder = FocrqBuilder::new()
+        .with_model_id(arch.id())
+        .with_license_notice(arch.license_notice());
+    builder
+        .add_tensor(
+            "model.embed_tokens.weight",
+            WriteDType::Bf16,
+            vec![1, 1],
+            vec![0; 2],
+        )
+        .expect("add minimal compatible high-precision tensor");
+    builder.build()
+}
+
+fn write_compatible_focrq() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "focr_golden_compatible_{}_{}.focrq",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::write(&path, compatible_focrq_blob()).expect("write compatible .focrq fixture");
+    path
+}
+
+fn write_compatible_focrq_in_temp_model_dir(file_name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!(
+        "focr_golden_compatible_model_dir_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).expect("create compatible model dir fixture");
+    std::fs::write(dir.join(file_name), compatible_focrq_blob())
+        .expect("write compatible .focrq fixture in model dir");
     dir
 }
 
@@ -344,6 +400,14 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
 
     assert_nonempty_string(tiers.get("selected"), "simd_tiers.selected");
     assert_nonempty_string(tiers.get("selected_feature"), "simd_tiers.selected_feature");
+    assert_nonempty_string(
+        tiers.get("hardware_selected"),
+        "simd_tiers.hardware_selected",
+    );
+    assert_nonempty_string(
+        tiers.get("hardware_selected_feature"),
+        "simd_tiers.hardware_selected_feature",
+    );
     assert_eq!(
         tiers
             .get("override_env")
@@ -353,8 +417,15 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
     );
     assert_eq!(
         tiers.get("status").and_then(serde_json::Value::as_str),
-        Some("runtime detection active"),
+        Some("runtime capability and effective-route selection active"),
         "robot backends must not regress to the stale Phase-3 placeholder"
+    );
+    assert_eq!(
+        tiers
+            .get("selection_scope")
+            .and_then(serde_json::Value::as_str),
+        Some("ordinary_dense_int8"),
+        "the effective route must not overclaim packed-int4 or packed-SMMLA dispatch"
     );
 
     let available = tiers.get("available").and_then(serde_json::Value::as_array);
@@ -376,6 +447,11 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
     tiers.insert("selected".into(), serde_json::json!("[simd-tier]"));
     tiers.insert(
         "selected_feature".into(),
+        serde_json::json!("[simd-feature]"),
+    );
+    tiers.insert("hardware_selected".into(), serde_json::json!("[simd-tier]"));
+    tiers.insert(
+        "hardware_selected_feature".into(),
         serde_json::json!("[simd-feature]"),
     );
     tiers.insert(
@@ -859,7 +935,7 @@ fn robot_health_golden() {
 #[test]
 fn robot_health_reports_model_present_for_sniffable_model_path() {
     let test = "robot_health_reports_model_present_for_sniffable_model_path";
-    let model = write_future_focrq();
+    let model = write_compatible_focrq();
     let raw = stdout_of_with_model_path(&["robot", "health"], &model);
     let line = raw
         .lines()
@@ -884,7 +960,7 @@ fn robot_health_reports_model_present_for_sniffable_model_path() {
 #[test]
 fn robot_health_reports_model_present_for_model_dir_direct_artifact() {
     let test = "robot_health_reports_model_present_for_model_dir_direct_artifact";
-    let model = write_future_focrq();
+    let model = write_compatible_focrq();
     let raw = stdout_of_with_model_dir(&["robot", "health"], &model);
     let line = raw
         .lines()
@@ -918,7 +994,7 @@ fn robot_health_reports_model_present_for_model_dir_direct_artifact() {
 #[test]
 fn robot_health_reports_model_present_for_model_dir_default_basename() {
     let test = "robot_health_reports_model_present_for_model_dir_default_basename";
-    let dir = write_future_focrq_in_temp_model_dir("unlimited-ocr.focrq");
+    let dir = write_compatible_focrq_in_temp_model_dir("unlimited-ocr.focrq");
     let raw = stdout_of_with_model_dir(&["robot", "health"], &dir);
     let line = raw
         .lines()
@@ -991,9 +1067,9 @@ fn robot_backends_golden() {
 /// model gets a machine-readable parity verdict against the scalar oracle on
 /// this host, each with its own worst-case-K overflow row (doctrine #6 per
 /// model). Runs weight-free by design (synthetic operands), so this e2e needs
-/// no model gating. A second leg forces `FOCR_FORCE_ARCH=scalar` end-to-end to
-/// prove the override reaches the dispatcher through the CLI and the scalar
-/// floor is self-consistent (oracle vs oracle can never diverge).
+/// no model gating. Subprocess legs force every host-available ISA tier and
+/// prove the named branch executed; unknown and unavailable tags must leave the
+/// native route unchanged.
 #[test]
 fn robot_selftest_proves_per_model_kernel_parity_e2e() {
     let test = "robot_selftest_proves_per_model_kernel_parity_e2e";
@@ -1018,6 +1094,36 @@ fn robot_selftest_proves_per_model_kernel_parity_e2e() {
     assert_eq!(v["command"].as_str(), Some("robot.selftest"));
     assert_eq!(v["verdict"].as_str(), Some("pass"));
     assert_eq!(v["all_ok"].as_bool(), Some(true));
+    assert_eq!(v["route_consistent"].as_bool(), Some(true));
+    let selected = v["selected"].as_str().expect("selected effective route");
+    let hardware_selected = v["hardware_selected"]
+        .as_str()
+        .expect("selected hardware tier");
+    assert_nonempty_string(v.get("selected_feature"), "selftest.selected_feature");
+    assert_nonempty_string(
+        v.get("hardware_selected_feature"),
+        "selftest.hardware_selected_feature",
+    );
+    assert_eq!(
+        v["executed_routes"],
+        serde_json::json!([selected]),
+        "the native selftest must observe exactly the selected effective route"
+    );
+    assert_eq!(
+        v["oracle_independent"].as_bool(),
+        Some(!matches!(selected, "autovec" | "scalar")),
+        "scalar/autovec compare the same scalar implementation; intrinsic tiers are independent"
+    );
+    let available_tiers: Vec<String> = v["available"]
+        .as_array()
+        .expect("available tier array")
+        .iter()
+        .map(|tier| tier.as_str().expect("available tier tag").to_owned())
+        .collect();
+    assert!(
+        available_tiers.iter().any(|tier| tier == hardware_selected),
+        "selected hardware tier must be available"
+    );
     let total = v["cases_total"].as_u64().expect("cases_total");
     assert_eq!(
         v["cases_passed"].as_u64(),
@@ -1077,46 +1183,80 @@ fn robot_selftest_proves_per_model_kernel_parity_e2e() {
         },
     );
 
-    // Leg 2: force the scalar tier END-TO-END. `run_focr` scrubs
-    // FOCR_FORCE_ARCH for hermeticity, so build the command by hand with the
-    // same hermetic env plus the override.
-    let mut command = Command::new(focr_bin());
-    command
-        .args(["robot", "selftest"])
-        .env_remove("FOCR_MODEL_PATH")
-        .env_remove(MODEL_DIR_ENV)
-        .env(RUN_STORE_ENV, fresh_run_store_path())
-        .env("HOME", hermetic_home())
-        .env("LOCALAPPDATA", hermetic_home())
-        .env("USERPROFILE", hermetic_home())
-        .env_remove(FORCE_TEST_ERROR_ENV)
-        .env("FOCR_FORCE_ARCH", "scalar");
-    let out = run_focr_command(command, &["robot", "selftest"]);
-    assert!(
-        out.status.success(),
-        "scalar-forced selftest must exit 0; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .expect("scalar selftest line");
-    let v = parse_json_line(line, "robot selftest (scalar)");
-    assert_eq!(
-        v["selected"].as_str(),
-        Some("scalar"),
-        "FOCR_FORCE_ARCH=scalar must reach the dispatcher e2e; line: {line}"
-    );
-    assert_eq!(v["verdict"].as_str(), Some("pass"));
-    tlog!(test,
-        "case": "forced_scalar",
-        "event": "result",
-        "stage": "selftest_scalar",
-        "inputs": {"argv": ["robot", "selftest"], "env": {"FOCR_FORCE_ARCH": "scalar"}},
-        "result": "pass",
-        "detail": "override reaches dispatch e2e; scalar floor self-consistent",
-    );
+    let run_with_force = |force: &str| {
+        let mut command = Command::new(focr_bin());
+        command
+            .args(["robot", "selftest"])
+            .env_remove("FOCR_MODEL_PATH")
+            .env_remove(MODEL_DIR_ENV)
+            .env(RUN_STORE_ENV, fresh_run_store_path())
+            .env("HOME", hermetic_home())
+            .env("LOCALAPPDATA", hermetic_home())
+            .env("USERPROFILE", hermetic_home())
+            .env_remove("FOCR_INT8_AUTOVEC")
+            .env_remove(FORCE_TEST_ERROR_ENV)
+            .env("FOCR_FORCE_ARCH", force);
+        let out = run_focr_command(command, &["robot", "selftest"]);
+        assert!(
+            out.status.success(),
+            "{force}-forced selftest must exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("forced selftest line");
+        parse_json_line(line, &format!("robot selftest ({force})"))
+    };
+
+    // Leg 2: force EVERY host-available ISA tier end-to-end. The execution trace
+    // is branch-derived, so a metadata-only override cannot satisfy this proof.
+    for tier in &available_tiers {
+        let forced = run_with_force(tier);
+        assert_eq!(forced["selected"].as_str(), Some(tier.as_str()));
+        assert_eq!(
+            forced["hardware_selected"].as_str(),
+            Some(tier.as_str()),
+            "forced ISA selection must match the requested available tier"
+        );
+        assert_eq!(
+            forced["executed_routes"],
+            serde_json::json!([tier.as_str()])
+        );
+        assert_eq!(forced["route_consistent"].as_bool(), Some(true));
+        assert_eq!(forced["verdict"].as_str(), Some("pass"));
+        assert_eq!(
+            forced["oracle_independent"].as_bool(),
+            Some(tier != "scalar")
+        );
+        tlog!(test,
+            "case": format!("forced_{tier}"),
+            "event": "result",
+            "stage": "selftest_forced_route",
+            "inputs": {"argv": ["robot", "selftest"], "env": {"FOCR_FORCE_ARCH": tier}},
+            "result": "pass",
+            "detail": "override and branch-derived execution route agree",
+        );
+    }
+
+    // Leg 3: unknown and host-unavailable tags are true no-ops. On Apple this
+    // specifically proves they do not disable the default autovec route merely
+    // because FOCR_FORCE_ARCH is present.
+    let unavailable_known = ["sdot", "smmla", "avx2", "avxvnni", "avx512vnni"]
+        .into_iter()
+        .find(|candidate| !available_tiers.iter().any(|tier| tier == candidate))
+        .expect("every host must lack at least one tier from the other architecture");
+    for ignored in ["definitely-unsupported", unavailable_known] {
+        let forced = run_with_force(ignored);
+        assert_eq!(forced["selected"].as_str(), Some(selected));
+        assert_eq!(
+            forced["hardware_selected"].as_str(),
+            Some(hardware_selected)
+        );
+        assert_eq!(forced["executed_routes"], serde_json::json!([selected]));
+        assert_eq!(forced["route_consistent"].as_bool(), Some(true));
+    }
 }
 
 /// bd-2z0y: `focr ocr --multi-page` is PDF-only and refuses non-composable
@@ -1397,7 +1537,7 @@ fn ocr_robot_future_focrq_stream_matches_exit_code() {
         run_error["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("format_version")
+            .contains("format version")
     );
     assert!(
         stderr.trim().is_empty(),
@@ -2746,6 +2886,7 @@ fn runs_schema_contract_over_populated_store() {
             .env_remove(MODEL_DIR_ENV)
             .env(RUN_STORE_ENV, &store)
             .env_remove("FOCR_FORCE_ARCH")
+            .env_remove("FOCR_INT8_AUTOVEC")
             .env_remove(FORCE_TEST_ERROR_ENV);
         command.output().expect("failed to spawn focr binary")
     };

@@ -13,6 +13,7 @@
 "robot_schema_v1.json" = { kind = "committed", note = "frozen robot NDJSON contract (bd-zc1o)" }
 "runs_schema.json" = { kind = "committed", note = "frozen runs/sync record contract (bd-wp8.11); versioned by hand" }
 "test_log_schema.json" = { kind = "committed", note = "TestLog line contract (bd-n68o)" }
+"moe_torch_2_10_cpu.json" = { kind = "regenerated-committed", script = "scripts/gen_moe_torch_2_10_cpu_fixture.py", note = "pinned macOS arm64 Torch 2.10 CPU unsorted-topk and production-width reduction oracle; sha256 84fa230a314ee2722a256b07504f9b319c470e246cb50729d1f49db78a3d01a2" }
 "tokenizer" = { kind = "committed", note = "hand-curated OQ-16 conformance corpus" }
 "tokenizer_baidu" = { kind = "regenerated-committed", script = "scripts/gen_token_id_fixtures.py" }
 "tokenizer_got" = { kind = "regenerated-committed", script = "scripts/gen_got_token_id_fixtures.py" }

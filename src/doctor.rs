@@ -28,7 +28,7 @@
 //! lost (lock held).
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -217,14 +217,46 @@ fn detect_unreadable_cache_entries(root: &DoctorRoot, out: &mut Vec<Finding>) {
 #[cfg(not(unix))]
 fn detect_unreadable_cache_entries(_root: &DoctorRoot, _out: &mut Vec<Finding>) {}
 
-fn detect_orphaned_partials(root: &DoctorRoot, out: &mut Vec<Finding>) {
-    let Ok(entries) = std::fs::read_dir(root.models_dir()) else {
+fn staging_download_is_active(path: &Path) -> bool {
+    let Some(lock_path) = crate::dist::pull_lock_path_for_staging(path) else {
+        return false;
+    };
+    let metadata = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return true;
+    }
+    let file = match std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => true,
+    }
+}
+
+fn detect_orphaned_partials_in_dir(directory: &Path, out: &mut Vec<Finding>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tmp") || name.ends_with(".partial") {
+        // macOS represents extended attributes as `._*` AppleDouble files on
+        // filesystems such as exFAT. They shadow the real staging file and must
+        // not become a second repair candidate.
+        if !name.starts_with("._")
+            && (name.ends_with(".tmp") || name.ends_with(".partial"))
+            && !staging_download_is_active(&path)
+        {
             out.push(Finding {
                 detector: "orphaned_partial_download",
                 severity: "warn",
@@ -234,6 +266,23 @@ fn detect_orphaned_partials(root: &DoctorRoot, out: &mut Vec<Finding>) {
                     op: "quarantine".into(),
                 },
             });
+        }
+    }
+}
+
+fn detect_orphaned_partials(root: &DoctorRoot, out: &mut Vec<Finding>) {
+    let models = root.models_dir();
+    detect_orphaned_partials_in_dir(&models, out);
+    let Ok(entries) = std::fs::read_dir(&models) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            detect_orphaned_partials_in_dir(&path, out);
         }
     }
 }
@@ -726,4 +775,66 @@ pub fn robot_docs() -> String {
     );
     let _ = writeln!(s, "blast radius is the user cache root only.");
     s
+}
+
+#[cfg(test)]
+mod pull_coordination_tests {
+    use super::*;
+
+    #[test]
+    fn live_pull_staging_is_not_reported_as_orphaned() {
+        let root =
+            std::env::temp_dir().join(format!("focr_doctor_pull_lock_{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create test root");
+        let key = "a".repeat(32);
+        let lock_path = root.join(format!(".focr-pull-{key}.lock"));
+        let stage_path = root.join(format!(
+            ".focr-stage-{key}-{}-0.partial",
+            std::process::id()
+        ));
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock");
+        holder.try_lock().expect("hold pull lock");
+        std::fs::write(&stage_path, b"in progress").expect("write staging file");
+
+        assert!(staging_download_is_active(&stage_path));
+        drop(holder);
+        assert!(
+            !staging_download_is_active(&stage_path),
+            "descriptor release must make crash-left staging discoverable"
+        );
+
+        std::fs::remove_file(stage_path).expect("remove stage");
+        std::fs::remove_file(lock_path).expect("remove lock");
+        std::fs::remove_dir(root).expect("remove test root");
+    }
+
+    #[test]
+    fn nested_model_staging_is_detected_after_pull_crash() {
+        let root =
+            std::env::temp_dir().join(format!("focr_doctor_nested_stage_{}", std::process::id()));
+        let model = root.join("got-ocr2");
+        std::fs::create_dir_all(&model).expect("create nested model directory");
+        let stage = model.join(format!(
+            ".focr-stage-{}-{}-0.partial",
+            "b".repeat(32),
+            std::process::id()
+        ));
+        std::fs::write(&stage, b"crash-left bytes").expect("write nested stage");
+
+        let mut findings = Vec::new();
+        detect_orphaned_partials_in_dir(&model, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].detector, "orphaned_partial_download");
+        assert_eq!(findings[0].path.as_deref(), stage.to_str());
+
+        std::fs::remove_file(stage).expect("remove nested stage");
+        std::fs::remove_dir(model).expect("remove nested model directory");
+        std::fs::remove_dir(root).expect("remove nested test root");
+    }
 }

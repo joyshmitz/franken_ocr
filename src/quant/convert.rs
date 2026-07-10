@@ -14,12 +14,11 @@
 //!
 //! ## The byte-for-byte contract
 //!
-//! `DecoderWeightCacheI8::build` quantizes a fixed set of decoder GEMM tensors
-//! with `quant_oc(w, out) = nn::quantize_int8(w, out, in)` and leaves everything
-//! else high-precision. This converter classifies each tensor with
-//! [`is_decoder_int8_tensor_for`] — the *same* set, derived from that builder
-//! but keyed by the target [`ModelArch`] (the decoder-layers name prefix and the
-//! lm_head policy are arch facts, not name coincidences) — and:
+//! The validated Unlimited-OCR recipe quantizes only decoder FFN/expert GEMMs
+//! and leaves attention plus `lm_head` high precision. This converter classifies
+//! each tensor with [`is_decoder_int8_tensor_for`], which delegates the default
+//! architecture to [`super::recipe::Recipe::validated_default`] and remains keyed
+//! by the target [`ModelArch`] for model-zoo layouts.
 //!
 //! * for a decoder int8 tensor: widens the bf16 `[n, k]` weight to f32 and calls
 //!   the SAME [`nn::quantize_int8`], emitting a `QInt8PerChan` record whose int8
@@ -29,25 +28,21 @@
 //!   `embed_tokens`, the MoE router `mlp.gate.weight`, and ALL norms): copies the
 //!   original bf16/f32 bytes verbatim.
 //!
-//! Because the offline int8 bytes equal the load-time int8 bytes, and the
-//! high-precision tensors are unchanged, a converted artifact decodes
-//! bit-for-bit like the `FOCR_DECODE_INT8` path on the source safetensors. The
-//! runtime closes the loop by reading those pre-quantized records back through
-//! [`Weights::qint8`] instead of re-quantizing (see `DecoderWeightCacheI8::build`).
-//!
-//! NB: this mirrors `DecoderWeightCacheI8::build` (the parity oracle the
-//! end-to-end check compares against), which quantizes attention `q/k/v/o` and
-//! `lm_head` UNCONDITIONALLY — a superset of the conservative kill-switched
-//! [`super::recipe`] policy. The recipe stays the policy authority for the gated
-//! runtime; `convert` targets the `build` byte image so the two are identical.
+//! The high-precision tensors are copied byte-for-byte. The existing all-int8
+//! runtime cache is an explicitly gated experimental path; it is not the
+//! converter's default artifact contract.
 
 use sha2::{Digest, Sha256};
 
 use super::focrq::{FocrqBuilder, WriteDType};
+use super::recipe::Recipe;
 use crate::error::{FocrError, FocrResult};
 use crate::native_engine::model_arch::ModelArch;
 use crate::native_engine::nn;
 use crate::native_engine::weights::{DType, Weights};
+
+/// Frozen identifier stamped into Unlimited-OCR conservative int8 artifacts.
+pub const UNLIMITED_OCR_INT8_RECIPE_ID: &str = "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1";
 
 /// The quantization target requested on the `focr convert` command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +66,8 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Whether `name` is one of the decoder GEMM tensors the doctrine-#2 int8 set
-/// covers for the given target `arch`.
+/// Whether `name` is one of the decoder tensors the target architecture's
+/// validated int8 recipe covers.
 ///
 /// A **pure function of the tensor name + the arch descriptor** (no I/O, no env)
 /// so it is deterministic and unit-testable. The classification is ARCH-AWARE,
@@ -85,13 +80,13 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
 ///   `model.vision_model.encoder.layers.{i}.self_attn.q_proj.weight` shares the
 ///   leaf name with a decoder GEMM but is NOT under the decoder prefix, so it
 ///   stays high-precision.
-/// * [`ModelArch::lm_head_stored_int8`] — whether a stored `lm_head.weight`
-///   joins the set. `true` for Unlimited-OCR (the historical
-///   [`crate::native_engine::decoder::DecoderWeightCacheI8::build`] byte image);
-///   `false` for SmolVLM2, whose UNTIED head stays high-precision per doctrine
-///   #2 (int8-lm_head only behind a measured quality kill-switch — spec §11).
 ///
-/// Under the prefix the set is exactly what `build` enumerates:
+/// Unlimited-OCR delegates to [`Recipe::validated_default`]: only FFN/expert
+/// projections are int8; attention and `lm_head` remain high precision. Other
+/// model families retain their architecture-specific, separately certified
+/// storage rules.
+///
+/// For non-default architectures, the prefix-based set is:
 ///
 /// * attention `self_attn.{q,k,v,o}_proj.weight` (GQA k/v panels like
 ///   SmolVLM2's `[320, 960]` are just rank-2 `[n, k]` — nothing special);
@@ -104,6 +99,9 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
 /// the entire vision tower.
 #[must_use]
 pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
+    if arch.id() == crate::native_engine::model_arch::default_arch().id() {
+        return Recipe::validated_default().is_quantized(name);
+    }
     if name == "lm_head.weight" {
         return arch.lm_head_stored_int8();
     }
@@ -202,6 +200,11 @@ pub fn safetensors_to_focrq(
         .with_source_sha256(source_sha256)
         .with_model_id(arch.id())
         .with_license_notice(arch.license_notice());
+    if arch.id() == crate::native_engine::model_arch::default_arch().id() {
+        builder = builder.with_packing_manifest_json(format!(
+            r#"{{"quant_recipe":"{UNLIMITED_OCR_INT8_RECIPE_ID}"}}"#
+        ));
+    }
 
     // When the arch ties `lm_head` to `embed_tokens` (GOT-OCR2: proven byte-identical,
     // spec §12), omit `lm_head.weight` — it is a duplicate the loader reconstructs
@@ -235,6 +238,17 @@ pub fn safetensors_to_focrq(
         if is_decoder_int8_tensor_for(name, arch) {
             quantize_decoder_tensor(&mut builder, weights, name, arch_target)?;
         } else {
+            if arch.id() == crate::native_engine::model_arch::default_arch().id()
+                && matches!(
+                    weights.record(name).map(|record| record.dtype),
+                    Some(DType::F16)
+                )
+            {
+                return Err(FocrError::FormatMismatch(format!(
+                    "convert: Unlimited-OCR high-precision tensor {name:?} is F16; recipe \
+                     {UNLIMITED_OCR_INT8_RECIPE_ID} permits only source BF16 or F32"
+                )));
+            }
             copy_high_precision_tensor(&mut builder, weights, name)?;
         }
     }
@@ -445,8 +459,6 @@ mod tests {
     }
 
     const INT8_NAMES: &[&str] = &[
-        "lm_head.weight",
-        "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.mlp.gate_proj.weight",
         "model.layers.1.mlp.experts.0.up_proj.weight",
         "model.layers.1.mlp.shared_experts.down_proj.weight",
@@ -457,10 +469,12 @@ mod tests {
         "model.layers.0.input_layernorm.weight",
         "model.norm.weight",
         "vision_model.patch_embed.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
     ];
 
     #[test]
-    fn classifier_matches_decoder_int8_set() {
+    fn classifier_matches_validated_default_recipe() {
         for name in INT8_NAMES {
             assert!(is_decoder_int8_tensor(name), "{name} must be int8");
         }
@@ -470,7 +484,9 @@ mod tests {
                 "{name} must stay high-precision"
             );
         }
-        // The router gate vs the dense FFN gate projection is the subtle split.
+        // The router gate vs the dense FFN gate projection is the subtle split;
+        // attention and lm_head are also kept unless their independent gates are
+        // certified and explicitly armed in a future artifact recipe.
         assert!(!is_decoder_int8_tensor("model.layers.3.mlp.gate.weight"));
         assert!(is_decoder_int8_tensor(
             "model.layers.3.mlp.gate_proj.weight"
@@ -480,6 +496,45 @@ mod tests {
         assert!(!is_decoder_int8_tensor(
             "vision_model.encoder.layers.2.mlp.fc2.weight"
         ));
+    }
+
+    #[test]
+    fn unlimited_ocr_validated_recipe_has_exactly_2148_int8_tensors() {
+        let mut names = Vec::new();
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            names.push(format!("model.layers.0.mlp.{proj}.weight"));
+        }
+        for layer in 1..12 {
+            for expert in 0..64 {
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    names.push(format!(
+                        "model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
+                    ));
+                }
+            }
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                names.push(format!(
+                    "model.layers.{layer}.mlp.shared_experts.{proj}.weight"
+                ));
+            }
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                names.push(format!("model.layers.{layer}.self_attn.{proj}.weight"));
+            }
+        }
+        names.extend([
+            "lm_head.weight".to_owned(),
+            "model.layers.0.self_attn.q_proj.weight".to_owned(),
+            "model.layers.0.self_attn.k_proj.weight".to_owned(),
+            "model.layers.0.self_attn.v_proj.weight".to_owned(),
+            "model.layers.0.self_attn.o_proj.weight".to_owned(),
+        ]);
+
+        let quantized = names
+            .iter()
+            .filter(|name| is_decoder_int8_tensor(name))
+            .count();
+        assert_eq!(quantized, 2148);
+        assert_eq!(names.len() - quantized, 49, "48 attention + one lm_head");
     }
 
     /// bd-2mo.3/.3.1: the `--arch aarch64-smmla` payload is a LOSSLESS
@@ -926,10 +981,9 @@ mod tests {
                 "{name} must stay high-precision under smolvlm2"
             );
         }
-        // The untied lm_head is the head-policy delta: HP under smolvlm2,
-        // int8 under the default (Unlimited-OCR byte image).
+        // Both architectures keep the untied lm_head high precision by default.
         assert!(!is_decoder_int8_tensor_for("lm_head.weight", smol));
-        assert!(is_decoder_int8_tensor_for("lm_head.weight", default));
+        assert!(!is_decoder_int8_tensor_for("lm_head.weight", default));
         // A default-namespace decoder GEMM is NOT smolvlm2's decoder.
         assert!(!is_decoder_int8_tensor_for(
             "model.layers.0.self_attn.q_proj.weight",
@@ -1180,7 +1234,9 @@ mod tests {
             "model.decoder.layers.0.fc1.weight",
             "model.decoder.layers.0.fc2.weight",
         ] {
-            let q = out.qint8(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let q = out
+                .qint8(name)
+                .unwrap_or_else(|e| unreachable!("{name}: {e}"));
             let src = w.mat(name).unwrap();
             let expect = crate::native_engine::nn::quantize_int8(&src.data, src.rows, src.cols);
             assert_eq!(q.w, expect.w, "{name} int8 bytes");
@@ -1196,7 +1252,9 @@ mod tests {
             "num_decoder.0.weight",
             "model.vision_tower.blocks.0.attn.qkv.weight",
         ] {
-            let t = out.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let t = out
+                .tensor(name)
+                .unwrap_or_else(|e| unreachable!("{name}: {e}"));
             assert_eq!(t.dtype, DType::BF16, "{name} stays HP");
         }
     }
@@ -1229,6 +1287,50 @@ mod tests {
         let err = safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [7u8; 32], one)
             .expect_err("untied bytes must be refused for a tied arch");
         assert!(matches!(err, FocrError::FormatMismatch(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unlimited_real_recipe_artifact_has_exact_dtype_census() {
+        let Some(path) =
+            std::env::var_os("FOCR_UNLIMITED_RECIPE_ARTIFACT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("[convert-test] skip_no_model: FOCR_UNLIMITED_RECIPE_ARTIFACT unset");
+            return;
+        };
+        let weights = Weights::load(&path).expect("recipe artifact loads through mmap");
+        assert_eq!(weights.model_id(), "unlimited-ocr");
+        assert_eq!(weights.len(), 2_710, "frozen real-model tensor census");
+        assert_eq!(
+            weights.source_sha256(),
+            "2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6"
+        );
+
+        let recipe = Recipe::validated_default();
+        let mut int8 = 0usize;
+        let mut gated_high_precision = 0usize;
+        for name in weights.names() {
+            let dtype = weights.record(name).expect("census name has record").dtype;
+            if recipe.is_quantized(name) {
+                assert_eq!(dtype, DType::QInt8PerChan, "{name}");
+                int8 += 1;
+            } else {
+                assert!(
+                    matches!(dtype, DType::BF16 | DType::F32),
+                    "{name}: {dtype:?}"
+                );
+                if matches!(
+                    recipe.classify(name).policy,
+                    crate::quant::recipe::QuantPolicy::Gated(_)
+                ) {
+                    gated_high_precision += 1;
+                }
+            }
+        }
+        assert_eq!(int8, 2_148, "dense + routed/shared FFN matrices");
+        assert_eq!(
+            gated_high_precision, 49,
+            "48 q/k/v/o projections plus lm_head"
+        );
     }
 
     #[test]
@@ -1328,68 +1430,28 @@ mod tests {
     }
 
     #[test]
-    fn default_and_got_classification_is_byte_unchanged() {
-        // REGRESSION (bd-3jo6.3.2): the arch-aware classifier instantiated at
-        // the default and GOT archs must equal the v1 name-only rule on EVERY
-        // name — including SmolVLM2-shaped names, which v1 never matched — so
-        // the historical `.focrq` byte images cannot drift.
-        let v1 = |name: &str| -> bool {
-            // The pre-arch-aware rule, transcribed literally.
-            if name == "lm_head.weight" {
-                return true;
-            }
-            let Some(rest) = name.strip_prefix("model.layers.") else {
-                return false;
-            };
-            if rest.contains(".self_attn.") {
-                return rest.ends_with(".q_proj.weight")
-                    || rest.ends_with(".k_proj.weight")
-                    || rest.ends_with(".v_proj.weight")
-                    || rest.ends_with(".o_proj.weight");
-            }
-            if rest.contains(".mlp.") {
-                return rest.ends_with(".gate_proj.weight")
-                    || rest.ends_with(".up_proj.weight")
-                    || rest.ends_with(".down_proj.weight");
-            }
-            false
-        };
+    fn default_and_got_classification_use_their_declared_recipes() {
         let got = crate::native_engine::model_arch::arch_by_id("got-ocr2").unwrap();
         let default = crate::native_engine::model_arch::default_arch();
-        let corpus: Vec<&str> = INT8_NAMES
-            .iter()
-            .chain(KEPT_NAMES)
-            .chain(SMOLVLM2_INT8_NAMES)
-            .chain(SMOLVLM2_KEPT_NAMES)
-            .copied()
-            .chain([
-                "model.layers.3.mlp.gate.weight",
-                "model.layers.3.mlp.gate_proj.weight",
-                "vision_model.encoder.layers.2.mlp.fc2.weight",
-                "model.embed_tokens.weight",
-                "model.norm.weight",
-            ])
-            .collect();
-        for name in corpus {
-            assert_eq!(
-                is_decoder_int8_tensor_for(name, default),
-                v1(name),
-                "default-arch classification changed for {name}"
-            );
-            assert_eq!(
-                is_decoder_int8_tensor_for(name, got),
-                v1(name),
-                "got-arch classification changed for {name}"
-            );
-            // And the public name-only helper remains the default instance.
-            assert_eq!(is_decoder_int8_tensor(name), v1(name), "{name}");
+        for name in INT8_NAMES {
+            assert!(is_decoder_int8_tensor_for(name, default), "{name}");
+            assert!(is_decoder_int8_tensor_for(name, got), "{name}");
+            assert!(is_decoder_int8_tensor(name), "{name}");
+        }
+        for name in [
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+        ] {
+            assert!(!is_decoder_int8_tensor_for(name, default), "{name}");
+            assert!(is_decoder_int8_tensor_for(name, got), "{name}");
         }
     }
 
     #[test]
-    fn default_arch_convert_is_unchanged_stores_lm_head_no_model_id() {
-        // Back-compat: the Unlimited-OCR (default arch) path stores lm_head as int8
-        // and emits NO model_id key — byte-identical to the historical artifact.
+    fn default_arch_convert_stamps_recipe_and_keeps_gated_tensors_high_precision() {
         let w = Weights::from_bytes(synthetic_safetensors()).expect("synthetic parse");
         let blob = safetensors_to_focrq(
             &w,
@@ -1401,13 +1463,20 @@ mod tests {
         .expect("default convert");
         assert!(
             !String::from_utf8_lossy(&blob).contains("model_id"),
-            "default arch must omit the model_id key (byte-parity with v1)"
+            "default arch must omit the redundant model_id key"
+        );
+        assert!(
+            String::from_utf8_lossy(&blob).contains(UNLIMITED_OCR_INT8_RECIPE_ID),
+            "artifact must self-describe the conservative recipe"
         );
         let out = Weights::from_bytes(blob).expect("loads");
         assert_eq!(out.model_id(), "unlimited-ocr");
-        assert!(
-            out.qint8("lm_head.weight").is_ok(),
-            "default keeps lm_head int8"
+        assert_eq!(out.tensor("lm_head.weight").unwrap().dtype, DType::BF16);
+        assert_eq!(
+            out.tensor("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .dtype,
+            DType::BF16
         );
         assert_eq!(out.license_notice(), FOCR_MODEL_LICENSE_NOTICE);
     }

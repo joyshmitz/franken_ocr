@@ -74,16 +74,26 @@ fn robot_triage_is_a_one_round_trip_mega_command() {
             .is_some_and(|r| !r.is_empty())
         && !v["commands"].is_null()
         && v["exit_codes"].as_array().is_some_and(|c| c.len() == 8);
-    // State-aware: hermetic env has NO model, so the first recommendation
-    // must be the acquisition command, copy-pasteable.
-    let recommends_pull = v["recommendations"][0]
+    // State-aware: the hermetic environment has no model. Triage must lead with
+    // the compatible default pull while retaining the explicit local/raw path.
+    let recommendations = v["recommendations"]
+        .as_array()
+        .expect("recommendations was checked above");
+    let recommends_default_pull = recommendations[0]
         .as_str()
         .is_some_and(|r| r.starts_with("focr pull"));
-    let ok = out.status.code() == Some(0) && has_all && recommends_pull;
+    let recommends_compatible_source = recommendations
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|r| r.starts_with("FOCR_MODEL_PATH="));
+    let actionable = recommends_default_pull && recommends_compatible_source;
+    let ok = out.status.code() == Some(0) && has_all && actionable;
     emit(
         "mega_command",
         ok,
-        &format!(r#""has_all_sections":{has_all},"recommends_pull_first":{recommends_pull}"#),
+        &format!(
+            r#""has_all_sections":{has_all},"recommends_default_pull":{recommends_default_pull},"recommends_compatible_source":{recommends_compatible_source}"#
+        ),
     );
     assert!(
         ok,
