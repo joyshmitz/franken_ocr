@@ -1154,8 +1154,10 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 )));
             }
             Ok(data
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::BF16 => {
@@ -1168,8 +1170,10 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
             // half::bf16 -> f32 is exact (bf16 is the high 16 bits of f32);
             // PROPOSED_ARCHITECTURE.md §6.12: widen BF16→f32, never narrow.
             Ok(data
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::QInt8PerChan | DType::QInt4PerGroup => Err(FocrError::FormatMismatch(format!(
@@ -1187,8 +1191,10 @@ fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
         )));
     }
     Ok(data
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 

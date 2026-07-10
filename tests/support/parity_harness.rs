@@ -770,8 +770,8 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
         ));
     }
     let mut data = Vec::with_capacity(numel);
-    for chunk in data_bytes[..numel * 4].chunks_exact(4) {
-        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in data_bytes[..numel * 4].as_chunks::<4>().0 {
+        data.push(f32::from_le_bytes(*chunk));
     }
     Ok((shape, data))
 }

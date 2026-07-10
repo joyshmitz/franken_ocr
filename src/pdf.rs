@@ -467,7 +467,7 @@ fn raw_samples_to_image(
         1 => bilevel_to_gray(&samples, width, height),
         16 => {
             // Samples are big-endian; downscale to 8-bpc by keeping the high byte.
-            let high: Vec<u8> = samples.chunks_exact(2).map(|c| c[0]).collect();
+            let high: Vec<u8> = samples.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
             raw_samples_to_image(high, width, height, 8, color_space)
         }
         other => Err(format!("unsupported bits-per-component {other}")),
@@ -494,7 +494,7 @@ fn cmyk8_to_rgb(samples: &[u8], width: u32, height: u32) -> Result<RgbImage, Str
         return Err("CMYK sample count does not match image dimensions".to_string());
     }
     let mut out = Vec::with_capacity(pixels * 3);
-    for px in samples.chunks_exact(4).take(pixels) {
+    for px in samples.as_chunks::<4>().0.iter().take(pixels) {
         let (c, m, y, k) = (
             u16::from(px[0]),
             u16::from(px[1]),

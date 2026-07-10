@@ -628,8 +628,10 @@ mod tests {
         // Leg 1: decoder-from-oracle-vision.
         let conn: Vec<f32> = std::fs::read(&conn_path)
             .expect("connector blob reads")
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let oracle_vision = Mat::from_vec(pre.n_frames * IMG_SLOTS_PER_FRAME, 960, conn);
         let statics = hydrate_statics(&weights).expect("statics");

@@ -521,8 +521,10 @@ mod tests {
         let read_f32 = |p: &str| -> Vec<f32> {
             std::fs::read(p)
                 .expect("oracle blob reads")
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let fx: serde_json::Value = serde_json::from_str(
@@ -965,8 +967,10 @@ mod tests {
         let read_f32 = |p: &str| -> Vec<f32> {
             std::fs::read(p)
                 .expect("oracle blob reads")
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let fx: serde_json::Value = serde_json::from_str(
@@ -1080,8 +1084,10 @@ mod tests {
         let read_f32 = |p: &str| -> Vec<f32> {
             std::fs::read(p)
                 .expect("oracle blob reads")
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let pre = read_f32(&pre_path);
