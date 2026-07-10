@@ -719,6 +719,7 @@ The committed `docs/gauntlet/RELEASE_SCORECARD.json` stays conservative: its sur
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
 | `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. |
+| `FOCR_NO_PROGRESS` | Disable the interactive stderr progress bar shown during multi-page PDF and `ocr-batch` runs (any value other than empty or `0`). The bar already auto-disables when stderr is not a TTY and in `--robot`/`--json` modes; this is the explicit opt-out for TTY sessions. |
 | `FOCR_FORCE_ARCH` | Force an available SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`avxvnni`/`avx512vnni`) for CPU dispatch; used by `robot selftest`, `robot backends`, and pinned perf runs. |
 | `FOCR_RESAMPLE` | Preprocess resampling kernel. Unset (default): the `image` crate's CatmullRom. `pil-bicubic`: a Pillow-bit-exact fixed-point BICUBIC at every resize site, for reference-exact comparison against the PIL/torch oracle (DISC-001 in `docs/DISCREPANCIES.md`). |
 | `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). |

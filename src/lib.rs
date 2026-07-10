@@ -28,6 +28,7 @@ pub mod error;
 pub mod native_engine;
 pub mod pdf;
 pub mod preprocess;
+pub mod progress;
 pub mod quant;
 pub mod robot;
 pub mod simd;

@@ -14,7 +14,19 @@ sections as they land.
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+
+- **Interactive progress bar for long runs** (GH #2). Multi-page PDF OCR
+  (per-page, `--extract-figures`, and `--multi-page` raster + cross-page
+  decode) and the sequential `ocr-batch` loop now render a single-line stderr
+  progress bar — done/total pages, percent, elapsed, and a linear ETA — so a
+  big scanned book is no longer minutes of silent compute. The bar is
+  stderr-only and machine-safe by construction: it is disabled in `--robot`
+  and `--json` modes, auto-disables when stderr is not an interactive
+  terminal (piped/redirected runs see byte-identical output), respects
+  `TERM=dumb`, and honors a `FOCR_NO_PROGRESS=1` kill switch. Zero new
+  dependencies; `tests/progress_stderr_discipline.rs` pins the
+  no-corruption contract end-to-end.
 
 ## [0.4.0] - 2026-07-07
 
