@@ -36,6 +36,7 @@ CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
 INSTALL_PS1="$REPO_ROOT/install.ps1"
 CHECK_SH="$REPO_ROOT/scripts/check.sh"
 TOOLCHAIN_TOML="$REPO_ROOT/rust-toolchain.toml"
+GITATTRIBUTES="$REPO_ROOT/.gitattributes"
 
 STATIC_ONLY=0
 case "${1:-}" in
@@ -384,7 +385,7 @@ else
 fi
 
 matrix_contract_ok=1
-for required in "$DIST_YML" "$CI_YML" "$INSTALL_PS1" "$CHECK_SH" "$TOOLCHAIN_TOML"; do
+for required in "$DIST_YML" "$CI_YML" "$INSTALL_PS1" "$CHECK_SH" "$TOOLCHAIN_TOML" "$GITATTRIBUTES"; do
   if [ ! -f "$required" ]; then
     bad "release contract input is missing: $required"
     matrix_contract_ok=0
@@ -437,6 +438,13 @@ EOF
     ! grep -Fq '$versionOutput = @(& $asset --version)' "$DIST_YML" ||
     ! grep -Fq '$versionExit = $LASTEXITCODE' "$DIST_YML"; then
     bad "Windows dist truncates the multi-line version probe or loses its exit code"
+    matrix_contract_ok=0
+  fi
+  if ! grep -Fxq 'src/native_engine/unlimited_ocr_manifest.json text eol=lf' "$GITATTRIBUTES" ||
+    ! grep -Fxq 'models/manifest-v2.json text eol=lf' "$GITATTRIBUTES" ||
+    ! grep -Fq 'git config --global core.autocrlf false' "$DIST_YML" ||
+    [ "$(grep -Fc '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3' "$DIST_YML")" -lt 2 ]; then
+    bad "embedded release manifests are not protected from Windows CRLF translation"
     matrix_contract_ok=0
   fi
   if [ "$(grep -Fc -- '--dist-ref-preflight' "$DIST_YML")" -lt 2 ]; then

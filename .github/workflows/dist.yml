@@ -123,6 +123,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/native_engine/unlimited_ocr_manifest.json'
+          $manifestSha = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedManifestSha = '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3'
+          if ($manifestSha -ne $expectedManifestSha) {
+            throw "embedded census manifest bytes differ from Git: expected $expectedManifestSha, got $manifestSha"
+          }
           $sourceRef = '${{ inputs.source_ref }}'
           $workflowSha = $env:GITHUB_SHA
           $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
@@ -339,6 +345,13 @@ jobs:
             asset: focr-aarch64-pc-windows-msvc.exe
             rustflags: ""
     steps:
+      # v0.7.0 predates the repository .gitattributes policy. Configure the
+      # ephemeral runner before checkout so exact-tag repairs embed Git's LF
+      # bytes instead of Git-for-Windows CRLF translations.
+      - name: Preserve canonical Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -354,6 +367,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/native_engine/unlimited_ocr_manifest.json'
+          $manifestSha = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedManifestSha = '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3'
+          if ($manifestSha -ne $expectedManifestSha) {
+            throw "embedded census manifest bytes differ from Git: expected $expectedManifestSha, got $manifestSha"
+          }
           $sourceRef = '${{ inputs.source_ref }}'
           $workflowSha = $env:GITHUB_SHA
           $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
