@@ -91,6 +91,17 @@ skip() { # reason [detail] — graceful fixture-absent skip: exit 0, one JSON li
   exit 0
 }
 
+batch_spine_enabled() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  case "$value" in
+    ''|0|off|false|no) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || ! [[ "$WARMUP" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --runs must be a positive integer, --warmup a non-negative integer" >&2
   exit 2
@@ -116,14 +127,26 @@ if [[ "$COMMAND" == "ocr" && ${#PAGES[@]} -gt 1 ]]; then
   echo "ERROR: --command ocr accepts exactly one --page" >&2
   exit 2
 fi
+if [[ "$COMMAND" == "ocr-batch" ]]; then
+  for arg in "${EXTRA_ARGS[@]}"; do
+    if [[ "$arg" == "--multi-page" ]]; then
+      echo "ERROR: --multi-page has no sequential gauntlet evidence contract" >&2
+      exit 2
+    fi
+  done
+fi
+if batch_spine_enabled "${FOCR_BATCH_SPINE:-}"; then
+  echo "FATAL: gauntlet capture forbids FOCR_BATCH_SPINE until it emits per-page timing evidence" >&2
+  exit 2
+fi
 if [[ -n "$AB_ENV" ]]; then
   if [[ ! "$AB_ENV" =~ ^FOCR_[A-Z0-9_]+$ || "$AB_ENV" == FOCR_GAUNTLET_* ]]; then
     echo "ERROR: --ab-env must name a non-harness FOCR_* variable" >&2
     exit 2
   fi
   case "$AB_ENV" in
-    FOCR_TIMING|FOCR_THREADS|FOCR_DECODE_INT8|FOCR_INT8_ATTN|FOCR_INT8_LMHEAD|FOCR_ATTN_GEMM|FOCR_INT8_KV|FOCR_SPEC_DECODE|FOCR_DECODE_STATELESS)
-      echo "ERROR: --ab-env cannot vary timing, thread, or precision-contract gates" >&2
+    FOCR_TIMING|FOCR_PROFILE_DECODE|FOCR_THREADS|FOCR_DECODE_INT8|FOCR_INT8_ATTN|FOCR_INT8_LMHEAD|FOCR_ATTN_GEMM|FOCR_INT8_KV|FOCR_SPEC_DECODE|FOCR_DECODE_STATELESS|FOCR_BATCH_SPINE)
+      echo "ERROR: --ab-env cannot vary timing, thread, precision, or uninstrumented batch-spine gates" >&2
       exit 2
       ;;
   esac
@@ -159,6 +182,20 @@ fi
 #    FOCR_TIMING lines; asserts the pipeline produces the expected stages. ────
 if (( SELF_TEST )); then
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/focr-gauntlet-selftest.XXXXXX")"
+  for spine_value in enabled 'f alse'; do
+    SPINE_OUTPUT=""
+    SPINE_RC=0
+    if SPINE_OUTPUT="$(env FOCR_BATCH_SPINE="$spine_value" "$0" --page "$TMP/missing.png" 2>&1)"; then
+      echo "SELF-TEST FAILED: armed FOCR_BATCH_SPINE=$spine_value was accepted" >&2
+      exit 1
+    else
+      SPINE_RC=$?
+    fi
+    if [[ "$SPINE_RC" -ne 2 || "$SPINE_OUTPUT" != *"gauntlet capture forbids FOCR_BATCH_SPINE"* ]]; then
+      echo "SELF-TEST FAILED: armed FOCR_BATCH_SPINE=$spine_value did not fail fast" >&2
+      exit 1
+    fi
+  done
   STUB="$TMP/focr-stub"
   cat >"$STUB" <<'STUB_EOF'
 #!/usr/bin/env bash
@@ -181,6 +218,7 @@ cat >&2 <<'ERR'
 [focr-timing] weight_cache_build_i8 0.90s
 [focr-timing] prefill_i8 1.80s (289 tokens)
 [focr-timing] decode_i8 6.00s (600 tokens, 0.010s/tok)
+[focr-timing] decode_i8 phases (ms): lm_head 900  attn 1800  experts 3200  route 100
 ERR
 if [[ "${FOCR_SELFTEST_OUTPUT_DRIFT:-0}" == "1" ]]; then
   echo "stub candidate text"
@@ -322,6 +360,15 @@ assert doc["stdout_identical_across_runs"] is True
 for want in ("preprocess", "vision_encode", "prefill", "decode_per_token", "end_to_end"):
     assert want in stages, f"missing stage {want}"
     assert stages[want]["n"] == 3, f"{want}: expected 3 samples"
+for want, expected_ms in (
+    ("decode_lm_head", 900.0),
+    ("decode_attn", 1800.0),
+    ("decode_experts", 3200.0),
+    ("decode_route", 100.0),
+):
+    assert stages[want]["n"] == 3, f"{want}: expected 3 samples"
+    assert stages[want]["p50_ms"] == expected_ms
+    assert stages[want]["cv_pct"] == 0.0
 assert stages["decode_per_token"]["tokens"] == 600
 assert abs(stages["decode_per_token"]["best_ms"] - 10.0) < 1e-6
 assert doc["precision"] == "focr-full-int8"
@@ -379,6 +426,12 @@ for arm in ("a", "b"):
     assert stages["end_to_end"]["p50_ms"] > 0
     assert stages["end_to_end"]["p95_ms"] >= stages["end_to_end"]["p50_ms"]
     assert stages["end_to_end"]["p99_ms"] >= stages["end_to_end"]["p95_ms"]
+    for phase in ("decode_lm_head", "decode_attn", "decode_experts", "decode_route"):
+        assert stages[phase]["n"] == 5
+        assert stages[phase]["cv_pct"] == 0.0
+comparisons = {row["stage"]: row for row in doc["comparisons"]}
+for phase in ("decode_lm_head", "decode_attn", "decode_experts", "decode_route"):
+    assert comparisons[phase]["a_p50_ms"] == comparisons[phase]["b_p50_ms"]
 print(json.dumps({"check": "gauntlet-focr-ab-self-test", "result": "pass"}))
 PY_EOF
   if env -u FOCR_ATTN_GEMM -u FOCR_INT8_KV -u FOCR_SPEC_DECODE \
@@ -596,6 +649,20 @@ for raw in sys.argv[1:]:
 print(json.dumps(pages, separators=(",", ":")))
 PY_EOF
 )" || { echo "FATAL: cannot establish stable page identities" >&2; exit 2; }
+CANONICAL_PAGES=()
+while IFS= read -r -d '' page; do
+  CANONICAL_PAGES+=("$page")
+done < <(python3 - "$PAGES_JSON" <<'PY_EOF'
+import json, sys
+
+for page in json.loads(sys.argv[1]):
+    sys.stdout.buffer.write(page["path"].encode("utf-8") + b"\0")
+PY_EOF
+)
+if (( ${#CANONICAL_PAGES[@]} != ${#PAGES[@]} )); then
+  echo "FATAL: canonical page argv does not match the identity manifest" >&2
+  exit 2
+fi
 export FOCR_GAUNTLET_PAGES_JSON="$PAGES_JSON"
 export FOCR_GAUNTLET_COMMAND="$COMMAND"
 export FOCR_GAUNTLET_WORKLOAD="$WORKLOAD_LABEL"
@@ -737,7 +804,7 @@ export FOCR_GAUNTLET_BINARY_SIZE="$EVIDENCE_BINARY_SIZE"
 export FOCR_GAUNTLET_BUILD_RECEIPT="${BUILD_RECEIPT:+$EVIDENCE_RECEIPT}"
 export FOCR_GAUNTLET_BUILD_RECEIPT_SHA256="$BUILD_RECEIPT_SHA256"
 
-CMD=("$BINARY" "$COMMAND" "${PAGES[@]}")
+CMD=("$BINARY" "$COMMAND" "${CANONICAL_PAGES[@]}")
 [[ -n "$MODEL" ]] && CMD+=("--model" "$MODEL")
 # Extra command arguments are recorded verbatim in every run receipt.
 (( ${#EXTRA_ARGS[@]} )) && CMD+=("${EXTRA_ARGS[@]}")
@@ -745,6 +812,7 @@ CMD=("$BINARY" "$COMMAND" "${PAGES[@]}")
 # Thread parity pins: focr's own budget plus the pool knobs a helper could
 # read. Recorded verbatim into every run's meta (the ledger `command/env`).
 export FOCR_TIMING=1
+export FOCR_PROFILE_DECODE=1
 export FOCR_THREADS="$THREADS"
 export OMP_NUM_THREADS="$THREADS"
 export RAYON_NUM_THREADS="$THREADS"
@@ -828,7 +896,13 @@ def sha256(path):
             h.update(chunk)
     return h.hexdigest()
 
-pins = ("FOCR_TIMING", "FOCR_THREADS", "OMP_NUM_THREADS", "RAYON_NUM_THREADS")
+pins = (
+    "FOCR_TIMING",
+    "FOCR_PROFILE_DECODE",
+    "FOCR_THREADS",
+    "OMP_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+)
 precision_gates = (
     "FOCR_DECODE_INT8",
     "FOCR_INT8_ATTN",

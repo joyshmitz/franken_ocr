@@ -28,6 +28,7 @@ use ft_core::{DType, Device, TensorMeta};
 
 use super::tensor::{Mat, QInt8};
 use crate::error::{FocrError, FocrResult};
+use crate::quant::recipe::switch_on;
 
 /// Build a contiguous 2-D f32 CPU `TensorMeta` for a `[rows, cols]` tensor.
 ///
@@ -450,12 +451,32 @@ pub fn layer_norm(
     Ok(Mat::from_vec(x.rows, x.cols, data))
 }
 
+/// Truthy diagnostic fallback that preserves the pre-optimization payload copy
+/// for same-binary A/B measurements. The ownership-transfer path remains the
+/// default.
+const SOFTMAX_COPY_ENV: &str = "FOCR_SOFTMAX_COPY";
+
+fn softmax_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| switch_on(SOFTMAX_COPY_ENV))
+}
+
+fn install_softmax_output(x: &mut Mat, out: Vec<f32>, copy: bool) {
+    if copy {
+        x.data.copy_from_slice(&out);
+    } else {
+        x.data = out;
+    }
+}
+
 /// In-place numerically-stable per-row softmax over the last dim
 /// (`softmax_dim_tensor_contiguous_f32`, dim = 1).
 ///
 /// Each row is softmaxed independently (max-subtract for overflow safety). The
-/// The kernel returns a fresh final buffer; transfer that allocation into `x`
-/// so call sites keep their in-place API without copying the full payload.
+/// kernel returns a fresh final buffer; transfer that allocation into `x` so
+/// call sites keep their in-place API without copying the full payload. Truthy
+/// [`SOFTMAX_COPY_ENV`] preserves the former payload copy for diagnostic A/Bs.
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the kernel rejects the shape.
@@ -474,7 +495,7 @@ pub fn softmax_rows(x: &mut Mat) -> FocrResult<()> {
             x.data.len()
         )));
     }
-    x.data = out;
+    install_softmax_output(x, out, softmax_copy_enabled());
     Ok(())
 }
 
@@ -727,6 +748,24 @@ mod tests {
         for &v in m.row(1) {
             assert!((v - 1.0 / 3.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn softmax_output_copy_fallback_preserves_values_and_old_allocation() {
+        let expected = vec![0.25, 0.75];
+
+        let mut copied = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        let copied_ptr = copied.data.as_ptr();
+        install_softmax_output(&mut copied, expected.clone(), true);
+        assert_eq!(copied.data, expected);
+        assert_eq!(copied.data.as_ptr(), copied_ptr);
+
+        let mut transferred = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        let out = expected.clone();
+        let out_ptr = out.as_ptr();
+        install_softmax_output(&mut transferred, out, false);
+        assert_eq!(transferred.data, expected);
+        assert_eq!(transferred.data.as_ptr(), out_ptr);
     }
 
     #[test]

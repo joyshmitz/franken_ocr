@@ -294,6 +294,12 @@ CERTIFICATION_GITHUB_REPOSITORY = "Dicklesworthstone/franken_ocr"
 CERTIFICATION_GITHUB_WORKFLOW = "CI"
 CERTIFICATION_GITHUB_EVENT = "push"
 CERTIFICATION_DIST_WORKFLOW = "dist"
+DIST_RELEASE_INPUT_NAMES = (
+    "RUST_TOOLCHAIN",
+    "FRANKENTORCH_REV",
+    "FRANKENSQLITE_REV",
+    "ASUPERSYNC_REV",
+)
 CERTIFICATION_MODEL_PARITY_WORKFLOW = "Model Parity"
 CERTIFICATION_MODEL_PARITY_EVENT = "workflow_dispatch"
 CERTIFICATION_MODEL_PARITY_REQUIRED_JOBS = {"weighted-model-parity"}
@@ -9117,6 +9123,59 @@ def _dist_portability_reasons(
     return reasons
 
 
+def _parse_tag_owned_dist_release_inputs(
+    workflow_text: str, toolchain_channel: str
+) -> dict[str, str]:
+    """Read the immutable build-input pins recorded in a release tag's workflow."""
+    inputs: dict[str, str] = {}
+    for name in DIST_RELEASE_INPUT_NAMES:
+        matches = re.findall(
+            rf"(?m)^  {re.escape(name)}: ([^\s#]+)[ \t]*$", workflow_text
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "tag-owned dist workflow must define exactly one "
+                f"top-level {name} release input"
+            )
+        inputs[name] = matches[0]
+    if re.fullmatch(r"nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}", inputs["RUST_TOOLCHAIN"]) is None:
+        raise ValueError("tag-owned RUST_TOOLCHAIN is not an exact dated nightly")
+    for name in DIST_RELEASE_INPUT_NAMES[1:]:
+        if not _valid_git_head(inputs[name]):
+            raise ValueError(f"tag-owned {name} is not a lowercase 40-hex revision")
+    if toolchain_channel != inputs["RUST_TOOLCHAIN"]:
+        raise ValueError(
+            "tag-owned RUST_TOOLCHAIN disagrees with rust-toolchain.toml: "
+            f"workflow={inputs['RUST_TOOLCHAIN']} toolchain={toolchain_channel}"
+        )
+    return inputs
+
+
+def _tag_owned_dist_release_inputs(root: Path) -> dict[str, str]:
+    workflow_path = root / CERTIFICATION_WORKFLOW_PATHS[CERTIFICATION_DIST_WORKFLOW]
+    workflow_text = _read_bounded_text(workflow_path)
+    try:
+        with (root / "rust-toolchain.toml").open("rb") as handle:
+            toolchain = tomllib.load(handle).get("toolchain")
+    except (OSError, ValueError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"cannot read tag-owned rust-toolchain.toml: {error}") from error
+    if not isinstance(toolchain, dict) or not isinstance(toolchain.get("channel"), str):
+        raise ValueError("tag-owned rust-toolchain.toml has no string toolchain.channel")
+    return _parse_tag_owned_dist_release_inputs(workflow_text, toolchain["channel"])
+
+
+def _dist_release_input_drift(
+    tag_inputs: dict[str, str], workflow_inputs: dict[str, str]
+) -> list[str]:
+    drift: list[str] = []
+    for name in DIST_RELEASE_INPUT_NAMES:
+        tag_value = tag_inputs[name]
+        workflow_value = workflow_inputs.get(name) or "<unset>"
+        if tag_value != workflow_value:
+            drift.append(f"{name} tag={tag_value} workflow={workflow_value}")
+    return drift
+
+
 def dist_ref_preflight() -> int:
     """Reject release builds whose ref, version, or main ancestry is ambiguous."""
     root = _repo_root()
@@ -9168,6 +9227,18 @@ def dist_ref_preflight() -> int:
             )
             if ancestor.returncode != 0:
                 raise ValueError("tagged dist commit is not reachable from origin/main")
+            if event == "workflow_dispatch":
+                tag_inputs = _tag_owned_dist_release_inputs(root)
+                workflow_inputs = {
+                    name: os.environ.get(name, "") for name in DIST_RELEASE_INPUT_NAMES
+                }
+                drift = _dist_release_input_drift(tag_inputs, workflow_inputs)
+                if drift:
+                    raise ValueError(
+                        "source_ref repair release inputs differ from immutable tag: "
+                        + "; ".join(drift)
+                        + "; immutable-tag repair is unsupported across release-input drift"
+                    )
         else:
             raise ValueError(
                 "dist is restricted to refs/heads/main or an exact Cargo-version tag"
@@ -11210,6 +11281,76 @@ def self_test() -> int:
         "focr_version_rejects_noncanonical_first_line",
         _reported_focr_version("source_license: MIT\nfocr 0.7.0\n") is None
         and _reported_focr_version("") is None,
+    )
+
+    legacy_tag_inputs = {
+        "RUST_TOOLCHAIN": "nightly-2026-07-09",
+        "FRANKENTORCH_REV": "f00c3ce79737ffd0e7c7e2f2e81540907ce26562",
+        "FRANKENSQLITE_REV": "14c5781680833c248ed18d84914312e233d145df",
+        "ASUPERSYNC_REV": "e7e96829632d89815248a0809499332ab0beabcb",
+    }
+    legacy_tag_workflow = "env:\n" + "".join(
+        f"  {name}: {value}\n" for name, value in legacy_tag_inputs.items()
+    )
+    parsed_legacy_inputs = _parse_tag_owned_dist_release_inputs(
+        legacy_tag_workflow, "nightly-2026-07-09"
+    )
+    check(
+        "dist_release_inputs_parse_exact_legacy_tag",
+        parsed_legacy_inputs == legacy_tag_inputs,
+    )
+    check(
+        "dist_release_inputs_exact_match_has_no_drift",
+        _dist_release_input_drift(parsed_legacy_inputs, dict(legacy_tag_inputs)) == [],
+    )
+    advanced_inputs = dict(legacy_tag_inputs)
+    advanced_inputs["ASUPERSYNC_REV"] = "a9b99549609b39bc1dd8b128591ef324d6ef2d71"
+    check(
+        "dist_release_inputs_reject_v0_7_asupersync_drift",
+        _dist_release_input_drift(parsed_legacy_inputs, advanced_inputs)
+        == [
+            "ASUPERSYNC_REV "
+            "tag=e7e96829632d89815248a0809499332ab0beabcb "
+            "workflow=a9b99549609b39bc1dd8b128591ef324d6ef2d71"
+        ],
+    )
+
+    def release_input_parse_rejected(workflow_text: str, channel: str) -> bool:
+        try:
+            _parse_tag_owned_dist_release_inputs(workflow_text, channel)
+        except ValueError:
+            return True
+        return False
+
+    check(
+        "dist_release_inputs_reject_missing_pin",
+        release_input_parse_rejected(
+            legacy_tag_workflow.replace(
+                f"  ASUPERSYNC_REV: {legacy_tag_inputs['ASUPERSYNC_REV']}\n", ""
+            ),
+            "nightly-2026-07-09",
+        ),
+    )
+    check(
+        "dist_release_inputs_reject_duplicate_pin",
+        release_input_parse_rejected(
+            legacy_tag_workflow
+            + f"  ASUPERSYNC_REV: {legacy_tag_inputs['ASUPERSYNC_REV']}\n",
+            "nightly-2026-07-09",
+        ),
+    )
+    check(
+        "dist_release_inputs_reject_malformed_revision",
+        release_input_parse_rejected(
+            legacy_tag_workflow.replace(
+                legacy_tag_inputs["ASUPERSYNC_REV"], "not-a-revision"
+            ),
+            "nightly-2026-07-09",
+        ),
+    )
+    check(
+        "dist_release_inputs_reject_toolchain_disagreement",
+        release_input_parse_rejected(legacy_tag_workflow, "nightly-2026-07-10"),
     )
 
     # --- Beta posterior mean + quantile sanity (Beta(201,1) ~ 0.9950 mean).

@@ -938,7 +938,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn versioned_quant_path(direct: &Path, quant: ModelQuantPreference) -> PathBuf {
     direct.with_extension(format!(
         "v{}.{}.focrq",
-        env!("CARGO_PKG_VERSION"),
+        crate::dist::UNLIMITED_OCR_ARTIFACT_VERSION,
         quant.as_str()
     ))
 }
@@ -952,14 +952,13 @@ fn short_model_candidates(
     let mut candidates = Vec::new();
 
     // A spec that names a `.focrq` blob (the default `unlimited-ocr.focrq`) or a
-    // bare stem (`unlimited-ocr`) gets the quant-variant expansion: the artifact
-    // `focr pull` actually installs is `unlimited-ocr.int8.focrq`, so the default
-    // lookup must try the `<stem>.int8.focrq` / `<stem>.int4.focrq` names too —
-    // otherwise a fresh `focr pull` + `focr ocr page.png` fails for want of a
-    // `--model` flag (bd-3u6x). `with_extension` replaces a trailing `.focrq` or
-    // appends one to a bare stem, so both spec forms map to the same candidates.
-    // Any other spec (a safetensors directory, an explicit non-focrq file) is
-    // taken verbatim.
+    // bare stem (`unlimited-ocr`) gets the quant-variant expansion. `focr pull`
+    // installs the artifact-versioned `<stem>.vX.Y.Z.int8.focrq`; historical
+    // releases used `<stem>.int8.focrq`, so the default lookup tries both. This
+    // keeps a fresh pull usable without `--model` while retaining old caches
+    // (bd-3u6x). `with_extension` replaces a trailing `.focrq` or appends one to
+    // a bare stem, so both spec forms map to the same candidates. Any other spec
+    // (a safetensors directory, an explicit non-focrq file) is taken verbatim.
     let is_focrq_or_bare = match spec.extension() {
         None => true,
         Some(ext) => ext.eq_ignore_ascii_case("focrq"),
@@ -979,9 +978,10 @@ fn short_model_candidates(
         push_unique_path(&mut candidates, direct.clone());
         // 3. The bare `<stem>.focrq` (covers a no-extension spec).
         push_unique_path(&mut candidates, direct.with_extension("focrq"));
-        // 4. Release-versioned distributed names. Versioning lets Windows
-        // upgrades commit a new model without deleting/replacing the legacy
-        // destination before the verified download exists.
+        // 4. Artifact-versioned distributed names. The model release version is
+        // independent of binary SemVer, so patch releases keep resolving the
+        // same verified download. Versioning lets Windows upgrades commit a new
+        // model without replacing the legacy destination first.
         for quant in ModelQuantPreference::ALL {
             push_unique_path(&mut candidates, versioned_quant_path(&direct, quant));
         }
@@ -4113,11 +4113,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_prefers_current_versioned_pull_over_legacy_quant_name() {
-        let dir = temp_model_dir("resolve_current_versioned_int8");
+    fn resolve_model_prefers_manifest_versioned_pull_over_legacy_quant_name() {
+        let dir = temp_model_dir("resolve_manifest_versioned_int8");
         let current = dir.join(format!(
             "unlimited-ocr.v{}.int8.focrq",
-            env!("CARGO_PKG_VERSION")
+            crate::dist::UNLIMITED_OCR_ARTIFACT_VERSION
         ));
         let legacy = dir.join("unlimited-ocr.int8.focrq");
         std::fs::write(&current, weights::FOCRQ_MAGIC).expect("write current model");
@@ -4125,7 +4125,7 @@ mod tests {
 
         let resolved =
             resolve_model_from_search_dirs(Path::new("models/unlimited-ocr.focrq"), &[dir])
-                .expect("default spec resolves current versioned pull");
+                .expect("default spec resolves manifest-versioned pull");
         assert_eq!(resolved, current);
     }
 

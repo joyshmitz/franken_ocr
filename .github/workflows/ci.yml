@@ -52,7 +52,7 @@ env:
   # and together, never by floating each job on sibling `main`.
   FRANKENTORCH_REV: f00c3ce79737ffd0e7c7e2f2e81540907ce26562
   FRANKENSQLITE_REV: 14c5781680833c248ed18d84914312e233d145df
-  ASUPERSYNC_REV: e7e96829632d89815248a0809499332ab0beabcb
+  ASUPERSYNC_REV: a9b99549609b39bc1dd8b128591ef324d6ef2d71
   # Surface full backtraces if a test panics, so failures are self-diagnosing.
   RUST_BACKTRACE: 1
 

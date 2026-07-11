@@ -160,12 +160,11 @@ stretch — record every stage, never just the favorable one.
 
 ---
 
-_No performance numbers recorded yet. The inference path is not implemented, so
-there is nothing to measure. This table stays empty until a real head-to-head
-ratio exists — no fabricated or projected numbers. The first row MUST carry full
-truth-pack provenance (`model_commit 3a7f4db…` + `fixture_hash` from
-`SOURCE_HASHES.md`), all roofline columns, and all fairness columns; its raw
-paired baseline/after gauntlet logs + SHA-256 manifest live in
+_Only measured rows backed by the required provenance and fairness controls belong
+in this table; no fabricated or projected numbers are accepted. Every new row MUST
+carry full truth-pack provenance (`model_commit 3a7f4db...` + `fixture_hash` from
+`SOURCE_HASHES.md`), all roofline columns, and all fairness columns. Its raw paired
+baseline/after gauntlet logs plus SHA-256 manifest live in
 `artifacts/perf/<bead>/` (the `evidence_id`). The manifest file must be one of
 `SHA256SUMS`, `SHA256SUMS.txt`, `sha256sums.txt`, `sha256.txt`,
 `manifest.sha256`, or `manifest.json` so `scripts/check_ledgers.py` can verify

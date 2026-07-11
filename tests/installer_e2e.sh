@@ -35,6 +35,7 @@ DIST_YML="$REPO_ROOT/.github/workflows/dist.yml"
 CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
 INSTALL_PS1="$REPO_ROOT/install.ps1"
 CHECK_SH="$REPO_ROOT/scripts/check.sh"
+GAUNTLET_CERT="$REPO_ROOT/scripts/gauntlet_cert.py"
 TOOLCHAIN_TOML="$REPO_ROOT/rust-toolchain.toml"
 GITATTRIBUTES="$REPO_ROOT/.gitattributes"
 
@@ -455,7 +456,11 @@ EOF
     [ "$(grep -Fc 'repair workflow is not current origin/main' "$DIST_YML")" -lt 2 ] ||
     [ "$(grep -Fc 'git", "cat-file", "blob"' "$DIST_YML")" -lt 2 ] ||
     [ "$(grep -Fc 'git hash-object $evidenceScript' "$DIST_YML")" -lt 2 ] ||
+    [ "$(grep -Fc 'python $evidenceScript --dist-ref-preflight' "$DIST_YML")" -ne 2 ] ||
+    [ "$(grep -Fc 'authenticated dist ref preflight exited' "$DIST_YML")" -ne 2 ] ||
     [ "$(grep -Fc 'FOCR_DIST_EVIDENCE_SCRIPT=' "$DIST_YML")" -lt 2 ] ||
+    ! grep -Fq 'source_ref repair release inputs differ from immutable tag' "$GAUNTLET_CERT" ||
+    ! grep -Fq 'immutable-tag repair is unsupported across release-input drift' "$GAUNTLET_CERT" ||
     ! grep -Fq 'python3 "$FOCR_DIST_EVIDENCE_SCRIPT"' "$DIST_YML" ||
     ! grep -Fq 'python $env:FOCR_DIST_EVIDENCE_SCRIPT' "$DIST_YML"; then
     bad "dist immutable-tag repair is not source- and workflow-bound"

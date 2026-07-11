@@ -34,6 +34,13 @@ use crate::error::{FocrError, FocrResult};
 /// Exact recipe required by this runtime for the default Unlimited-OCR artifact.
 pub const UNLIMITED_OCR_REQUIRED_RECIPE: &str = crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID;
 
+/// Release that owns the immutable, hash-pinned Unlimited-OCR model artifact.
+///
+/// This is deliberately independent of the `focr` binary version: patch
+/// releases can keep consuming the same verified 4.16 GB model bytes without
+/// renaming or republishing them.
+pub(crate) const UNLIMITED_OCR_ARTIFACT_VERSION: &str = "0.7.0";
+
 /// Recipe carried by the historical full-int8 artifact. It is retained for
 /// provenance and fail-closed compatibility tests, but is not compatible with
 /// the conservative default runtime.
@@ -1921,8 +1928,8 @@ mod tests {
             .expect("committed primary artifact must match the runtime recipe");
         assert_eq!(
             primary.focrq.filename,
-            format!("unlimited-ocr.v{}.int8.focrq", env!("CARGO_PKG_VERSION")),
-            "distributed filename must be release-versioned for atomic upgrades"
+            format!("unlimited-ocr.v{UNLIMITED_OCR_ARTIFACT_VERSION}.int8.focrq"),
+            "distributed filename must be bound to the verified model release"
         );
         assert_eq!(primary.focrq.size, 4_157_448_783);
         assert_eq!(
@@ -1952,7 +1959,9 @@ mod tests {
             assert_eq!(part.sha256, sha256);
             assert_eq!(part.urls.len(), 1);
             assert!(part.urls.iter().all(|url| url.ends_with(filename)));
-            assert!(part.urls[0].contains("/releases/download/v0.7.0/"));
+            assert!(part.urls[0].contains(&format!(
+                "/releases/download/v{UNLIMITED_OCR_ARTIFACT_VERSION}/"
+            )));
         }
 
         let mut legacy = primary.clone();

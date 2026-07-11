@@ -38,11 +38,12 @@ on:
     branches: [main]
     tags: ["v*"]
   # Allow a manual cross-arch build from main. source_ref lets the current
-  # workflow repair an immutable release tag without changing its source tree.
+  # workflow repair a compatible immutable tag; tag-owned build-input drift is
+  # rejected before sibling provisioning.
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "Optional exact vX.Y.Z source tag to rebuild"
+        description: "Optional compatible vX.Y.Z source tag to rebuild"
         required: false
         type: string
         default: ""
@@ -61,7 +62,7 @@ env:
   # immutable revisions aligned with the package versions in Cargo.lock.
   FRANKENTORCH_REV: f00c3ce79737ffd0e7c7e2f2e81540907ce26562
   FRANKENSQLITE_REV: 14c5781680833c248ed18d84914312e233d145df
-  ASUPERSYNC_REV: e7e96829632d89815248a0809499332ab0beabcb
+  ASUPERSYNC_REV: a9b99549609b39bc1dd8b128591ef324d6ef2d71
 
 jobs:
   dist:
@@ -162,6 +163,8 @@ jobs:
             if ($actualScriptBlob -ne $expectedScriptBlob) {
               throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
             }
+            python $evidenceScript --dist-ref-preflight
+            if ($LASTEXITCODE -ne 0) { throw "authenticated dist ref preflight exited $LASTEXITCODE" }
             Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
           }
           "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
@@ -406,6 +409,8 @@ jobs:
             if ($actualScriptBlob -ne $expectedScriptBlob) {
               throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
             }
+            python $evidenceScript --dist-ref-preflight
+            if ($LASTEXITCODE -ne 0) { throw "authenticated dist ref preflight exited $LASTEXITCODE" }
             Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
           }
           "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV

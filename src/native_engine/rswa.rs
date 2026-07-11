@@ -38,6 +38,7 @@
 
 use super::tensor::Mat;
 use crate::error::{FocrError, FocrResult};
+use crate::quant::recipe::is_truthy;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -99,22 +100,32 @@ const INT8_KV_ENV: &str = "FOCR_INT8_KV";
 /// dot or online-softmax reduction.
 const PARALLEL_HEADS_ENV: &str = "FOCR_RSWA_PARALLEL_ATTN";
 
-/// Read `FOCR_ATTN_GEMM` ONCE into a process-global bool (doctrine: not per
-/// token). The int8-KV path subsumes the GEMM path, so it is dispatched ahead of
-/// this flag in [`decode_attention`].
+fn risky_opt_in_enabled_for(value: Option<&str>) -> bool {
+    value.is_some_and(is_truthy)
+}
+
+/// Read a truthy `FOCR_ATTN_GEMM` ONCE into a process-global bool (doctrine: not
+/// per token). The int8-KV path subsumes the GEMM path, so it is dispatched ahead
+/// of this flag in [`decode_attention`].
 fn attn_gemm_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(ATTN_GEMM_ENV).is_some())
+    *FLAG.get_or_init(|| {
+        let value = std::env::var(ATTN_GEMM_ENV).ok();
+        risky_opt_in_enabled_for(value.as_deref())
+    })
 }
 
-/// Read `FOCR_INT8_KV` ONCE into a process-global bool. Also gates whether
-/// [`RingCache::new`] allocates the int8 K/V mirror buffers (so the default path
-/// pays zero extra memory).
+/// Read a truthy `FOCR_INT8_KV` ONCE into a process-global bool. Also gates
+/// whether [`RingCache::new`] allocates the int8 K/V mirror buffers (so the
+/// default path pays zero extra memory).
 fn int8_kv_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(INT8_KV_ENV).is_some())
+    *FLAG.get_or_init(|| {
+        let value = std::env::var(INT8_KV_ENV).ok();
+        risky_opt_in_enabled_for(value.as_deref())
+    })
 }
 
 /// Read [`PARALLEL_HEADS_ENV`] once. Unknown/unset values use the measured
@@ -201,9 +212,9 @@ pub struct RingCache {
     /// new writes recreate the same cursor values. Re-prefill also advances it.
     lineage_epoch: u64,
     /// Per-row symmetric int8 mirror of the K/V regions — `Some` iff
-    /// [`FOCR_INT8_KV`](INT8_KV_ENV) was set when this cache was built (so the
-    /// default path allocates nothing). Populated in lock-step with the f32 K/V
-    /// by [`RingCache::record_prefill`] / [`RingCache::write_decode_step`].
+    /// [`FOCR_INT8_KV`](INT8_KV_ENV) was truthy when this cache was built (so
+    /// the default path allocates nothing). Populated in lock-step with the f32
+    /// K/V by [`RingCache::record_prefill`] / [`RingCache::write_decode_step`].
     int8: Option<Int8Kv>,
 }
 
@@ -972,10 +983,10 @@ impl BatchedRingCache {
 /// Dispatch (env read ONCE into a bool — doctrine):
 ///  * default — the bit-exact per-head scalar kernel scheduled across Rayon;
 ///  * `FOCR_RSWA_PARALLEL_ATTN=0` — [`decode_attention_scalar`], its serial oracle;
-///  * [`FOCR_INT8_KV`](INT8_KV_ENV) — [`decode_attention_int8`] (int8 `QK` dot +
-///    int8 `V` dequant), overriding the f32 GEMM path;
-///  * [`FOCR_ATTN_GEMM`](ATTN_GEMM_ENV) — [`decode_attention_gemm`], the f32
-///    batched-GEMV path (`exp` lifted out of the dot loop).
+///  * truthy [`FOCR_INT8_KV`](INT8_KV_ENV) — [`decode_attention_int8`] (int8
+///    `QK` dot + int8 `V` dequant), overriding the f32 GEMM path;
+///  * truthy [`FOCR_ATTN_GEMM`](ATTN_GEMM_ENV) — [`decode_attention_gemm`], the
+///    f32 batched-GEMV path (`exp` lifted out of the dot loop).
 ///
 /// Returns the decode context as a `[1, NUM_HEADS * HEAD_DIM]` [`Mat`] (the
 /// concatenated per-head outputs, ready for `o_proj`).
@@ -1892,6 +1903,29 @@ mod tests {
     }
 
     // ── decode-attention lever parity (FOCR_ATTN_GEMM / FOCR_INT8_KV) ──────────
+
+    #[test]
+    fn risky_decode_attention_opt_ins_require_truthy_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+        ] {
+            assert!(
+                !risky_opt_in_enabled_for(value),
+                "{value:?} must keep accuracy-risky attention experiments disabled"
+            );
+        }
+        for value in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(
+                risky_opt_in_enabled_for(Some(value)),
+                "{value:?} must explicitly enable the requested experiment"
+            );
+        }
+    }
 
     fn max_abs_diff(a: &Mat, b: &Mat) -> f32 {
         assert_eq!(a.shape(), b.shape(), "shape mismatch in max_abs_diff");

@@ -50,6 +50,13 @@ MAX_TIMING_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_RAW_DIRECTORY_ENTRIES = 2048
 MIN_AB_RUNS_PER_ARM = 5
 
+DECODE_PHASE_STAGES = (
+    "decode_lm_head",
+    "decode_attn",
+    "decode_experts",
+    "decode_route",
+)
+
 PRECISION_MIXED_FFN_INT8 = "focr-mixed-ffn-int8"
 PRECISION_FULL_INT8 = "focr-full-int8"
 UNLIMITED_PRECISIONS = frozenset((PRECISION_MIXED_FFN_INT8, PRECISION_FULL_INT8))
@@ -136,7 +143,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "decode_phases",
         re.compile(
-            r"^decode_i8 phases \(ms\): lm_head (?P<head>\d+)\s+attn (?P<attn>\d+)"
+            r"^decode(?:_i8)? phases \(ms\): lm_head (?P<head>\d+)\s+attn (?P<attn>\d+)"
             r"\s+experts (?P<experts>\d+)\s+route (?P<route>\d+)$"
         ),
     ),
@@ -262,6 +269,24 @@ def parse_run(stderr_text: str) -> dict:
         )
     if not stages:
         raise TimingParseError("[focr-timing] prefix seen but no stage line parsed")
+    phase_lines = stages.pop("_decode_phase_lines", None)
+    if phase_lines is not None:
+        decode = stages.get("decode_total")
+        expected = decode.get("occurrences") if decode is not None else None
+        observed = {
+            stage: stages.get(stage, {}).get("occurrences")
+            for stage in DECODE_PHASE_STAGES
+        }
+        if (
+            not isinstance(expected, int)
+            or phase_lines["occurrences"] != expected
+            or any(value != expected for value in observed.values())
+        ):
+            raise TimingParseError(
+                "decode phase lines are incomplete or duplicated relative to decode totals: "
+                f"decode_total={expected!r}, phase_lines={phase_lines['occurrences']!r}, "
+                f"phase_occurrences={observed!r}"
+            )
     return stages
 
 
@@ -281,10 +306,15 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
             entry["occurrences"] += 1
         return
     if name == "decode_phases":
-        entry = stages.setdefault(name, {"occurrences": 0})
-        for key in ("head", "attn", "experts", "route"):
-            entry[f"{key}_ms"] = entry.get(f"{key}_ms", 0.0) + float(groups[key])
-        entry["occurrences"] += 1
+        marker = stages.setdefault("_decode_phase_lines", {"occurrences": 0})
+        marker["occurrences"] += 1
+        for key, stage in (
+            ("head", "decode_lm_head"),
+            ("attn", "decode_attn"),
+            ("experts", "decode_experts"),
+            ("route", "decode_route"),
+        ):
+            _add(stages, stage, float(groups[key]) / 1000.0, None)
         return
     if name == "got_decode":
         # The shared-engine decode breakdown (all dense lanes) carries BOTH the
@@ -386,6 +416,14 @@ def _truthy(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() in {"1", "true", "on", "yes"}
 
 
+def _batch_spine_enabled(value: object) -> bool:
+    """Mirror `decoder::batch_spine_enabled` including nonstandard armed values."""
+    return (
+        isinstance(value, str)
+        and value.strip().lower() not in {"", "0", "off", "false", "no"}
+    )
+
+
 def _validate_unlimited_contract(precision: str, meta: dict) -> None:
     """Bind a canonical runtime marker to artifact and gate evidence."""
     if precision not in UNLIMITED_PRECISIONS:
@@ -438,6 +476,180 @@ def _validate_unlimited_contract(precision: str, meta: dict) -> None:
             f"FOCR_DECODE_INT8={gates.get('FOCR_DECODE_INT8')!r}, "
             f"FOCR_INT8_ATTN={gates.get('FOCR_INT8_ATTN')!r}, "
             f"FOCR_INT8_LMHEAD={gates.get('FOCR_INT8_LMHEAD')!r}"
+        )
+
+
+def _validate_profiled_decode_capture(capture: dict, precision: str) -> None:
+    """Require the focused-stage evidence declared by the Unlimited campaign."""
+    if precision not in UNLIMITED_PRECISIONS:
+        return
+    pins = capture["meta0"].get("env_pins")
+    if not isinstance(pins, dict) or pins.get("FOCR_PROFILE_DECODE") != "1":
+        raise TimingParseError(
+            "canonical Unlimited-OCR evidence requires FOCR_PROFILE_DECODE=1 "
+            "in the recorded environment pins"
+        )
+    for index, run in enumerate(capture["runs"], start=1):
+        missing = [stage for stage in DECODE_PHASE_STAGES if stage not in run]
+        if missing:
+            raise TimingParseError(
+                f"run {index} lacks required decode phase evidence: {', '.join(missing)}"
+            )
+
+
+def _validate_sequential_batch_result(
+    meta: dict,
+    parsed: dict,
+    stderr_text: str,
+    stdout_bytes: bytes,
+    *,
+    source: str,
+) -> None:
+    """Bind one successful result and decode occurrence to every batch page."""
+    workload = meta.get("workload")
+    command = meta.get("command")
+    argv_is_batch = (
+        isinstance(command, list)
+        and len(command) >= 2
+        and command[1] == "ocr-batch"
+    )
+    workload_is_batch = (
+        isinstance(workload, dict) and workload.get("command") == "ocr-batch"
+    )
+    if not argv_is_batch and not workload_is_batch:
+        return
+    if not argv_is_batch or not workload_is_batch:
+        raise TimingParseError(
+            f"{source}: batch argv and workload metadata disagree"
+        )
+    switch_states = meta.get("performance_switch_states")
+    focr_env = meta.get("focr_env")
+    if (
+        not isinstance(switch_states, dict)
+        or "FOCR_BATCH_SPINE" not in switch_states
+        or not isinstance(focr_env, dict)
+    ):
+        raise TimingParseError(
+            f"{source}: batch capture lacks a complete FOCR_BATCH_SPINE receipt"
+        )
+    switch_value = switch_states["FOCR_BATCH_SPINE"]
+    env_has_spine = "FOCR_BATCH_SPINE" in focr_env
+    if not isinstance(switch_value, str):
+        raise TimingParseError(
+            f"{source}: FOCR_BATCH_SPINE receipt value is not a string"
+        )
+    if switch_value == "<unset>":
+        if env_has_spine:
+            raise TimingParseError(
+                f"{source}: FOCR_BATCH_SPINE absence sentinel contradicts focr_env"
+            )
+        switch_armed = False
+    else:
+        if not env_has_spine or focr_env["FOCR_BATCH_SPINE"] != switch_value:
+            raise TimingParseError(
+                f"{source}: FOCR_BATCH_SPINE receipts disagree"
+            )
+        switch_armed = _batch_spine_enabled(switch_value)
+    if switch_armed:
+        raise TimingParseError(
+            f"{source}: FOCR_BATCH_SPINE has no canonical per-page timing contract"
+        )
+    pages = meta.get("pages")
+    page_count = workload.get("page_count")
+    if (
+        not isinstance(pages, list)
+        or not isinstance(page_count, int)
+        or isinstance(page_count, bool)
+        or page_count <= 0
+        or page_count != len(pages)
+    ):
+        raise TimingParseError(
+            f"{source}: sequential batch metadata has an invalid page count"
+        )
+    if (
+        not isinstance(command, list)
+        or len(command) < 2 + page_count
+        or command[1] != "ocr-batch"
+        or any(not isinstance(value, str) for value in command)
+    ):
+        raise TimingParseError(f"{source}: sequential batch command is invalid")
+    command_pages = command[2 : 2 + page_count]
+    command_options = command[2 + page_count :]
+    metadata_paths = [
+        page.get("path") if isinstance(page, dict) else None for page in pages
+    ]
+    if (
+        any(not isinstance(path, str) for path in metadata_paths)
+        or [os.path.abspath(path) for path in command_pages] != metadata_paths
+    ):
+        raise TimingParseError(
+            f"{source}: sequential batch command pages do not bind metadata pages"
+        )
+    if "--multi-page" in command_options:
+        raise TimingParseError(
+            f"{source}: --multi-page has no sequential batch evidence contract"
+        )
+    occurrences = parsed.get("decode_total", {}).get("occurrences")
+    if occurrences != page_count:
+        raise TimingParseError(
+            f"{source}: sequential batch decoded {occurrences!r} of "
+            f"{page_count} declared pages"
+        )
+    failed = [
+        line
+        for line in stderr_text.splitlines()
+        if line.startswith("[focr] ") and " FAILED (" in line
+    ]
+    if failed:
+        raise TimingParseError(
+            f"{source}: sequential batch reported {len(failed)} failed page(s)"
+        )
+    if "--json" in command:
+        payload = _bounded_json_bytes(stdout_bytes, f"{source} stdout")
+        results = payload.get("results")
+        if (
+            payload.get("command") != "ocr-batch"
+            or payload.get("count") != page_count
+            or not isinstance(results, list)
+            or len(results) != page_count
+            or any(
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("image") != command_pages[index]
+                or not isinstance(result.get("markdown"), str)
+                for index, result in enumerate(results)
+            )
+        ):
+            raise TimingParseError(
+                f"{source}: sequential JSON batch output lacks one success per page"
+            )
+        return
+    success_pattern = re.compile(
+        r"^\[focr\] (?P<path>.*) \(\d+(?:\.\d+)?s\)$"
+    )
+    success_paths = [
+        match.group("path")
+        for line in stderr_text.splitlines()
+        if (match := success_pattern.fullmatch(line)) is not None
+    ]
+    if success_paths != command_pages:
+        raise TimingParseError(
+            f"{source}: sequential batch lacks one ordered success record per page"
+        )
+    try:
+        stdout_text = stdout_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise TimingParseError(
+            f"{source}: sequential batch stdout is not UTF-8: {error}"
+        ) from error
+    expected_headers = [f"===== {path} =====" for path in command_pages]
+    expected_header_set = set(expected_headers)
+    observed_headers = [
+        line for line in stdout_text.splitlines() if line in expected_header_set
+    ]
+    if observed_headers != expected_headers:
+        raise TimingParseError(
+            f"{source}: sequential batch stdout lacks one ordered page header per result"
         )
 
 
@@ -519,7 +731,7 @@ def raw_observation(
     """Preserve one measured run before any best/median/CV aggregation."""
     stages: dict[str, dict] = {}
     for name, entry in run.items():
-        if name in {"decode_phases", "precision"} or "s" not in entry:
+        if name == "precision" or "s" not in entry:
             continue
         sample = {"ms": round(float(entry["s"]) * 1000.0, 6)}
         if entry.get("tokens") is not None:
@@ -688,7 +900,7 @@ def aggregate_runs(
 
     records: list[dict] = []
     for name in names:
-        if name in ("decode_phases", "precision"):
+        if name == "precision":
             continue
         present = [run[name] for run in runs if name in run]
         if len(present) != len(runs):
@@ -698,6 +910,11 @@ def aggregate_runs(
             )
         samples_ms = [entry["s"] * 1000.0 for entry in present]
         tokens = [entry.get("tokens") for entry in present]
+        occurrences = [entry.get("occurrences", 1) for entry in present]
+        if len(set(occurrences)) != 1:
+            raise TimingParseError(
+                f"stage {name!r} occurrence counts drift across runs: {occurrences!r}"
+            )
         record = {
             "schema": SCHEMA_STAGE,
             "source": "focr",
@@ -710,7 +927,7 @@ def aggregate_runs(
             "precision": precision,
             "backend": backend,
             "allocator": allocator,
-            "occurrences": present[0].get("occurrences", 1),
+            "occurrences": occurrences[0],
             "synthetic": synthetic,
         }
         views = [entry.get("views") for entry in present]
@@ -866,6 +1083,13 @@ def _load_capture(run_dir: str, *, prefix: str = "") -> dict:
                 "is not perf evidence"
             )
         parsed = parse_run(stderr_text)
+        _validate_sequential_batch_result(
+            meta,
+            parsed,
+            stderr_text,
+            stdout_bytes,
+            source=meta_path,
+        )
         try:
             wall = float(meta["wall_ms"])
         except (KeyError, TypeError, ValueError, OverflowError) as error:
@@ -926,6 +1150,7 @@ def _resolve_capture_precision(capture: dict, requested: str | None) -> str:
             "pass an explicit zoo-lane --precision"
         )
     _validate_unlimited_contract(precision, capture["meta0"])
+    _validate_profiled_decode_capture(capture, precision)
     return precision
 
 
@@ -1343,6 +1568,7 @@ _SYNTHETIC_UNLIMITED_MIXED = """\
 [focr-timing] weight_cache_build 6.10s
 [focr-timing] prefill 2.80s (289 tokens)
 [focr-timing] decode 12.00s (750 tokens, 0.016s/tok)
+[focr-timing] decode phases (ms): lm_head 1600  attn 3200  experts 6000  route 200
 """
 
 _SYNTHETIC_GOT = """\
@@ -1381,7 +1607,7 @@ def _self_test() -> int:
     check("unlimited-prefill-tokens", run["prefill"]["tokens"] == 289)
     check("unlimited-decode-tokens", run["decode_total"]["tokens"] == 750)
     check("unlimited-int8-marker", run["decode_total"].get("int8") is True)
-    check("unlimited-phases", math.isclose(run["decode_phases"]["experts_ms"], 4300.0))
+    check("unlimited-phases", math.isclose(run["decode_experts"]["s"], 4.3))
     check("unlimited-full-int8-precision", infer_precision([run]) == PRECISION_FULL_INT8)
 
     mixed_run = parse_run(_SYNTHETIC_UNLIMITED_MIXED)
@@ -1389,6 +1615,39 @@ def _self_test() -> int:
         "unlimited-mixed-precision",
         infer_precision([mixed_run]) == PRECISION_MIXED_FFN_INT8,
     )
+    check(
+        "unlimited-mixed-phases",
+        math.isclose(mixed_run["decode_lm_head"]["s"], 1.6)
+        and math.isclose(mixed_run["decode_attn"]["s"], 3.2)
+        and math.isclose(mixed_run["decode_experts"]["s"], 6.0)
+        and math.isclose(mixed_run["decode_route"]["s"], 0.2),
+    )
+    two_page_mixed = parse_run(_SYNTHETIC_UNLIMITED_MIXED * 2)
+    check(
+        "unlimited-multipage-phases-sum-and-count",
+        math.isclose(two_page_mixed["decode_experts"]["s"], 12.0)
+        and two_page_mixed["decode_experts"]["occurrences"] == 2
+        and two_page_mixed["decode_total"]["occurrences"] == 2,
+    )
+    phase_line = (
+        "[focr-timing] decode phases (ms): lm_head 1600  attn 3200  "
+        "experts 6000  route 200\n"
+    )
+    for name, text in (
+        (
+            "refuses-missing-multipage-phase-line",
+            (_SYNTHETIC_UNLIMITED_MIXED * 2).replace(phase_line, "", 1),
+        ),
+        (
+            "refuses-duplicated-multipage-phase-line",
+            _SYNTHETIC_UNLIMITED_MIXED * 2 + phase_line,
+        ),
+    ):
+        try:
+            parse_run(text)
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
     for name, text in (
         (
             "refuses-missing-runtime-precision",
@@ -1476,6 +1735,12 @@ def _self_test() -> int:
     expected_cv = statistics.stdev([12.0, 12.8]) / statistics.fmean([12.0, 12.8]) * 100
     check("agg-per-token-cv", math.isclose(per_tok["cv_pct"], round(expected_cv, 3)))
     check("agg-e2e-best", math.isclose(by_stage["end_to_end"]["best_ms"], 15000.0))
+    check(
+        "agg-decode-phase-stats",
+        by_stage["decode_experts"]["samples_ms"] == [4300.0, 4300.0]
+        and by_stage["decode_experts"]["p50_ms"] == 4300.0
+        and by_stage["decode_experts"]["cv_pct"] == 0.0,
+    )
     check("agg-p95-nearest-rank", _stats([float(v) for v in range(1, 21)])["p95_ms"] == 19.0)
     check("agg-p99-nearest-rank", _stats([float(v) for v in range(1, 101)])["p99_ms"] == 99.0)
     check("rss-p99-nearest-rank", _byte_stats(list(range(1, 101)))["p99_bytes"] == 99)
@@ -1502,6 +1767,13 @@ def _self_test() -> int:
     check(
         "raw-observation-preserves-wall-sample",
         raw["stages"]["end_to_end"] == {"ms": 15000.0},
+    )
+    check(
+        "raw-observation-preserves-decode-phases",
+        raw["stages"]["decode_lm_head"] == {"ms": 1200.0}
+        and raw["stages"]["decode_attn"] == {"ms": 2400.0}
+        and raw["stages"]["decode_experts"] == {"ms": 4300.0}
+        and raw["stages"]["decode_route"] == {"ms": 100.0},
     )
     mac_resources = parse_resource_usage(
         "  11677941760  maximum resident set size\n"
@@ -1548,6 +1820,270 @@ def _self_test() -> int:
         check("agg-missing-stage-refused", False)
     except TimingParseError:
         check("agg-missing-stage-refused", True)
+    try:
+        aggregate_runs(
+            [mixed_run, two_page_mixed],
+            [1.0, 2.0],
+            threads=8,
+            precision=PRECISION_MIXED_FFN_INT8,
+            allocator="system",
+            synthetic=True,
+        )
+        check("agg-occurrence-drift-refused", False)
+    except TimingParseError:
+        check("agg-occurrence-drift-refused", True)
+
+    sequential_paths = [os.path.abspath("a.png"), os.path.abspath("b.png")]
+    sequential_meta = {
+        "command": ["/evidence/focr", "ocr-batch", *sequential_paths],
+        "pages": [{"path": path} for path in sequential_paths],
+        "workload": {"label": "2-page", "command": "ocr-batch", "page_count": 2},
+        "focr_env": {},
+        "performance_switch_states": {"FOCR_BATCH_SPINE": "<unset>"},
+    }
+    sequential_stdout = (
+        f"===== {sequential_paths[0]} =====\nalpha\n"
+        f"===== {sequential_paths[1]} =====\nbeta\n"
+    ).encode()
+    sequential_stderr = "".join(
+        f"[focr] {path} (1.00s)\n" for path in sequential_paths
+    )
+    try:
+        _validate_sequential_batch_result(
+            sequential_meta,
+            two_page_mixed,
+            sequential_stderr,
+            sequential_stdout,
+            source="synthetic.meta.json",
+        )
+        check("batch-results-match-declared-pages", True)
+    except TimingParseError as err:
+        check("batch-results-match-declared-pages", False, error=str(err))
+    try:
+        _validate_sequential_batch_result(
+            sequential_meta,
+            mixed_run,
+            sequential_stderr,
+            sequential_stdout,
+            source="synthetic.meta.json",
+        )
+        check("refuses-incomplete-sequential-batch", False)
+    except TimingParseError:
+        check("refuses-incomplete-sequential-batch", True)
+    for name, failed_stderr, stdout in (
+        (
+            "refuses-post-decode-page-failure",
+            f"[focr] {sequential_paths[0]} (1.00s)\n"
+            f"[focr] {sequential_paths[1]} FAILED (1.00s): tokenizer failure\n",
+            f"===== {sequential_paths[0]} =====\nalpha\n".encode(),
+        ),
+        (
+            "refuses-missing-page-success-record",
+            f"[focr] {sequential_paths[0]} (1.00s)\n",
+            sequential_stdout,
+        ),
+    ):
+        try:
+            _validate_sequential_batch_result(
+                sequential_meta,
+                two_page_mixed,
+                failed_stderr,
+                stdout,
+                source="synthetic.meta.json",
+            )
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
+    multi_page_meta = json.loads(json.dumps(sequential_meta))
+    multi_page_meta["command"].append("--multi-page")
+    try:
+        _validate_sequential_batch_result(
+            multi_page_meta,
+            two_page_mixed,
+            sequential_stderr,
+            sequential_stdout,
+            source="synthetic.meta.json",
+        )
+        check("refuses-multi-page-as-sequential-batch", False)
+    except TimingParseError:
+        check("refuses-multi-page-as-sequential-batch", True)
+    delimiter_stdout = sequential_stdout + b"===== chapter =====\nbody\n"
+    try:
+        _validate_sequential_batch_result(
+            sequential_meta,
+            two_page_mixed,
+            sequential_stderr,
+            delimiter_stdout,
+            source="synthetic.meta.json",
+        )
+        check("accepts-markdown-delimiter-shaped-content", True)
+    except TimingParseError as err:
+        check("accepts-markdown-delimiter-shaped-content", False, error=str(err))
+    mismatched_command = json.loads(json.dumps(sequential_meta))
+    mismatched_command["command"][2] = os.path.abspath("other.png")
+    try:
+        _validate_sequential_batch_result(
+            mismatched_command,
+            two_page_mixed,
+            sequential_stderr,
+            sequential_stdout,
+            source="synthetic.meta.json",
+        )
+        check("refuses-command-page-mismatch", False)
+    except TimingParseError:
+        check("refuses-command-page-mismatch", True)
+    for name, mutate in (
+        ("refuses-missing-batch-workload", lambda meta: meta.pop("workload")),
+        (
+            "refuses-mismatched-batch-workload",
+            lambda meta: meta["workload"].update(command="ocr"),
+        ),
+        (
+            "refuses-missing-spine-receipt",
+            lambda meta: meta.pop("performance_switch_states"),
+        ),
+        (
+            "refuses-non-string-spine-receipt",
+            lambda meta: (
+                meta["performance_switch_states"].update(FOCR_BATCH_SPINE=1),
+                meta["focr_env"].update(FOCR_BATCH_SPINE=1),
+            ),
+        ),
+    ):
+        bad_meta = json.loads(json.dumps(sequential_meta))
+        mutate(bad_meta)
+        try:
+            _validate_sequential_batch_result(
+                bad_meta,
+                two_page_mixed,
+                sequential_stderr,
+                sequential_stdout,
+                source="synthetic.meta.json",
+            )
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
+    try:
+        _validate_sequential_batch_result(
+            sequential_meta,
+            two_page_mixed,
+            sequential_stderr,
+            f"===== {sequential_paths[0]} =====\nalpha\n".encode(),
+            source="synthetic.meta.json",
+        )
+        check("refuses-truncated-human-batch-output", False)
+    except TimingParseError:
+        check("refuses-truncated-human-batch-output", True)
+    json_meta = json.loads(json.dumps(sequential_meta))
+    json_meta["command"].append("--json")
+    json_payload = {
+        "command": "ocr-batch",
+        "count": 2,
+        "results": [
+            {"image": path, "ok": True, "markdown": text}
+            for path, text in zip(sequential_paths, ("alpha", "beta"))
+        ],
+    }
+    try:
+        _validate_sequential_batch_result(
+            json_meta,
+            two_page_mixed,
+            "",
+            json.dumps(json_payload).encode(),
+            source="synthetic.meta.json",
+        )
+        check("accepts-complete-json-batch", True)
+    except TimingParseError as err:
+        check("accepts-complete-json-batch", False, error=str(err))
+    for name, mutate in (
+        (
+            "refuses-json-page-failure",
+            lambda payload: payload["results"][1].update(ok=False),
+        ),
+        (
+            "refuses-json-page-reordering",
+            lambda payload: payload["results"].reverse(),
+        ),
+        (
+            "refuses-json-missing-markdown",
+            lambda payload: payload["results"][1].pop("markdown"),
+        ),
+    ):
+        bad_payload = json.loads(json.dumps(json_payload))
+        mutate(bad_payload)
+        try:
+            _validate_sequential_batch_result(
+                json_meta,
+                two_page_mixed,
+                "",
+                json.dumps(bad_payload).encode(),
+                source="synthetic.meta.json",
+            )
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
+    spine_meta = json.loads(json.dumps(sequential_meta))
+    for value in ("1", "enabled", "2"):
+        spine_meta["performance_switch_states"] = {"FOCR_BATCH_SPINE": value}
+        spine_meta["focr_env"] = {"FOCR_BATCH_SPINE": value}
+        try:
+            _validate_sequential_batch_result(
+                spine_meta,
+                two_page_mixed,
+                sequential_stderr,
+                sequential_stdout,
+                source="synthetic.meta.json",
+            )
+            check(f"refuses-uninstrumented-batch-spine-{value}", False)
+        except TimingParseError:
+            check(f"refuses-uninstrumented-batch-spine-{value}", True)
+    check(
+        "batch-spine-disabled-values-match-runtime",
+        all(
+            not _batch_spine_enabled(value)
+            for value in (None, "", "0", "off", "FALSE", " no ")
+        )
+        and _batch_spine_enabled("<unset>"),
+    )
+    literal_sentinel_meta = json.loads(json.dumps(sequential_meta))
+    literal_sentinel_meta["performance_switch_states"] = {
+        "FOCR_BATCH_SPINE": "<unset>"
+    }
+    literal_sentinel_meta["focr_env"] = {"FOCR_BATCH_SPINE": "<unset>"}
+    try:
+        _validate_sequential_batch_result(
+            literal_sentinel_meta,
+            two_page_mixed,
+            sequential_stderr,
+            sequential_stdout,
+            source="synthetic.meta.json",
+        )
+        check("refuses-literal-unset-batch-spine-value", False)
+    except TimingParseError:
+        check("refuses-literal-unset-batch-spine-value", True)
+
+    profiled_capture = {
+        "meta0": {"env_pins": {"FOCR_PROFILE_DECODE": "1"}},
+        "runs": [mixed_run],
+    }
+    try:
+        _validate_profiled_decode_capture(
+            profiled_capture, PRECISION_MIXED_FFN_INT8
+        )
+        check("profiled-capture-has-focused-stages", True)
+    except TimingParseError as err:
+        check("profiled-capture-has-focused-stages", False, error=str(err))
+    unprofiled_run = parse_run(
+        _SYNTHETIC_UNLIMITED_MIXED.replace(phase_line, "")
+    )
+    try:
+        _validate_profiled_decode_capture(
+            {"meta0": profiled_capture["meta0"], "runs": [unprofiled_run]},
+            PRECISION_MIXED_FFN_INT8,
+        )
+        check("refuses-missing-focused-stage-evidence", False)
+    except TimingParseError:
+        check("refuses-missing-focused-stage-evidence", True)
 
     base_meta = {
         "model": "/models/unlimited-ocr.conservative.focrq",
