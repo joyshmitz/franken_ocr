@@ -8964,6 +8964,17 @@ def _numeric_version(value: str) -> tuple[int, ...] | None:
     return tuple(int(part) for part in value.split("."))
 
 
+def _reported_focr_version(stdout: str) -> str | None:
+    lines = stdout.splitlines()
+    if not lines:
+        return None
+    match = re.fullmatch(
+        r"focr ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)",
+        lines[0],
+    )
+    return match.group(1) if match is not None else None
+
+
 def _dist_build_command(target_name: str) -> str | None:
     target = CERTIFICATION_DIST_TRIPLES.get(target_name)
     if target is None:
@@ -9303,11 +9314,8 @@ def produce_dist_target_evidence(
                 timeout=30,
                 check=False,
             )
-            match = re.fullmatch(
-                r"focr ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*",
-                version_line.stdout,
-            )
-            if version_line.returncode != 0 or match is None:
+            reported_version = _reported_focr_version(version_line.stdout)
+            if version_line.returncode != 0 or reported_version is None:
                 raise ValueError("offline-installed Windows asset has no canonical version")
             portability = {
                 "kind": "native-offline-install.ps1",
@@ -9315,7 +9323,7 @@ def produce_dist_target_evidence(
                 "offline": True,
                 "asset_sha256": asset_sha,
                 "installed_sha256": installed_identity["sha256"],
-                "reported_version": match.group(1),
+                "reported_version": reported_version,
                 "installer_sha256": _sha256_file(root / "install.ps1"),
                 "transcript_path": transcript_relative,
                 "transcript_sha256": transcript_sha,
@@ -11186,6 +11194,22 @@ def self_test() -> int:
     check(
         "glibc_floor_numeric_order_rejects_2_18",
         _numeric_version("2.18") > _numeric_version(CERTIFICATION_LINUX_GLIBC_FLOOR),
+    )
+    check(
+        "focr_version_accepts_canonical_multiline_report",
+        _reported_focr_version(
+            "focr 0.7.0\n"
+            "source_license: franken_ocr - MIT License\n"
+            "model_license: Baidu Unlimited-OCR - MIT License\n"
+        )
+        == "0.7.0"
+        and _reported_focr_version("focr 0.7.0-rc.1+build.9\r\nsource_license: MIT\r\n")
+        == "0.7.0-rc.1+build.9",
+    )
+    check(
+        "focr_version_rejects_noncanonical_first_line",
+        _reported_focr_version("source_license: MIT\nfocr 0.7.0\n") is None
+        and _reported_focr_version("") is None,
     )
 
     # --- Beta posterior mean + quantile sanity (Beta(201,1) ~ 0.9950 mean).
