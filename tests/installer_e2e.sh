@@ -433,8 +433,19 @@ EOF
     bad "Windows dist does not exercise install.ps1 against the exact offline asset"
     matrix_contract_ok=0
   fi
+  if grep -Fq '& $asset --version | Select-Object -First 1' "$DIST_YML" ||
+    ! grep -Fq '$versionOutput = @(& $asset --version)' "$DIST_YML" ||
+    ! grep -Fq '$versionExit = $LASTEXITCODE' "$DIST_YML"; then
+    bad "Windows dist truncates the multi-line version probe or loses its exit code"
+    matrix_contract_ok=0
+  fi
   if [ "$(grep -Fc -- '--dist-ref-preflight' "$DIST_YML")" -lt 2 ]; then
     bad "not every dist build job fails closed on ref/version ancestry"
+    matrix_contract_ok=0
+  fi
+  if [ "$(grep -Fc 'ref: ${{ inputs.source_ref || github.ref }}' "$DIST_YML")" -lt 2 ] ||
+    [ "$(grep -Fc 'repair workflow is not current origin/main' "$DIST_YML")" -lt 2 ]; then
+    bad "dist immutable-tag repair is not source- and workflow-bound"
     matrix_contract_ok=0
   fi
 

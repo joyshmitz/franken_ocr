@@ -37,8 +37,15 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  # Allow a manual cross-arch build from the Actions tab (main only).
+  # Allow a manual cross-arch build from main. source_ref lets the current
+  # workflow repair an immutable release tag without changing its source tree.
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Optional exact vX.Y.Z source tag to rebuild"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: dist-${{ github.workflow }}-${{ github.ref }}
@@ -103,6 +110,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
 
       - name: Set up Python for evidence receipts
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -110,7 +120,34 @@ jobs:
           python-version: "3.12"
 
       - name: Validate release ref and Cargo version
-        run: python3 scripts/gauntlet_cert.py --dist-ref-preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourceRef = '${{ inputs.source_ref }}'
+          $workflowSha = $env:GITHUB_SHA
+          if ($sourceRef) {
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
+                $env:GITHUB_REF_TYPE -ne 'branch' -or
+                $env:GITHUB_REF_NAME -ne 'main') {
+              throw 'source_ref repairs must be dispatched from main'
+            }
+            $env:GITHUB_REF_TYPE = 'tag'
+            $env:GITHUB_REF_NAME = $sourceRef
+          }
+          python scripts/gauntlet_cert.py --dist-ref-preflight
+          if ($LASTEXITCODE -ne 0) { throw "dist ref preflight exited $LASTEXITCODE" }
+          if ($sourceRef) {
+            $head = (git rev-parse HEAD).Trim()
+            $tagHead = (git rev-parse "refs/tags/${sourceRef}^{commit}").Trim()
+            $originMain = (git rev-parse refs/remotes/origin/main).Trim()
+            if ($head -ne $tagHead) {
+              throw "source_ref checkout mismatch: expected $tagHead, got $head"
+            }
+            if ($workflowSha -ne $originMain) {
+              throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
+            }
+            Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
+          }
 
       - name: Provision sibling path dependencies
         shell: pwsh
@@ -293,6 +330,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
 
       - name: Set up Python for evidence receipts
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -300,7 +340,34 @@ jobs:
           python-version: "3.12"
 
       - name: Validate release ref and Cargo version
-        run: python scripts/gauntlet_cert.py --dist-ref-preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourceRef = '${{ inputs.source_ref }}'
+          $workflowSha = $env:GITHUB_SHA
+          if ($sourceRef) {
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
+                $env:GITHUB_REF_TYPE -ne 'branch' -or
+                $env:GITHUB_REF_NAME -ne 'main') {
+              throw 'source_ref repairs must be dispatched from main'
+            }
+            $env:GITHUB_REF_TYPE = 'tag'
+            $env:GITHUB_REF_NAME = $sourceRef
+          }
+          python scripts/gauntlet_cert.py --dist-ref-preflight
+          if ($LASTEXITCODE -ne 0) { throw "dist ref preflight exited $LASTEXITCODE" }
+          if ($sourceRef) {
+            $head = (git rev-parse HEAD).Trim()
+            $tagHead = (git rev-parse "refs/tags/${sourceRef}^{commit}").Trim()
+            $originMain = (git rev-parse refs/remotes/origin/main).Trim()
+            if ($head -ne $tagHead) {
+              throw "source_ref checkout mismatch: expected $tagHead, got $head"
+            }
+            if ($workflowSha -ne $originMain) {
+              throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
+            }
+            Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
+          }
 
       # Identical to the `dist` job: clone the three path-dep siblings and rewrite
       # the CI-only `/dp/asupersync` paths to `../asupersync`. On Windows the
@@ -416,8 +483,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $asset = (Resolve-Path 'dist/${{ matrix.asset }}').Path
           $releaseDir = (Resolve-Path dist).Path
-          $versionLine = (& $asset --version | Select-Object -First 1).Trim()
-          if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch '^focr ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$') {
+          $versionOutput = @(& $asset --version)
+          $versionExit = $LASTEXITCODE
+          $versionLine = if ($versionOutput.Count -gt 0) { ([string]$versionOutput[0]).Trim() } else { '' }
+          if ($versionExit -ne 0 -or $versionLine -notmatch '^focr ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$') {
             throw "staged asset returned a noncanonical version: $versionLine"
           }
           $version = "v$($Matches[1])"
