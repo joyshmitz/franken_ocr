@@ -16,6 +16,41 @@ sections as they land.
 
 No changes yet.
 
+## [0.7.1] - 2026-07-11
+
+This patch release restores reproducible Windows distribution and tightens the
+current-tree performance evidence boundary without changing the immutable
+Unlimited-OCR model payload.
+
+### Changed
+
+- Binary SemVer is independent from model-artifact SemVer: the `v0.7.1`
+  executables continue to consume the exact hash-pinned `v0.7.0` conservative
+  Unlimited-OCR artifact.
+- CI and distribution workflows now pin the exact asupersync revision carrying
+  the Windows socket-handle fix, and tag rebuilds bind their source and sibling
+  dependency inputs to immutable Git objects.
+
+### Fixed
+
+- Preserve canonical LF manifest bytes on Windows, hash executable bytes in
+  binary mode, and accept canonical multiline `focr --version` output in the
+  native release and offline-installer path.
+- Reject build-input drift during exact-tag rebuilds and require accuracy-risky
+  attention/KV environment opt-ins to be truthy rather than merely present.
+- Reject incomplete or failed batch results and incomplete decode-phase timing
+  evidence in the current-tree gauntlet, with explicit writable cache and
+  scratch roots for reproducible large-model runs.
+
+### Verification
+
+- The exact pinned dependency closure passed `scripts/check.sh`, including all
+  validators, installer E2E, formatting, locked all-target check, clippy, 1,048
+  runnable library tests, integration suites, doc tests, and UBS.
+- CI run `29160016305` and dist run `29160016312` passed the Windows x86-64 and
+  ARM64 check, build, native test, no-weights smoke, checksum, offline
+  `install.ps1`, evidence-binding, and artifact-upload stages.
+
 ## [0.7.0] - 2026-07-10
 
 This release hardens the native Unlimited-OCR path around exact reference
@@ -635,7 +670,8 @@ results above. The `.focrq` byte-parity, the SHA256 manifest verification in
 `focr pull`, and the 24/24 `robot selftest` (including the K=6848 overflow case) were
 all verified on real hardware on Apple Silicon and on a real x86 AVX2 host.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.1...v0.5.2
