@@ -819,16 +819,22 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(_read_bounded_file(path)).hexdigest()
 
 
+def _readonly_binary_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
 def _read_bounded_file(
     path: Path, max_bytes: int = CERTIFICATION_MAX_ARTIFACT_BYTES
 ) -> bytes:
     """Read one stable regular-file snapshot through a single bounded fd."""
     if max_bytes < 0:
         raise ValueError("file size limit must be nonnegative")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _readonly_binary_flags())
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -868,8 +874,7 @@ def _stream_file_identity(
     """Hash and optionally snapshot one stable regular file without buffering it."""
     if max_bytes < 0:
         raise ValueError("file size limit must be nonnegative")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _readonly_binary_flags())
     snapshot_descriptor: int | None = None
     try:
         before = os.fstat(descriptor)
@@ -883,6 +888,7 @@ def _stream_file_identity(
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
@@ -3404,8 +3410,7 @@ def _correctness_receipt_reasons(
 
 
 def _bounded_file_identity(path: Path, maximum: int) -> dict:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _readonly_binary_flags())
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
@@ -3670,9 +3675,8 @@ def _source_pack_reasons(path: Path, manifest: dict) -> list[str]:
     entries = manifest.get("entries")
     if not isinstance(entries, list):
         return ["source pack cannot replay a malformed manifest entry list"]
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path, _readonly_binary_flags())
     except OSError as error:
         return [f"source input pack is unreadable: {error}"]
     try:
@@ -7126,8 +7130,7 @@ def _is_canonical_source_pack_artifact(relative: str) -> bool:
 
 
 def _nofollow_regular_file_size(path: Path, maximum: int) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _readonly_binary_flags())
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -11733,6 +11736,36 @@ def self_test() -> int:
         except ValueError:
             bounded_rejected = True
         check("bounded_reader_rejects_oversize_input", bounded_rejected)
+        binary_payload = b"PE\x00\r\n\x1a\x00payload\r\n"
+        binary_input = fixture_root / "binary-input.bin"
+        binary_snapshot = fixture_root / "binary-snapshot.bin"
+        binary_input.write_bytes(binary_payload)
+        check(
+            "bounded_reader_preserves_windows_binary_bytes",
+            _read_bounded_file(binary_input) == binary_payload,
+        )
+        bounded_binary_identity = _bounded_file_identity(
+            binary_input, len(binary_payload)
+        )
+        check(
+            "bounded_identity_preserves_windows_binary_bytes",
+            bounded_binary_identity
+            == {
+                "sha256": hashlib.sha256(binary_payload).hexdigest(),
+                "size": len(binary_payload),
+            },
+        )
+        binary_identity = _stream_file_identity(
+            binary_input,
+            len(binary_payload),
+            snapshot_path=binary_snapshot,
+        )
+        check(
+            "streamed_identity_preserves_windows_binary_bytes",
+            binary_identity["size"] == len(binary_payload)
+            and binary_identity["sha256"] == hashlib.sha256(binary_payload).hexdigest()
+            and binary_snapshot.read_bytes() == binary_payload,
+        )
         deep_json_rejected = False
         try:
             _parse_json_bytes(

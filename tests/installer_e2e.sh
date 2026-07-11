@@ -444,7 +444,12 @@ EOF
     matrix_contract_ok=0
   fi
   if [ "$(grep -Fc 'ref: ${{ inputs.source_ref || github.ref }}' "$DIST_YML")" -lt 2 ] ||
-    [ "$(grep -Fc 'repair workflow is not current origin/main' "$DIST_YML")" -lt 2 ]; then
+    [ "$(grep -Fc 'repair workflow is not current origin/main' "$DIST_YML")" -lt 2 ] ||
+    [ "$(grep -Fc 'git", "cat-file", "blob"' "$DIST_YML")" -lt 2 ] ||
+    [ "$(grep -Fc 'git hash-object $evidenceScript' "$DIST_YML")" -lt 2 ] ||
+    [ "$(grep -Fc 'FOCR_DIST_EVIDENCE_SCRIPT=' "$DIST_YML")" -lt 2 ] ||
+    ! grep -Fq 'python3 "$FOCR_DIST_EVIDENCE_SCRIPT"' "$DIST_YML" ||
+    ! grep -Fq 'python $env:FOCR_DIST_EVIDENCE_SCRIPT' "$DIST_YML"; then
     bad "dist immutable-tag repair is not source- and workflow-bound"
     matrix_contract_ok=0
   fi

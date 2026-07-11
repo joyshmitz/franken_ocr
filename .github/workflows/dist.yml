@@ -125,6 +125,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $sourceRef = '${{ inputs.source_ref }}'
           $workflowSha = $env:GITHUB_SHA
+          $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
           if ($sourceRef) {
             if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
                 $env:GITHUB_REF_TYPE -ne 'branch' -or
@@ -146,8 +147,18 @@ jobs:
             if ($workflowSha -ne $originMain) {
               throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
             }
+            $evidenceScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/gauntlet_cert.workflow-repair.py'
+            $blobSpec = "${workflowSha}:scripts/gauntlet_cert.py"
+            python -c 'import pathlib, subprocess, sys; pathlib.Path(sys.argv[2]).write_bytes(subprocess.check_output(["git", "cat-file", "blob", sys.argv[1]]))' $blobSpec $evidenceScript
+            if ($LASTEXITCODE -ne 0) { throw "failed to extract authenticated evidence producer" }
+            $expectedScriptBlob = (git rev-parse $blobSpec).Trim()
+            $actualScriptBlob = (git hash-object $evidenceScript).Trim()
+            if ($actualScriptBlob -ne $expectedScriptBlob) {
+              throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
+            }
             Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
           }
+          "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
 
       - name: Provision sibling path dependencies
         shell: pwsh
@@ -267,7 +278,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/gauntlet_cert.py \
+          python3 "$FOCR_DIST_EVIDENCE_SCRIPT" \
             --dist-target-evidence '${{ matrix.name }}' \
             --dist-asset 'dist/${{ matrix.asset }}' \
             --dist-glibc-floor '${{ matrix.glibc_floor }}' \
@@ -345,6 +356,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $sourceRef = '${{ inputs.source_ref }}'
           $workflowSha = $env:GITHUB_SHA
+          $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
           if ($sourceRef) {
             if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
                 $env:GITHUB_REF_TYPE -ne 'branch' -or
@@ -366,8 +378,18 @@ jobs:
             if ($workflowSha -ne $originMain) {
               throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
             }
+            $evidenceScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/gauntlet_cert.workflow-repair.py'
+            $blobSpec = "${workflowSha}:scripts/gauntlet_cert.py"
+            python -c 'import pathlib, subprocess, sys; pathlib.Path(sys.argv[2]).write_bytes(subprocess.check_output(["git", "cat-file", "blob", sys.argv[1]]))' $blobSpec $evidenceScript
+            if ($LASTEXITCODE -ne 0) { throw "failed to extract authenticated evidence producer" }
+            $expectedScriptBlob = (git rev-parse $blobSpec).Trim()
+            $actualScriptBlob = (git hash-object $evidenceScript).Trim()
+            if ($actualScriptBlob -ne $expectedScriptBlob) {
+              throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
+            }
             Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
           }
+          "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
 
       # Identical to the `dist` job: clone the three path-dep siblings and rewrite
       # the CI-only `/dp/asupersync` paths to `../asupersync`. On Windows the
@@ -641,7 +663,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/gauntlet_cert.py `
+          python $env:FOCR_DIST_EVIDENCE_SCRIPT `
             --dist-target-evidence '${{ matrix.name }}' `
             --dist-asset 'dist/${{ matrix.asset }}' `
             --dist-installed-asset $env:FOCR_DIST_INSTALLED_ASSET `
