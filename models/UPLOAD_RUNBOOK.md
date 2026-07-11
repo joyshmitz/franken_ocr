@@ -2,16 +2,15 @@
 
 The weights themselves are **never committed** (`*.focrq` is gitignored); only
 the small [`manifest-v2.json`](./manifest-v2.json) lives in the repo. The primary
-Unlimited-OCR entry now names the quality-cleared conservative recipe prepared
-for v0.7.0. Its three GitHub URLs are the publication contract, but they do not
-exist until the staged assets are attached to the v0.7.0 release. Do not claim
-the model is published before those remote objects are uploaded and verified.
+Unlimited-OCR entry names the quality-cleared conservative recipe published in
+v0.7.0. Its three GitHub URLs resolve to remotely verified release assets whose
+sizes and SHA-256 digests match the table below.
 
 [`manifest.json`](./manifest.json) remains the schema-1 endpoint fetched by
 already-released v0.6 binaries. New binaries do not fetch it: they embed
 `manifest-v2.json`, so a later branch edit cannot silently retarget a release.
 
-## v0.7.0 conservative artifact (prepared, not uploaded)
+## v0.7.0 conservative artifact (published and remotely verified)
 
 Recipe: `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`
 
@@ -67,11 +66,11 @@ macOS created `._*` AppleDouble sidecars on the external volume. They are not
 release assets. Never upload with a wildcard; name exactly the three files in
 the table.
 
-### Upload after the v0.7.0 release exists
+### v0.7.0 upload command (completed)
 
-The release-preparation/DSR lane owns tag and release creation. This runbook
-does not create, tag, publish, or mutate the release. After that lane has created
-the v0.7.0 release, attach exactly the retained files:
+The release-preparation/DSR lane created the tag and release. The public v0.7.0
+release contains exactly the three retained files below; this command is kept
+for provenance and must not be rerun:
 
 ```bash
 A=/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_release_0_7_0/model_assets
@@ -82,12 +81,12 @@ gh release upload v0.7.0 \
   "$A/unlimited-ocr.v0.7.0.int8.focrq.part02"
 ```
 
-Do not use `--clobber`. Verify the release reports the three exact names and
-sizes, then verify a clean-cache `focr pull` checks every part hash and the
-reassembled hash before running OCR against the installed artifact. The live
-manifest deliberately has only the GitHub URLs. Add a Hugging Face fallback in
-a later commit only after the identical objects have actually been uploaded and
-verified there.
+Do not rerun the upload or use `--clobber`. The public release reports the three
+exact names, sizes, and SHA-256 digests. A clean-cache `focr pull` remains an
+independent installer acceptance check; when run, it must verify every part hash
+and the reassembled hash before OCR. The live manifest deliberately has only the
+GitHub URLs. Add a Hugging Face fallback in a later commit only after the
+identical objects have actually been uploaded and verified there.
 
 The tokenizer remains public at `baidu/Unlimited-OCR`; its manifest identity is
 9,979,544 bytes and SHA-256
@@ -114,11 +113,11 @@ The `models-v1` bytes stay available for old provenance records but must never b
 restored as the current default. Their exact-recipe rejection remains covered by
 `legacy_default_pull_stops_before_any_artifact_request`.
 
-## Expected behavior by release phase
+## Published v0.7.0 behavior
 
-Before the three v0.7.0 assets are uploaded, a source build accepts the manifest
-recipe and then fails when the not-yet-published GitHub URL returns an error.
-After upload and remote verification:
+The three v0.7.0 model parts are published and remotely verified. A v0.7.0
+release binary accepts the embedded exact recipe; `focr pull` downloads,
+verifies, and installs the reassembled artifact:
 
 ```bash
 focr pull

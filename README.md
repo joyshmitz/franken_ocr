@@ -439,7 +439,11 @@ precision by construction.
 
 ### `focr pull`
 
-Download a manifest-compatible model and tokenizer into the cache, verifying every byte. The committed Unlimited-OCR entry is intentionally not compatible with the current runtime: it declares `unlimited-ocr-full-int8-attn-int8-lmhead-int8-v1`, while the runtime requires `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`.
+Download a manifest-compatible model and tokenizer into the cache, verifying
+every byte. The embedded v0.7.0 Unlimited-OCR entry declares the
+runtime-compatible conservative recipe
+`unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`; the historical schema-v1
+full-int8 entry remains incompatible and is rejected.
 
 ```bash
 focr pull                                   # versioned conservative Unlimited-OCR artifact
@@ -714,7 +718,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 
 | Variable | Effect |
 |---|---|
-| `FOCR_MODEL_PATH` | Override the model artifact path (a `.focrq` blob or a safetensors directory). For the current default, point this at raw BF16 weights or an artifact using exact recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`; the committed legacy pull is rejected. |
+| `FOCR_MODEL_PATH` | Override the model artifact path (a `.focrq` blob or a safetensors directory). For the current default, point this at raw BF16 weights or an artifact using exact recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`; the historical schema-v1 full-int8 pull is rejected. |
 | `FOCR_MODEL_DIR` | Add one or more model search roots before the default cache. A bare `focr ocr` can resolve pulled artifacts from this directory without `--model`. |
 | `FOCR_QUANT` | Pick the quant-suffixed artifact name during cache resolution when multiple variants are present. |
 | `FOCR_MANIFEST_URL` | Override the release-bound embedded manifest with a local path or an HTTPS URL. |
