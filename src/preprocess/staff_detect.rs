@@ -5,7 +5,7 @@
 //!
 //! Classical CV, pure Rust, no new dependencies:
 //!
-//! 1. ink gray plane (the DISC-004 rule: inverted alpha only when alpha
+//! 1. ink gray plane (the DISC-007 rule: inverted alpha only when alpha
 //!    varies; else cv2 fixed-point luma) → Otsu binarization;
 //! 2. global deskew by shear: the angle in ±5° that MAXIMIZES the row-
 //!    projection variance (staff lines align → sharp peaks), coarse 1° then
@@ -40,7 +40,7 @@ pub struct StaffCrop {
     pub lines: [usize; 5],
 }
 
-/// The ink gray plane (shared with `tromr_staff_tensor` — DISC-004 rule).
+/// The ink gray plane (shared with `tromr_staff_tensor` — DISC-007 rule).
 fn ink_gray(img: &DynamicImage) -> (Vec<u8>, usize, usize) {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let alpha_is_ink = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255);

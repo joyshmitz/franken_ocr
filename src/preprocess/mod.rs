@@ -1017,7 +1017,7 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
     // The ink gray plane. The inverted-alpha convention applies ONLY when
     // the alpha channel varies: upstream applies 255−alpha to EVERY
     // 4-channel input, which BLANKS fully-opaque PNGs (their own demo
-    // staves are opaque RGBA — measured 2026-07-06, DISC-004). A deliberate,
+    // staves are opaque RGBA — measured 2026-07-06, DISC-007). A deliberate,
     // documented divergence; opaque-alpha images take the RGB luma path.
     let alpha_is_ink = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255);
     let gray: Vec<u8> = if alpha_is_ink {
@@ -1058,7 +1058,7 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
 mod tests {
     #[test]
     fn tromr_alpha_ink_path_fires_only_when_alpha_varies() {
-        // DISC-004: the inverted-alpha ink convention applies ONLY to PNGs
+        // DISC-007: the inverted-alpha ink convention applies ONLY to PNGs
         // whose alpha channel varies (rendered transparent-background
         // staves); fully-opaque RGBA takes the luma path.
         use image::{DynamicImage, Rgba, RgbaImage};

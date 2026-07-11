@@ -435,7 +435,7 @@ bd-3kix) extends to staves — synthesize via Verovio/MuseScore renders with kno
   through our sdpa — the stable-softmax difference is bitwise-benign at f32.
 - **OQ-T5** wide-staff policy: our 10:1 clamp + barline chunking is a documented divergence
   (upstream undefined, §2b) — needs a measured DISCREPANCIES entry once E5 exists.
-- **OQ-T6 RESOLVED (DISC-004, measured):** on REAL staves argmax and top-k/T=0.2
+- **OQ-T6 RESOLVED (DISC-007, measured):** on REAL staves argmax and top-k/T=0.2
   sampling produce IDENTICAL streams (SER equal on all 4 committed examples);
   the apparent argmax collapse was the upstream opaque-alpha blank-input bug.
   Default = argmax; `FOCR_TROMR_SAMPLE=1` + `FOCR_TROMR_SEED` = seeded sampling.

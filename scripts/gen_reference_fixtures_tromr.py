@@ -63,7 +63,7 @@ def readimg(cv2, np, path: str):
         # channel actually varies. Upstream applies 255−alpha to EVERY
         # 4-channel input, which BLANKS fully-opaque PNGs (their own
         # examples/*.png are opaque RGBA: alpha ≡ 255 ⇒ ink ≡ 0 — measured
-        # 2026-07-06, DISC-004). Deliberate, documented divergence.
+        # 2026-07-06, DISC-007). Deliberate, documented divergence.
         img = 255 - img[:, :, 3]
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3 and img.shape[2] == 4:

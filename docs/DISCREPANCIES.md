@@ -237,11 +237,14 @@ since exact-token OCR fails in the tail.
 
 ---
 
-## DISC-004: TrOMR upstream `readimg` blanks fully-opaque RGBA inputs; opaque-alpha images take the RGB path here
+## DISC-007: TrOMR upstream `readimg` blanks fully-opaque RGBA inputs; opaque-alpha images take the RGB path here
 
 - claim_id / evidence_id: CLAIM-e8-alpha-ink → the armed E8/E9 cert logs
     (`tromr::tests::{tromr_preprocess_envelope_and_output_gate,tromr_ser_vs_committed_ground_truth}`,
     src/native_engine/tromr.rs) + `scripts/gen_reference_fixtures_tromr.py`
+- Identity note: this entry was originally assigned the already-used
+    `DISC-004` identifier. Live source and documentation use `DISC-007`; frozen
+    receipts may retain the historical ambiguous label.
 - Provenance (model commit + fixture hash): NetEase/Polyphonic-TrOMR
     `img2score_epoch47.pth` sha256 02925259ef… (census pin, tromr-spec §Sources);
     `examples/{1..4}.png` + committed `.txt` ground truths (upstream clone)

@@ -810,7 +810,7 @@ pub struct MusicStreams {
     pub lift: Vec<u32>,
 }
 
-/// The per-step token pick. MEASURED 2026-07-06 (DISC-004): pure argmax
+/// The per-step token pick. MEASURED 2026-07-06 (DISC-007): pure argmax
 /// COLLAPSES to a stereotyped degenerate reading — the oracle's own argmax
 /// emits the identical 42-token stream for different staves (SER ~1.55 vs
 /// the committed ground truths). Upstream ships top-k(thres 0.9) sampling at
@@ -939,7 +939,7 @@ pub fn generate_with(w: &TromrDecoderW, ctx: &Mat, pick: DecodePick) -> FocrResu
 }
 
 /// The ARGMAX decode — the L4 oracle-parity mode (degenerate on real staves,
-/// DISC-004; the product default is [`generate`]).
+/// DISC-007; the product default is [`generate`]).
 ///
 /// # Errors
 /// A decoder-forward failure.
@@ -950,7 +950,7 @@ pub fn generate_argmax(w: &TromrDecoderW, ctx: &Mat) -> FocrResult<MusicStreams>
 /// The PRODUCT decode: per-head ARGMAX — deterministic, and MEASURED
 /// equivalent to upstream's top-k/T=0.2 sampling on real staves (identical
 /// SER 0.211 across the 4 committed examples, 2026-07-06 — the sharp T=0.2
-/// almost always picks the argmax token; DISC-004's apparent "argmax
+/// almost always picks the argmax token; DISC-007's apparent "argmax
 /// collapse" was a blank-input artifact of the upstream alpha bug).
 /// `FOCR_TROMR_SAMPLE=1` enables the upstream sampling arithmetic from a
 /// pinned PCG32 seed (`FOCR_TROMR_SEED`, default 0) — the spec §5
@@ -2033,7 +2033,7 @@ mod tests {
             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
         ];
         // NOTE: these literals are a FROZEN realistic stream (the 2026-07-05
-        // oracle run, pre-DISC-004) paired with the upstream-merge golden
+        // oracle run, pre-DISC-007) paired with the upstream-merge golden
         // below — a self-consistent synthetic case pinning the MERGE math.
         // The ARMED cert covers the live fixture; this one never regenerates.
         let streams = MusicStreams {

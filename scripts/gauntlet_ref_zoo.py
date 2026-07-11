@@ -287,7 +287,7 @@ def setup_tromr(stage: str, page: str, model_dir: str):
         timers["encoder_ns"] += dur
 
     _wrap_module_forward(model.encoder, on_encoder)
-    # focr's music lane decodes ARGMAX by default (DISC-004 / E-wave: argmax ==
+    # focr's music lane decodes ARGMAX by default (DISC-007 / E-wave: argmax ==
     # top-k/T0.2 sampling on real staves); force the same on the reference so
     # the timed decode path and the output stream are comparable.
     torch.multinomial = lambda probs, n, **kw: probs.argmax(-1, keepdim=True)
@@ -300,7 +300,7 @@ def run_tromr(stage: str, page: str, model_dir: str, state) -> dict:
         raise ReferenceEntryError("setup state missing — pass --setup gauntlet_ref_zoo:setup_tromr")
     import cv2
     import numpy as np
-    from gen_reference_fixtures_tromr import readimg  # the byte-faithful L0 preprocess (DISC-004 rule)
+    from gen_reference_fixtures_tromr import readimg  # the byte-faithful L0 preprocess (DISC-007 rule)
 
     torch = state["torch"]
     state["timers"]["encoder_ns"] = 0
@@ -325,7 +325,7 @@ def run_tromr(stage: str, page: str, model_dir: str, state) -> dict:
     stages = {
         "preprocess": {
             "ms": pre_ns * ms,
-            "note": "upstream readimg (cv2 load + 128-height resize + ToGray + normalize; DISC-004 ink rule)",
+            "note": "upstream readimg (cv2 load + 128-height resize + ToGray + normalize; DISC-007 ink rule)",
         },
         "vision_encode": {
             "ms": enc_ns * ms,
@@ -334,7 +334,7 @@ def run_tromr(stage: str, page: str, model_dir: str, state) -> dict:
         "decode_per_token": {
             "ms": (gen_ns - enc_ns) * ms,
             "tokens": tokens,
-            "note": "generate() minus the encoder span; multinomial argmax-forced (matches focr's default per DISC-004); NO prefill stage — the decoder seeds from BOS",
+            "note": "generate() minus the encoder span; multinomial argmax-forced (matches focr's default per DISC-007); NO prefill stage — the decoder seeds from BOS",
         },
         "end_to_end": {
             "ms": total_ns * ms,
