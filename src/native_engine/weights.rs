@@ -1015,12 +1015,12 @@ impl Weights {
         let w: Vec<i8> = if self.arch_target == 1 {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
-                eprintln!(
+                crate::progress::stderr_message(format_args!(
                     "[focr] arch mismatch: .focrq is packed for aarch64-smmla but this \
                      host dispatches {}; un-permuting to the generic layout at load \
                      (correct, but the offline packing buys nothing here)",
                     crate::simd::tier_string()
-                );
+                ));
             });
             let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
             crate::simd::pack::smmla_unpack_panels(&packed, n, k)
@@ -1262,7 +1262,7 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::BF16 => {
@@ -1278,7 +1278,7 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .map(|c| bf16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::QInt8PerChan | DType::QInt4PerGroup => Err(FocrError::FormatMismatch(format!(
@@ -1299,7 +1299,7 @@ fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
         .as_chunks::<4>()
         .0
         .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 

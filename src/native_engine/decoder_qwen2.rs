@@ -1786,7 +1786,7 @@ fn generate_greedy_kvcache_with(
             DECODE_GEMV_NS.load(Ordering::Relaxed) as f64 * ns,
             DECODE_LMHEAD_NS.load(Ordering::Relaxed) as f64 * ns,
         );
-        eprintln!(
+        crate::progress::stderr_message(format_args!(
             "[focr-timing]   decode {} tok in {:.2}s ({:.1} tok/s) | seed(prefill {n} tok) {:.2}s | \
              layers {:.2}s (attn {:.2}s, gemv+misc {:.2}s) | lm_head {:.2}s",
             ids.len(),
@@ -1797,7 +1797,7 @@ fn generate_greedy_kvcache_with(
             attn,
             layers - attn,
             head,
-        );
+        ));
     }
     Ok(ids)
 }
@@ -2483,7 +2483,7 @@ mod tests {
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 

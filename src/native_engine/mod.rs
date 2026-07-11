@@ -705,7 +705,7 @@ fn spec_decode_enabled() -> bool {
 /// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
 pub(crate) fn timing_log(msg: &str) {
     if std::env::var_os("FOCR_TIMING").is_some() {
-        eprintln!("[focr-timing] {msg}");
+        crate::progress::stderr_message(format_args!("[focr-timing] {msg}"));
     }
 }
 
@@ -1899,7 +1899,7 @@ impl OcrModel {
             // Human-visible skip note on stderr (the bd-fck1 PDF page-skip
             // precedent) — stdout stays the data surface. The MusicXML still
             // carries every staff that recognized (bd-av64.2).
-            eprintln!(
+            crate::progress::stderr_message(format_args!(
                 "[focr] staff {}/{} skipped: {} (bbox x{} y{} w{} h{})",
                 skip.index + 1,
                 total,
@@ -1908,7 +1908,7 @@ impl OcrModel {
                 skip.bbox.1,
                 skip.bbox.2,
                 skip.bbox.3
-            );
+            ));
         }
         timing_log(&format!(
             "tromr forward {:.2}s ({}/{} staves recognized, semantic {} chars total)",
@@ -2659,7 +2659,9 @@ impl OcrModel {
                         // properly TYPED per-page error (FormatMismatch stays
                         // exit 7, ModelNotFound stays exit 3), and a
                         // batched-only bug degrades to correct results.
-                        eprintln!("[focr] batched vision failed ({e}); using the per-page tower");
+                        crate::progress::stderr_message(format_args!(
+                            "[focr] batched vision failed ({e}); using the per-page tower"
+                        ));
                     }
                 }
             }

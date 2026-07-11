@@ -28,6 +28,11 @@ semantics, artifact identity, rollback safety, and reproducible distribution.
   availability probes.
 - A reproducible Torch 2.10 CPU MoE fixture generator covering 2,048 unsorted
   top-k cases and 256 production-width routed-reduction cases.
+- An interactive stderr progress bar for long multi-page PDF and sequential
+  `ocr-batch` runs, reporting pages, percent, elapsed time, and ETA. It is
+  disabled for robot/JSON output, non-interactive stderr, `TERM=dumb`,
+  `FOCR_TIMING`, and `FOCR_NO_PROGRESS=1`; end-to-end tests pin the
+  machine-output boundary.
 - Strict source-root and evidence-path binding for gauntlet rows and release
   certificates, plus committed evidence from a 14-pass optimization campaign.
 - Native release matrices for Apple Silicon, Intel macOS, Linux x86-64/ARM64,
@@ -72,6 +77,8 @@ semantics, artifact identity, rollback safety, and reproducible distribution.
 - Make pull locks process-scoped and reusable after crashes, preserve the
   working model on failed replacement, and distinguish live staging downloads
   from orphaned partial files in `focr doctor`.
+- Anchor strict certificate self-test round dates to the fixture clock so the
+  freshness checks remain valid across UTC date changes.
 
 ### Verification
 

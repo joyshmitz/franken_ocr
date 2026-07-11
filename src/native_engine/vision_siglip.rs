@@ -624,7 +624,7 @@ mod tests {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let cos = |a: &[f32], b: &[f32]| -> f64 {
@@ -685,7 +685,7 @@ mod tests {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let pv = read_f32(&pv_path);

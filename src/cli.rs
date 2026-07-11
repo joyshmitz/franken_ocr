@@ -16,7 +16,7 @@
 
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
-    native_engine, pdf, quant, robot, simd,
+    native_engine, pdf, progress, quant, robot, simd,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
@@ -58,9 +58,15 @@ pub fn cli_main() -> ExitCode {
             std::process::exit(130);
         }
         crate::request_shutdown();
-        eprintln!(
-            "focr: interrupt received — finishing the current step then aborting (Ctrl+C again to force)"
-        );
+        progress::suppress_for_interrupt();
+        let _ = std::thread::Builder::new()
+            .name("focr-interrupt-notice".into())
+            .spawn(|| {
+                progress::stderr_message(format_args!(
+                    "focr: interrupt received — finishing the current step then aborting \
+                     (Ctrl+C again to force)"
+                ));
+            });
     });
 
     let cli = Cli::parse();
@@ -1271,7 +1277,9 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         .and_then(|p| crate::storage::RunStore::open(&p))
         .and_then(|store| store.insert_run(&record))
     {
-        eprintln!("[focr] run-store note (telemetry only, run unaffected): {e}");
+        let _ = progress::try_stderr_message(format_args!(
+            "[focr] run-store note (telemetry only, run unaffected): {e}"
+        ));
     }
     outcome
 }
@@ -1305,6 +1313,11 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // the figure-aware variants additionally crop the `![](images/…)` regions out
     // of the source and rewrite the markdown references to the saved files.
     let is_pdf = pdf::looks_like_pdf(&request.image);
+    // Human-mode progress (GH #2): a stderr-only bar for the long per-page PDF
+    // drivers. NEVER in robot/`--json` mode — those stdout contracts are
+    // machine-consumed — and `progress::Progress` additionally self-disables
+    // when stderr is not an interactive TTY, so piped runs are byte-identical.
+    let show_progress = !robot_mode && !args.json;
     if !is_pdf && (request.pages.is_some() || request.split_spreads || request.multi_page) {
         return Err(FocrError::Usage(format!(
             "--pages/--split-spreads/--multi-page operate on PDF pages, but {} is not a PDF \
@@ -1330,7 +1343,8 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     }
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, is_pdf) {
         (Some(plan), true) => {
-            let (pdf_rec, figs) = recognize_pdf_with_figures(&engine, &request, robot_mode, plan)?;
+            let (pdf_rec, figs) =
+                recognize_pdf_with_figures(&engine, &request, robot_mode, show_progress, plan)?;
             (Recognition::Pdf(pdf_rec), figs)
         }
         (Some(plan), false) => {
@@ -1344,11 +1358,16 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             (Recognition::Single(doc), writer.into_written())
         }
         (None, true) if request.multi_page => (
-            Recognition::Pdf(recognize_pdf_multi_page(&engine, &request, robot_mode)?),
+            Recognition::Pdf(recognize_pdf_multi_page(
+                &engine,
+                &request,
+                robot_mode,
+                show_progress,
+            )?),
             Vec::new(),
         ),
         (None, true) => (
-            Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode)?),
+            Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode, show_progress)?),
             Vec::new(),
         ),
         (None, false) => (
@@ -1516,6 +1535,10 @@ where
         Ok(md) => Ok(md),
         Err(FocrError::ModelNotFound(msg)) => {
             if request.model.is_none() && !robot_mode && is_interactive() {
+                // A failed recognition retires its progress renderer without
+                // waiting. Synchronize the generic terminal line before the
+                // interactive download prompt is allowed to render.
+                progress::clear_active_line();
                 match offer_first_run_download()? {
                     Some(outcome) => recog(Some(&outcome.focrq_path)),
                     None => Err(FocrError::ModelNotFound(with_pull_hint(&msg))),
@@ -1645,26 +1668,34 @@ fn recognize_pdf_multi_page(
     engine: &OcrEngine,
     request: &OcrRequest,
     robot_mode: bool,
+    show_progress: bool,
 ) -> FocrResult<PdfRecognition> {
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
+    let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
     let mut images: Vec<image::DynamicImage> = Vec::new();
     let mut first_error: Option<FocrError> = None;
-    for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
+    // Rasterization progress (GH #2): a long book spends real time here before
+    // the decode pass even starts. Stderr-only; self-disabled off-TTY.
+    let raster_bar = progress::Progress::new("raster", selected.len(), show_progress);
+    for idx in selected {
+        raster_bar.start_item(format!("page {}/{page_count}", idx + 1));
         match pages.render(idx) {
             Ok(image) => images.push(image),
             Err(e) => {
                 if robot_mode {
                     emit(&robot::page_skipped_event(idx + 1, &e));
                 } else {
-                    eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                    raster_bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
                 }
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
             }
         }
+        raster_bar.complete_item();
     }
+    raster_bar.finish();
     if images.is_empty() {
         return Err(first_error.unwrap_or_else(|| {
             FocrError::Other(anyhow::anyhow!(
@@ -1688,9 +1719,34 @@ fn recognize_pdf_multi_page(
                 .unwrap_or_else(OcrEngine::model_path);
             engine.recognize_multi_page_dynamic_streaming_with_model(&model_path, imgs, sink)
         } else {
-            match model {
-                Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
-                None => engine.recognize_multi_page_dynamic(imgs),
+            // Human-mode progress (GH #2) rides the SAME proven streaming
+            // driver robot mode uses (identical assembled markdown, bd-2z0y);
+            // the sink just advances a stderr bar per crossed <PAGE> boundary.
+            // Off-TTY (or FOCR_NO_PROGRESS) the bar is disabled and the run
+            // takes the original non-streaming arms, byte-for-byte.
+            let bar = progress::Progress::new("ocr", imgs.len(), show_progress);
+            if bar.is_enabled() {
+                bar.start_item(format!("page 1/{}", imgs.len()));
+                let model_path = model
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(OcrEngine::model_path);
+                let sink = bar.page_sink();
+                let out = engine.recognize_multi_page_dynamic_streaming_with_model(
+                    &model_path,
+                    imgs,
+                    sink,
+                );
+                if out.is_ok() {
+                    bar.finish();
+                } else {
+                    bar.retire();
+                }
+                out
+            } else {
+                match model {
+                    Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
+                    None => engine.recognize_multi_page_dynamic(imgs),
+                }
             }
         }
     })?;
@@ -1729,15 +1785,23 @@ fn recognize_pdf(
     engine: &OcrEngine,
     request: &OcrRequest,
     robot_mode: bool,
+    show_progress: bool,
 ) -> FocrResult<PdfRecognition> {
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
     recognize_with_autodownload(request, robot_mode, |model| {
+        let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
+        // Per-page progress bar (GH #2): stderr-only, never in robot/--json
+        // mode, self-disabled off-TTY (see `progress`). Built per ATTEMPT so a
+        // ModelNotFound retires it without waiting; the autodownload wrapper
+        // synchronizes the terminal line before its first-run prompt renders.
+        let bar = progress::Progress::new("ocr", selected.len(), show_progress);
         let mut document = String::new();
         let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
         let mut ok_pages = 0usize;
         let mut first_error: Option<FocrError> = None;
-        for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
+        for idx in selected {
+            bar.start_item(format!("page {}/{page_count}", idx + 1));
             let halves = match pages.render(idx) {
                 Ok(image) => logical_pages(image, request.split_spreads, idx + 1),
                 Err(e) => {
@@ -1745,11 +1809,12 @@ fn recognize_pdf(
                     if robot_mode {
                         emit(&robot::page_skipped_event(idx + 1, &e));
                     } else {
-                        eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                        bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
                     }
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
+                    bar.complete_item();
                     continue;
                 }
             };
@@ -1790,7 +1855,7 @@ fn recognize_pdf(
                         if robot_mode {
                             emit(&robot::page_skipped_event(idx + 1, &e));
                         } else {
-                            eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                            bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
                         }
                         if first_error.is_none() {
                             first_error = Some(e);
@@ -1798,7 +1863,9 @@ fn recognize_pdf(
                     }
                 }
             }
+            bar.complete_item();
         }
+        bar.finish();
         if ok_pages == 0 {
             // PdfPages::open guarantees >=1 page, and ModelNotFound returns early,
             // so first_error is always Some here; fall back defensively.
@@ -1827,6 +1894,7 @@ fn recognize_pdf_with_figures(
     engine: &OcrEngine,
     request: &OcrRequest,
     robot_mode: bool,
+    show_progress: bool,
     plan: &FigurePlan,
 ) -> FocrResult<(PdfRecognition, Vec<WrittenFigure>)> {
     type OkPage = (
@@ -1837,9 +1905,14 @@ fn recognize_pdf_with_figures(
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
     let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
+        let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
+        // Same per-page progress bar as `recognize_pdf` (GH #2): stderr-only,
+        // disabled in robot mode and off-TTY, per-attempt lifetime.
+        let bar = progress::Progress::new("ocr", selected.len(), show_progress);
         let mut out: Vec<OkPage> = Vec::new();
         let mut first_error: Option<FocrError> = None;
-        for idx in parse_page_spec(request.pages.as_deref(), page_count)? {
+        for idx in selected {
+            bar.start_item(format!("page {}/{page_count}", idx + 1));
             let page = pages.render(idx).and_then(|image| match model {
                 Some(m) => engine.recognize_dynamic_with_figures_model(m, image),
                 None => engine.recognize_dynamic_with_figures(image),
@@ -1855,14 +1928,16 @@ fn recognize_pdf_with_figures(
                     if robot_mode {
                         emit(&robot::page_skipped_event(idx + 1, &e));
                     } else {
-                        eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                        bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
                     }
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
                 }
             }
+            bar.complete_item();
         }
+        bar.finish();
         if out.is_empty() {
             return Err(first_error.unwrap_or_else(|| {
                 FocrError::InputDecode(format!(
@@ -2030,16 +2105,28 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         }
     } else {
         // Sequential per-image loop — the proven oracle path (FOCR_BATCH_SPINE=0),
-        // byte-for-byte what it has always been.
-        for image in &args.images {
+        // byte-for-byte what it has always been. The progress bar (GH #2) is
+        // stderr-only, disabled under `--json`, and self-disabled off-TTY; it
+        // is suspended around each result block so the bar never fuses to the
+        // per-image markdown/summary output.
+        let bar = progress::Progress::new("batch", count, !args.json);
+        for (i, image) in args.images.iter().enumerate() {
+            let name = image.file_name().map_or_else(
+                || image.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            bar.start_item(format!("image {}/{count}: {name}", i + 1));
             let started = std::time::Instant::now();
             let outcome = match model.as_deref() {
                 Some(m) => engine.recognize_with_model(m, image),
                 None => engine.recognize(image),
             };
             let secs = started.elapsed().as_secs_f64();
+            bar.complete_item();
+            bar.suspend();
             emit_batch_result(args.json, image, secs, outcome, &mut results);
         }
+        bar.finish();
     }
 
     let elapsed = total.elapsed().as_secs_f64();
@@ -2953,7 +3040,12 @@ impl ErrorMode {
 
 fn exit_code_from_error(err: &FocrError, mode: ErrorMode) -> ExitCode {
     match mode {
-        ErrorMode::Human => eprintln!("focr: {err}"),
+        // Error paths retire the detached renderer without waiting for
+        // terminal I/O. Do not reintroduce that wait while printing the final
+        // diagnostic; a stalled renderer makes this best-effort.
+        ErrorMode::Human => {
+            let _ = progress::try_stderr_message(format_args!("focr: {err}"));
+        }
         ErrorMode::Robot => emit(&robot::run_error_event(err)),
     }
     ExitCode::from(exit_code_byte(err))

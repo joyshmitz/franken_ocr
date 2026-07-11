@@ -14547,7 +14547,7 @@ def self_test() -> int:
         strict_rounds = [
             {
                 **canonical_round(round_number, 0 if round_number >= 9 else 4),
-                "date": "2026-07-10",
+                "date": fixed_now.date().isoformat(),
             }
             for round_number in range(1, 11)
         ]

@@ -24,7 +24,7 @@ fn read_sam_input(path: &str) -> Result<Mat> {
         .as_chunks::<4>()
         .0
         .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     if !data.len().is_multiple_of(3) {
         bail!(

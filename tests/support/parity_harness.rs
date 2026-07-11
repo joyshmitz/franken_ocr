@@ -771,7 +771,7 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
     }
     let mut data = Vec::with_capacity(numel);
     for chunk in data_bytes[..numel * 4].as_chunks::<4>().0 {
-        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        data.push(f32::from_le_bytes(*chunk));
     }
     Ok((shape, data))
 }
@@ -1328,7 +1328,9 @@ pub fn assert_outputs_deterministic(
         if divergence.is_none() { "pass" } else { "fail" }
     );
     if let Some(off) = divergence {
-        panic!(
+        assert_eq!(
+            reference,
+            output,
             "DETERMINISM VIOLATION ({test}/{case}): attempt {attempt} diverges from the \
              reference at byte {off} (lens {} vs {}) — a real engine bug under greedy, \
              never test noise",
