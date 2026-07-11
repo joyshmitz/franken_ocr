@@ -5,10 +5,11 @@ regressed, were neutral, or could not be measured head-to-head**. It exists to
 prevent stale optimism from being reused as proof, and to stop the swarm from
 re-attempting a lever that has already been shown not to pay.
 
-**A "win" only counts with a head-to-head MEASURED ratio against a real
-reference and a correctness proof.** Anything else lands here, not in
-`docs/PERF_LEDGER.md`. Do not retry a rejected lever unless its explicit retry
-condition is satisfied.
+**A `WIN` only counts with a head-to-head MEASURED ratio against a real
+reference and a correctness proof.** A bit-exact local A/B that has not cleared
+the strict current-tree and reference gates is a `PROVISIONAL_LOCAL_WIN`, not a
+`WIN`, and remains in this ledger rather than `docs/PERF_LEDGER.md`. Do not retry
+a rejected lever unless its explicit retry condition is satisfied.
 
 This is an **artifact-graph ledger** (plan §8.4), not prose: every entry carries
 the FrankenSuite artifact-graph fields so each claim is reproducible and traceable
@@ -45,7 +46,7 @@ old commit. A franken_ocr entry without a resolvable truth-pack provenance is
 Every entry records (the frankentorch format **plus** the artifact-graph fields):
 
 ```
-date | WIN / NEGATIVE(reverted) | lever (what was tried, where)
+date | WIN / PROVISIONAL_LOCAL_WIN / NEGATIVE(reverted) / NEGATIVE(retained-for-proof) | lever (what was tried, where)
   claim_id / evidence_id                         # artifact-graph IDs (claim under test → evidence dir)
   model source commit + fixture hash             # truth-pack provenance: HF 3a7f4db… + (file_sha256, lines)
                                                   #   from SOURCE_HASHES.md, plus .focrq/weights hash
@@ -64,7 +65,11 @@ date | WIN / NEGATIVE(reverted) | lever (what was tried, where)
   evidence dir: artifacts/perf/<bead>/             # paired baseline/after gauntlet logs + SHA-256 manifest
 ```
 
-A lever that does not clear its measurement bar is **REVERTED**, not kept. The
+`PROVISIONAL_LOCAL_WIN` means the implementation survived its local A/B and
+correctness gate but still lacks strict current-tree/reference qualification.
+`NEGATIVE(retained-for-proof)` means a non-winning path remains available only
+for portability or parity diagnostics. A lever that fails its measurement bar
+is **REVERTED** unless one of those explicit classifications applies. The
 `per-lever tally` accumulates across attempts so a thrice-failed idea is visibly
 dead. The **evidence dir** `artifacts/perf/<bead>/` holds the paired baseline/after
 gauntlet logs and their SHA-256 manifest — the `evidence_id` points at it, so the
@@ -569,7 +574,7 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-bf16-stream/
 
-2026-07-10 | WIN | bit-exact parallel independent-head scheduling in scalar R-SWA decode attention (`src/native_engine/rswa.rs::decode_attention_scalar_parallel`)
+2026-07-10 | PROVISIONAL_LOCAL_WIN | bit-exact parallel independent-head scheduling in scalar R-SWA decode attention (`src/native_engine/rswa.rs::decode_attention_scalar_parallel`)
   claim_id: CLAIM-bd-2mo30-rswa-parallel-heads   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-rswa-par-heads/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
@@ -666,7 +671,7 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-thread-count/
 
-2026-07-10 | WIN | mmap-capable production `.focrq` loading (`OcrModel::load` -> `Weights::load`)
+2026-07-10 | PROVISIONAL_LOCAL_WIN | mmap-capable production `.focrq` loading (`OcrModel::load` -> `Weights::load`)
   claim_id: CLAIM-bd-2mo30-mmap-production-load   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
@@ -714,7 +719,7 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-prefill-chunk/
 
-2026-07-10 | WIN | transfer ownership of the kernel softmax result instead of copying it (`nn::softmax_rows`)
+2026-07-10 | PROVISIONAL_LOCAL_WIN | transfer ownership of the kernel softmax result instead of copying it (`nn::softmax_rows`)
   claim_id: CLAIM-bd-2mo30-softmax-ownership   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-softmax-ownership/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
@@ -738,7 +743,7 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-softmax-ownership/
 
-2026-07-10 | WIN | cache Unlimited-OCR SAM weights and the pretransposed bridge projector across pages
+2026-07-10 | PROVISIONAL_LOCAL_WIN | cache Unlimited-OCR SAM weights and the pretransposed bridge projector across pages
   claim_id: CLAIM-bd-2mo30-unlimited-vision-statics   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-unlimited-vision-cache/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
@@ -762,7 +767,7 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-unlimited-vision-cache/
 
-2026-07-10 | WIN | select LLVM-autovectorized scalar dense-int8 contraction over hand-written SDOT on Apple (`src/simd/arm.rs::igemm_{s8s8,u8s8}`)
+2026-07-10 | PROVISIONAL_LOCAL_WIN | select LLVM-autovectorized scalar dense-int8 contraction over hand-written SDOT on Apple (`src/simd/arm.rs::igemm_{s8s8,u8s8}`)
   claim_id: CLAIM-bd-2mo30-apple-int8-autovec   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-apple-int8-autovec/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
@@ -865,6 +870,26 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass13-page0590-precision-20260710T082044Z/
 
+2026-07-11 | NEGATIVE(reverted) | CASS prior-session mining preflight for the current profiling campaign
+  claim_id: CLAIM-bd-2mo30-cass-preflight-timeout   evidence_id: artifacts/perf/bd-2mo.30/profile-head-58cf4e1/
+  model source commit + fixture hash:
+    query is model-independent campaign preflight; the affected profile is bound to source HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 and Unlimited-OCR HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+  CPU feature string: not compute-dependent; observed on Apple M4 arm64 while no focr benchmark was running
+  exact command + env:
+    `gtimeout 20 cass search "franken_ocr int8 simd gemm" --robot --limit 5`
+    exit 124 after 20 seconds with no stdout on 2026-07-11; the original profile preflight independently recorded the same 20-second non-response.
+  fallback / kill-switch state: no runtime or source switch. The conservative fallback is to use only committed ledgers, hash-verified artifact bundles, and current source inspection; no claim may depend on unavailable session history.
+  measured before -> after vs reference:
+    blocked preflight, not a performance measurement: CASS produced no result within the fixed 20-second budget, so prior-session evidence could not be incorporated or cited. The profile remains attribution-only for its independently documented reasons.
+  bit-exact correctness proof: no source, model, fixture, or runtime state changed; `gtimeout` terminated only the bounded read-only query. Artifact integrity remains covered by `artifacts/perf/bd-2mo.30/profile-head-58cf4e1/SHA256SUMS`.
+  disposition: REVERT TO COMMITTED EVIDENCE ONLY (no source change)
+  do-not-retry: "retry CASS mining only after `cass search ... --robot --limit 5` returns within 20 seconds or index health has been repaired; never block profiling or infer prior results from a timed-out query."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: NavyTiger
+  evidence dir: artifacts/perf/bd-2mo.30/profile-head-58cf4e1/
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a
@@ -876,7 +901,7 @@ The evidence dir must include a hash manifest named `SHA256SUMS`,
 dirs exist but are not hash-anchored.
 
 ```
-2026-MM-DD | <WIN|NEGATIVE(reverted)> | <lever, file:fn>
+2026-MM-DD | <WIN|PROVISIONAL_LOCAL_WIN|NEGATIVE(reverted)|NEGATIVE(retained-for-proof)> | <lever, file:fn>
   claim_id: <e.g. CLAIM-int8-expert-ffn-decode>   evidence_id: artifacts/perf/<bead>/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
