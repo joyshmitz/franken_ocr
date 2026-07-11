@@ -82,10 +82,12 @@ gh release upload v0.7.0 \
 ```
 
 Do not rerun the upload or use `--clobber`. The public release reports the three
-exact names, sizes, and SHA-256 digests. A clean-cache `focr pull` remains an
-independent installer acceptance check; when run, it must verify every part hash
-and the reassembled hash before OCR. The live manifest deliberately has only the
-GitHub URLs. Add a Hugging Face fallback in a later commit only after the
+exact names, sizes, and SHA-256 digests. On 2026-07-11, a clean-cache v0.7.0
+`focr pull` verified every part hash, installed the artifact with reassembled
+SHA-256 `573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592`,
+returned `from_cache:true` on a second pull, and reproduced the pinned
+`page_0009` OCR golden byte-for-byte. The live manifest deliberately has only
+the GitHub URLs. Add a Hugging Face fallback in a later commit only after the
 identical objects have actually been uploaded and verified there.
 
 The tokenizer remains public at `baidu/Unlimited-OCR`; its manifest identity is
