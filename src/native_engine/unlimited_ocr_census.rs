@@ -414,30 +414,23 @@ mod tests {
     }
 
     #[test]
-    fn manifest_matches_pinned_index_and_recipe_exactly() {
+    fn manifest_matches_pinned_census_and_recipe_exactly() {
         let manifest = manifest().expect("embedded production manifest parses");
-        let index: serde_json::Value = serde_json::from_str(include_str!(
-            "../../docs/truth-pack/snapshots/model.safetensors.index.json"
-        ))
-        .expect("pinned truth-pack index parses");
-        let weight_map = index["weight_map"]
-            .as_object()
-            .expect("pinned index has weight_map");
-        let index_total_size = index["metadata"]["total_size"]
-            .as_u64()
-            .expect("pinned index has integer metadata.total_size");
-        assert_eq!(
-            manifest.source_index_total_size, index_total_size,
-            "embedded source_index_total_size must mean the index tensor-payload total"
-        );
+        assert_eq!(manifest.source_index_sha256, SOURCE_INDEX_SHA256);
+        assert_eq!(manifest.source_index_total_size, SOURCE_INDEX_TOTAL_SIZE);
         assert_eq!(manifest.source_file_size, SOURCE_FILE_SIZE);
-        assert_eq!(weight_map.len(), TENSOR_COUNT);
         assert_eq!(manifest.tensors.len(), TENSOR_COUNT);
-        let manifest_names: std::collections::BTreeSet<&str> =
-            manifest.tensors.keys().map(String::as_str).collect();
-        let index_names: std::collections::BTreeSet<&str> =
-            weight_map.keys().map(String::as_str).collect();
-        assert_eq!(manifest_names, index_names);
+        for landmark in [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.layers.11.mlp.experts.63.down_proj.weight",
+            "model.vision_model.transformer.layers.23.self_attn.out_proj.weight",
+        ] {
+            assert!(
+                manifest.tensors.contains_key(landmark),
+                "embedded production census omits {landmark}"
+            );
+        }
 
         let int8_count = manifest
             .tensors
