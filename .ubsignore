@@ -3,4 +3,5 @@
 # the suite grows (e.g. tests/robot_contract_tests.rs, tests/conformance_*.rs).
 artifacts/**
 docs/gauntlet/bundle/source_evidence/**
+target*/**
 tests/**

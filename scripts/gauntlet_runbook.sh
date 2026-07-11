@@ -30,6 +30,8 @@
 #   FORCE=1          bypass the loadavg gate (the row notes must say why)
 #   PAGES="page_0009.png page_0014.png"   override the measured page set
 #   FOCR_GAUNTLET_SCRATCH_ROOT=/path       fresh Cargo target parent for `build`
+#   FOCR_GAUNTLET_HF_HOME=/path            offline Hugging Face cache directory
+#   FOCR_GAUNTLET_TMPDIR=/path             reference-side temporary directory
 # Required subject path:
 #   FOCR_GAUNTLET_FOCR_MODEL=/absolute/path/to/conservative-recipe.focrq
 set -euo pipefail
@@ -60,6 +62,8 @@ REFERENCE_MODEL_DIR="${FOCR_GAUNTLET_REFERENCE_MODEL_DIR:-$WORK/model}"
 SUBJECT_MODEL="${FOCR_GAUNTLET_FOCR_MODEL:-}"
 PAGES_DIR="${FOCR_GAUNTLET_PAGES_DIR:-$WORK/pages}"
 VENV_PY="${FOCR_GAUNTLET_VENV_PY:-/Volumes/focrvenv/venv/bin/python}"
+REFERENCE_HF_HOME="${FOCR_GAUNTLET_HF_HOME:-$WORK/hf_home}"
+REFERENCE_TMPDIR="${FOCR_GAUNTLET_TMPDIR:-$WORK/tmp}"
 FOCR_BIN="${FOCR_BIN:-}"
 
 # ── measurement contract (docs/PERF_LEDGER.md §9.3) ─────────────────────────
@@ -95,7 +99,7 @@ ref_env() {
       OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS" \
       OPENBLAS_NUM_THREADS="$THREADS" VECLIB_MAXIMUM_THREADS="$THREADS" \
       NUMEXPR_NUM_THREADS="$THREADS" \
-      HF_HOME=/Volumes/focrvenv/hf_home TMPDIR=/Volumes/focrvenv/tmp \
+      HF_HOME="$REFERENCE_HF_HOME" TMPDIR="$REFERENCE_TMPDIR" \
       HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
       "$@"
 }
@@ -1184,6 +1188,10 @@ PY
 }
 
 step_self_test() {
+  local ref_paths
+  ref_paths="$(ref_env sh -c 'printf "%s\n%s\n" "$HF_HOME" "$TMPDIR"')"
+  [[ "$ref_paths" == "$REFERENCE_HF_HOME"$'\n'"$REFERENCE_TMPDIR" ]] \
+    || die "reference cache/temp environment override wiring failed"
   python3 scripts/baseline/compare_ocr.py --self-test >/dev/null
   verify_timed_text_pair --self-test >/dev/null
   build_receipt_tool self-test >/dev/null
@@ -1279,6 +1287,12 @@ step_preflight() {
 
   [[ -d "$REFERENCE_MODEL_DIR" ]] || die "reference model dir missing: $REFERENCE_MODEL_DIR"
   [[ -x "$VENV_PY" ]] || die "reference venv python missing: $VENV_PY"
+  mkdir -p "$REFERENCE_HF_HOME" "$REFERENCE_TMPDIR" \
+    || die "cannot create reference cache/temp directories"
+  [[ -d "$REFERENCE_HF_HOME" && -w "$REFERENCE_HF_HOME" ]] \
+    || die "reference Hugging Face cache is not a writable directory: $REFERENCE_HF_HOME"
+  [[ -d "$REFERENCE_TMPDIR" && -w "$REFERENCE_TMPDIR" ]] \
+    || die "reference TMPDIR is not a writable directory: $REFERENCE_TMPDIR"
   verify_subject_model
 
   # Fixture hashes must match the embedded truth-pack values (moved page = STOP).
