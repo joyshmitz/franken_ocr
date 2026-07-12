@@ -5611,6 +5611,7 @@ def _strict_evidence_reasons(
     provenance_root: Path | None = None,
     ci_run_verifier: Callable[[Path, str, str, Sequence[dict]], bool] | None = None,
 ) -> list[str]:
+    bundle_dir = bundle_dir.resolve()
     reasons: list[str] = []
     evidence_classes = certificate.get("evidence_classes")
     if not isinstance(evidence_classes, dict):
@@ -6852,6 +6853,7 @@ def _certificate_source_claim_reasons(
     source_digest_resolver: Callable[[Path, str, str], str | None] | None = None,
     perf_evidence_checker: Callable[[str, Path, str], bool] | None = None,
 ) -> list[str]:
+    bundle_dir = bundle_dir.resolve()
     reasons: list[str] = []
     claim_sources = certificate.get("claim_sources")
     readiness_relative = (
