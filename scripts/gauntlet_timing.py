@@ -154,9 +154,47 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"\s+experts (?P<experts>\d+)\s+route (?P<route>\d+)$"
         ),
     ),
+    (
+        "multi_page_vision",
+        re.compile(
+            r"^multi_page\.vision \((?P<pages>\d+) pages\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
+        "multi_page_decode",
+        re.compile(
+            r"^multi_page\.decode (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
+        "got_hydrate",
+        re.compile(r"^got\.hydrate\(cached\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
     ("got_vision_splice", re.compile(r"^got\.vision\+splice (?P<s>\d+(?:\.\d+)?)s$")),
+    (
+        "got_vision_splice_batch",
+        re.compile(
+            r"^got\.vision\+splice\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
     ("got_generate", re.compile(r"^got\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$")),
+    (
+        "got_generate_batch",
+        re.compile(
+            r"^got\.generate\(batch of (?P<streams>\d+)\) (?P<tok>\d+) tokens "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
     ("got_forward", re.compile(r"^got forward (?P<s>\d+(?:\.\d+)?)s$")),
+    (
+        "got_forward_batch",
+        re.compile(
+            r"^got-ocr2 forward\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
     # The SmolVLM2 / OneChart lanes (A11, bd-3jo6.1.11) — same shape as GOT's:
     # vision+splice, generate, forward-total. Their decode/seed(prefill)
     # breakdown arrives via the SHARED engine line (`got_decode` above —
@@ -169,17 +207,67 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     (
+        "smolvlm2_hydrate",
+        re.compile(r"^smolvlm2\.hydrate\(cached\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "smolvlm2_vision_splice_batch",
+        re.compile(
+            r"^smolvlm2\.vision\+splice\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
         "smolvlm2_generate",
         re.compile(r"^smolvlm2\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"),
     ),
+    (
+        "smolvlm2_generate_batch",
+        re.compile(
+            r"^smolvlm2\.generate\(batch of (?P<streams>\d+)\) (?P<tok>\d+) tokens "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
     ("smolvlm2_forward", re.compile(r"^smolvlm2 forward (?P<s>\d+(?:\.\d+)?)s$")),
+    (
+        "smolvlm2_forward_batch",
+        re.compile(
+            r"^smolvlm2 forward\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
+        "onechart_hydrate",
+        re.compile(r"^onechart\.hydrate\(cached\) (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
     (
         "onechart_vision_splice",
         re.compile(r"^onechart\.vision\+splice (?P<s>\d+(?:\.\d+)?)s$"),
     ),
     (
+        "onechart_vision_splice_batch",
+        re.compile(
+            r"^onechart\.vision\+splice\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
         "onechart_generate",
         re.compile(r"^onechart\.generate (?P<tok>\d+) tokens (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "onechart_generate_batch",
+        re.compile(
+            r"^onechart\.generate\(batch of (?P<streams>\d+)\) (?P<tok>\d+) tokens "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
+        "onechart_forward_batch",
+        re.compile(
+            r"^onechart forward\(batch of (?P<views>\d+)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
     ),
     # Polyphonic-TrOMR (bd-2sez): encode folds straight into the canonical
     # vision_encode stage; generate is the decode TOTAL (per-token derives from
@@ -193,6 +281,14 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "decode_total",
         re.compile(r"^tromr\.generate (?P<tok>\d+) steps (?P<s>\d+(?:\.\d+)?)s$"),
+    ),
+    (
+        "tromr_split",
+        re.compile(
+            r"^tromr\.split seg (?P<segment>\d+) "
+            r"\[(?P<start>\d+)\.\.(?P<end>\d+)\] "
+            r"(?P<s>\d+(?:\.\d+)?)s \((?P<chars>\d+) chars\)$"
+        ),
     ),
     (
         "tromr_forward",
@@ -236,6 +332,27 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
+_KNOWN_EVENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^tromr\.staff_detect (?P<staves>\d+) staves$"),
+    re.compile(
+        r"^tromr\.staff (?P<staff>\d+) split-recognized "
+        r"\((?P<w>\d+)x(?P<h>\d+)\)$"
+    ),
+    re.compile(
+        r"^tromr\.staff (?P<staff>\d+) ok "
+        r"\((?P<w>\d+)x(?P<h>\d+), semantic (?P<chars>\d+) chars\)$"
+    ),
+    re.compile(
+        r"^tromr\.staff (?P<staff>\d+) SKIP "
+        r"\((?P<w>\d+)x(?P<h>\d+)\): (?P<reason>.+)$"
+    ),
+    re.compile(
+        r"^tromr\.sanity "
+        r"(?P<kind>overfull_bar|underfull_bar|impossible_duration|key_mismatch) "
+        r"part (?P<part>\d+) measure (?P<measure>\d+): (?P<detail>.+)$"
+    ),
+)
+
 
 class TimingParseError(ValueError):
     """A run's stderr could not be parsed into timing evidence."""
@@ -267,6 +384,11 @@ def parse_run(stderr_text: str) -> dict:
             matched = True
             _fold(stages, name, m)
             break
+        if not matched and any(pattern.match(body) for pattern in _KNOWN_EVENT_PATTERNS):
+            # These are structured lifecycle/warning events, not durations.
+            # Recognize their exact vocabulary without fabricating a zero-time
+            # stage that numeric aggregation could mistake for measurement.
+            matched = True
         if not matched:
             raise TimingParseError(f"unrecognized [focr-timing] line: {body!r}")
     if not saw_prefix:
@@ -333,6 +455,18 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
         _add(stages, "decode_layers", float(groups["layers"]), None)
         _add(stages, "decode_attn", float(groups["attn"]), None)
         _add(stages, "decode_lm_head", float(groups["head"]), None)
+        return
+    if name == "multi_page_vision":
+        _add(stages, "vision_encode", float(groups["s"]), None)
+        entry = stages["vision_encode"]
+        entry["pages"] = entry.get("pages", 0) + int(groups["pages"])
+        return
+    if name.endswith("_generate_batch"):
+        base = name[: -len("_batch")]
+        _add(stages, base, float(groups["s"]), int(groups["tok"]))
+        entry = stages[base]
+        entry["batched"] = True
+        entry["streams"] = entry.get("streams", 0) + int(groups["streams"])
         return
     if name.endswith("_batch"):
         # Batched vision (bd-t6a): same tower work as the per-view lines, one
@@ -937,10 +1071,11 @@ def aggregate_runs(
             "occurrences": occurrences[0],
             "synthetic": synthetic,
         }
-        views = [entry.get("views") for entry in present]
-        if any(v is not None for v in views):
-            record["views"] = views[0]
-            record["views_consistent"] = len(set(views)) == 1
+        for dimension in ("views", "pages", "streams"):
+            values = [entry.get(dimension) for entry in present]
+            if any(value is not None for value in values):
+                record[dimension] = values[0]
+                record[f"{dimension}_consistent"] = len(set(values)) == 1
         if any(t is not None for t in tokens):
             record["tokens"] = tokens[0]
             record["tokens_consistent"] = len(set(tokens)) == 1
@@ -1599,6 +1734,39 @@ _SYNTHETIC_BATCH = """\
 [focr-timing]   vision.bridge(batch of 5) 0.12s
 """
 
+_SYNTHETIC_ZOO_BATCH = """\
+[focr-timing]   got.hydrate(cached) 0.10s
+[focr-timing]   got.vision+splice(batch of 3) 1.20s
+[focr-timing]   got.generate(batch of 3) 12 tokens 2.30s
+[focr-timing] got-ocr2 forward(batch of 3) 3.60s
+[focr-timing]   smolvlm2.hydrate(cached) 0.20s
+[focr-timing]   smolvlm2.vision+splice(batch of 3) 1.30s
+[focr-timing]   smolvlm2.generate(batch of 3) 15 tokens 2.40s
+[focr-timing] smolvlm2 forward(batch of 3) 3.90s
+[focr-timing]   onechart.hydrate(cached) 0.30s
+[focr-timing]   onechart.vision+splice(batch of 3) 1.40s
+[focr-timing]   onechart.generate(batch of 3) 18 tokens 2.50s
+[focr-timing] onechart forward(batch of 3) 4.20s
+"""
+
+_SYNTHETIC_MULTI_PAGE = """\
+[focr-timing] multi_page.vision (3 pages) 4.50s
+[focr-timing] decode 1.00s (5 tokens, 0.200s/tok)
+[focr-timing] multi_page.decode 5 tokens 2.00s
+"""
+
+_SYNTHETIC_TROMR_EVENTS = """\
+[focr-timing]   tromr.staff_detect 2 staves
+[focr-timing]   tromr.staff 0 split-recognized (100x20)
+[focr-timing]   tromr.staff 0 ok (100x20, semantic 42 chars)
+[focr-timing]   tromr.staff 1 SKIP (90x20): blank staff
+[focr-timing]   tromr.sanity underfull_bar part 1 measure 2: short by one beat
+[focr-timing] tromr.encode 0.30s (w 100, 20 ctx tokens)
+[focr-timing]     tromr.split seg 0 [0..100] 0.20s (42 chars)
+[focr-timing] tromr.generate 10 steps 0.50s
+[focr-timing] tromr forward 1.20s (1/2 staves recognized, semantic 42 chars total)
+"""
+
 
 def _self_test() -> int:
     failures: list[str] = []
@@ -1719,6 +1887,84 @@ def _self_test() -> int:
     mixed = parse_run(_SYNTHETIC_BATCH + "[focr-timing]   vision.sam 1.00s\n")
     check("batch-mixed-sam-sum", math.isclose(mixed["vision_sam"]["s"], 4.20))
     check("batch-mixed-occurrences", mixed["vision_sam"]["occurrences"] == 3)
+
+    # Current zoo lanes emit first-use hydration plus three dense-batch spans.
+    # Batch folds retain the sequential stage names while recording cardinality.
+    zoo_batch = parse_run(_SYNTHETIC_ZOO_BATCH)
+    hydrate_seconds = {"got": 0.1, "smolvlm2": 0.2, "onechart": 0.3}
+    for lane, tokens in (("got", 12), ("smolvlm2", 15), ("onechart", 18)):
+        check(
+            f"{lane}-hydrate",
+            math.isclose(zoo_batch[f"{lane}_hydrate"]["s"], hydrate_seconds[lane]),
+        )
+        check(
+            f"{lane}-batch-vision",
+            zoo_batch[f"{lane}_vision_splice"]["batched"] is True
+            and zoo_batch[f"{lane}_vision_splice"]["views"] == 3,
+        )
+        check(
+            f"{lane}-batch-generate",
+            zoo_batch[f"{lane}_generate"]["batched"] is True
+            and zoo_batch[f"{lane}_generate"]["streams"] == 3
+            and zoo_batch[f"{lane}_generate"]["tokens"] == tokens,
+        )
+        check(
+            f"{lane}-batch-forward",
+            zoo_batch[f"{lane}_forward"]["batched"] is True
+            and zoo_batch[f"{lane}_forward"]["views"] == 3,
+        )
+
+    zoo_records = aggregate_runs(
+        [zoo_batch, zoo_batch],
+        [5000.0, 5100.0],
+        threads=8,
+        precision="zoo-mixed",
+        allocator="system",
+        synthetic=True,
+    )
+    zoo_by_stage = {record["stage"]: record for record in zoo_records}
+    check(
+        "zoo-batch-cardinality-aggregation",
+        zoo_by_stage["got_vision_splice"]["views"] == 3
+        and zoo_by_stage["got_vision_splice"]["views_consistent"] is True
+        and zoo_by_stage["got_generate"]["streams"] == 3
+        and zoo_by_stage["got_generate"]["streams_consistent"] is True,
+    )
+
+    multi_page = parse_run(_SYNTHETIC_MULTI_PAGE)
+    check(
+        "multi-page-vision-canonical-stage",
+        math.isclose(multi_page["vision_encode"]["s"], 4.5)
+        and multi_page["vision_encode"]["pages"] == 3,
+    )
+    check(
+        "multi-page-outer-decode-is-informational",
+        math.isclose(multi_page["decode_total"]["s"], 1.0)
+        and math.isclose(multi_page["multi_page_decode"]["s"], 2.0)
+        and multi_page["multi_page_decode"]["tokens"] == 5,
+    )
+
+    tromr_events = parse_run(_SYNTHETIC_TROMR_EVENTS)
+    check(
+        "tromr-events-do-not-fabricate-numeric-stages",
+        set(tromr_events) == {"vision_encode", "tromr_split", "decode_total", "tromr_forward"},
+    )
+    check(
+        "tromr-split-timing",
+        math.isclose(tromr_events["tromr_split"]["s"], 0.2),
+    )
+
+    for name, malformed in (
+        ("refuses-near-miss-got-batch-name", "got-ocr2x forward(batch of 3) 1.00s"),
+        ("refuses-malformed-tromr-split", "tromr.split seg 0 [a..b] 0.20s (4 chars)"),
+        ("refuses-empty-tromr-skip-reason", "tromr.staff 1 SKIP (90x20):"),
+        ("refuses-unknown-tromr-sanity-kind", "tromr.sanity oddity part 1 measure 2: detail"),
+    ):
+        try:
+            parse_run(f"[focr-timing] preprocess 0.01s\n[focr-timing] {malformed}\n")
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
 
     # No timing lines / unknown timing line both refuse (never fabricate).
     for name, text in (
