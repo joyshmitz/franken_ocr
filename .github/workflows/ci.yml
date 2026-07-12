@@ -50,8 +50,8 @@ env:
   # Path dependencies are build inputs. Keep these immutable revisions aligned
   # with the package versions recorded in Cargo.lock; update them deliberately
   # and together, never by floating each job on sibling `main`.
-  FRANKENTORCH_REV: f00c3ce79737ffd0e7c7e2f2e81540907ce26562
-  FRANKENSQLITE_REV: 14c5781680833c248ed18d84914312e233d145df
+  FRANKENTORCH_REV: 062cf3671c194f6ab184da98f0559ebc76cff7c7
+  FRANKENSQLITE_REV: cd9990bb16291d8c7c247b75b47faae8d7701adb
   ASUPERSYNC_REV: 53aa5c72f855352148c3a88e6961f7f09adb535c
   # Surface full backtraces if a test panics, so failures are self-diagnosing.
   RUST_BACKTRACE: 1
@@ -149,7 +149,10 @@ jobs:
       # The full stdout/stderr is captured and uploaded as a CI artifact (the
       # evidence-graph capture, bd-4yks item 10) even when the gate fails.
       - name: Run the gate (scripts/check.sh)
-        run: ./scripts/check.sh 2>&1 | tee gate-log-${{ matrix.os }}.txt
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check.sh 2>&1 | tee gate-log-${{ matrix.os }}.txt
 
       - name: Bind successful gate evidence
         run: |
@@ -197,9 +200,9 @@ jobs:
           python3 scripts/bench_guardrail.py || echo "guardrail reported (advisory; non-blocking)"
 
   advisory-targets:
-    name: advisory target (${{ matrix.name }})
+    name: target (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    continue-on-error: false
     strategy:
       fail-fast: false
       matrix:
@@ -236,7 +239,7 @@ jobs:
             skip_reason: ""
           # arm64 Windows checks natively on the hosted windows-11-arm runner.
           # The binary build/no-weights smoke passed in dist run 29048523156;
-          # this remains advisory until full model OCR is proven on that host.
+          # Full model OCR remains covered by the separate weighted parity gate.
           - name: windows-msvc-aarch64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -248,11 +251,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Explain advisory skip
+      - name: Explain target skip
         if: ${{ matrix.skip }}
         shell: bash
         run: |
-          echo "Advisory target '${{ matrix.name }}' is not built in Phase 0:"
+          echo "Target '${{ matrix.name }}' is not built in Phase 0:"
           echo "${{ matrix.skip_reason }}"
 
       - name: Provision sibling path dependencies
@@ -310,7 +313,7 @@ jobs:
         if: ${{ !matrix.skip }}
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: advisory-${{ matrix.name }}-${{ matrix.target }}
+          key: target-${{ matrix.name }}-${{ matrix.target }}
           cache-all-crates: true
 
       - name: Cargo check target

@@ -350,12 +350,27 @@ fi
 rm -rf "$atomic_work"
 
 if command -v pwsh >/dev/null 2>&1; then
-  if pwsh -NoLogo -NoProfile -NonInteractive \
-      -Command '$null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $args[0]))' \
-      "$INSTALL_PS1" >/dev/null 2>&1; then
+  if powershell_parse_output="$(
+    # shellcheck disable=SC2016
+    INSTALL_PS1="$INSTALL_PS1" pwsh -NoLogo -NoProfile -NonInteractive -Command '
+      $ErrorActionPreference = "Stop"
+      $tokens = $null
+      $errors = $null
+      [void][System.Management.Automation.Language.Parser]::ParseFile(
+        $env:INSTALL_PS1,
+        [ref]$tokens,
+        [ref]$errors
+      )
+      if ($errors.Count -gt 0) {
+        $errors | ForEach-Object { [Console]::Error.WriteLine($_.ToString()) }
+        exit 1
+      }
+    ' 2>&1
+  )"; then
     pass "PowerShell installer parses"
   else
     bad "PowerShell installer has a parse error"
+    printf '%s\n' "$powershell_parse_output" >&2
   fi
 else
   skip "pwsh not installed — PowerShell parse check not exercised"

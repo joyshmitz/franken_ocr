@@ -7152,6 +7152,7 @@ def _bound_source_pack_artifacts(
     root: Path, bundle_dir: Path, entries: dict[str, dict]
 ) -> set[str]:
     """Return only source packs named by canonical colocated PERF row bindings."""
+    bundle_dir = bundle_dir.resolve()
     bound: set[str] = set()
     for relative, entry in entries.items():
         if "error" in entry or Path(relative).name != "row.json":
@@ -7220,6 +7221,7 @@ def _snapshot_bundle_artifacts(
     max_bundle_bytes: int = CERTIFICATION_MAX_BUNDLE_BYTES,
 ) -> tuple[list[str], float, int, set[str]]:
     """Verify artifacts and materialize an immutable replay snapshot."""
+    bundle_dir = bundle_dir.resolve()
     reasons: list[str] = []
     max_age = 0.0
     total_artifact_bytes = 0
@@ -13204,9 +13206,21 @@ def self_test() -> int:
             snapshotted_large_pack = (
                 Path(large_snapshot_tmp) / large_pack_relative
             )
-            snapshotted_identity = _stream_file_identity(
-                snapshotted_large_pack, PERF_MAX_SOURCE_PACK_BYTES
-            )
+            snapshotted_identity: dict | None = None
+            if not large_snapshot_reasons:
+                if snapshotted_large_pack.is_file():
+                    try:
+                        snapshotted_identity = _stream_file_identity(
+                            snapshotted_large_pack, PERF_MAX_SOURCE_PACK_BYTES
+                        )
+                    except (OSError, ValueError) as error:
+                        large_snapshot_reasons.append(
+                            f"large source-pack snapshot is unreadable: {error}"
+                        )
+                else:
+                    large_snapshot_reasons.append(
+                        "large source-pack snapshot is missing"
+                    )
         check(
             "bundle-large-bound-source-pack-streams-through-manifest-and-snapshot",
             not large_stale
@@ -13215,6 +13229,7 @@ def self_test() -> int:
             and not large_snapshot_reasons
             and large_streamed_paths == {large_pack_relative}
             and large_snapshot_total > CERTIFICATION_MAX_ARTIFACT_BYTES
+            and snapshotted_identity is not None
             and snapshotted_identity["sha256"]
             == large_entries[large_pack_relative]["sha256"]
             and snapshotted_identity["size"] == large_pack_size,
