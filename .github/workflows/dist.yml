@@ -20,10 +20,9 @@
 #   Phase-0 CI tracked linux arm64, darwin x86-64, and windows-msvc x86-64 as
 #   advisory targets; this workflow now ships real artifacts for all of them. The
 #   Unix/macOS variants build in the `dist` job below and native Windows builds in
-#   the `dist-windows` job. Because hosted macOS has a read-only root filesystem,
-#   the workflow rewrites the CI-only `/dp/asupersync` paths in this checkout and
-#   the cloned `frankensqlite` root to the sibling `../asupersync` checkout; the
-#   identical rewrite (already written in PowerShell) also runs on Windows.
+#   the `dist-windows` job. Every runner clones the three pinned path dependencies
+#   beside the source checkout, matching the repository's portable
+#   `../{frankentorch,frankensqlite,asupersync}` layout.
 #
 # Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
 # referenced. Tag pushes (v*) cut a versioned set of artifacts.
@@ -192,24 +191,6 @@ jobs:
           Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
           Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
           Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
-
-          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              if ($required) {
-                throw "expected $cargoToml to contain $needle before CI path rewrite"
-              }
-              # frankensqlite migrated to a crates.io asupersync dep
-              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
-              # root [patch.crates-io] (rewritten above) unifies its graph.
-              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
-              return
-            }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
-          }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
       # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.
@@ -415,11 +396,10 @@ jobs:
           }
           "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
 
-      # Identical to the `dist` job: clone the three path-dep siblings and rewrite
-      # the CI-only `/dp/asupersync` paths to `../asupersync`. On Windows the
-      # checkout lives at e.g. D:\a\franken_ocr\franken_ocr, so the siblings land
-      # next to it and the `../{frankentorch,frankensqlite,asupersync}` path deps
-      # resolve exactly as they do on Unix.
+      # Identical to the `dist` job: clone the three path-dep siblings. On Windows
+      # the checkout lives at e.g. D:\a\franken_ocr\franken_ocr, so the siblings
+      # land next to it and the `../{frankentorch,frankensqlite,asupersync}` path
+      # deps resolve exactly as they do on Unix.
       - name: Provision sibling path dependencies
         shell: pwsh
         run: |
@@ -443,24 +423,6 @@ jobs:
           Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
           Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
           Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
-
-          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              if ($required) {
-                throw "expected $cargoToml to contain $needle before CI path rewrite"
-              }
-              # frankensqlite migrated to a crates.io asupersync dep
-              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
-              # root [patch.crates-io] (rewritten above) unifies its graph.
-              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
-              return
-            }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
-          }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       # Same pinned nightly as the Unix/macOS jobs (REQUIRED for the stdarch
       # int8 intrinsics), plus the explicit MSVC compile target.

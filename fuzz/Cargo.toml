@@ -15,9 +15,10 @@ path = ".."
 
 # Mirror the parent's asupersync unification (see the root Cargo.toml): the
 # fuzz crate resolves franken_ocr's whole graph itself, so the same
-# crates-io patch (IDENTICAL path string) must apply here.
+# crates-io patch must apply here. This manifest is one directory below the
+# repository root, so the shared sibling checkout is `../../asupersync`.
 [patch.crates-io]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { path = "../../asupersync" }
 
 # focrq_parse lives in the init stub's file name (fuzz_target_1.rs) — RULE 1
 # (no file deletion without permission) keeps the generated path; the BIN name

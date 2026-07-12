@@ -732,50 +732,47 @@ mod tests {
         );
     }
 
-    /// bd-223.2: construct/drop leaves no `focr`-prefixed runtime threads.
+    /// bd-223.2: dropping the engine shuts down its owned runtime and pools.
     #[test]
     fn engine_owns_single_runtime_and_drops_clean() {
-        let count_focr_threads = || {
-            // No portable thread enumeration in std: approximate via the
-            // process thread COUNT delta (macOS/Linux: /proc or libproc are
-            // overkill here — the runtime joins its workers on drop, so the
-            // total must return to the baseline).
-            std::thread::available_parallelism().map(|_| ()).ok(); // warm std
-            thread_count()
-        };
-        fn thread_count() -> usize {
-            #[cfg(target_os = "macos")]
-            {
-                // `ps -M` style enumeration is heavyweight; use the Mach-free
-                // fallback: spawn/join delta is what we assert below instead.
-                0
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                std::fs::read_dir("/proc/self/task")
-                    .map(|d| d.count())
-                    .unwrap_or(0)
-            }
-        }
-        let before = count_focr_threads();
-        {
-            let engine = OcrEngine::new().expect("engine builds");
-            // The runtime is live: a trivial blocking stage round-trips.
-            let out = engine
-                .run_blocking_stage_with_budget("drop-probe", Duration::from_secs(5), || Ok(42u8))
-                .expect("stage runs");
-            assert_eq!(out, 42);
-            log_line(
-                "engine_owns_single_runtime_and_drops_clean",
-                "live",
-                "pass",
-                "",
-            );
-        } // <- drop joins the runtime workers
-        let after = count_focr_threads();
+        let engine = OcrEngine::new().expect("engine builds");
+        // Capture the weak handle installed on an actual runtime worker. It
+        // observes this engine's runtime lifecycle without inspecting other
+        // tests' process-wide threads.
+        let runtime_witness = engine
+            .runtime
+            .block_on(engine.runtime.handle().spawn(async {
+                Runtime::current_handle().expect("spawned task has a runtime handle")
+            }));
+
+        // The runtime is live: a trivial blocking stage round-trips.
+        let out = engine
+            .run_blocking_stage_with_budget("drop-probe", Duration::from_secs(5), || Ok(42u8))
+            .expect("stage runs");
+        assert_eq!(out, 42);
+        log_line(
+            "engine_owns_single_runtime_and_drops_clean",
+            "live",
+            "pass",
+            "",
+        );
+
+        drop(engine); // joins the runtime workers
+
         assert!(
-            after <= before,
-            "thread count grew across engine drop: {before} -> {after}"
+            matches!(
+                runtime_witness.try_spawn(async { 42u8 }),
+                Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable)
+            ),
+            "dropped engine runtime should reject new tasks"
+        );
+        assert!(
+            runtime_witness.spawn_blocking(|| {}).is_none(),
+            "dropped engine runtime should not accept blocking tasks"
+        );
+        assert!(
+            runtime_witness.blocking_handle().is_none(),
+            "dropped engine runtime should not expose its blocking pool"
         );
         log_line(
             "engine_owns_single_runtime_and_drops_clean",

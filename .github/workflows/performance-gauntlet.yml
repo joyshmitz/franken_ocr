@@ -94,15 +94,7 @@ jobs:
           }
           verify_or_fetch frankentorch "$FRANKENTORCH_REV"
           verify_or_fetch frankensqlite "$FRANKENSQLITE_REV"
-          [[ -d /dp/asupersync/.git ]] || { echo "/dp/asupersync is missing" >&2; exit 1; }
-          [[ "$(git -C /dp/asupersync rev-parse HEAD)" == "$ASUPERSYNC_REV" ]] || {
-            echo "/dp/asupersync is not at the pinned revision" >&2
-            exit 1
-          }
-          [[ -z "$(git -C /dp/asupersync status --porcelain=v1 --untracked-files=all)" ]] || {
-            echo "/dp/asupersync is dirty" >&2
-            exit 1
-          }
+          verify_or_fetch asupersync "$ASUPERSYNC_REV"
           command -v rch >/dev/null
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || {
             echo "source checkout is dirty before performance capture" >&2

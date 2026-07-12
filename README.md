@@ -259,7 +259,7 @@ On Linux, swap the asset name and use `sha256sum -c "$asset.sha256"`.
 
 `franken_ocr` requires the nightly Rust toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml). `cargo build --locked --release` builds both the `focr` and `franken_ocr` binaries from one shared entrypoint.
 
-The catch: `franken_ocr` path-depends on sibling repositories that are not published on crates.io (`asupersync`, patched to `/dp/asupersync`; `../frankentorch`; `../frankensqlite`). A fresh-clone `cargo build --locked` or a `cargo install --git` will fail to resolve those dependencies. There is no working `cargo install` from crates.io. Prebuilt binaries are the supported path; build from source only if you have those sibling repositories laid out as the workspace expects.
+The catch: `franken_ocr` path-depends on sibling repositories that are not published on crates.io (`../asupersync`, `../frankentorch`, and `../frankensqlite`). A fresh-clone `cargo build --locked` or a `cargo install --git` will fail to resolve those dependencies. There is no working `cargo install` from crates.io. Prebuilt binaries are the supported path; build from source only if you have those sibling repositories laid out as the workspace expects.
 
 ```bash
 cargo build --locked --release

@@ -47,7 +47,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 It is built on:
 - `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`, `ft-serialize`) — custom CPU tensor kernels, consumed at the **kernel** level (not the autograd level).
-- `/dp/asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
+- `../asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
 - `/dp/frankensqlite` (`fsqlite`) — durable local run state + telemetry (NEVER `rusqlite`).
 
 **The single source of truth for what we are building and why is [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md).** Read it before writing any kernel.

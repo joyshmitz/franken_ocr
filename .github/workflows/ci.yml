@@ -12,12 +12,10 @@
 # CI installs that same dated toolchain plus the needed components/targets, so a
 # later nightly cannot silently change lint, codegen, or intrinsic behavior.
 #
-# Path dependencies: franken_ocr currently consumes sibling checkouts at
-# `../frankentorch`, `../frankensqlite`, and a host-local `/dp/asupersync`.
-# Fresh GitHub runners do not have those paths, and hosted macOS has a read-only
-# root filesystem, so each Cargo job clones the siblings and rewrites the CI-only
-# `/dp/asupersync` paths in this checkout and the cloned `frankensqlite` root to
-# the sibling `../asupersync` checkout.
+# Path dependencies: franken_ocr consumes sibling checkouts at
+# `../frankentorch`, `../frankensqlite`, and `../asupersync`. Fresh GitHub
+# runners do not have those paths, so each Cargo job clones the pinned siblings
+# next to the source checkout before invoking Cargo.
 #
 # Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
 # tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
@@ -95,24 +93,6 @@ jobs:
           Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
           Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
           Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
-
-          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              if ($required) {
-                throw "expected $cargoToml to contain $needle before CI path rewrite"
-              }
-              # frankensqlite migrated to a crates.io asupersync dep
-              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
-              # root [patch.crates-io] (rewritten above) unifies its graph.
-              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
-              return
-            }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
-          }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
@@ -282,24 +262,6 @@ jobs:
           Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
           Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
           Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
-
-          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              if ($required) {
-                throw "expected $cargoToml to contain $needle before CI path rewrite"
-              }
-              # frankensqlite migrated to a crates.io asupersync dep
-              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
-              # root [patch.crates-io] (rewritten above) unifies its graph.
-              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
-              return
-            }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
-          }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
 
       - name: Install pinned nightly toolchain
         if: ${{ !matrix.skip }}
