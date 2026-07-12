@@ -592,23 +592,28 @@ else
     bindir="$work/fresh/account/.local/bin"
     mkdir -p "$rel" "$fakehome" "$test_tmp"  # NB: bindir intentionally NOT created here
 
-    # Fake focr: a tiny stub that answers `--version` like the real CLI so the
-    # installer's verify_install step succeeds. Anything else is a clean no-op.
-    cat > "$rel/$asset" <<'STUB'
-#!/bin/sh
-case "${1:-}" in
-  --version) echo "focr 0.2.0" ;;
-  *) exit 0 ;;
-esac
+    # Fake focr: compile a host-native stub so Gate 2 exercises the same kind of
+    # executable as a release asset. A shebang script takes a different macOS
+    # execution-policy path and can stall before its interpreter reaches main.
+    stub_src="$work/focr_stub.rs"
+    cat > "$stub_src" <<'STUB'
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("focr 0.2.0");
+    }
+}
 STUB
-    chmod +x "$rel/$asset"
+    if ! rustc --edition=2024 -C opt-level=0 -C debuginfo=0 -o "$rel/$asset" "$stub_src"; then
+      bad "failed to compile the native fake-release focr"
+      asset=""
+    fi
 
     # SHA256 sidecar in the installer's expected "<hex>  <asset>" format.
-    if command -v sha256sum >/dev/null 2>&1; then
+    if [ -n "$asset" ] && command -v sha256sum >/dev/null 2>&1; then
       ( cd "$rel" && sha256sum "$asset" > "$asset.sha256" )
-    elif command -v shasum >/dev/null 2>&1; then
+    elif [ -n "$asset" ] && command -v shasum >/dev/null 2>&1; then
       ( cd "$rel" && shasum -a 256 "$asset" > "$asset.sha256" )
-    else
+    elif [ -n "$asset" ]; then
       skip "no sha256 tool"; asset=""
     fi
 
