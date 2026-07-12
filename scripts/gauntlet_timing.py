@@ -333,6 +333,14 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 _KNOWN_EVENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^pdf page (?P<page>\d+): spread split at x=(?P<gutter>\d+) "
+        r"\((?P<w>\d+)x(?P<h>\d+)\)$"
+    ),
+    re.compile(
+        r"^pdf page (?P<page>\d+): no spread detected "
+        r"\((?P<w>\d+)x(?P<h>\d+)\), unsplit$"
+    ),
     re.compile(r"^tromr\.staff_detect (?P<staves>\d+) staves$"),
     re.compile(
         r"^tromr\.staff (?P<staff>\d+) split-recognized "
@@ -416,6 +424,7 @@ def parse_run(stderr_text: str) -> dict:
                 f"decode_total={expected!r}, phase_lines={phase_lines['occurrences']!r}, "
                 f"phase_occurrences={observed!r}"
             )
+    _validate_run_coherence(stages)
     return stages
 
 
@@ -457,10 +466,19 @@ def _fold(stages: dict[str, dict], name: str, m: re.Match[str]) -> None:
         _add(stages, "decode_lm_head", float(groups["head"]), None)
         return
     if name == "multi_page_vision":
+        existing = stages.get("vision_encode")
+        if existing is not None and existing.get("pages") is None:
+            raise TimingParseError(
+                "one run mixed single-page vision_tower totals with multi_page.vision"
+            )
         _add(stages, "vision_encode", float(groups["s"]), None)
         entry = stages["vision_encode"]
         entry["pages"] = entry.get("pages", 0) + int(groups["pages"])
         return
+    if name == "vision_encode" and stages.get(name, {}).get("pages") is not None:
+        raise TimingParseError(
+            "one run mixed multi_page.vision with single-page vision_tower totals"
+        )
     if name.endswith("_generate_batch"):
         base = name[: -len("_batch")]
         _add(stages, base, float(groups["s"]), int(groups["tok"]))
@@ -496,6 +514,83 @@ def _add(stages: dict[str, dict], name: str, secs: float, tokens: int | None) ->
     entry["occurrences"] += 1
     if tokens is not None:
         entry["tokens"] = entry.get("tokens", 0) + tokens
+
+
+def _validate_run_coherence(stages: dict[str, dict]) -> None:
+    multi_vision = stages.get("vision_encode")
+    multi_pages = multi_vision.get("pages") if multi_vision is not None else None
+    multi_decode = stages.get("multi_page_decode")
+    if multi_pages is not None or multi_decode is not None:
+        if multi_pages is None or multi_decode is None:
+            raise TimingParseError(
+                "multi-page timing requires one paired vision and outer decode total"
+            )
+        if multi_vision["occurrences"] != 1 or multi_decode["occurrences"] != 1:
+            raise TimingParseError(
+                "one timing capture must contain exactly one multi-page transaction: "
+                f"vision_occurrences={multi_vision['occurrences']!r}, "
+                f"decode_occurrences={multi_decode['occurrences']!r}"
+            )
+        pages = multi_vision["pages"]
+        if not isinstance(pages, int) or pages <= 0:
+            raise TimingParseError(f"multi-page vision reported invalid page count {pages!r}")
+        detail_counts = {
+            stage: stages.get(stage, {}).get("occurrences")
+            for stage in ("vision_sam", "vision_clip", "vision_bridge")
+        }
+        if any(count != pages for count in detail_counts.values()):
+            raise TimingParseError(
+                "multi-page vision detail counts do not match its page count: "
+                f"pages={pages!r}, detail_occurrences={detail_counts!r}"
+            )
+        decode = stages.get("decode_total")
+        expected = {
+            "occurrences": multi_decode.get("occurrences"),
+            "tokens": multi_decode.get("tokens"),
+        }
+        observed = (
+            {
+                "occurrences": decode.get("occurrences"),
+                "tokens": decode.get("tokens"),
+            }
+            if decode is not None
+            else None
+        )
+        if observed != expected:
+            raise TimingParseError(
+                "multi-page outer decode disagrees with the decoder total: "
+                f"outer={expected!r}, decode_total={observed!r}"
+            )
+
+    for lane in ("got", "smolvlm2", "onechart"):
+        vision = stages.get(f"{lane}_vision_splice")
+        generate = stages.get(f"{lane}_generate")
+        forward = stages.get(f"{lane}_forward")
+        entries = (vision, generate, forward)
+        batch_markers = [bool(entry and entry.get("batched")) for entry in entries]
+        if not any(batch_markers):
+            continue
+        if not all(batch_markers):
+            raise TimingParseError(
+                f"{lane} dense-batch timing requires vision, generate, and forward spans"
+            )
+        occurrences = [entry.get("occurrences") for entry in entries]
+        if occurrences != [1, 1, 1]:
+            raise TimingParseError(
+                f"{lane} dense-batch timing is duplicated or mixed with sequential spans: "
+                f"occurrences={occurrences!r}"
+            )
+        counts = [vision.get("views"), generate.get("streams"), forward.get("views")]
+        if any(not isinstance(count, int) or count <= 0 for count in counts):
+            raise TimingParseError(
+                f"{lane} dense-batch timing has invalid cardinalities: {counts!r}"
+            )
+        if len(set(counts)) != 1:
+            raise TimingParseError(
+                f"{lane} dense-batch cardinalities disagree: "
+                f"vision_views={counts[0]!r}, generate_streams={counts[1]!r}, "
+                f"outer_inputs={counts[2]!r}"
+            )
 
 
 def infer_precision(runs: list[dict]) -> str | None:
@@ -1074,8 +1169,12 @@ def aggregate_runs(
         for dimension in ("views", "pages", "streams"):
             values = [entry.get(dimension) for entry in present]
             if any(value is not None for value in values):
+                if any(value is None for value in values) or len(set(values)) != 1:
+                    raise TimingParseError(
+                        f"stage {name!r} {dimension} counts drift across runs: {values!r}"
+                    )
                 record[dimension] = values[0]
-                record[f"{dimension}_consistent"] = len(set(values)) == 1
+                record[f"{dimension}_consistent"] = True
         if any(t is not None for t in tokens):
             record["tokens"] = tokens[0]
             record["tokens_consistent"] = len(set(tokens)) == 1
@@ -1750,9 +1849,24 @@ _SYNTHETIC_ZOO_BATCH = """\
 """
 
 _SYNTHETIC_MULTI_PAGE = """\
+[focr-timing]   vision.sam 1.00s
+[focr-timing]   vision.clip 0.20s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing]   vision.sam 1.10s
+[focr-timing]   vision.clip 0.21s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing]   vision.sam 1.20s
+[focr-timing]   vision.clip 0.22s
+[focr-timing]   vision.bridge 0.01s
 [focr-timing] multi_page.vision (3 pages) 4.50s
 [focr-timing] decode 1.00s (5 tokens, 0.200s/tok)
 [focr-timing] multi_page.decode 5 tokens 2.00s
+"""
+
+_SYNTHETIC_PDF_EVENTS = """\
+[focr-timing] pdf page 1: spread split at x=100 (200x300)
+[focr-timing] pdf page 2: no spread detected (200x300), unsplit
+[focr-timing] preprocess 0.01s
 """
 
 _SYNTHETIC_TROMR_EVENTS = """\
@@ -1930,12 +2044,19 @@ def _self_test() -> int:
         and zoo_by_stage["got_generate"]["streams"] == 3
         and zoo_by_stage["got_generate"]["streams_consistent"] is True,
     )
-
     multi_page = parse_run(_SYNTHETIC_MULTI_PAGE)
     check(
         "multi-page-vision-canonical-stage",
         math.isclose(multi_page["vision_encode"]["s"], 4.5)
-        and multi_page["vision_encode"]["pages"] == 3,
+        and multi_page["vision_encode"]["pages"] == 3
+        and multi_page["vision_encode"]["occurrences"] == 1,
+    )
+    check(
+        "multi-page-vision-detail-counts",
+        multi_page["vision_sam"]["occurrences"] == 3
+        and multi_page["vision_clip"]["occurrences"] == 3
+        and multi_page["vision_bridge"]["occurrences"] == 3
+        and math.isclose(multi_page["vision_sam"]["s"], 3.3),
     )
     check(
         "multi-page-outer-decode-is-informational",
@@ -1943,6 +2064,85 @@ def _self_test() -> int:
         and math.isclose(multi_page["multi_page_decode"]["s"], 2.0)
         and multi_page["multi_page_decode"]["tokens"] == 5,
     )
+
+    pdf_events = parse_run(_SYNTHETIC_PDF_EVENTS)
+    check(
+        "pdf-spread-events-do-not-fabricate-numeric-stages",
+        set(pdf_events) == {"preprocess"},
+    )
+
+    for name, text in (
+        (
+            "refuses-dense-batch-live-count-drift",
+            _SYNTHETIC_ZOO_BATCH.replace(
+                "got.generate(batch of 3)", "got.generate(batch of 2)"
+            ),
+        ),
+        (
+            "refuses-dense-batch-outer-smaller-than-live",
+            _SYNTHETIC_ZOO_BATCH.replace(
+                "got-ocr2 forward(batch of 3)", "got-ocr2 forward(batch of 2)"
+            ),
+        ),
+        (
+            "refuses-dense-batch-reduced-live-workload",
+            _SYNTHETIC_ZOO_BATCH.replace(
+                "got-ocr2 forward(batch of 3)", "got-ocr2 forward(batch of 4)"
+            ),
+        ),
+        (
+            "refuses-incomplete-dense-batch",
+            _SYNTHETIC_ZOO_BATCH.replace(
+                "[focr-timing]   got.generate(batch of 3) 12 tokens 2.30s\n", ""
+            ),
+        ),
+        (
+            "refuses-zero-cardinality-dense-batch",
+            _SYNTHETIC_ZOO_BATCH.replace("batch of 3", "batch of 0"),
+        ),
+        (
+            "refuses-mixed-sequential-and-dense-batch",
+            _SYNTHETIC_ZOO_BATCH + "[focr-timing]   got.vision+splice 0.10s\n",
+        ),
+        (
+            "refuses-multi-page-token-drift",
+            _SYNTHETIC_MULTI_PAGE.replace(
+                "multi_page.decode 5 tokens", "multi_page.decode 6 tokens"
+            ),
+        ),
+        (
+            "refuses-multi-page-page-count-drift",
+            _SYNTHETIC_MULTI_PAGE.replace("(3 pages)", "(4 pages)"),
+        ),
+        (
+            "refuses-multi-page-without-outer-decode",
+            _SYNTHETIC_MULTI_PAGE.replace(
+                "[focr-timing] multi_page.decode 5 tokens 2.00s\n", ""
+            ),
+        ),
+        (
+            "refuses-multi-page-decode-without-vision-total",
+            _SYNTHETIC_MULTI_PAGE.replace(
+                "[focr-timing] multi_page.vision (3 pages) 4.50s\n", ""
+            ),
+        ),
+        (
+            "refuses-duplicate-multi-page-transaction",
+            _SYNTHETIC_MULTI_PAGE * 2,
+        ),
+        (
+            "refuses-ambiguous-vision-total",
+            _SYNTHETIC_MULTI_PAGE.replace(
+                "[focr-timing] multi_page.vision",
+                "[focr-timing] vision_tower 4.40s\n[focr-timing] multi_page.vision",
+            ),
+        ),
+    ):
+        try:
+            parse_run(text)
+            check(name, False)
+        except TimingParseError:
+            check(name, True)
 
     tromr_events = parse_run(_SYNTHETIC_TROMR_EVENTS)
     check(
@@ -1959,6 +2159,7 @@ def _self_test() -> int:
         ("refuses-malformed-tromr-split", "tromr.split seg 0 [a..b] 0.20s (4 chars)"),
         ("refuses-empty-tromr-skip-reason", "tromr.staff 1 SKIP (90x20):"),
         ("refuses-unknown-tromr-sanity-kind", "tromr.sanity oddity part 1 measure 2: detail"),
+        ("refuses-malformed-pdf-spread", "pdf page 1: spread split x=100 (200x300)"),
     ):
         try:
             parse_run(f"[focr-timing] preprocess 0.01s\n[focr-timing] {malformed}\n")
@@ -2069,6 +2270,20 @@ def _self_test() -> int:
     )
     drift_tok = next(r for r in drift if r["stage"] == "decode_per_token")
     check("agg-token-drift-flagged", drift_tok["tokens_consistent"] is False)
+
+    zoo_batch_four = parse_run(_SYNTHETIC_ZOO_BATCH.replace("batch of 3", "batch of 4"))
+    try:
+        aggregate_runs(
+            [zoo_batch, zoo_batch_four],
+            [1.0, 1.0],
+            threads=8,
+            precision="zoo-mixed",
+            allocator="system",
+            synthetic=True,
+        )
+        check("refuses-cross-run-batch-cardinality-drift", False)
+    except TimingParseError:
+        check("refuses-cross-run-batch-cardinality-drift", True)
 
     # A stage missing from one run is a comparability error, not a silent gap.
     try:
