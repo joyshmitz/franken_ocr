@@ -100,6 +100,13 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"^vision\.hydrate\(batch\) (?P<s>\d+(?:\.\d+)?)s$"),
     ),
     (
+        "unlimited_vision_hydrate",
+        re.compile(
+            r"^unlimited_vision\.hydrate\((?:cached|batch-local)\) "
+            r"(?P<s>\d+(?:\.\d+)?)s$"
+        ),
+    ),
+    (
         "vision_sam_batch",
         re.compile(
             r"^vision\.sam\(batch of (?P<views>\d+), side (?P<side>\d+)\)"
@@ -1561,6 +1568,7 @@ noise line the parser must ignore
 _SYNTHETIC_UNLIMITED_MIXED = """\
 [focr-timing] precision focr-mixed-ffn-int8
 [focr-timing] preprocess 0.12s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.11s
 [focr-timing]   vision.sam 1.20s
 [focr-timing]   vision.clip 0.40s
 [focr-timing]   vision.bridge 0.05s
@@ -1583,6 +1591,7 @@ layers 10.00s (attn 3.00s, gemv+misc 7.00s) | lm_head 1.50s
 # sam, single lines for hydrate/clip/bridge; the second sam group proves the
 # same-stage fold sums seconds and view counts).
 _SYNTHETIC_BATCH = """\
+[focr-timing]     unlimited_vision.hydrate(batch-local) 0.21s
 [focr-timing]   vision.hydrate(batch) 0.62s
 [focr-timing]   vision.sam(batch of 3, side 1024) 2.40s
 [focr-timing]   vision.sam(batch of 2, side 640) 0.80s
@@ -1614,6 +1623,10 @@ def _self_test() -> int:
     check(
         "unlimited-mixed-precision",
         infer_precision([mixed_run]) == PRECISION_MIXED_FFN_INT8,
+    )
+    check(
+        "unlimited-mixed-vision-hydrate",
+        math.isclose(mixed_run["unlimited_vision_hydrate"]["s"], 0.11),
     )
     check(
         "unlimited-mixed-phases",
@@ -1688,6 +1701,10 @@ def _self_test() -> int:
     # bd-t6a batched-vision lines: hydrate is its own stage; sam/clip/bridge
     # batch lines fold into the per-view stage names, summing seconds + views.
     batch = parse_run(_SYNTHETIC_BATCH)
+    check(
+        "batch-unlimited-vision-hydrate",
+        math.isclose(batch["unlimited_vision_hydrate"]["s"], 0.21),
+    )
     check("batch-hydrate", math.isclose(batch["vision_hydrate"]["s"], 0.62))
     check("batch-sam-sum", math.isclose(batch["vision_sam"]["s"], 3.20))
     check("batch-sam-views", batch["vision_sam"]["views"] == 5)
