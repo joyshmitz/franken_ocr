@@ -589,12 +589,25 @@ jobs:
             Remove-Item Env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS -ErrorAction SilentlyContinue
             Remove-Item Env:FOCR_INSTALL_TEST_MODE -ErrorAction SilentlyContinue
           }
-          for ($attempt = 0; $attempt -lt 50 -and -not (Test-Path -LiteralPath $lockReady); $attempt++) {
-            if ($holder.HasExited) { throw "lock holder exited before acquiring the lock: $($holder.ExitCode)" }
+          function Write-LockHolderLogs {
+            foreach ($path in @($lockHolderOut, $lockHolderErr)) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Get-Content -LiteralPath $path | Write-Host
+              }
+            }
+          }
+          for ($attempt = 0; $attempt -lt 300 -and -not (Test-Path -LiteralPath $lockReady); $attempt++) {
+            if ($holder.HasExited) {
+              Write-LockHolderLogs
+              throw "lock holder exited before acquiring the lock: $($holder.ExitCode)"
+            }
             Start-Sleep -Milliseconds 100
           }
           if (-not (Test-Path -LiteralPath $lockReady -PathType Leaf)) {
-            throw 'lock holder did not publish deterministic readiness'
+            if (-not $holder.HasExited) { Stop-Process -Id $holder.Id -Force }
+            $holder.WaitForExit()
+            Write-LockHolderLogs
+            throw 'lock holder did not publish deterministic readiness within 30 seconds'
           }
           try {
             & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `

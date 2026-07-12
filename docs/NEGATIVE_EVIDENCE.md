@@ -575,29 +575,30 @@ claims.
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-bf16-stream/
 
 2026-07-10 | PROVISIONAL_LOCAL_WIN | bit-exact parallel independent-head scheduling in scalar R-SWA decode attention (`src/native_engine/rswa.rs::decode_attention_scalar_parallel`)
-  claim_id: CLAIM-bd-2mo30-rswa-parallel-heads   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-rswa-par-heads/
+  claim_id: CLAIM-bd-2mo30-rswa-parallel-heads   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/revalidate-rswa-parallel-25cecb9-20260712/
   model source commit + fixture hash:
     HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
     config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
     model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
     conservative recipe `.focrq` sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
-    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2; page_0590.png sha256 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
-    source baseline HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the bd-2mo.30 conservative-recipe worktree
-  CPU feature string: Apple M4 arm64, `RAYON_NUM_THREADS=8`; R-SWA kernel is f32 scalar/autovectorized math, parallelized only across ten independent heads
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2; complete 20-page hashes are bound by `batch20/focr_ab.json`
+    clean workspace HEAD 25cecb9c4cbfa599fbf48a45d9bf9748daab4192; source-manifest root 09a9893d1ae83d7bef652051e3772b2ee6d27eeec9c5768ad25f12a88dda9f0d (22,489 entries)
+    pinned siblings frankentorch 062cf3671c194f6ab184da98f0559ebc76cff7c7, frankensqlite cd9990bb16291d8c7c247b75b47faae8d7701adb, asupersync 53aa5c72f855352148c3a88e6961f7f09adb535c
+  CPU feature string: dual-socket AMD EPYC 7282 x86_64 with AVX2, `FOCR_THREADS=8`; R-SWA kernel is f32 scalar/autovectorized math, parallelized only across ten independent heads
   exact command + env:
-    normal-page runs in order `FOCR_RSWA_PARALLEL_ATTN=0,1,1,0,0,1`, each:
-    `FOCR_RSWA_PARALLEL_ATTN=<mode> FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 /usr/bin/time -p /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr ocr /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png --model /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq`
-    sentinel command is identical except `page_0590.png`, one complete run per mode.
-  fallback / kill-switch state: default `FOCR_RSWA_PARALLEL_ATTN=1` schedules the ten disjoint heads across Rayon; `=0|off|false|no` restores the serial oracle. `FOCR_ATTN_GEMM` and `FOCR_INT8_KV` unset throughout; system allocator.
+    trusted producer: `rch exec -- cargo build --locked --profile release-perf --bin focr --target x86_64-unknown-linux-gnu`; binary sha256 0e50d513e60956d544af4e7cd707e76888a00de83598563dffd4b0cbc94961c6
+    both balanced A/Bs: `FOCR_DECODE_INT8=0 FOCR_INT8_ATTN=0 FOCR_INT8_LMHEAD=0 FOCR_THREADS=8 bash scripts/gauntlet_focr.sh --runs 5 --warmup 1 --threads 8 --precision focr-mixed-ffn-int8 --ab-env FOCR_RSWA_PARALLEL_ATTN --a-label shipped-parallel --a-value '<unset>' --b-label serial-control --b-value 0 ...`
+    dense used `--command ocr --workload-label dense --page page_0014.png`; broad used `FOCR_MAX_NEW_TOKENS=32 --command ocr-batch --workload-label 20-page` and all 20 sorted pinned pages. Exact argv, schedule, environment, hashes, and raw-file bindings are in each `focr_ab.json`.
+  fallback / kill-switch state: default/unset schedules the ten disjoint heads across Rayon; `FOCR_RSWA_PARALLEL_ATTN=0|off|false|no` restores the serial oracle. `FOCR_ATTN_GEMM`, `FOCR_INT8_KV`, `FOCR_SPEC_DECODE`, and `FOCR_DECODE_STATELESS` unset throughout; system allocator.
   measured before -> after vs reference:
-    local focr-only interleaved A/B (no pinned torch CPU reference ratio): normal-page median decode 15.11 -> 14.19 s (-6.09%, 1.065x); median profiled attention 6,080 -> 5,254 ms (-13.59%, 1.157x). All three adjacent comparisons favored parallel: decode -6.28%, -1.52%, -6.34%. On the full 32,768-token sentinel, decode 928.81 -> 884.20 s (-4.80%, 1.050x) and attention 364,725 -> 317,677 ms (-12.90%, 1.148x). The sentinel's shared max-length runaway is an independent baseline release blocker (`bd-2mo.30.12`), not an optimization divergence.
+    current-tree focr-only interleaved A/B (no pinned torch CPU reference ratio), serial -> parallel: dense end-to-end p50 49.028 -> 45.860 s (-6.46%), decode 27.550 -> 24.260 s (-11.94%), attention 8.646 -> 5.890 s (-31.88%); CVs 0.824/3.008%, 1.655/2.211%, and 1.202/3.848% respectively. Capped 20-page end-to-end p50 326.374 -> 323.910 s (-0.76%), decode 34.710 -> 31.750 s (-8.53%), attention 9.932 -> 7.161 s (-27.90%); CVs 1.042/1.087%, 1.220/1.459%, and 1.115/2.606%. RSS p50 changed by +0.028% dense and +0.004% broad. Pre-run load1 was 0.44 and 0.58 without `FORCE=1`.
   bit-exact correctness proof:
-    serial and parallel call the same extracted per-head body; every within-head `dot`, reference-then-ring online-softmax fold, accumulator update, and normalization retains its original order, and heads write disjoint 128-float lanes. Focused unit gate `parallel_heads_are_bit_identical_to_serial` passed. All six page_0014 outputs are byte-identical (sha256 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a), and both complete 32,768-token page_0590 outputs are byte-identical (92,028 bytes, sha256 23d9e8b353ac2b2884943019a031eb91f00a39f0610fc1082a94af98ba7b7123).
+    serial and parallel call the same extracted per-head body; every within-head `dot`, reference-then-ring online-softmax fold, accumulator update, and normalization retains its original order, and heads write disjoint 128-float lanes. Focused unit gate `parallel_heads_are_bit_identical_to_serial` passed. Both current-tree harnesses report `cross_arm_output.byte_identical=true`; all dense outputs hash to 7190e15dcbe5a85caf1fc61d2ac27aa2fc997e841965aceb0566cc39c8e13d0a, and the full 20-page output hash is bound in `batch20/focr_ab.json`.
   disposition: KEEP (parallel default; serial deterministic fallback retained)
   do-not-retry: "do not parallelize inside a head or reorder its online-softmax fold. Further R-SWA work may tile or prefetch only if it preserves the per-key reduction order and independently clears the page_0590 byte-identity sentinel."
-  per-lever tally: W 1 / L 0 / N 0
-  agent: BrownFox
-  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-rswa-par-heads/
+  per-lever tally: W 2 / L 0 / N 0
+  agent: BrownFox (original), Codex (strict current-tree revalidation)
+  evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/revalidate-rswa-parallel-25cecb9-20260712/ (original evidence retained at `ab-rswa-par-heads/`)
 
 2026-07-10 | NEGATIVE(reverted) | scalar adjacent-row interleave for the high-precision `lm_head` (`src/native_engine/decoder.rs` experiment)
   claim_id: CLAIM-bd-2mo30-lmhead-row-interleave   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-lmhead-row-interleave/
