@@ -16,6 +16,42 @@ sections as they land.
 
 No changes yet.
 
+## [0.7.2] - 2026-07-12
+
+This patch release makes the exact pinned source closure portable, certifies the
+default parallel R-SWA decode path on the current tree, and hardens the native
+Windows installer gate without changing the immutable Unlimited-OCR model
+payload.
+
+### Changed
+
+- Replace host-specific `/dp/asupersync` dependency paths with the portable
+  pinned sibling layout used by CI, dist, fuzzing, and downstream source builds.
+- Record a strict current-tree A/B for parallel R-SWA attention: the focused
+  decode median improved by 11.94%, the capped 20-page decode median improved by
+  8.53%, and both workloads produced byte-identical cross-arm output.
+- Binary SemVer remains independent from model-artifact SemVer: the `v0.7.2`
+  executables continue to consume the exact hash-pinned `v0.7.0` conservative
+  Unlimited-OCR artifact.
+
+### Fixed
+
+- Remove release-time source rewriting for asupersync paths so fresh clones and
+  all six native build targets consume the same immutable source closure.
+- Give the Windows offline-installer lock holder up to 30 seconds to publish its
+  deterministic readiness marker, and emit its captured logs on early exit or
+  timeout.
+
+### Verification
+
+- The exact pinned dependency closure passed `scripts/check.sh`, including all
+  repository validators, installer E2E, formatting, locked all-target check,
+  clippy, 1,046 passing library tests with one ignored test, integration suites,
+  doc tests, and UBS.
+- The committed performance receipts bind the subject binary, 22,489-entry
+  source manifest, model and tokenizer hashes, five measured runs per arm after
+  warmup, quiet-host preflight, and byte-identical outputs for both workloads.
+
 ## [0.7.1] - 2026-07-11
 
 This patch release restores reproducible Windows distribution and tightens the
@@ -670,7 +706,8 @@ results above. The `.focrq` byte-parity, the SHA256 manifest verification in
 `focr pull`, and the 24/24 `robot selftest` (including the K=6848 overflow case) were
 all verified on real hardware on Apple Silicon and on a real x86 AVX2 host.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.5.2...v0.6.0

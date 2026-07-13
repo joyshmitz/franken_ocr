@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "franken_ocr"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "asupersync",
